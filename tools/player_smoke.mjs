@@ -7,9 +7,11 @@ import { promisify } from 'node:util';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { withBrowser, pngPixels, pause, root } from './browser.mjs';
-const run=promisify(execFile), headed=process.argv.includes('--headed');
+const run=promisify(execFile), headed=process.argv.includes('--headed'), unitControl=process.argv.includes('--unit-mesh'), gpuUnitControl=process.argv.includes('--gpu-unit-mesh'), legacyControl=process.argv.includes('--legacy-greedy');
+assert(!((unitControl||legacyControl)&&gpuUnitControl),'Choose one unit tessellation control');
+const expectedGpuUnit=!(unitControl||legacyControl);
 const dir=join(root,'.local/artifacts',`m3-${Date.now()}`);await mkdir(dir,{recursive:true});
-await withBrowser({headed,width:780,height:437,path:'/?scene=forest&meshDelayMs=200&workerMeshDelayMs=200'},async({call,evaluate,waitFor})=>{
+await withBrowser({headed,width:780,height:437,path:'/?scene=forest&meshDelayMs=200&workerMeshDelayMs=200'+(unitControl?'&unit_mesh=1':'')+(gpuUnitControl?'&gpu_unit_mesh=1':'')+(legacyControl?'&legacy_gpu_greedy=1':'')},async({call,evaluate,waitFor})=>{
   await waitFor('document.documentElement.dataset.m2',s=>{if(s==='error')throw new Error('Client loading failed');return s==='ready';});
   const stats=async()=>JSON.parse(await evaluate('JSON.stringify(window.__M2Stats())'));
   async function until(test,timeout=20000){const end=Date.now()+timeout;let last;while(Date.now()<end){last=await stats();if(test(last))return last;await pause(30);}throw new Error(`Player condition timed out: ${JSON.stringify(last)}`);}
@@ -18,7 +20,7 @@ await withBrowser({headed,width:780,height:437,path:'/?scene=forest&meshDelayMs=
   const capture=async(name)=>{const data=await evaluate("document.querySelector('canvas').toDataURL('image/png')");assert(data.startsWith('data:image/png;base64,'));const bytes=Buffer.from(data.split(',')[1],'base64');const image=pngPixels(bytes);assert.equal(image.width,780);assert.equal(image.height,437);const path=join(dir,`${name}.png`);await writeFile(path,bytes);return path;};
   const compare=async(reference,actual,control)=>{const {stdout}=await run('cargo',['run','--locked','-p','render','--example','compare_frames','--',reference,actual,...(control?[control]:[])],{cwd:root,timeout:120000,maxBuffer:1000000});const metric=JSON.parse(stdout.trim());assert(metric.blackControlFlipMean>0.05,'FLIP positive control failed');return metric;};
   const checkTransient=metric=>{assert(metric.flipMean<=0.001,`H1 transient FLIP: ${JSON.stringify(metric)}`);assert(metric.maxDelta<=4,`H1 transient edge/color: ${JSON.stringify(metric)}`);};
-  const initial=await stats();assert.equal(initial.residentPages,27);assert.equal(initial.loadedPages,125);assert(initial.residentQuads>=500);assert.equal(initial.sampleCount,4);
+  const initial=await stats();assert.equal(initial.diagnosticUnitMesh,unitControl);assert.equal(initial.diagnosticGpuUnitMesh,expectedGpuUnit);assert.equal(initial.residentPages,27);assert.equal(initial.loadedPages,125);assert(initial.residentQuads>=500);assert.equal(initial.sampleCount,4);
   await tap('KeyV','v');const avatar=await until(s=>s.playerSpawned&&s.cameraMode===1&&s.selfModelRendered);await capture('third-person');
   await tap('KeyH','h');await pause(100);const denied=await stats();assert.equal(denied.deniedDebugRequests,1);assert.equal(denied.noclip,false);
   await tap('KeyV','v');await tap('KeyF','f');const height=(await stats()).playerPosition[1];
@@ -47,6 +49,6 @@ await withBrowser({headed,width:780,height:437,path:'/?scene=forest&meshDelayMs=
   const presented=await fence(s=>s.presentationLatencyMeasured&&s.presentedEditCount>=1&&s.pendingEditPresentations===0);
   assert(presented.editPresentedFramesMax>=1&&presented.editPresentedFramesMax<=2,`Presented edit exceeded two completed frames: ${JSON.stringify(presented)}`);
   assert.equal(presented.presentationProbeOverflow,false);
-  const result={initial,avatar,flight,denied,fast,final,breaking,rollback,placing,presented,presentationLatencyMeasured:true,workerDelayMs:200,visualPublicationBarrier:true};await writeFile(join(dir,'player-smoke.json'),JSON.stringify(result,null,2)+'\n');
-  console.log(`PLAYER_BROWSER_OK ${JSON.stringify({breaking,rollback,placing,artifacts:dir,presentationLatencyMeasured:true,presentedEditFrames:presented.editPresentedFramesMax})}`);
+  const result={initial,avatar,flight,denied,fast,final,breaking,rollback,placing,presented,presentationLatencyMeasured:true,workerDelayMs:200,visualPublicationBarrier:true,diagnosticUnitMesh:unitControl,gpuUnitRasterization:expectedGpuUnit,diagnosticLegacyGreedy:legacyControl};await writeFile(join(dir,'player-smoke.json'),JSON.stringify(result,null,2)+'\n');
+  console.log(`${gpuUnitControl?'PLAYER_GPU_UNIT_MESH_CONTROL_OK':unitControl?'PLAYER_UNIT_MESH_CONTROL_OK':'PLAYER_BROWSER_OK'} ${JSON.stringify({breaking,rollback,placing,artifacts:dir,presentationLatencyMeasured:true,presentedEditFrames:presented.editPresentedFramesMax,diagnosticUnitMesh:unitControl,gpuUnitRasterization:expectedGpuUnit,diagnosticLegacyGreedy:legacyControl})}`);
 });

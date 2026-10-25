@@ -108,6 +108,8 @@ def summarize(value):
             "durationSeconds": (frames[-1]["timeNs"] - frames[0]["timeNs"]) / 1e9,
             "completeWindow": value["completeWindow"], "lostFrames": value["lostFrames"],
             "lostInputs": value["lostInputs"], "benchmark": value.get("benchmark"),
+            "hitches25": sum(f["intervalNs"] > 25_000_000 for f in frames),
+            "hitches50": sum(f["intervalNs"] > 50_000_000 for f in frames),
             "frame": distribution([f["intervalNs"] or None for f in frames]),
             "cpu": distribution([f.get("cpuNs") for f in frames]),
             "gpu": distribution([f.get("gpuNs") for f in frames]), "work": work,
@@ -171,6 +173,7 @@ def render(records):
 окно {'полное' if summary['completeWindow'] else 'неполное'} ·
 потери кадров {summary['lostFrames']}, ввода {summary['lostInputs']}</p>
 <table><thead><tr><th>Измерение, мс</th><th>p50</th><th>p95</th><th>p99</th><th>Образцов</th></tr></thead><tbody>{rows}</tbody></table>
+<p>Кадров &gt;25 мс: {summary['hitches25']}; &gt;50 мс: {summary['hitches50']}. Мерцание этим самописцем не измеряется.</p>
 <p>Аллокатор: {summary['allocationSamples']} измеренных кадров, {summary['allocCalls']} вызовов.</p>
 <p>Сопутствующие события: {observed or 'не зарегистрированы'}. Причинность по этим флагам не устанавливается.</p>
 <p><code>{work}</code></p><svg class="plot" data-series="{index}" viewBox="0 0 1000 240" role="img" aria-label="Время кадров"><text x="8" y="20">График загружается</text></svg>

@@ -121,10 +121,11 @@ fn network_intents_keep_authority_and_unavailable_routes_explicit() {
         right: false,
         shift: false,
     };
-    assert_eq!(
-        ui_bridge::dispatch(&mut network, slot.clone(), 0).unwrap(),
-        Dispatch::Unsupported(slot)
-    );
+    assert!(matches!(
+        ui_bridge::dispatch(&mut network, slot, 0).unwrap(),
+        Dispatch::Sent(_)
+    ));
+    assert!(network.take_outgoing(10).iter().any(|message|matches!(message,ClientMessage::Action {action:Action::Window(net::window::WindowIntent::Click {guard,slot:0,..}),..} if guard.id==5 && guard.revision==3 && guard.inventory_revision==2)));
     assert_eq!(
         ui_bridge::dispatch(&mut network, Intent::ImportPack, 0).unwrap(),
         Dispatch::Local(Intent::ImportPack)
@@ -137,4 +138,67 @@ fn network_intents_keep_authority_and_unavailable_routes_explicit() {
     assert!(categories.contains(&(audio::Category::Machines, 0.25)));
     assert!(categories.contains(&(audio::Category::Blocks, 0.25)));
     assert!(categories.contains(&(audio::Category::Players, 1.0)));
+}
+#[test]
+fn presence_projection_keeps_roles_ping_and_chat_authoritative_without_idle_allocations() {
+    use net::presence::{ChatLine, PresenceServerEvent, RosterDelta, RosterEntry};
+    let mut network = connection();
+    network
+        .receive(
+            ServerMessage::Presence(PresenceServerEvent::RosterDelta(RosterDelta {
+                base: 0,
+                revision: 1,
+                reset: true,
+                upserts: vec![RosterEntry {
+                    identity: PlayerId([1; 16]),
+                    name: "A".repeat(64),
+                    role: Role::Owner,
+                    ping_ms: None,
+                }],
+                removes: vec![],
+            })),
+            0,
+        )
+        .unwrap();
+    network
+        .receive(
+            ServerMessage::Presence(PresenceServerEvent::Chat(ChatLine {
+                sequence: 1,
+                tick: Tick(1),
+                identity: PlayerId([1; 16]),
+                name: "A".repeat(64),
+                text: "B".repeat(256),
+            })),
+            0,
+        )
+        .unwrap();
+    let mut bridge = UiBridge::default();
+    let mut ui = UiApp::new().unwrap();
+    bridge.sync_authority(&mut ui, &network).unwrap();
+    assert_eq!(ui.snapshot.role, ui::app::Role::Owner);
+    assert_eq!(ui.snapshot.players[0].ping_ms, None);
+    assert_eq!(ui.chat_len(), 1);
+    assert_eq!(ui.last_chat().unwrap().len(), 322);
+    let scope = telemetry::AllocationScope::begin().unwrap();
+    for _ in 0..10_000 {
+        assert!(!bridge.sync_authority(&mut ui, &network).unwrap());
+    }
+    let counts = scope.finish();
+    assert_eq!(counts.allocating_calls(), 0);
+    assert_eq!(counts.dealloc_calls, 0);
+    network
+        .receive(
+            ServerMessage::Presence(PresenceServerEvent::RosterDelta(RosterDelta {
+                base: 2,
+                revision: 3,
+                reset: false,
+                upserts: vec![],
+                removes: vec![],
+            })),
+            0,
+        )
+        .unwrap();
+    bridge.sync_authority(&mut ui, &network).unwrap();
+    assert_eq!(ui.snapshot.role, ui::app::Role::Player);
+    assert_eq!(ui.chat_len(), 1);
 }

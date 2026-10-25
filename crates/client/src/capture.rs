@@ -1,6 +1,9 @@
 //! Two fixed GPU readbacks. Mapping never blocks a frame and completion is tied
 //! to the original submitted frame. Unsupported or missed measurements stay None.
-use render::terrain_gpu::{GpuFrameGraph, GpuPassKind, TerrainGpu};
+use render::{
+    gpu_time::TimingSource,
+    terrain_gpu::{GpuPassKind, TerrainGpu},
+};
 use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
@@ -22,11 +25,16 @@ pub struct CaptureTicket {
     slot: usize,
     generation: u64,
 }
+#[derive(Clone, Copy)]
+struct FrameQueryGraph {
+    kinds: [u8; 64],
+    periods: [f32; 64],
+    count: usize,
+}
 struct Slot {
     buffer: wgpu::Buffer,
     state: Arc<AtomicU8>,
-    graph: Option<GpuFrameGraph>,
-    period: f32,
+    graph: Option<FrameQueryGraph>,
     frame: u64,
     generation: u64,
 }
@@ -40,13 +48,12 @@ impl FrameGpuCapture {
             slots: std::array::from_fn(|_| Slot {
                 buffer: device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("nonblocking frame timings"),
-                    size: 512,
+                    size: 1024,
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
                 }),
                 state: Arc::new(AtomicU8::new(0)),
                 graph: None,
-                period: 0.0,
                 frame: 0,
                 generation: 0,
             }),
@@ -61,16 +68,73 @@ impl FrameGpuCapture {
         encoder: &mut wgpu::CommandEncoder,
         frame: u64,
     ) -> Option<CaptureTicket> {
-        let Some((queries, period)) = renderer.timestamp_buffer() else {
+        self.encode_terrain_and(renderer, &[], encoder, frame)
+    }
+    pub fn encode_terrain_and(
+        &mut self,
+        renderer: &TerrainGpu,
+        extra: &[TimingSource<'_>],
+        encoder: &mut wgpu::CommandEncoder,
+        frame: u64,
+    ) -> Option<CaptureTicket> {
+        let terrain = renderer.timestamp_buffer().map(|(buffer, period)| {
+            let graph = renderer.frame_graph();
+            let kinds = std::array::from_fn(|index| terrain_kind(graph.passes[index]));
+            TimingSource {
+                buffer,
+                period,
+                kinds,
+                count: graph.count,
+            }
+        });
+        self.encode_sources(
+            terrain.into_iter().chain(extra.iter().copied()),
+            encoder,
+            frame,
+        )
+    }
+    /// Copy up to 64 queries from at most 16 frame-graph nodes, without waiting
+    /// or allocating containers. Each pass can use its own timestamp period.
+    pub fn encode_sources<'a>(
+        &mut self,
+        sources: impl IntoIterator<Item = TimingSource<'a>>,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: u64,
+    ) -> Option<CaptureTicket> {
+        let mut graph = FrameQueryGraph {
+            kinds: [255; 64],
+            periods: [0.0; 64],
+            count: 0,
+        };
+        let mut buffers = [None; 16];
+        let mut source_count = 0;
+        for source in sources {
+            let count = source.count as usize;
+            if source_count == buffers.len()
+                || count > 32
+                || graph.count + count > 64
+                || !source.period.is_finite()
+                || source.period <= 0.0
+                || source.buffer.size() < source.count as u64 * 16
+                || !source.buffer.usage().contains(wgpu::BufferUsages::COPY_SRC)
+                || source.kinds[..count]
+                    .iter()
+                    .any(|&kind| kind >= 16 && kind != 255)
+            {
+                self.stats.failed += 1;
+                return None;
+            }
+            graph.kinds[graph.count..graph.count + count].copy_from_slice(&source.kinds[..count]);
+            graph.periods[graph.count..graph.count + count].fill(source.period);
+            graph.count += count;
+            buffers[source_count] = Some(source);
+            source_count += 1;
+        }
+        if source_count == 0 {
             self.stats.unsupported += 1;
             return None;
-        };
-        let graph = renderer.frame_graph();
-        if graph.count == 0 {
-            return None;
         }
-        if graph.count > 32 || !period.is_finite() || period <= 0.0 {
-            self.stats.failed += 1;
+        if graph.count == 0 {
             return None;
         }
         let Some((index, slot)) = self
@@ -86,9 +150,15 @@ impl FrameGpuCapture {
             self.stats.failed += 1;
             return None;
         };
-        encoder.copy_buffer_to_buffer(queries, 0, &slot.buffer, 0, u64::from(graph.count) * 16);
+        let mut offset = 0;
+        for source in buffers[..source_count].iter().flatten() {
+            let bytes = u64::from(source.count) * 16;
+            if bytes != 0 {
+                encoder.copy_buffer_to_buffer(source.buffer, 0, &slot.buffer, offset, bytes);
+            }
+            offset += bytes;
+        }
         slot.graph = Some(graph);
-        slot.period = period;
         slot.frame = frame;
         slot.generation = generation;
         slot.state.store(1, Ordering::Release);
@@ -127,8 +197,7 @@ impl FrameGpuCapture {
             match slot.state.load(Ordering::Acquire) {
                 3 => {
                     let data = slot.buffer.slice(..).get_mapped_range();
-                    let measurement =
-                        decode(&data, slot.graph.expect("prepared graph"), slot.period);
+                    let measurement = decode(&data, slot.graph.expect("prepared graph"));
                     drop(data);
                     slot.buffer.unmap();
                     match measurement {
@@ -162,29 +231,36 @@ impl FrameGpuCapture {
         self.stats
     }
 }
-fn decode(data: &[u8], graph: GpuFrameGraph, period: f32) -> Option<(u64, [Option<u64>; 16])> {
+fn decode(data: &[u8], graph: FrameQueryGraph) -> Option<(u64, [Option<u64>; 16])> {
     let mut passes = [None; 16];
     let mut total = 0_u64;
-    for (index, pass) in graph.passes[..graph.count as usize].iter().enumerate() {
+    for (index, pass) in graph.kinds[..graph.count].iter().enumerate() {
         let offset = index * 16;
         let begin = u64::from_le_bytes(data.get(offset..offset + 8)?.try_into().ok()?);
         let end = u64::from_le_bytes(data.get(offset + 8..offset + 16)?.try_into().ok()?);
-        let nanos = (end.checked_sub(begin)? as f64 * f64::from(period)).round();
+        let nanos = (end.checked_sub(begin)? as f64 * f64::from(graph.periods[index])).round();
         if !nanos.is_finite() || !(0.0..u64::MAX as f64).contains(&nanos) {
             return None;
         }
         let nanos = nanos as u64;
         total = total.checked_add(nanos)?;
-        let slot = match pass {
-            GpuPassKind::ResetVisibility | GpuPassKind::CullFrustum => 0,
-            GpuPassKind::DepthPrepass => 1,
-            GpuPassKind::HiZBase | GpuPassKind::HiZReduce => 2,
-            GpuPassKind::CullOcclusion => 3,
-            GpuPassKind::Color => 6, // Actual combined sky + terrain color pass.
-            GpuPassKind::Presentation => 13,
-            GpuPassKind::Unused => continue,
-        };
+        if *pass == 255 {
+            continue;
+        }
+        let slot = *pass as usize;
         passes[slot] = Some(passes[slot].unwrap_or(0_u64).checked_add(nanos)?);
     }
     Some((total, passes))
+}
+
+fn terrain_kind(pass: GpuPassKind) -> u8 {
+    match pass {
+        GpuPassKind::ResetVisibility | GpuPassKind::CullFrustum => 0,
+        GpuPassKind::DepthPrepass => 1,
+        GpuPassKind::HiZBase | GpuPassKind::HiZReduce => 2,
+        GpuPassKind::CullOcclusion => 3,
+        GpuPassKind::Color => 6,
+        GpuPassKind::Presentation => 13,
+        GpuPassKind::Unused => 255,
+    }
 }

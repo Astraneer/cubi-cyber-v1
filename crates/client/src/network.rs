@@ -1,7 +1,10 @@
 //! Transport-independent client authority/prediction owner. Platform sockets feed
 //! bounded net frames here; only confirmed, sanitized pages enter its world view.
 //! Rendering integration consumes `take_page_updates` at the scene owner boundary.
+pub mod audio;
 pub mod entities;
+pub mod presence;
+pub mod window;
 use core_types::{BlockPos, Cell, PageId, SpaceId, SpaceTransform, Tick, Version};
 use net::{
     Action, ActionId, ActionReply, ActionStatus, ClientMessage, FarSummary, Hello, InputFrame,
@@ -126,6 +129,9 @@ pub struct Connection {
     remote_players: BTreeMap<PlayerId, PlayerState>,
     remote_tick: Tick,
     inventory: Option<rules::survival::Inventory>,
+    presence: presence::PresenceCache,
+    window: window::WindowCache,
+    entities: entities::EntityReplica,
     page_updates: VecDeque<PageUpdate>,
     page_removals: VecDeque<PageId>,
     geometry_interest: BTreeMap<PageId, PageInterest>,
@@ -183,6 +189,10 @@ impl Connection {
             remote_players: BTreeMap::new(),
             remote_tick: Tick(0),
             inventory: None,
+            presence: presence::PresenceCache::new(),
+            window: window::WindowCache::default(),
+            entities: entities::EntityReplica::new(net::entities::MAX_ENTITIES)
+                .map_err(|_| NetworkError::Capacity)?,
             page_updates: VecDeque::new(),
             page_removals: VecDeque::new(),
             geometry_interest: BTreeMap::new(),
@@ -250,6 +260,20 @@ impl Connection {
     }
     pub fn remote_players(&self) -> impl Iterator<Item = &PlayerState> {
         self.remote_players.values()
+    }
+    pub fn window(&self) -> Option<&net::window::WindowSnapshot> {
+        self.inventory
+            .as_ref()
+            .and_then(|i| self.window.matching_inventory(i.revision()))
+    }
+    pub fn presence(&self) -> &presence::PresenceCache {
+        &self.presence
+    }
+    pub fn current_role(&self) -> Option<net::Role> {
+        self.presence.own_role()
+    }
+    pub fn entity_replica(&self) -> &entities::EntityReplica {
+        &self.entities
     }
     pub fn inventory(&self) -> Option<&rules::survival::Inventory> {
         self.inventory.as_ref()
@@ -429,6 +453,7 @@ impl Connection {
                 self.next_action = welcome.next_action.0;
                 self.latest_tick = welcome.tick;
                 self.last_received_at = now_ms;
+                self.presence.reset(welcome.identity);
                 self.welcome = Some(welcome);
                 self.handshake = None;
             }
@@ -646,11 +671,40 @@ impl Connection {
                     }
                 }
             }
+            ServerMessage::Presence(event) => {
+                if let Some(reply) = self
+                    .presence
+                    .receive(event)
+                    .map_err(|_| NetworkError::Protocol)?
+                {
+                    self.queue(ClientMessage::Presence(reply))?;
+                }
+            }
+            ServerMessage::Window(state) => {
+                self.window
+                    .receive(*state)
+                    .map_err(|_| NetworkError::Protocol)?;
+            }
+            ServerMessage::Entities(frame) => {
+                let request = match self
+                    .entities
+                    .apply(*frame)
+                    .map_err(|_| NetworkError::Protocol)?
+                {
+                    entities::Apply::Applied(r)
+                    | entities::Apply::Stale(r)
+                    | entities::Apply::MissingBase(r) => r,
+                };
+                self.queue(ClientMessage::Entities(request))?;
+            }
             ServerMessage::State { .. } | ServerMessage::Pong(_) => {}
         }
         Ok(())
     }
 
+    pub fn server_tick_time(&self, now_ms: u64) -> f64 {
+        self.latest_tick.0 as f64 + now_ms.saturating_sub(self.last_received_at) as f64 / 50.0
+    }
     pub fn estimated_server_tick(&self, now_ms: u64) -> Tick {
         Tick(
             self.latest_tick

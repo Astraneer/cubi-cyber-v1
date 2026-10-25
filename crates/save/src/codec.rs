@@ -881,7 +881,7 @@ fn write_runtimes(w: &mut Writer, records: &[RuntimeRecord]) -> Result<(), SaveE
     }
     let mut seen = 0u16;
     for record in records {
-        if !(RUNTIME_SURVIVAL..=RUNTIME_MACHINES).contains(&record.kind) {
+        if !(RUNTIME_SURVIVAL..=RUNTIME_CHAT).contains(&record.kind) {
             return Err(SaveError::Invalid("runtime kind"));
         }
         let bit = 1u16 << record.kind;
@@ -898,7 +898,7 @@ fn write_runtimes(w: &mut Writer, records: &[RuntimeRecord]) -> Result<(), SaveE
     }
     w.raw(b"RUN1");
     w.count(records.len(), MAX_RUNTIME_RECORDS);
-    for kind in RUNTIME_SURVIVAL..=RUNTIME_MACHINES {
+    for kind in RUNTIME_SURVIVAL..=RUNTIME_CHAT {
         if let Some(record) = records.iter().find(|record| record.kind == kind) {
             w.u16(kind);
             w.bytes(&record.payload, MAX_RUNTIME_BYTES);
@@ -918,7 +918,7 @@ fn read_runtimes(r: &mut Reader<'_>) -> Result<Vec<RuntimeRecord>, SaveError> {
     let mut previous = 0u16;
     for _ in 0..count {
         let kind = r.u16()?;
-        if !(RUNTIME_SURVIVAL..=RUNTIME_MACHINES).contains(&kind) || kind <= previous {
+        if !(RUNTIME_SURVIVAL..=RUNTIME_CHAT).contains(&kind) || kind <= previous {
             return Err(SaveError::Invalid("runtime kind/order"));
         }
         previous = kind;

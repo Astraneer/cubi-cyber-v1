@@ -21,7 +21,9 @@ struct Statistics {steps:atomic<u32>,hits:atomic<u32>,unknown:atomic<u32>,publis
 fn voxel(cell:vec3<i32>)->u32 {
     let page=(cell>>vec3(4u))-params.world_origin.xyz;
     if any(page<vec3(0))||any(vec3<u32>(page)>=params.world_counts.xyz){return 0u;}
-    let p=vec3<u32>(page);let local=vec3<u32>(cell)&vec3(15u);
+    let counts=params.world_counts.xyz;let ring_index=params.world_counts.w;
+    let ring=vec3(ring_index%counts.x,ring_index/(counts.x*counts.z),ring_index/counts.x%counts.z);
+    let p=(vec3<u32>(page)+ring)%counts;let local=vec3<u32>(cell)&vec3(15u);
     let page_index=p.x+params.world_counts.x*(p.z+params.world_counts.z*p.y);
     return world[page_index*4096u+local.x+16u*(local.z+16u*local.y)];
 }

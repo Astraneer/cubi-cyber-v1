@@ -140,6 +140,31 @@ fn static_ui_ten_thousand_frames_allocate_and_build_nothing() {
     assert!(scope.finish().allocating_calls() > 0);
 }
 #[test]
+fn world_drop_sprites_use_the_same_original_nonblock_item_pixels() {
+    let atlas = atlas::UiAtlas::load().unwrap();
+    let sprites = atlas::ItemSprites::from_atlas(&atlas).unwrap();
+    let mut count = 0;
+    for (id, item) in rules::all_items() {
+        if matches!(item.kind, rules::items::ItemKind::Block(_)) {
+            assert_eq!(sprites.layer(id), None);
+            continue;
+        }
+        let layer = sprites.layer(id).unwrap() as usize;
+        let pixels = &sprites.rgba[layer * 1024..(layer + 1) * 1024];
+        assert!(pixels.chunks_exact(4).any(|p| p[3] > 0));
+        let uv = atlas.item(id).unwrap();
+        let x = (uv.x * atlas::ATLAS_SIZE as f32).round() as usize;
+        let y = (uv.y * atlas::ATLAS_SIZE as f32).round() as usize;
+        let at = (y * atlas::ATLAS_SIZE as usize + x) * 4;
+        assert_eq!(&pixels[..64], &atlas.pixels[at..at + 64]);
+        count += 1;
+    }
+    assert_eq!(sprites.layers, count);
+    assert!((1..=256).contains(&count));
+    assert_eq!(sprites.rgba.len(), count as usize * 1024);
+    println!("ITEM_SPRITE_LAYERS={count}");
+}
+#[test]
 fn furnace_slots_are_guarded_and_recipe_bookmarks_are_visible_and_persisted() {
     let atlas = atlas::UiAtlas::load().unwrap();
     let mut ui = UiApp::new().unwrap();

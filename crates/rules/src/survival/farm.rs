@@ -7,7 +7,37 @@ use crate::{
     items::{ItemKind, idef},
     stack::ItemStack,
 };
-use core_types::Cell;
+use core_types::{Cell, DeterministicRng, LocalIdx, PageId, Tick};
+
+pub const DEFAULT_RANDOM_TICK_SPEED: u16 = 3;
+/// Select exactly `speed` cells of one active 16³ section, with replacement.
+/// The owner maintains active eligible sections incrementally. A sampled crop
+/// still performs its separate moisture/light/growth roll. Page keys isolate
+/// random streams from unrelated chunk load or map iteration order.
+pub fn random_tick_indices(
+    seed: u64,
+    page: PageId,
+    now: Tick,
+    speed: u16,
+    out: &mut [LocalIdx],
+) -> Result<usize, SurvivalError> {
+    if speed > 4096 || out.len() < usize::from(speed) {
+        return Err(SurvivalError::Capacity);
+    }
+    let mut key = 0xcbf29ce484222325u64;
+    for part in [page.space.0, page.x as u32, page.y as u32, page.z as u32] {
+        for byte in part.to_le_bytes() {
+            key = (key ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+    let mut rng = DeterministicRng::from_key(seed, 0x52414e445449434b, key, now.0);
+    for slot in out.iter_mut().take(usize::from(speed)) {
+        let random = rng.next_u64();
+        let index = ((random & 15) | ((random >> 8 & 15) << 4) | ((random >> 4 & 15) << 8)) as u16;
+        *slot = LocalIdx::new(index).expect("three bounded coordinates");
+    }
+    Ok(usize::from(speed))
+}
 
 pub fn is_crop(id: u16) -> bool {
     matches!(id, WHEAT | CARROTS | POTATOES)

@@ -33,6 +33,8 @@ def legal_files(metadata):
     files["licenses/assets/sounds-CREDITS.md"] = file_bytes(ROOT / "donor/web/sounds/CREDITS.md")
     files["licenses/assets/atlas-provenance.py"] = file_bytes(ROOT / "donor/tools/atlas.py")
     files["licenses/assets/IMPORT.json"] = file_bytes(ROOT / "donor/IMPORT.json")
+    for name in ("LICENSE-NVIDIA", "PROVENANCE.json"):
+        files["licenses/crates/nv-flip-sys-0.1.0/" + name] = file_bytes(ROOT / "crates/compat-nv-flip-sys" / name)
     for package in sorted(metadata["packages"], key=lambda p: (p["name"], p["version"])):
         if package["source"] is None:
             continue

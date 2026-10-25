@@ -148,7 +148,7 @@ async fn run(options: Options) -> Result<(), String> {
         }
         std::thread::yield_now();
     }
-    view.activate_player();
+    view.start_benchmark_route()?;
     if !view.stats().player_spawned {
         return Err("loaded world has no safe player spawn".into());
     }

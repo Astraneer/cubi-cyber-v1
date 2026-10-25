@@ -71,6 +71,22 @@ impl Network {
     }
 }
 impl Grid {
+    /// One indexed member; owner edits never need a complete grid snapshot.
+    pub fn node(&self, position: Position) -> Option<NodeSnapshot> {
+        self.members.get(&position).map(|member| NodeSnapshot {
+            position,
+            network: member.network,
+            resource: member.resource,
+            links: member.links,
+        })
+    }
+    pub fn validate_reservoir(&self, id: NetworkId, state: Reservoir) -> Result<(), GridError> {
+        if self.network(id)?.valid_reservoir(state) {
+            Ok(())
+        } else {
+            Err(GridError::InvalidSubstance)
+        }
+    }
     pub fn network_ids(&self) -> impl Iterator<Item = NetworkId> + '_ {
         self.slots.iter().enumerate().filter_map(|(slot, state)| {
             state.network.as_ref().map(|_| NetworkId {
@@ -141,7 +157,7 @@ impl Grid {
                             pair[1].pull,
                             pair[1].position,
                             pair[1].face as u8,
-                        )
+                        ) || (pair[0].owner, pair[0].pull) == (pair[1].owner, pair[1].pull)
                     })
                 {
                     return Err(GridError::InvalidEndpoints);
@@ -189,6 +205,9 @@ impl Grid {
                 generation: slot.generation,
                 network,
             });
+            if grid.slots[index].network.is_none() && slot.generation < u32::MAX {
+                grid.free_slots.insert(index as u32);
+            }
         }
         if seen.len() != state.nodes.len() {
             return Err(GridError::Missing);

@@ -576,6 +576,7 @@ impl ShadowGpu {
                 storage_entry(3, compute, false, false),
                 storage_entry(5, compute, false, true),
                 storage_entry(6, compute, false, true),
+                storage_entry(7, compute, false, true),
             ],
         });
 
@@ -617,6 +618,7 @@ impl ShadowGpu {
                     buffer_entry(3, &indirect),
                     buffer_entry(5, geometry.edit_masks),
                     buffer_entry(6, geometry.patch_states),
+                    buffer_entry(7, geometry.quads),
                 ],
             })
         });
@@ -773,6 +775,10 @@ impl ShadowGpu {
             combined,
             last_dynamic: None,
         })
+    }
+    /// Two render pipelines (depth/rect clear) and two compute pipelines (reset/cull), all loading-only.
+    pub const fn startup_pipeline_compilations(&self) -> u32 {
+        4
     }
     pub fn cache(&self) -> &ShadowCache {
         &self.cache

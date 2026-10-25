@@ -189,7 +189,8 @@ fn static_catalog_gpu_poses_culls_and_shades_all_mob_item_kinds() {
             .await
             .unwrap();
         let mut terrain = terrain(&gpu);
-        let mut entities = EntityGpu::new(
+        let items = render::entity_models::item_atlas(&vec![255; 16 * 16 * 4 * 4], 4).unwrap();
+        let mut entities = EntityGpu::new_with_items(
             &gpu.device,
             &gpu.queue,
             terrain.geometry(),
@@ -198,6 +199,7 @@ fn static_catalog_gpu_poses_culls_and_shades_all_mob_item_kinds() {
                 atlas_layers: 186,
             },
             None,
+            &items,
         )
         .unwrap();
         let startup = entities.take_work();
@@ -583,6 +585,102 @@ fn first_person_human_hides_color_but_keeps_shadow_without_static_redraw() {
         assert_ne!(crouch, sky);
         println!(
             "M7 localhuman firstpersoncolorhidden shadowBITWISEsame copies0staticdraws0; crouchGPU changespose"
+        );
+    });
+}
+#[test]
+fn nonblock_sprites_use_separate_item_array_with_real_cutout_alpha() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut terrain = terrain(&gpu);
+        let mut icon = instance(7);
+        icon.position = [0.; 3];
+        icon.scale = 1.;
+        icon.color = 0;
+        let mut no_icons = EntityGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            terrain.geometry(),
+            EntityConfig {
+                max_entities: 1,
+                atlas_layers: 186,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            no_icons.upload(&gpu.queue, &[icon], &[], &mut UploadBudget::new(68)),
+            Err(EntityError::InvalidInstance)
+        );
+        let mut rgba = vec![0; 16 * 16 * 4];
+        for y in 0..16 {
+            for x in 0..16 {
+                let i = (x + y * 16) * 4;
+                rgba[i..i + 4].copy_from_slice(&[
+                    255,
+                    0,
+                    255,
+                    if (4..12).contains(&x) && (4..12).contains(&y) {
+                        0
+                    } else {
+                        255
+                    },
+                ]);
+            }
+        }
+        let atlas = render::entity_models::item_atlas(&rgba, 1).unwrap();
+        let mut icons = EntityGpu::new_with_items(
+            &gpu.device,
+            &gpu.queue,
+            terrain.geometry(),
+            EntityConfig {
+                max_entities: 1,
+                atlas_layers: 186,
+            },
+            None,
+            &atlas,
+        )
+        .unwrap();
+        icons
+            .upload(&gpu.queue, &[icon], &[], &mut UploadBudget::new(68))
+            .unwrap();
+        let c = Camera::perspective(
+            [0., 0.6, 4.],
+            [0., 0.6, 0.],
+            [0., 1., 0.],
+            1.,
+            256. / 192.,
+            0.1,
+            200.,
+        );
+        let sky = frame(&gpu, &mut terrain, None, c).0;
+        let image = frame(&gpu, &mut terrain, Some(&mut icons), c).0;
+        let colored = image
+            .chunks_exact(4)
+            .zip(sky.chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(colored > 500);
+        let magenta = image
+            .chunks_exact(4)
+            .filter(|p| {
+                u32::from(p[0]) > u32::from(p[1]) * 2 && u32::from(p[2]) > u32::from(p[1]) * 2
+            })
+            .count();
+        assert!(
+            magenta > 500,
+            "item array was replaced with a terrain block layer"
+        );
+        let i = (128 + 96 * 256) * 4;
+        assert_eq!(
+            &image[i..i + 4],
+            &sky[i..i + 4],
+            "transparent item hole was made opaque"
+        );
+        println!(
+            "M7 separate item sprites actualmagenta{magenta}px,cutoutcenterSkyExact,noSpritesRejected; terrainatlasunchanged"
         );
     });
 }

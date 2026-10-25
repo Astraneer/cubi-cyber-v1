@@ -112,10 +112,29 @@ struct AuthorityStamp {
     health_bits: u32,
     creative: bool,
     role: Role,
+    roster: u64,
+    window: Option<WindowStamp>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowStamp {
+    guard: net::window::WindowGuard,
+    closed: bool,
+    progress: u16,
+    fuel: u16,
+    energy: u64,
+    sides: [u8; 6],
 }
 #[derive(Default)]
 pub struct UiBridge {
     authority: Option<AuthorityStamp>,
+    chat: u64,
+}
+fn role(value: net::Role) -> Role {
+    match value {
+        net::Role::Player => Role::Player,
+        net::Role::Admin => Role::Admin,
+        net::Role::Owner => Role::Owner,
+    }
 }
 impl UiBridge {
     /// Copies only authoritative fields and only after they change. Presence,
@@ -126,13 +145,7 @@ impl UiBridge {
         network: &Connection,
     ) -> Result<bool, &'static str> {
         let player = network.player();
-        let role = network
-            .welcome()
-            .map_or(Role::Player, |welcome| match welcome.role {
-                net::Role::Player => Role::Player,
-                net::Role::Admin => Role::Admin,
-                net::Role::Owner => Role::Owner,
-            });
+        let own_role = network.current_role().map_or(Role::Player, role);
         let next = AuthorityStamp {
             connected: network.welcome().is_some(),
             session: network.welcome().map(|welcome| welcome.session),
@@ -154,22 +167,43 @@ impl UiBridge {
                 },
                 |p| p.mode == sim::GameMode::Creative,
             ),
-            role,
+            role: own_role,
+            roster: network.presence().revision(),
+            window: network.window().map(|state| WindowStamp {
+                guard: state.guard,
+                closed: state.closed,
+                progress: state.progress,
+                fuel: state.fuel,
+                energy: state.energy,
+                sides: state.sides,
+            }),
         };
-        if self.authority == Some(next) {
-            return Ok(false);
-        }
         let reset = !next.connected
             || self
                 .authority
                 .is_some_and(|old| old.session != next.session || old.identity != next.identity);
+        if reset {
+            self.chat = 0;
+            ui.clear_chat();
+        }
+        let mut chat_changed = false;
+        for line in network.presence().chats() {
+            if line.sequence > self.chat {
+                ui.message(&format!("{}: {}", line.name, line.text));
+                self.chat = self.chat.max(line.sequence);
+                chat_changed = true;
+            }
+        }
+        if self.authority == Some(next) {
+            return Ok(chat_changed);
+        }
         let mut snapshot = if !reset {
             ui.snapshot.clone()
         } else {
             ui::app::Snapshot::default()
         };
         snapshot.connected = next.connected;
-        snapshot.role = role;
+        snapshot.role = own_role;
         snapshot.creative = next.creative;
         snapshot.hp = f32::from_bits(next.health_bits).clamp(0.0, 20.0).ceil() as u8;
         if let Some(inventory) = network.inventory() {
@@ -183,7 +217,22 @@ impl UiBridge {
             snapshot.selected = 0;
             snapshot.armor = 0;
         }
+        snapshot.players = network
+            .presence()
+            .roster()
+            .map(|entry| ui::app::PlayerRow {
+                name: entry.name.clone(),
+                role: role(entry.role),
+                ping_ms: entry.ping_ms,
+            })
+            .collect();
+        if network.window().is_none() {
+            snapshot.window_id = 0;
+        }
         ui.set_snapshot(snapshot)?;
+        if let Some(window) = network.window() {
+            crate::ui_window::apply_window(ui, window)?;
+        }
         self.authority = Some(next);
         Ok(true)
     }
@@ -205,12 +254,80 @@ pub fn dispatch(
         Intent::SelectSlot(slot) => Action::SelectSlot(slot),
         Intent::Chat(ref text) if text.starts_with('/') => Action::Command(text.clone()),
         Intent::CreativeGive { item, count } => Action::Command(format!("/give {item} {count}")),
-        Intent::SlotClick { .. }
-        | Intent::RecipeFill { .. }
-        | Intent::TakeCraft { .. }
-        | Intent::MachineSide { .. }
-        | Intent::Chat(_)
-        | Intent::Drop { .. } => return Ok(Dispatch::Unsupported(intent)),
+        Intent::Chat(text) => Action::Chat(text),
+        Intent::OpenInventory => Action::Window(net::window::WindowIntent::OpenInventory),
+        Intent::CloseWindow {
+            window,
+            revision,
+            inventory_revision,
+        } => Action::Window(net::window::WindowIntent::Close {
+            guard: net::window::WindowGuard {
+                id: window,
+                revision,
+                inventory_revision,
+            },
+        }),
+        Intent::SlotClick {
+            window,
+            revision,
+            inventory_revision,
+            slot,
+            right,
+            shift,
+        } => Action::Window(net::window::WindowIntent::Click {
+            guard: net::window::WindowGuard {
+                id: window,
+                revision,
+                inventory_revision,
+            },
+            slot,
+            right,
+            shift,
+        }),
+        Intent::RecipeFill {
+            window,
+            revision,
+            inventory_revision,
+            recipe,
+            all,
+        } => Action::Window(net::window::WindowIntent::RecipeFill {
+            guard: net::window::WindowGuard {
+                id: window,
+                revision,
+                inventory_revision,
+            },
+            recipe,
+            all,
+        }),
+        Intent::TakeCraft {
+            window,
+            revision,
+            inventory_revision,
+            all,
+        } => Action::Window(net::window::WindowIntent::TakeCraft {
+            guard: net::window::WindowGuard {
+                id: window,
+                revision,
+                inventory_revision,
+            },
+            all,
+        }),
+        Intent::MachineSide {
+            window,
+            revision,
+            inventory_revision,
+            face,
+            mode,
+        } => Action::Window(net::window::WindowIntent::MachineSide {
+            guard: net::window::WindowGuard {
+                id: window,
+                revision,
+                inventory_revision,
+            },
+            face,
+            mode,
+        }),
+        Intent::Drop { .. } => return Ok(Dispatch::Unsupported(intent)),
         _ => return Ok(Dispatch::Local(intent)),
     };
     network.action(action, false, now_ms).map(Dispatch::Sent)

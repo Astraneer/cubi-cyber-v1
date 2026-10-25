@@ -159,6 +159,28 @@ impl WindowState {
     pub fn result(&self, book: &RecipeBook) -> ItemStack {
         book.result(&self.craft)
     }
+    /// Refresh a cache from authoritative block contents. Cursor and crafting
+    /// remain owned by the player; a changed cache invalidates old click guards.
+    pub fn refresh_container_trusted(&mut self, slots: &[ItemStack]) -> Result<bool, WindowError> {
+        if slots.len() != self.container().len() {
+            return Err(WindowError::Slot);
+        }
+        if slots == self.container() {
+            return Ok(false);
+        }
+        let revision = self.revision.checked_add(1).ok_or(WindowError::Overflow)?;
+        self.container[..slots.len()].copy_from_slice(slots);
+        self.revision = revision;
+        Ok(true)
+    }
+    /// Side configuration changes no item but advances the same guarded window.
+    pub fn plan_configuration(
+        &self,
+        inventory: &Inventory,
+        guard: WindowGuard,
+    ) -> Result<WindowPlan, WindowError> {
+        self.plan(inventory, guard)
+    }
     fn plan(&self, inventory: &Inventory, guard: WindowGuard) -> Result<WindowPlan, WindowError> {
         if guard != self.guard(inventory) {
             return Err(WindowError::Stale);

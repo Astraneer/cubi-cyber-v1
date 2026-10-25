@@ -142,4 +142,60 @@ fn actual_readbacks_have_bounded_backpressure_frame_identity_and_stale_ticket_gu
             .gpu_ns
             .is_none()
     );
+    // Copy the same real query stream twice on purpose. Distinct metadata kinds
+    // and periods test combined-buffer offsets; this is an API control, not an
+    // assertion that these queries came from two different rendering passes.
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    renderer.invalidate();
+    renderer
+        .encode_frame(
+            &gpu.queue,
+            &mut encoder,
+            &output,
+            &camera,
+            CullingMode::FrustumAndHiZ,
+        )
+        .unwrap();
+    let graph = renderer.frame_graph();
+    let (buffer, period) = renderer.timestamp_buffer().unwrap();
+    let sources = [
+        render::gpu_time::TimingSource {
+            buffer,
+            period,
+            kinds: [6; 32],
+            count: graph.count,
+        },
+        render::gpu_time::TimingSource {
+            buffer,
+            period,
+            kinds: [13; 32],
+            count: graph.count,
+        },
+    ];
+    let ticket = capture.encode_sources(sources, &mut encoder, 12).unwrap();
+    gpu.queue.submit([encoder.finish()]);
+    capture.submitted(ticket);
+    recorder
+        .record_frame(Sample {
+            frame: 12,
+            monotonic_ns: 12,
+            ..Sample::default()
+        })
+        .unwrap();
+    gpu.device.poll(wgpu::PollType::Wait).unwrap();
+    capture.collect(&mut recorder);
+    let sample = recorder.frames().last().unwrap();
+    assert!(sample.gpu_passes_ns[6].unwrap() > 0);
+    assert_eq!(sample.gpu_passes_ns[6], sample.gpu_passes_ns[13]);
+    assert_eq!(sample.gpu_ns, Some(sample.gpu_passes_ns[6].unwrap() * 2));
+    let mut invalid = gpu.device.create_command_encoder(&Default::default());
+    let source = render::gpu_time::TimingSource {
+        buffer,
+        period,
+        kinds: [16; 32],
+        count: graph.count,
+    };
+    assert!(capture.encode_sources([source], &mut invalid, 13).is_none());
+    assert_eq!(capture.stats().failed, 1);
+    assert_eq!(capture.pending(), 0);
 }

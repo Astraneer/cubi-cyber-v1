@@ -311,7 +311,7 @@ impl BrowserState {
         let draw_world = self
             .product
             .as_ref()
-            .is_none_or(|product| product.layer.app.snapshot.connected && self.view.is_ready());
+            .is_none_or(|product| product.layer.app.snapshot.connected);
         if !(self.ui_pending
             || draw_world
                 && self
@@ -622,15 +622,15 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
             wasm_bindgen_futures::spawn_local(async move {
                 let _ = animation_frame().await;
                 let _ = animation_frame().await;
-                let prepared = audio::browser::with_local_resources(|local| {
-                    audio::scene::PreparedSounds::prepare(Some(local), local.minecraft_index())
-                });
+                let revision = audio::browser::with_local_resources(|local| local.revision());
+                let prepared = audio::browser::prepare_current_sound_bank().await;
+                if audio::browser::with_local_resources(|local| local.revision()) != revision {
+                    return;
+                }
                 if let Some(state) = weak.upgrade()
                     && let Some(product) = &mut state.borrow_mut().product
                 {
-                    let result = prepared
-                        .map_err(js_error)
-                        .and_then(|prepared| product.audio.replace_bank(prepared));
+                    let result = prepared.and_then(|prepared| product.audio.replace_bank(prepared));
                     product.layer.app.set_status(if result.is_ok() {
                         "Локальные звуки подготовлены"
                     } else {
@@ -730,6 +730,8 @@ fn stats_object(view: &ClientView) -> JsValue {
         ("flying", stats.flying),
         ("noclip", stats.noclip),
         ("onGround", stats.on_ground),
+        ("diagnosticUnitMesh", view.demo_unit_mesh()),
+        ("diagnosticGpuUnitMesh", view.demo_gpu_unit_mesh()),
     ] {
         let _ = js_sys::Reflect::set(&value, &name.into(), &flag.into());
     }
@@ -1040,6 +1042,7 @@ fn install_input(state: &Rc<RefCell<BrowserState>>) -> Result<(), JsValue> {
             state.view.clear_keys();
             if let Some(product) = &mut state.product
                 && product.layer.app.screen == ui::app::Screen::Game
+                && product.layer.app.focus == ui::app::Focus::None
             {
                 product.layer.app.open(ui::app::Screen::Pause);
             }
@@ -1142,16 +1145,26 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
         &atlas,
     )
     .map_err(|error| js_error(error.to_string()))?;
-    let mut view = ClientView::new(
-        terrain,
-        if diagnostic {
-            client::SceneConfig::forest()
-        } else {
-            client::remote::RemoteSession::scene_config()
-        },
-    )
+    let params = web_sys::UrlSearchParams::new_with_str(&window.location().search()?)?;
+    let scene_config = if diagnostic {
+        client::SceneConfig::forest()
+    } else {
+        client::remote::RemoteSession::scene_config()
+    };
+    let legacy = diagnostic
+        && (params.get("unit_mesh").as_deref() == Some("1")
+            || params.get("legacy_gpu_greedy").as_deref() == Some("1"));
+    let mut view = if legacy {
+        ClientView::new_with_rasterization(
+            terrain,
+            scene_config,
+            client::view::NearRasterization::LegacyGreedy,
+        )
+    } else {
+        ClientView::new(terrain, scene_config)
+    }
     .map_err(js_error)?;
-    let product = if diagnostic {
+    let mut product = if diagnostic {
         None
     } else {
         Some(product_ui::ProductUi::prepare(
@@ -1160,6 +1173,13 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
             config.format,
         )?)
     };
+    if let Some(product) = &mut product {
+        let applied = view.apply_settings(&product.layer.app.settings);
+        product
+            .layer
+            .app
+            .set_pending_settings(applied.pending_render);
+    }
     let recorder = if diagnostic {
         None
     } else {
@@ -1170,7 +1190,12 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
     } else {
         Some(client::capture::FrameGpuCapture::new(&gpu.device))
     };
-    let params = web_sys::UrlSearchParams::new_with_str(&window.location().search()?)?;
+    if diagnostic && params.get("unit_mesh").as_deref() == Some("1") {
+        view.set_demo_unit_mesh(true).map_err(js_error)?;
+    }
+    if diagnostic && params.get("gpu_unit_mesh").as_deref() == Some("1") {
+        view.prepare_gpu_unit_mesh().map_err(js_error)?;
+    }
     let delay_ms = params
         .get("meshDelayMs")
         .and_then(|value| value.parse::<u64>().ok())

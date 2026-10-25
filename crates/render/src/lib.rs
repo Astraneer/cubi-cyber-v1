@@ -3,8 +3,10 @@
 
 pub mod atmosphere;
 pub mod block_models;
+pub mod cloud_gpu;
 pub mod entity_gpu;
 pub mod entity_models;
+pub mod environment_gpu;
 pub mod gi;
 pub mod gpu_time;
 pub mod height_gpu;
@@ -16,6 +18,8 @@ pub mod post;
 pub mod shadows;
 pub mod terrain_gpu;
 pub mod terrain_mesh;
+pub mod terrain_unit;
+pub mod water_gpu;
 
 pub const MSAA_SAMPLES: u32 = 4;
 pub const MAX_FRAMES_IN_FLIGHT: u32 = 2;

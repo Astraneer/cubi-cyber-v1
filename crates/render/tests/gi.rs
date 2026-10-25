@@ -651,3 +651,160 @@ struct Vertex{@builtin(position)position:vec4<f32>,@location(0)uv:vec2<f32>};
         );
     });
 }
+
+#[test]
+fn toroidal_recenter_retains_overlap_and_new_bricks_are_unknown_until_uploaded() {
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let initial = GiConfig {
+        world_origin_page: [0; 3],
+        world_pages: [2, 1, 1],
+        probe_origin: [6., 4., 4.],
+        probe_counts: [4, 2, 2],
+        probe_spacing: 4.,
+        max_jobs: 16,
+        ..GiConfig::default()
+    };
+    let mut budget = UploadBudget::new(4_000_000);
+    let mut gi = GiGpu::new(&gpu.device, &gpu.queue, initial, &mut budget).unwrap();
+    let data = |page: i32| {
+        std::array::from_fn(|index| {
+            let x = page * 16 + (index % 16) as i32;
+            let z = index / 16 % 16;
+            let y = index / 256;
+            if y == 0 || y == 15 || z == 0 || z == 15 || x == 0 || x == 47 {
+                GiVoxel::opaque_reflected([
+                    if page == 0 { 0.5 } else { 0.0 },
+                    if page == 1 { 0.5 } else { 0.0 },
+                    if page == 2 { 0.5 } else { 0.0 },
+                ])
+                .unwrap()
+            } else {
+                GiVoxel::EMPTY
+            }
+        })
+    };
+    for page in 0..2 {
+        gi.upload_page(&gpu.queue, [page, 0, 0], 1, &data(page), 0, &mut budget)
+            .unwrap();
+    }
+    assert_eq!(
+        tick(&gpu, &mut gi, 0, 10000, &mut budget).updated_probes,
+        16
+    );
+    let before = probes(&gpu, &gi);
+    let revision = gi.source_revision();
+    let pending = gi.pending();
+    let expected_bytes = 96 + 4 * 128 + 4096 * 4;
+    let mut refused = UploadBudget::new(expected_bytes - 1);
+    assert_eq!(
+        gi.recenter(&gpu.queue, [1, 0, 0], [1, 0, 0], 1, &mut refused),
+        Err(GiError::UploadBudget)
+    );
+    assert_eq!(refused.remaining_bytes, expected_bytes - 1);
+    assert_eq!(gi.source_revision(), revision);
+    assert_eq!(gi.pending(), pending);
+    assert_eq!(
+        bytemuck::cast_slice::<_, u8>(&probes(&gpu, &gi)),
+        bytemuck::cast_slice::<_, u8>(&before)
+    );
+    let scroll = gi
+        .recenter(&gpu.queue, [1, 0, 0], [1, 0, 0], 1, &mut budget)
+        .unwrap();
+    assert_eq!(
+        (
+            scroll.recycled_probes,
+            scroll.retained_probes,
+            scroll.cleared_pages,
+            scroll.upload_bytes
+        ),
+        (4, 12, 1, expected_bytes)
+    );
+    let after = probes(&gpu, &gi);
+    for y in 0..2 {
+        for z in 0..2 {
+            for x in 0..4 {
+                let slot = gi.probe_slot([x, y, z]).unwrap();
+                let actual = &after[slot];
+                assert_eq!(
+                    actual.position[..3],
+                    [10. + x as f32 * 4., 4. + y as f32 * 4., 4. + z as f32 * 4.]
+                );
+                if x < 3 {
+                    let old = (x + 1 + 4 * (z + 2 * y)) as usize;
+                    assert_eq!(
+                        bytemuck::bytes_of(actual),
+                        bytemuck::bytes_of(&before[old]),
+                        "retained slot must preserve cached radiance and visibility bitwise"
+                    );
+                } else {
+                    assert_eq!(actual.stamps[0], 2);
+                    assert_eq!(actual.stamps[2], 0);
+                    assert_eq!(actual.sh_r, [0.; 4]);
+                    assert_eq!(actual.sh_g, [0.; 4]);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        gi.upload_page(&gpu.queue, [1, 0, 0], 1, &data(1), 1, &mut budget)
+            .unwrap(),
+        0,
+        "overlap retains page-version identity"
+    );
+    gi.upload_page(&gpu.queue, [2, 0, 0], 0, &data(2), 1, &mut budget)
+        .unwrap();
+    tick(&gpu, &mut gi, 1, 10000, &mut budget);
+    let mut fresh = GiGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        GiConfig {
+            world_origin_page: [1, 0, 0],
+            probe_origin: [10., 4., 4.],
+            ..initial
+        },
+        &mut budget,
+    )
+    .unwrap();
+    for page in 1..3 {
+        fresh
+            .upload_page(&gpu.queue, [page, 0, 0], 1, &data(page), 1, &mut budget)
+            .unwrap();
+    }
+    tick(&gpu, &mut fresh, 1, 10000, &mut budget);
+    let moved = probes(&gpu, &gi);
+    let canonical = probes(&gpu, &fresh);
+    for y in 0..2 {
+        for z in 0..2 {
+            for x in 0..4 {
+                let actual = &moved[gi.probe_slot([x, y, z]).unwrap()];
+                let expected = &canonical[(x + 4 * (z + 2 * y)) as usize];
+                assert_eq!(actual.position, expected.position);
+                assert_eq!(actual.sh_r, expected.sh_r);
+                assert_eq!(actual.sh_g, expected.sh_g);
+                assert_eq!(actual.sh_b, expected.sh_b);
+                assert_eq!(actual.visibility_a, expected.visibility_a);
+                assert_eq!(actual.visibility_b, expected.visibility_b);
+            }
+        }
+    }
+    // A teleport recycles the entire lattice; no previous green/blue energy may
+    // survive in entering Unknown bricks even before those bricks are populated.
+    let teleport = gi
+        .recenter(&gpu.queue, [-2, 0, 0], [-20, 0, 0], 2, &mut budget)
+        .unwrap();
+    assert_eq!((teleport.recycled_probes, teleport.cleared_pages), (16, 2));
+    tick(&gpu, &mut gi, 2, 10000, &mut budget);
+    assert!(
+        probes(&gpu, &gi)
+            .iter()
+            .all(|p| p.sh_r == [0.; 4] && p.sh_g == [0.; 4] && p.sh_b == [0.; 4])
+    );
+    let noop = gi
+        .recenter(&gpu.queue, [-2, 0, 0], [0; 3], 3, &mut UploadBudget::new(0))
+        .unwrap();
+    assert_eq!(noop.upload_bytes, 0);
+    println!(
+        "GI_SCROLL_GPU_OK retained_bitwise=12 recycled=4 one_page_cleared_bytes=16384 total_upload_bytes={} canonical_SH_visibility_bitwise=true teleport_unknown_leaks=0 budget_refusal_atomic=true",
+        scroll.upload_bytes
+    );
+}

@@ -2,6 +2,7 @@
 //! components only; unrelated networks are never rebuilt. Allocation is confined
 //! to topology/endpoint edits, with fixed configured node/endpoint bounds.
 mod persistence;
+mod topology;
 use super::{
     logistics::fair_share,
     sides::{self, Face},
@@ -10,6 +11,7 @@ pub use persistence::{
     GridSnapshot, NetworkSnapshot, NodeSnapshot, PhaseScratch, Reservoir, SlotSnapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
+pub use topology::{IndexedSlot, TopologyBudget, TopologyDelta, TopologyEdit, TopologyRecords};
 
 pub type Position = [i32; 3];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +122,7 @@ pub trait GridWorld {
 pub struct Grid {
     members: BTreeMap<Position, Member>,
     slots: Vec<Slot>,
+    free_slots: BTreeSet<u32>,
     max_nodes: usize,
     max_endpoints: usize,
 }
@@ -128,6 +131,7 @@ impl Grid {
         Self {
             members: BTreeMap::new(),
             slots: Vec::new(),
+            free_slots: BTreeSet::new(),
             max_nodes,
             max_endpoints,
         }
@@ -156,12 +160,8 @@ impl Grid {
         slot.network.as_mut().ok_or(GridError::Stale)
     }
     fn allocate(&mut self, resource: Resource) -> Result<NetworkId, GridError> {
-        let available = self
-            .slots
-            .iter()
-            .position(|slot| slot.network.is_none() && slot.generation < u32::MAX);
-        let slot = if let Some(i) = available {
-            i
+        let slot = if let Some(i) = self.free_slots.pop_first() {
+            i as usize
         } else {
             if self.slots.len() == self.max_nodes {
                 return Err(GridError::Capacity);
@@ -289,6 +289,9 @@ impl Grid {
             .network
             .take()
             .ok_or(GridError::Stale)?;
+        if source.generation < u32::MAX {
+            self.free_slots.insert(source.slot);
+        }
         for p in &other.members {
             self.members.get_mut(p).expect("member").network = target;
         }
@@ -323,6 +326,9 @@ impl Grid {
             .ok_or(GridError::Stale)?;
         let remaining: Vec<_> = old.members.iter().copied().filter(|q| *q != p).collect();
         if remaining.is_empty() {
+            if id.generation < u32::MAX {
+                self.free_slots.insert(id.slot);
+            }
             return Ok(old.stored);
         }
         let mut seen = BTreeSet::new();

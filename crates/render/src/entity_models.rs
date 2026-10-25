@@ -527,8 +527,100 @@ pub fn model_atlas() -> Result<crate::terrain_gpu::AtlasImage, String> {
     crate::terrain_gpu::AtlasImage::from_png(&png_data)
 }
 
+/// Loading-only nonblock item sprites. Unlike block atlas import this preserves
+/// transparent layers40/41. RGB is alpha-weighted and averaged in linear light.
+pub fn item_atlas(rgba: &[u8], layers: u32) -> Result<crate::terrain_gpu::AtlasImage, String> {
+    use crate::terrain_gpu::{AtlasImage, AtlasMip};
+    if layers == 0 || layers > 256 || rgba.len() != layers as usize * 16 * 16 * 4 {
+        return Err("item sprites must be16x16 RGBA layers1..256".into());
+    }
+    let mut mips = vec![AtlasMip {
+        size: 16,
+        rgba: rgba.to_vec(),
+        tint_mask: vec![0; layers as usize * 16 * 16],
+    }];
+    while mips.last().expect("base item mip").size > 1 {
+        let source = mips.last().expect("source mip");
+        let size = source.size / 2;
+        let mut mip = AtlasMip {
+            size,
+            rgba: vec![0; layers as usize * size as usize * size as usize * 4],
+            tint_mask: vec![0; layers as usize * size as usize * size as usize],
+        };
+        for layer in 0..layers {
+            for y in 0..size {
+                for x in 0..size {
+                    let mut rgb = [0f64; 3];
+                    let mut alpha = 0f64;
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let i = ((layer * source.size * source.size
+                                + (y * 2 + dy) * source.size
+                                + x * 2
+                                + dx)
+                                * 4) as usize;
+                            let a = f64::from(source.rgba[i + 3]) / 255.;
+                            alpha += a;
+                            for (c, total) in rgb.iter_mut().enumerate() {
+                                let s = f64::from(source.rgba[i + c]) / 255.;
+                                let linear = if s <= 0.04045 {
+                                    s / 12.92
+                                } else {
+                                    ((s + 0.055) / 1.055).powf(2.4)
+                                };
+                                *total += linear * a;
+                            }
+                        }
+                    }
+                    let i = ((layer * size * size + y * size + x) * 4) as usize;
+                    for (c, total) in rgb.into_iter().enumerate() {
+                        let linear = if alpha > 0. { total / alpha } else { 0. };
+                        let encoded = if linear <= 0.0031308 {
+                            linear * 12.92
+                        } else {
+                            1.055 * linear.powf(1. / 2.4) - 0.055
+                        };
+                        mip.rgba[i + c] = (encoded.clamp(0., 1.) * 255.).round() as u8;
+                    }
+                    mip.rgba[i + 3] = (alpha * 255. / 4.).round() as u8;
+                }
+            }
+        }
+        mips.push(mip);
+    }
+    Ok(AtlasImage {
+        tile_size: 16,
+        layers,
+        mips,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn item_mips_preserve_alpha40_41_and_average_linear_rgb() {
+        let mut pixels = vec![0; 42 * 16 * 16 * 4];
+        for y in 0..16 {
+            for x in 0..16 {
+                let c = if (x + y) % 2 == 0 { 0 } else { 255 };
+                let i = (x + 16 * y) * 4;
+                pixels[i..i + 4].copy_from_slice(&[c, c, c, 255]);
+            }
+        }
+        let atlas = super::item_atlas(&pixels, 42).unwrap();
+        assert_eq!(atlas.mips.len(), 5);
+        assert_eq!(&atlas.mips[1].rgba[..4], &[188, 188, 188, 255]);
+        for mip in atlas.mips {
+            for layer in [40, 41] {
+                let first = layer * mip.size as usize * mip.size as usize * 4;
+                assert!(
+                    mip.rgba[first..first + mip.size as usize * mip.size as usize * 4]
+                        .chunks_exact(4)
+                        .all(|p| p[3] == 0)
+                );
+            }
+        }
+    }
     use super::*;
     #[test]
     fn all_models_are_built_once_with_bounded_valid_uvs() {

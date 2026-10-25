@@ -687,7 +687,7 @@ fn survival_placement_consumes_owned_stack_atomically_and_never_reconsumes_a_rep
 }
 
 #[test]
-fn mining_uses_owned_tool_and_persists_wear_and_one_durable_drop_bundle() {
+fn mining_import_pickup_and_restart_keep_one_owned_drop_and_exact_tool_wear() {
     let directory = Directory::new();
     let mut h = Harness::new(&directory);
     let owner = directory.owner();
@@ -727,34 +727,69 @@ fn mining_uses_owned_tool_and_persists_wear_and_one_durable_drop_bundle() {
     accepted(mined);
     let worn = inventory(&mut h, 1, 2);
     assert_eq!(worn.hand().damage(), 1);
-    let id = h
+    for _ in 0..200 {
+        if h.server.item_entities().len() == 1 {
+            break;
+        }
+        h.advance();
+    }
+    let entity = *h
         .server
-        .world()
-        .page(pos(8, 2, 11).page())
-        .unwrap()
-        .component(pos(8, 2, 11).local_index())
-        .unwrap();
-    let component = h.server.world().component(id).unwrap();
-    assert_eq!(component.data.kind, server::survival::DROP_COMPONENT);
-    let bundle = server::survival::DropBundle::decode(&component.data.payload).unwrap();
-    assert_eq!(bundle.entries.len(), 1);
-    assert_eq!(bundle.entries[0].player, welcome.identity.0);
-    assert_eq!(bundle.entries[0].action, 2);
-    assert_eq!(bundle.entries[0].stack.count(), 1);
-    let entry = bundle.entries[0].clone();
+        .item_entities()
+        .rows()
+        .first()
+        .expect("durable imported item");
+    assert_eq!(entity.stack.item(), rules::ids::COBBLE);
+    assert_eq!(entity.stack.count(), 1);
+    assert!(
+        !h.server
+            .world()
+            .components()
+            .any(|(_, c)| c.data.kind == server::survival::DROP_COMPONENT)
+    );
     drop(h);
+    // The accepted mining transaction still contains the independently durable
+    // source bundle. Its later removal and the entity ledger share one WAL batch.
+    let entry = {
+        let (_store, recovery) = save::Store::open(&directory.0).unwrap();
+        let source = recovery
+            .batches
+            .iter()
+            .flat_map(|(_, b)| &b.changes)
+            .find(|change| Some(change.tx) == mined.transaction)
+            .unwrap();
+        let component = source
+            .components
+            .iter()
+            .find_map(|c| {
+                c.after
+                    .as_ref()
+                    .filter(|r| r.data.kind == server::survival::DROP_COMPONENT)
+            })
+            .unwrap();
+        let bundle = server::survival::DropBundle::decode(&component.data.payload).unwrap();
+        assert_eq!(bundle.entries.len(), 1);
+        bundle.entries[0].clone()
+    };
+    assert_eq!(entry.player, welcome.identity.0);
+    assert_eq!(entry.action, 2);
+    assert_eq!(entry.entity_id, entity.id.0);
+    assert_eq!(entry.stack, entity.stack);
     let mut h = Harness {
         server: Server::open(directory.config()).unwrap(),
         now: 0,
         outputs: Vec::new(),
     };
-    h.join(2, owner);
+    h.join(2, owner.clone());
     assert_eq!(inventory(&mut h, 2, 2), worn);
-    assert_eq!(h.action(2, 2, action), mined);
-    let component = h.server.world().component(id).unwrap();
-    let bundle = server::survival::DropBundle::decode(&component.data.payload).unwrap();
-    assert_eq!(bundle.entries.len(), 1);
-    assert_eq!(bundle.entries[0], entry);
+    assert_eq!(h.action(2, 2, action.clone()), mined);
+    let restored = h
+        .server
+        .item_entities()
+        .get(entity.id)
+        .expect("entity recovered from WAL");
+    assert_eq!(restored.stack, entry.stack);
+    assert_eq!(h.server.item_entities().len(), 1);
     assert_eq!(
         h.action(
             2,
@@ -784,6 +819,48 @@ fn mining_uses_owned_tool_and_persists_wear_and_one_durable_drop_bundle() {
         )
         .status,
         ActionStatus::Rejected(RejectReason::Unauthorized)
+    );
+    let position = h.server.item_entities().get(entity.id).unwrap().position;
+    accepted(h.action(
+        2,
+        6,
+        Action::Command(format!("/tp {} 1 {}", position[0], position[2])),
+    ));
+    for _ in 0..300 {
+        if h.server.item_entities().is_empty() {
+            break;
+        }
+        h.advance();
+    }
+    assert!(
+        h.server.item_entities().is_empty(),
+        "actual server physics/delay/pickup phase consumed item once"
+    );
+    let picked = inventory(&mut h, 2, 4);
+    assert_eq!(picked.get(1).unwrap().item(), rules::ids::COBBLE);
+    assert_eq!(picked.get(1).unwrap().count(), 1);
+    assert_eq!(h.action(2, 2, action), mined);
+    assert!(
+        h.server.item_entities().is_empty(),
+        "replayed mining cannot recreate an already picked drop"
+    );
+    for _ in 0..200 {
+        if h.server.request_checkpoint() {
+            break;
+        }
+        h.advance();
+    }
+    drop(h);
+    let mut h = Harness {
+        server: Server::open(directory.config()).unwrap(),
+        now: 0,
+        outputs: Vec::new(),
+    };
+    h.join(3, owner);
+    assert_eq!(inventory(&mut h, 3, 4), picked);
+    assert!(
+        h.server.item_entities().is_empty(),
+        "snapshot/reopen conserves picked item"
     );
 }
 
@@ -944,4 +1021,196 @@ fn aimed_click_uses_its_validated_camera_and_keeps_action_id_idempotence() {
     );
     assert_eq!(h.final_reply(1, 2), first);
     assert_eq!(h.server.world().version(), version);
+}
+
+#[test]
+fn ordinary_chat_is_durable_idempotent_and_recovers_before_unpublished_ack() {
+    let directory = Directory::new();
+    let mut h = Harness::new(&directory);
+    let owner = directory.owner();
+    let welcome = h.join(1, owner.clone());
+    h.join(2, guest("chat-observer"));
+    let first = h.action(1, 1, Action::Chat("Первое сообщение".into()));
+    accepted(first);
+    let outgoing=h.until(|o|o.connection==2 && matches!(&o.message,ServerMessage::Presence(net::presence::PresenceServerEvent::Chat(line)) if line.text=="Первое сообщение"));
+    let ServerMessage::Presence(net::presence::PresenceServerEvent::Chat(line)) = outgoing.message
+    else {
+        unreachable!()
+    };
+    assert_eq!(line.identity, welcome.identity);
+    assert!(line.sequence > 0);
+    assert_eq!(
+        h.action(1, 1, Action::Chat("изменённый повтор".into())),
+        first
+    );
+    assert!(!h.outputs.iter().any(|o|o.connection==2 && matches!(&o.message,ServerMessage::Presence(net::presence::PresenceServerEvent::Chat(next)) if next.sequence==line.sequence)),"retry is never rebroadcast to other peers");
+    for _ in 0..100 {
+        if h.server.request_checkpoint() {
+            break;
+        }
+        h.advance();
+    }
+    drop(h);
+    let mut h = Harness {
+        server: Server::open(directory.config()).unwrap(),
+        now: 0,
+        outputs: Vec::new(),
+    };
+    h.join(3, owner.clone());
+    let recovered=h.until(|o|o.connection==3 && matches!(&o.message,ServerMessage::Presence(net::presence::PresenceServerEvent::Chat(next)) if next.sequence==line.sequence));
+    assert_eq!(
+        recovered.message,
+        ServerMessage::Presence(net::presence::PresenceServerEvent::Chat(line.clone()))
+    );
+    assert_eq!(h.action(3, 1, Action::Chat("ignored retry".into())), first);
+    // Process a new action and let its actual writer finish, without polling
+    // the publication boundary. Reopening must recover the line and accepted
+    // ActionId together, so the retry cannot acknowledge a missing message.
+    h.now += 1000;
+    h.send(
+        3,
+        ClientMessage::Action {
+            id: ActionId(2),
+            action: Action::Chat("Записано до ACK".into()),
+        },
+    );
+    assert!(
+        !h.outputs
+            .iter()
+            .any(|o| matches!(o.message,ServerMessage::Action(reply) if reply.id==ActionId(2)))
+    );
+    drop(h);
+    let mut h = Harness {
+        server: Server::open(directory.config()).unwrap(),
+        now: 0,
+        outputs: Vec::new(),
+    };
+    h.join(4, owner);
+    let outgoing=h.until(|o|o.connection==4 && matches!(&o.message,ServerMessage::Presence(net::presence::PresenceServerEvent::Chat(next)) if next.text=="Записано до ACK"));
+    let ServerMessage::Presence(net::presence::PresenceServerEvent::Chat(next)) = outgoing.message
+    else {
+        unreachable!()
+    };
+    assert!(next.sequence > line.sequence);
+    accepted(h.action(4, 2, Action::Chat("ignored after crash".into())));
+    let third = h.action(4, 3, Action::Chat("После восстановления".into()));
+    accepted(third);
+    let final_line=h.until(|o|matches!(&o.message,ServerMessage::Presence(net::presence::PresenceServerEvent::Chat(last)) if last.text=="После восстановления"));
+    let ServerMessage::Presence(net::presence::PresenceServerEvent::Chat(last)) =
+        final_line.message
+    else {
+        unreachable!()
+    };
+    assert!(last.sequence > next.sequence);
+}
+
+fn window_image(
+    h: &mut Harness,
+    connection: u64,
+    id: u64,
+    revision: u64,
+) -> net::window::WindowSnapshot {
+    let outgoing=h.until(|o|o.connection==connection && matches!(&o.message,ServerMessage::Window(state) if state.guard.id>=id && state.guard.revision>=revision));
+    let ServerMessage::Window(state) = outgoing.message else {
+        unreachable!()
+    };
+    *state
+}
+#[test]
+fn actual_inventory_crafting_cursor_and_window_epoch_survive_restart_without_duplication() {
+    use net::window::WindowIntent as W;
+    let directory = Directory::new();
+    let mut h = Harness::new(&directory);
+    let owner = directory.owner();
+    h.join(1, owner.clone());
+    h.join(2, guest("window-observer"));
+    accepted(h.action(
+        1,
+        1,
+        Action::Command(format!("/give {} 1", rules::ids::LOG)),
+    ));
+    accepted(h.action(1, 2, Action::Window(W::OpenInventory)));
+    let opened = window_image(&mut h, 1, 2, 0);
+    assert!(!opened.closed);
+    assert_eq!(opened.cursor, net::window::Stack::EMPTY);
+    let click = W::Click {
+        guard: opened.guard,
+        slot: 0,
+        right: false,
+        shift: false,
+    };
+    accepted(h.action(1, 3, Action::Window(click)));
+    let hand = window_image(&mut h, 1, 2, 1);
+    assert_eq!(hand.cursor.item, rules::ids::LOG);
+    assert_eq!(hand.cursor.count, 1);
+    assert_eq!(
+        h.action(1, 4, Action::Window(click)).status,
+        ActionStatus::Rejected(RejectReason::Stale)
+    );
+    accepted(h.action(
+        1,
+        5,
+        Action::Window(W::Click {
+            guard: hand.guard,
+            slot: 100,
+            right: false,
+            shift: false,
+        }),
+    ));
+    let craft = window_image(&mut h, 1, 2, 2);
+    assert_eq!(craft.craft[0].item, rules::ids::LOG);
+    assert_eq!(craft.craft_result.item, rules::ids::PLANKS);
+    assert_eq!(craft.craft_result.count, 4);
+    let take = Action::Window(W::TakeCraft {
+        guard: craft.guard,
+        all: false,
+    });
+    let taken = h.action(1, 6, take.clone());
+    accepted(taken);
+    let result = window_image(&mut h, 1, 2, 3);
+    assert_eq!(result.cursor.item, rules::ids::PLANKS);
+    assert_eq!(result.cursor.count, 4);
+    assert_eq!(result.craft[0], net::window::Stack::EMPTY);
+    assert!(h.outputs.iter().filter(|o|o.connection==2).all(|o|!matches!(&o.message,ServerMessage::Window(w) if w.cursor.item==rules::ids::LOG || w.cursor.item==rules::ids::PLANKS)),"private cursor never broadcast");
+    drop(h);
+    let mut h = Harness {
+        server: Server::open(directory.config()).unwrap(),
+        now: 0,
+        outputs: Vec::new(),
+    };
+    h.join(3, owner.clone());
+    let recovered = window_image(&mut h, 3, 2, 3);
+    assert_eq!(recovered.cursor, result.cursor);
+    assert_eq!(recovered.guard, result.guard);
+    assert_eq!(h.action(3, 6, take), taken);
+    accepted(h.action(
+        3,
+        7,
+        Action::Window(W::Close {
+            guard: recovered.guard,
+        }),
+    ));
+    let closed = window_image(&mut h, 3, 2, 4);
+    assert!(closed.closed);
+    assert_eq!(closed.cursor, net::window::Stack::EMPTY);
+    let after = inventory(&mut h, 3, 3);
+    assert_eq!(after.get(0).unwrap().item(), rules::ids::PLANKS);
+    assert_eq!(after.get(0).unwrap().count(), 4);
+    accepted(h.action(3, 8, Action::Window(W::OpenInventory)));
+    let reopened = window_image(&mut h, 3, 3, 0);
+    assert!(
+        reopened.guard.id > closed.guard.id,
+        "new persistent epoch prevents staleguard ABA"
+    );
+    drop(h);
+    let mut h = Harness {
+        server: Server::open(directory.config()).unwrap(),
+        now: 0,
+        outputs: Vec::new(),
+    };
+    h.join(4, owner);
+    assert_eq!(inventory(&mut h, 4, 3), after);
+    let persisted = window_image(&mut h, 4, 3, 0);
+    assert_eq!(persisted.guard.id, reopened.guard.id);
+    assert_eq!(persisted.cursor, net::window::Stack::EMPTY);
 }

@@ -65,6 +65,8 @@ pub enum TerrainError {
     OcclusionDisabled,
     InvalidEdit,
     LatePreparation,
+    SceneSamplingDisabled,
+    InvalidRasterMesh,
 }
 
 impl std::fmt::Display for TerrainError {
@@ -240,6 +242,7 @@ struct Slot {
 }
 
 struct Targets {
+    sampled: bool,
     _color: wgpu::Texture,
     color: wgpu::TextureView,
     _resolved: wgpu::Texture,
@@ -282,6 +285,7 @@ pub struct TerrainGeometry<'a> {
 
 pub struct TerrainGpu {
     config: GpuConfig,
+    unit_raster: bool,
     width: u32,
     height: u32,
     output_format: wgpu::TextureFormat,
@@ -329,6 +333,7 @@ pub struct TerrainGpu {
     atlas_layers: u32,
     last_camera: Option<(Camera, CullingMode)>,
     scene_revision: u64,
+    hdr_revision: u64,
     last_render: Option<(Camera, CullingMode, u64)>,
     work: telemetry::WorkCounters,
     pass_queries: Option<PassQueries>,
@@ -441,7 +446,7 @@ impl TerrainGpu {
         });
         let compute = wgpu::ShaderStages::COMPUTE;
         let fragment = wgpu::ShaderStages::FRAGMENT;
-        let render_layout = terrain_render_layout(device, false);
+        let render_layout = terrain_render_layout(device, false, false);
         let frustum_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frustum compute tables"),
             entries: &[
@@ -451,6 +456,7 @@ impl TerrainGpu {
                 buffer_entry(3, compute, false, false),
                 buffer_entry(5, compute, false, true),
                 buffer_entry(6, compute, false, true),
+                buffer_entry(7, compute, false, true),
             ],
         });
         let cull_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -462,6 +468,7 @@ impl TerrainGpu {
                 buffer_entry(3, compute, false, false),
                 buffer_entry(5, compute, false, true),
                 buffer_entry(6, compute, false, true),
+                buffer_entry(7, compute, false, true),
                 texture_entry(
                     4,
                     compute,
@@ -534,6 +541,7 @@ impl TerrainGpu {
             &indirect,
             &edit_masks,
             &patch_states,
+            &quads,
             None,
         );
         let render_pipeline_layout =
@@ -691,7 +699,7 @@ impl TerrainGpu {
         let hiz_cull_pipeline = config
             .occlusion
             .then(|| compute_pipeline(device, &cull_pl, &cull_shader, "occlusion"));
-        let targets = create_targets(device, width, height, &tone_layout);
+        let targets = create_targets(device, width, height, &tone_layout, false);
         let (hiz_base_layout, hiz_reduce_layout, hiz_base_pipeline, hiz_reduce_pipeline, hiz) =
             if config.occlusion {
                 let base = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -754,6 +762,7 @@ impl TerrainGpu {
                     &indirect,
                     &edit_masks,
                     &patch_states,
+                    &quads,
                 );
                 (Some(base), Some(reduce), Some(bp), Some(rp), Some(hiz))
             } else {
@@ -788,6 +797,7 @@ impl TerrainGpu {
             });
         Ok(Self {
             config,
+            unit_raster: false,
             width,
             height,
             output_format: format,
@@ -844,12 +854,64 @@ impl TerrainGpu {
             atlas_layers: atlas.layers,
             last_camera: None,
             scene_revision: 0,
+            hdr_revision: 0,
             last_render: None,
             work,
             pass_queries,
             pass_count: std::cell::Cell::new(0),
             pass_kinds: std::cell::Cell::new([GpuPassKind::Unused; 32]),
         })
+    }
+
+    /// Keep CPU greedy descriptors, but rasterize each visible voxel face on
+    /// the same unit grid as H1 overlays. No new arena, pipeline or visibility
+    /// allocation is needed. Must precede uploads and the first encoded frame.
+    /// A conservative slot bound makes every possible bucket fit its capacity:
+    /// each allocated object contributes at most 4096*6 visible unit entries.
+    pub fn prepare_unit_rasterization(&mut self) -> Result<u32, TerrainError> {
+        if self.last_render.is_some() || self.free_slots.len() != self.slots.len() {
+            return Err(TerrainError::LatePreparation);
+        }
+        if self.config.max_quads > (1 << 24) || self.config.max_quads < MAX_PAGE_QUADS as u32 {
+            return Err(TerrainError::Capacity);
+        }
+        self.unit_raster = true;
+        self.last_camera = None;
+        self.invalidate();
+        Ok(self.config.max_quads / MAX_PAGE_QUADS as u32)
+    }
+    pub fn unit_rasterization(&self) -> bool {
+        self.unit_raster
+    }
+    pub fn unit_object_limit(&self) -> Option<u32> {
+        self.unit_raster
+            .then_some((self.config.max_quads / MAX_PAGE_QUADS as u32).min(self.config.max_pages))
+    }
+    fn can_allocate_slots(&self, count: usize) -> bool {
+        self.free_slots.len() >= count
+            && self.unit_object_limit().is_none_or(|limit| {
+                self.slots.len() - self.free_slots.len() + count <= limit as usize
+            })
+    }
+    fn validate_raster_mesh(&self, mesh: &PageMesh) -> Result<(), TerrainError> {
+        if !self.unit_raster {
+            return Ok(());
+        }
+        let mut units = 0usize;
+        for &quad in mesh.iter() {
+            crate::terrain_mesh::QuadDescriptor::from_le_bytes(quad.to_le_bytes())
+                .map_err(|_| TerrainError::InvalidRasterMesh)?;
+            let [width, height] = quad.size();
+            let area = usize::from(width) * usize::from(height);
+            if area > 1 && quad.ao().iter().any(|&ao| ao != quad.ao()[0]) {
+                return Err(TerrainError::InvalidRasterMesh);
+            }
+            units += area;
+            if units > MAX_PAGE_QUADS {
+                return Err(TerrainError::Capacity);
+            }
+        }
+        Ok(())
     }
 
     pub fn take_work(&mut self) -> telemetry::WorkCounts {
@@ -867,6 +929,28 @@ impl TerrainGpu {
         shadows: &crate::shadows::ShadowGpu,
         lights: &crate::light_volume::LightVolumeGpu,
     ) -> Result<(), TerrainError> {
+        self.prepare_lighting(device, shadows, lights, None)
+    }
+
+    /// Optional reflected-light receiver. The GI source contains reflected
+    /// outgoing radiance only; CPU block light and sunlight remain separate.
+    pub fn attach_lighting_with_gi(
+        &mut self,
+        device: &wgpu::Device,
+        shadows: &crate::shadows::ShadowGpu,
+        lights: &crate::light_volume::LightVolumeGpu,
+        gi: &crate::gi::GiGpu,
+    ) -> Result<(), TerrainError> {
+        self.prepare_lighting(device, shadows, lights, Some(gi))
+    }
+
+    fn prepare_lighting(
+        &mut self,
+        device: &wgpu::Device,
+        shadows: &crate::shadows::ShadowGpu,
+        lights: &crate::light_volume::LightVolumeGpu,
+        gi: Option<&crate::gi::GiGpu>,
+    ) -> Result<(), TerrainError> {
         if self.last_render.is_some() {
             return Err(TerrainError::LatePreparation);
         }
@@ -875,41 +959,46 @@ impl TerrainGpu {
         {
             return Err(TerrainError::InvalidSize);
         }
-        let layout = terrain_render_layout(device, true);
+        let layout = terrain_render_layout(device, true, gi.is_some());
+        let mut entries = vec![
+            buffer_binding(0, &self.cameras[0]),
+            buffer_binding(1, &self.objects),
+            buffer_binding(2, &self.quads),
+            buffer_binding(3, &self.visible),
+            buffer_binding(4, &self.materials),
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&self.colors),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&self.tint_masks),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::Sampler(&self.sampler),
+            },
+            buffer_binding(8, &self.edit_masks),
+            buffer_binding(16, &self.edit_neighbors),
+            buffer_binding(9, shadows.sampling_buffer()),
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(shadows.depth_view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::Sampler(shadows.sampler()),
+            },
+            buffer_binding(12, lights.buffer()),
+        ];
+        if let Some(gi) = gi {
+            entries.push(buffer_binding(13, gi.sampling_buffer()));
+            entries.push(buffer_binding(14, gi.probe_buffer()));
+        }
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("terrain light volumes and cached cascades"),
+            label: Some("terrain light volumes, cascades and optional reflected GI"),
             layout: &layout,
-            entries: &[
-                buffer_binding(0, &self.cameras[0]),
-                buffer_binding(1, &self.objects),
-                buffer_binding(2, &self.quads),
-                buffer_binding(3, &self.visible),
-                buffer_binding(4, &self.materials),
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&self.colors),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(&self.tint_masks),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                buffer_binding(8, &self.edit_masks),
-                buffer_binding(16, &self.edit_neighbors),
-                buffer_binding(9, shadows.sampling_buffer()),
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: wgpu::BindingResource::TextureView(shadows.depth_view()),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 11,
-                    resource: wgpu::BindingResource::Sampler(shadows.sampler()),
-                },
-                buffer_binding(12, lights.buffer()),
-            ],
+            entries: &entries,
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("lit terrain pipeline layout"),
@@ -918,7 +1007,7 @@ impl TerrainGpu {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("terrain RGB sky and cascaded sunlight"),
-            source: wgpu::ShaderSource::Wgsl(lit_terrain_shader().into()),
+            source: wgpu::ShaderSource::Wgsl(lit_terrain_shader(gi.is_some()).into()),
         });
         self.opaque_pipeline =
             terrain_pipeline(device, &pipeline_layout, &shader, false, false, false);
@@ -997,6 +1086,36 @@ impl TerrainGpu {
     /// Valid after a submitted `FrustumAndHiZ` frame; mip zero is padded to powers of two.
     pub fn conservative_depth_texture(&self) -> Option<&wgpu::Texture> {
         self.hiz.as_ref().map(|hiz| &hiz._texture)
+    }
+
+    /// Prepare read-only scene MSAA inputs for water/cloud composition during loading.
+    /// Replaces only the color target; depth, resolved HDR and pipelines are retained.
+    pub fn prepare_scene_sampling(&mut self, device: &wgpu::Device) -> Result<(), TerrainError> {
+        if self.last_render.is_some() {
+            return Err(TerrainError::LatePreparation);
+        }
+        if !self.targets.sampled {
+            let color = create_scene_color(device, self.width, self.height, true);
+            self.targets.color = color.create_view(&Default::default());
+            self.targets._color = color;
+            self.targets.sampled = true;
+        }
+        Ok(())
+    }
+
+    pub fn scene_color_msaa_view(&self) -> Option<&wgpu::TextureView> {
+        self.targets.sampled.then_some(&self.targets.color)
+    }
+    pub fn scene_depth_msaa_view(&self) -> &wgpu::TextureView {
+        &self.targets.depth
+    }
+    pub fn resolved_hdr_view(&self) -> &wgpu::TextureView {
+        &self.targets.resolved
+    }
+    /// Changes after each newly encoded HDR scene, including camera movement.
+    /// The caller must submit that encoder before using this revision as a cache key.
+    pub fn hdr_revision(&self) -> u64 {
+        self.hdr_revision
     }
 
     /// Linear HDR source. In the basic opaque/cutout graph, alpha records actual
@@ -1098,6 +1217,10 @@ impl TerrainGpu {
         mesh: &PageMesh,
         budget: &mut UploadBudget,
     ) -> Result<PageHandle, TerrainError> {
+        self.validate_raster_mesh(mesh)?;
+        if handle.is_none() && !self.can_allocate_slots(1) {
+            return Err(TerrainError::Capacity);
+        }
         let len = mesh.opaque.len() + mesh.cutout.len() + mesh.water.len();
         if len > MAX_PAGE_QUADS || len > self.config.max_quads as usize {
             return Err(TerrainError::Capacity);
@@ -1595,7 +1718,7 @@ impl TerrainGpu {
             None
         };
         let new_slots = usize::from(base.is_none()) + usize::from(overlay.is_none());
-        if self.free_slots.len() < new_slots {
+        if !self.can_allocate_slots(new_slots) {
             return Err(TerrainError::Capacity);
         }
         for slot in self.free_slots.iter().rev().take(new_slots) {
@@ -1605,6 +1728,7 @@ impl TerrainGpu {
                 .ok_or(TerrainError::Capacity)?;
         }
         for mesh in [base_mesh, patch_mesh] {
+            self.validate_raster_mesh(mesh)?;
             if mesh.quad_count() > MAX_PAGE_QUADS
                 || mesh.quad_count() > self.config.max_quads as usize
             {
@@ -1794,7 +1918,7 @@ impl TerrainGpu {
             None
         };
         let new_slots = usize::from(base.is_none()) + usize::from(overlay.is_none());
-        if self.free_slots.len() < new_slots {
+        if !self.can_allocate_slots(new_slots) {
             return Err(TerrainError::Capacity);
         }
         for slot in self.free_slots.iter().rev().take(new_slots) {
@@ -1804,6 +1928,7 @@ impl TerrainGpu {
                 .ok_or(TerrainError::Capacity)?;
         }
         if let Some(mesh) = base_mesh {
+            self.validate_raster_mesh(mesh)?;
             if mesh.quad_count() > MAX_PAGE_QUADS
                 || mesh.quad_count() > self.config.max_quads as usize
             {
@@ -2002,7 +2127,13 @@ impl TerrainGpu {
         if self.width == width && self.height == height {
             return Ok(());
         }
-        self.targets = create_targets(device, width, height, &self.tone_layout);
+        self.targets = create_targets(
+            device,
+            width,
+            height,
+            &self.tone_layout,
+            self.targets.sampled,
+        );
         self.hiz = match (&self.hiz_base_layout, &self.hiz_reduce_layout) {
             (Some(base), Some(reduce)) => Some(create_hiz(
                 device,
@@ -2018,6 +2149,7 @@ impl TerrainGpu {
                 &self.indirect,
                 &self.edit_masks,
                 &self.patch_states,
+                &self.quads,
             )),
             _ => None,
         };
@@ -2052,6 +2184,39 @@ impl TerrainGpu {
         mode: CullingMode,
         extra: impl FnOnce(&mut wgpu::RenderPass<'_>) -> u32,
     ) -> Result<TerrainFrameWork, TerrainError> {
+        self.encode_impl(queue, encoder, Some(output), camera, mode, false, extra)
+    }
+
+    /// Retain the four linear HDR/depth samples for separate water/cloud targets.
+    /// This encodes no presentation pass. Sources must never also be attachments
+    /// of a consuming pass. Prepare sampling once before the first frame.
+    #[allow(clippy::too_many_arguments)] // Explicit graph inputs and prepared extra batches.
+    pub fn encode_scene_with_extra(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: &Camera,
+        mode: CullingMode,
+        skip_plain_water: bool,
+        extra: impl FnOnce(&mut wgpu::RenderPass<'_>) -> u32,
+    ) -> Result<TerrainFrameWork, TerrainError> {
+        if !self.targets.sampled {
+            return Err(TerrainError::SceneSamplingDisabled);
+        }
+        self.encode_impl(queue, encoder, None, camera, mode, skip_plain_water, extra)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Shared opaque graph with optional presentation.
+    fn encode_impl(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        output: Option<&wgpu::TextureView>,
+        camera: &Camera,
+        mode: CullingMode,
+        skip_plain_water: bool,
+        extra: impl FnOnce(&mut wgpu::RenderPass<'_>) -> u32,
+    ) -> Result<TerrainFrameWork, TerrainError> {
         self.pass_count.set(0);
         self.pass_kinds.set([GpuPassKind::Unused; 32]);
         if mode == CullingMode::FrustumAndHiZ && !self.config.occlusion {
@@ -2067,7 +2232,7 @@ impl TerrainGpu {
         }
         let mut work = TerrainFrameWork {
             objects_considered: self.config.max_pages,
-            draw_calls: 8,
+            draw_calls: 7 + u32::from(output.is_some()) - 2 * u32::from(skip_plain_water),
             passes: 4,
             camera_upload_bytes: 0,
         };
@@ -2085,7 +2250,7 @@ impl TerrainGpu {
                     params: [
                         self.config.max_pages,
                         self.config.max_quads,
-                        u32::from(mode != CullingMode::None),
+                        u32::from(mode != CullingMode::None) | (u32::from(self.unit_raster) << 1),
                         phase as u32,
                     ],
                 };
@@ -2181,7 +2346,11 @@ impl TerrainGpu {
                     resolve_target: Some(&self.targets.resolved),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Discard,
+                        store: if output.is_none() {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -2207,6 +2376,9 @@ impl TerrainGpu {
             }
             pass.set_bind_group(0, &self.render_bind, &[]);
             for bucket in 0..6 {
+                if skip_plain_water && bucket % 3 == 2 {
+                    continue;
+                }
                 pass.set_pipeline(match bucket {
                     1 => &self.cutout_pipeline,
                     4 => &self.masked_cutout_pipeline,
@@ -2217,7 +2389,7 @@ impl TerrainGpu {
             }
             work.draw_calls += extra(&mut pass);
         }
-        {
+        if let Some(output) = output {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("HDR presentation transfer"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2241,6 +2413,7 @@ impl TerrainGpu {
         if let Some(queries) = &self.pass_queries {
             encoder.resolve_query_set(&queries.set, 0..work.passes * 2, &queries.resolved, 0);
         }
+        self.hdr_revision = self.hdr_revision.wrapping_add(1);
         self.last_render = Some((*camera, mode, self.scene_revision));
         Ok(work)
     }
@@ -2321,7 +2494,7 @@ fn world_bounds(model: [[f32; 4]; 4]) -> ([f32; 4], [f32; 4]) {
     (low, high)
 }
 
-fn terrain_render_layout(device: &wgpu::Device, lighting: bool) -> wgpu::BindGroupLayout {
+fn terrain_render_layout(device: &wgpu::Device, lighting: bool, gi: bool) -> wgpu::BindGroupLayout {
     let vertex = wgpu::ShaderStages::VERTEX;
     let fragment = wgpu::ShaderStages::FRAGMENT;
     let mut entries = vec![
@@ -2372,13 +2545,19 @@ fn terrain_render_layout(device: &wgpu::Device, lighting: bool) -> wgpu::BindGro
             buffer_entry(12, fragment, false, true),
         ]);
     }
+    if gi {
+        entries.extend([
+            buffer_entry(13, fragment, true, true),
+            buffer_entry(14, fragment, false, true),
+        ]);
+    }
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("terrain render tables"),
         entries: &entries,
     })
 }
 
-fn lit_terrain_shader() -> String {
+fn lit_terrain_shader(gi: bool) -> String {
     let source = include_str!("terrain.wgsl");
     let (before, rest) = source
         .split_once("// BEGIN_DEFAULT_LIGHTING")
@@ -2386,13 +2565,20 @@ fn lit_terrain_shader() -> String {
     let (_, after) = rest
         .split_once("// END_DEFAULT_LIGHTING")
         .expect("terrain lighting end");
+    let indirect = if gi {
+        " + reflected_irradiance(world_position,normal)*0.3183098862"
+    } else {
+        ""
+    };
     format!(
-        "{}\n{}\n{}\n{}\n{}",
-        before,
-        "let light=sample_page_light(slot,local_position,local_normal);let sky=light.a;let visibility=cascade_shadow(world_position,normal);let direct=max(dot(normalize(normal),normalize(shadow_sampling.sun.xyz)),0.0)*visibility*sky*0.85;return albedo*((light.rgb+vec3(sky*0.15))*ao+vec3(direct));",
-        after,
+        "{before}\nlet light=sample_page_light(slot,local_position,local_normal);let sky=light.a;let visibility=cascade_shadow(world_position,normal);let direct=max(dot(normalize(normal),normalize(shadow_sampling.sun.xyz)),0.0)*visibility*sky*0.85;return albedo*((light.rgb+vec3(sky*0.15){indirect})*ao+vec3(direct));\n{after}\n{}\n{}\n{}",
         include_str!("shadow_sampling.wgsl"),
-        include_str!("light_volume.wgsl")
+        include_str!("light_volume.wgsl"),
+        if gi {
+            include_str!("gi_sampling.wgsl")
+        } else {
+            ""
+        },
     )
 }
 
@@ -2466,6 +2652,7 @@ fn compute_bind(
     indirect: &wgpu::Buffer,
     edit_masks: &wgpu::Buffer,
     patch_states: &wgpu::Buffer,
+    quads: &wgpu::Buffer,
     hiz: Option<&wgpu::TextureView>,
 ) -> wgpu::BindGroup {
     let mut entries = vec![
@@ -2475,6 +2662,7 @@ fn compute_bind(
         buffer_binding(3, indirect),
         buffer_binding(5, edit_masks),
         buffer_binding(6, patch_states),
+        buffer_binding(7, quads),
     ];
     if let Some(view) = hiz {
         entries.push(wgpu::BindGroupEntry {
@@ -2571,11 +2759,39 @@ fn terrain_pipeline(
     })
 }
 
+fn create_scene_color(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    sampled: bool,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("HDR MSAA4 color"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: MSAA_SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format: HDR_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | if sampled {
+                wgpu::TextureUsages::TEXTURE_BINDING
+            } else {
+                wgpu::TextureUsages::empty()
+            },
+        view_formats: &[],
+    })
+}
+
 fn create_targets(
     device: &wgpu::Device,
     width: u32,
     height: u32,
     tone_layout: &wgpu::BindGroupLayout,
+    sampled: bool,
 ) -> Targets {
     let texture = |label, format, count, usage| {
         device.create_texture(&wgpu::TextureDescriptor {
@@ -2593,12 +2809,7 @@ fn create_targets(
             view_formats: &[],
         })
     };
-    let color = texture(
-        "HDR MSAA4 color",
-        HDR_FORMAT,
-        MSAA_SAMPLES,
-        wgpu::TextureUsages::RENDER_ATTACHMENT,
-    );
+    let color = create_scene_color(device, width, height, sampled);
     let resolved = texture(
         "resolved linear HDR",
         HDR_FORMAT,
@@ -2625,6 +2836,7 @@ fn create_targets(
         }],
     });
     Targets {
+        sampled,
         _color: color,
         color: color_view,
         _resolved: resolved,
@@ -2650,6 +2862,7 @@ fn create_hiz(
     indirect: &wgpu::Buffer,
     edit_masks: &wgpu::Buffer,
     patch_states: &wgpu::Buffer,
+    quads: &wgpu::Buffer,
 ) -> HiZ {
     let width = width.next_power_of_two();
     let height = height.next_power_of_two();
@@ -2723,6 +2936,7 @@ fn create_hiz(
         indirect,
         edit_masks,
         patch_states,
+        quads,
         Some(&view),
     );
     HiZ {

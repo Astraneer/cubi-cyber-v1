@@ -14,6 +14,53 @@ pub struct UiAtlas {
     items: BTreeMap<rules::ItemId, Rect>,
     pub white: Rect,
 }
+/// Shared original item art for world-drop sprites. It is separate from the
+/// block material array and needs no donor renderer, UI font, or frame uploads.
+pub struct ItemSprites {
+    pub rgba: Vec<u8>,
+    pub layers: u32,
+    items: BTreeMap<rules::ItemId, u32>,
+}
+impl ItemSprites {
+    pub fn load() -> Result<Self, &'static str> {
+        Self::from_atlas(&UiAtlas::load()?)
+    }
+    pub fn from_atlas(atlas: &UiAtlas) -> Result<Self, &'static str> {
+        if atlas.pixels.len() != ATLAS_SIZE as usize * ATLAS_SIZE as usize * 4 {
+            return Err("UI atlas pixels already uploaded");
+        }
+        let mut rgba = Vec::new();
+        let mut items = BTreeMap::new();
+        for (id, definition) in rules::all_items() {
+            if matches!(definition.kind, rules::items::ItemKind::Block(_)) {
+                continue;
+            }
+            if items.len() >= 256 {
+                return Err("item sprite layer budget");
+            }
+            let uv = atlas.item(id).ok_or("missing registered item sprite")?;
+            let x = (uv.x * ATLAS_SIZE as f32).round() as usize;
+            let y = (uv.y * ATLAS_SIZE as f32).round() as usize;
+            if x + 16 > ATLAS_SIZE as usize || y + 16 > ATLAS_SIZE as usize {
+                return Err("item sprite bounds");
+            }
+            let layer = items.len() as u32;
+            items.insert(id, layer);
+            for row in 0..16 {
+                let at = ((y + row) * ATLAS_SIZE as usize + x) * 4;
+                rgba.extend_from_slice(&atlas.pixels[at..at + 64]);
+            }
+        }
+        Ok(Self {
+            rgba,
+            layers: items.len() as u32,
+            items,
+        })
+    }
+    pub fn layer(&self, item: rules::ItemId) -> Option<u32> {
+        self.items.get(&item).copied()
+    }
+}
 struct Packer {
     pixels: Vec<u8>,
     x: usize,

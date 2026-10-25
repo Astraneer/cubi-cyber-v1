@@ -1,9 +1,14 @@
 //! Thin native window/input shell; shared client owns world, budgets and camera.
+mod flight;
 mod remote_transport;
 use client::view::{ClientView, InputKey};
 use render::terrain_gpu::{AtlasImage, TerrainGpu, UploadBudget};
 use std::{
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 use winit::{
@@ -104,6 +109,10 @@ struct NativeState {
     demo_mesh_delay_ticks: u64,
     remote: Option<RemoteNative>,
     network_started: Instant,
+    flight: flight::NativeFlight,
+    in_flight: Arc<AtomicU32>,
+    drawable: bool,
+    legacy_gpu_greedy: bool,
 }
 impl NativeState {
     async fn new(
@@ -111,6 +120,7 @@ impl NativeState {
         software: bool,
         mode: SceneMode,
         connection: Option<ConnectOptions>,
+        benchmark: Option<flight::BenchmarkOptions>,
     ) -> Result<Self, String> {
         #[cfg(target_os = "windows")]
         {
@@ -120,20 +130,36 @@ impl NativeState {
                 mode,
                 wgpu::Backends::DX12,
                 connection.clone(),
+                benchmark.clone(),
             )
             .await
             {
                 Ok(state) => Ok(state),
                 Err(dx12) => {
                     eprintln!("D3D12 initialization failed; trying Vulkan: {dx12}");
-                    Self::new_backend(window, software, mode, wgpu::Backends::VULKAN, connection)
-                        .await
-                        .map_err(|vulkan| format!("D3D12:{dx12}; Vulkan:{vulkan}"))
+                    Self::new_backend(
+                        window,
+                        software,
+                        mode,
+                        wgpu::Backends::VULKAN,
+                        connection,
+                        benchmark,
+                    )
+                    .await
+                    .map_err(|vulkan| format!("D3D12:{dx12}; Vulkan:{vulkan}"))
                 }
             }
         }
         #[cfg(not(target_os = "windows"))]
-        Self::new_backend(window, software, mode, wgpu::Backends::VULKAN, connection).await
+        Self::new_backend(
+            window,
+            software,
+            mode,
+            wgpu::Backends::VULKAN,
+            connection,
+            benchmark,
+        )
+        .await
     }
     async fn new_backend(
         window: Arc<Window>,
@@ -141,12 +167,14 @@ impl NativeState {
         mode: SceneMode,
         backend: wgpu::Backends,
         connection: Option<ConnectOptions>,
+        benchmark: Option<flight::BenchmarkOptions>,
     ) -> Result<Self, String> {
         let instance = render::instance_for(backend);
         let surface = instance
             .create_surface(window.clone())
             .map_err(|error| error.to_string())?;
         let gpu = render::Gpu::request(&instance, Some(&surface), software).await?;
+        let flight = flight::NativeFlight::new(&gpu.device, benchmark)?;
         let size = window.inner_size();
         let mut config = surface
             .get_default_config(&gpu.adapter, size.width.max(1), size.height.max(1))
@@ -227,10 +255,15 @@ impl NativeState {
             demo_mesh_delay_ticks: 0,
             remote: connection.map(RemoteNative::new).transpose()?,
             network_started: Instant::now(),
+            flight,
+            in_flight: Arc::new(AtomicU32::new(0)),
+            drawable: size.width != 0 && size.height != 0,
+            legacy_gpu_greedy: false,
         })
     }
     fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
-        if width == 0 || height == 0 {
+        self.drawable = width != 0 && height != 0;
+        if !self.drawable {
             return Ok(());
         }
         self.config.width = width;
@@ -257,7 +290,12 @@ impl NativeState {
                 } else {
                     client::SceneConfig::forest()
                 };
-                let mut view = ClientView::new(terrain, scene)?;
+                let raster = if self.legacy_gpu_greedy {
+                    client::view::NearRasterization::LegacyGreedy
+                } else {
+                    client::view::NearRasterization::CompactUnit
+                };
+                let mut view = ClientView::new_with_rasterization(terrain, scene, raster)?;
                 view.set_demo_mesh_delay_ticks(self.demo_mesh_delay_ticks);
                 self.view = Some(view);
                 self.loading = None;
@@ -273,10 +311,39 @@ impl NativeState {
         Ok(())
     }
     fn draw(&mut self, force_present: bool) -> Result<Option<bool>, String> {
+        self.gpu
+            .device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| error.to_string())?;
+        self.flight.collect();
+        self.poll_loading()?;
+        if let Some(view) = self.view.as_mut() {
+            self.flight.prepare_route(view)?;
+        }
+        if self.flight.route_finished() {
+            if let Some(view) = self.view.as_ref() {
+                let done = self.flight.finish_if_drained(
+                    &self.gpu.adapter.get_info(),
+                    view,
+                    self.config.width,
+                    self.config.height,
+                    self.in_flight.load(Ordering::Acquire),
+                )?;
+                return Ok(done.then_some(true));
+            }
+            return Err("benchmark lost its world".into());
+        }
+        // A route step corresponds to one actual presentation. Pending GPU work
+        // delays that step rather than silently skipping replay inputs.
+        if self.flight.route_active() && self.in_flight.load(Ordering::Acquire) != 0 {
+            return Ok(None);
+        }
         let started = Instant::now();
+        let scope = telemetry::AllocationScope::begin()
+            .map_err(|error| format!("frame allocator scope: {error:?}"))?;
+        let mut stages = [None; telemetry::flight::CPU_STAGES.len()];
         let elapsed = self.last_frame.elapsed().as_secs_f64();
         self.last_frame = Instant::now();
-        self.poll_loading()?;
         let now = self
             .network_started
             .elapsed()
@@ -285,16 +352,27 @@ impl NativeState {
         if let Some(remote) = self.remote.as_mut() {
             remote.pump_socket(now)?;
         }
-        let size = self.window.inner_size();
-        if size.width == 0 || size.height == 0 {
+        if !self.drawable {
             return Ok(None);
         }
         if let Some(view) = self.view.as_mut() {
+            if let Some(command) = self.flight.route_input() {
+                let input_started = Instant::now();
+                command.apply(view);
+                stages[0] = Some(flight::nanos(input_started.elapsed()));
+            }
             if let Some(remote) = self.remote.as_mut() {
                 remote.session.pump(view, now)?;
                 remote.pump_socket(now)?;
             }
-            view.advance_input(elapsed)?;
+            let simulation_started = Instant::now();
+            view.advance_input(if self.flight.route_active() {
+                client::benchmark::STEP_SECONDS
+            } else {
+                elapsed
+            })?;
+            stages[1] = Some(flight::nanos(simulation_started.elapsed()));
+            let jobs_started = Instant::now();
             let mut budget = client::ClientScene::default_budget();
             let tick = view.tick();
             view.scene
@@ -305,29 +383,49 @@ impl NativeState {
                     8,
                 )
                 .map_err(|error| error.to_string())?;
+            stages[2] = Some(flight::nanos(jobs_started.elapsed()));
             if let Some(error) = view.scene.error() {
                 return Err(error.to_string());
             }
+            let upload_started = Instant::now();
             view.upload_ready(&self.gpu.queue, &mut UploadBudget::new(512 * 1024))?;
+            stages[4] = Some(flight::nanos(upload_started.elapsed()));
         }
-        if !force_present
+        let busy = self.in_flight.load(Ordering::Acquire)
+            >= if self.mode == SceneMode::Forest {
+                1
+            } else {
+                render::MAX_FRAMES_IN_FLIGHT
+            };
+        let clean = !force_present
+            && !self.flight.route_active()
             && self
                 .view
                 .as_ref()
-                .is_some_and(|view| !view.needs_redraw(self.config.width, self.config.height))
-        {
+                .is_some_and(|view| !view.needs_redraw(self.config.width, self.config.height));
+        if clean || busy {
+            let work = self
+                .view
+                .as_mut()
+                .map_or(telemetry::WorkCounts::ZERO, ClientView::take_frame_work);
+            let allocations = scope.finish();
+            self.record_flight(started, stages, work, allocations, false, busy)?;
             return Ok(None);
         }
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                self.resize(size.width, size.height)?;
+                if self.flight.route_active() {
+                    return Err("benchmark interrupted by surface reconfiguration".into());
+                }
+                self.resize(self.config.width, self.config.height)?;
                 return Ok(None);
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(None),
+            Err(wgpu::SurfaceError::Timeout) if !self.flight.route_active() => return Ok(None),
             Err(error) => return Err(format!("surface frame failed:{error}")),
         };
         let output = frame.texture.create_view(&Default::default());
+        let encode_started = Instant::now();
         let work = if let Some(view) = self.view.as_mut() {
             let mut encoder =
                 self.gpu
@@ -342,21 +440,35 @@ impl NativeState {
                 self.config.width,
                 self.config.height,
             )?;
+            let ticket = self.flight.encode(view, &mut encoder);
             self.gpu.queue.submit([encoder.finish()]);
+            if let Some(ticket) = ticket {
+                self.flight.submitted(ticket);
+            }
             view.take_frame_work()
         } else {
             self.sky.render(&self.gpu.device, &self.gpu.queue, &output);
             self.sky.take_work()
         };
+        stages[5] = Some(flight::nanos(encode_started.elapsed()));
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let pending = self.in_flight.clone();
+        self.gpu.queue.on_submitted_work_done(move || {
+            pending.fetch_sub(1, Ordering::AcqRel);
+        });
+        let present_started = Instant::now();
         self.window.pre_present_notify();
         frame.present();
+        stages[6] = Some(flight::nanos(present_started.elapsed()));
         self.frames += 1;
         self.recorder.push(telemetry::FrameRecord {
             frame: self.frames,
-            cpu_ns: started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            cpu_ns: flight::nanos(started.elapsed()),
             gpu_ns: None,
             work,
         });
+        let allocations = scope.finish();
+        self.record_flight(started, stages, work, allocations, true, false)?;
         let ready =
             self.mode == SceneMode::Sky || self.view.as_ref().is_some_and(ClientView::is_ready);
         if ready && !self.reported_ready {
@@ -366,6 +478,50 @@ impl NativeState {
             }
         }
         Ok(Some(ready))
+    }
+    fn record_flight(
+        &mut self,
+        started: Instant,
+        stages: [Option<u64>; 8],
+        work: telemetry::WorkCounts,
+        allocations: telemetry::AllocationCounts,
+        presented: bool,
+        waiting: bool,
+    ) -> Result<(), String> {
+        self.flight.record(
+            telemetry::flight::Sample {
+                cpu_ns: Some(flight::nanos(started.elapsed())),
+                cpu_stages_ns: stages,
+                work,
+                allocations: Some(allocations),
+                observations: if waiting {
+                    flight::waiting()
+                } else {
+                    Default::default()
+                },
+                in_flight: self
+                    .in_flight
+                    .load(Ordering::Acquire)
+                    .min(u32::from(u8::MAX)) as u8,
+                ..Default::default()
+            },
+            self.view.as_ref(),
+            presented,
+        )
+    }
+    fn export_flight(&mut self) -> Result<(), String> {
+        self.flight.collect();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis();
+        self.flight.export(
+            &std::path::PathBuf::from(format!(".local/artifacts/flight/native-{stamp}.json")),
+            &self.gpu.adapter.get_info(),
+            self.view.as_ref(),
+            self.config.width,
+            self.config.height,
+        )
     }
     fn print_stats(&self, label: &str) {
         if let Some(view) = self.view.as_ref() {
@@ -382,6 +538,9 @@ impl NativeState {
         }
     }
     fn capture(&mut self, enabled: bool) {
+        if enabled && self.flight.benchmark_configured() {
+            return;
+        }
         if enabled {
             if let Err(error) = self
                 .window
@@ -423,6 +582,9 @@ impl NativeState {
         }
     }
     fn input(&mut self, key: InputKey, pressed: bool) {
+        if self.flight.benchmark_configured() {
+            return;
+        }
         if let Some(view) = self.view.as_mut() {
             view.set_key(key, pressed);
         }
@@ -445,6 +607,10 @@ struct App {
     next_redraw: Instant,
     mesh_delay_ticks: u64,
     connection: Option<ConnectOptions>,
+    benchmark: Option<flight::BenchmarkOptions>,
+    benchmark_frames: u32,
+    software: bool,
+    legacy_gpu_greedy: bool,
 }
 impl App {
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: String) {
@@ -471,12 +637,14 @@ impl ApplicationHandler for App {
         };
         match pollster::block_on(NativeState::new(
             window,
-            self.smoke_frames.is_some(),
+            self.smoke_frames.is_some() || self.software,
             self.scene,
             self.connection.clone(),
+            self.benchmark.clone(),
         )) {
             Ok(mut state) => {
                 state.demo_mesh_delay_ticks = self.mesh_delay_ticks;
+                state.legacy_gpu_greedy = self.legacy_gpu_greedy;
                 self.state = Some(Box::new(state));
             }
             Err(error) => self.fail(event_loop, error),
@@ -505,7 +673,12 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
-                if event.physical_key == PhysicalKey::Code(KeyCode::Escape) && pressed {
+                if event.physical_key == PhysicalKey::Code(KeyCode::F8) && pressed && !event.repeat
+                {
+                    if let Err(error) = state.export_flight() {
+                        self.fail(event_loop, error);
+                    }
+                } else if event.physical_key == PhysicalKey::Code(KeyCode::Escape) && pressed {
                     state.capture(false);
                 } else if let PhysicalKey::Code(code) = event.physical_key {
                     state.keyboard(code, pressed);
@@ -528,6 +701,10 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                if self.benchmark.is_some() && self.started.elapsed().as_secs() > 600 {
+                    self.fail(event_loop, "native benchmark timeout".into());
+                    return;
+                }
                 if self.smoke_frames.is_some() && self.started.elapsed().as_secs() > 90 {
                     self.fail(
                         event_loop,
@@ -537,6 +714,10 @@ impl ApplicationHandler for App {
                 }
                 match state.draw(self.smoke_frames.is_some()) {
                     Ok(Some(true)) => {
+                        if state.flight.complete() {
+                            event_loop.exit();
+                            return;
+                        }
                         self.frames += 1;
                         if self.smoke_frames.is_some_and(|limit| self.frames >= limit) {
                             if self.scene == SceneMode::Sky {
@@ -617,10 +798,35 @@ fn main() -> Result<(), String> {
         next_redraw: Instant::now(),
         mesh_delay_ticks: 0,
         connection: None,
+        benchmark: None,
+        benchmark_frames: client::benchmark::FRAMES,
+        software: false,
+        legacy_gpu_greedy: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--benchmark" => {
+                app.benchmark = Some(flight::BenchmarkOptions {
+                    output: args
+                        .next()
+                        .ok_or("--benchmark requires a JSON output path")?
+                        .into(),
+                    frames: app.benchmark_frames,
+                });
+            }
+            "--benchmark-frames" => {
+                app.benchmark_frames = args
+                    .next()
+                    .ok_or("--benchmark-frames requires N")?
+                    .parse()
+                    .map_err(|_| "invalid benchmark frame count")?;
+                if app.benchmark_frames == 0 || app.benchmark_frames > client::benchmark::FRAMES {
+                    return Err("benchmark frames must be 1..1800".into());
+                }
+            }
+            "--software" => app.software = true,
+            "--legacy-gpu-greedy" => app.legacy_gpu_greedy = true,
             "--connect" => {
                 let url = args.next().ok_or("--connect requires ws://loopback:port")?;
                 app.connection = Some(ConnectOptions {
@@ -679,6 +885,17 @@ fn main() -> Result<(), String> {
             _ => return Err(format!("unknown argument:{arg}")),
         }
     }
+    if let Some(benchmark) = &mut app.benchmark {
+        benchmark.frames = app.benchmark_frames;
+        if app.connection.is_some() || app.scene != SceneMode::Forest || app.smoke_frames.is_some()
+        {
+            return Err(
+                "the fixed benchmark requires standalone forest and no --smoke-frames".into(),
+            );
+        }
+    } else if app.benchmark_frames != client::benchmark::FRAMES {
+        return Err("--benchmark-frames requires --benchmark".into());
+    }
     let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop
@@ -694,6 +911,14 @@ fn main() -> Result<(), String> {
             "smoke closed after{} of{expected} ready frames",
             app.frames
         ));
+    }
+    if app.benchmark.is_some()
+        && !app
+            .state
+            .as_ref()
+            .is_some_and(|state| state.flight.complete())
+    {
+        return Err("benchmark window closed before the requested route completed".into());
     }
     Ok(())
 }

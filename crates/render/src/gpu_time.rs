@@ -1,6 +1,16 @@
 //! Fixed-capacity pass timing; no frame allocations and no queries when unsupported.
 use std::cell::Cell;
 
+/// An owned pass mapping borrowing one resolved timestamp buffer. Kinds refer
+/// to telemetry::flight::GPU_PASSES; 255 retains only the measured total.
+#[derive(Clone, Copy, Debug)]
+pub struct TimingSource<'a> {
+    pub buffer: &'a wgpu::Buffer,
+    pub period: f32,
+    pub kinds: [u8; 32],
+    pub count: u32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PassGraph<const N: usize> {
     pub kinds: [u32; N],

@@ -1827,6 +1827,19 @@ fn sixty_four_pages_complete_one_thousand_incremental_edits_with_bounded_uploads
             &atlas,
         )
         .unwrap();
+        let unit_raster = std::env::var_os("H1_GPU_UNIT_RASTER").is_some();
+        if unit_raster {
+            assert_eq!(renderer.prepare_unit_rasterization().unwrap(), 170);
+        }
+        let raster_count = |mesh: &PageMesh| {
+            if unit_raster {
+                mesh.iter()
+                    .map(|q| usize::from(q.size()[0]) * usize::from(q.size()[1]))
+                    .sum()
+            } else {
+                mesh.quad_count()
+            }
+        };
         let old = cube(3);
         let mut startup = UploadBudget::new(2 * 1024 * 1024);
         let mut pages = Vec::with_capacity(64);
@@ -1844,7 +1857,7 @@ fn sixty_four_pages_complete_one_thousand_incremental_edits_with_bounded_uploads
                     mask: [0; 128],
                     changed: [0; 4096],
                     face_counts: [0; 4096],
-                    base_quads: old.quad_count(),
+                    base_quads: raster_count(&old),
                 });
             }
         }
@@ -1869,6 +1882,7 @@ fn sixty_four_pages_complete_one_thousand_incremental_edits_with_bounded_uploads
         let mut completed_frames = 0;
         let mut rebases = 0;
         let mut ever_changed = false;
+        let mut peak_raster_instances = 0u32;
         let frames = std::env::var("H1_GPU_LOAD_FRAMES")
             .ok()
             .map(|value| value.parse::<u16>().expect("integer H1_GPU_LOAD_FRAMES"))
@@ -1977,7 +1991,7 @@ fn sixty_four_pages_complete_one_thousand_incremental_edits_with_bounded_uploads
                     page.base = base;
                     page.overlay = overlay;
                     page.mask = mask;
-                    page.base_quads = mesh.quad_count();
+                    page.base_quads = raster_count(&mesh);
                     revision += 1;
                     rebases += 1;
                 }
@@ -2010,6 +2024,7 @@ fn sixty_four_pages_complete_one_thousand_incremental_edits_with_bounded_uploads
                 .sum::<usize>();
             let (image, counts) = frame(&gpu, &mut renderer, &camera, CullingMode::None, 256, 192);
             completed_frames += 1;
+            peak_raster_instances = peak_raster_instances.max(counts.into_iter().sum());
             assert_eq!(
                 counts[0] as usize, active,
                 "completed frame {tick} missed or retained an owner update"
@@ -2042,6 +2057,8 @@ fn sixty_four_pages_complete_one_thousand_incremental_edits_with_bounded_uploads
         )
         .unwrap();
         let mut final_budget = UploadBudget::new(2 * 1024 * 1024);
+        let mut reference_budget = UploadBudget::new(16 * 1024 * 1024);
+        let mut unit_reference = PageMesh::default();
         for page in &mut pages {
             let mut mesh = PageMesh::default();
             mesh_page(&page.halo, classify, &mut scratch, &mut mesh);
@@ -2059,8 +2076,18 @@ fn sixty_four_pages_complete_one_thousand_incremental_edits_with_bounded_uploads
                 )
                 .unwrap();
             revision += 1;
+            if unit_raster {
+                render::terrain_unit::expand(&mesh, &mut unit_reference).unwrap();
+            }
             reference
-                .upload_page(&gpu.queue, None, 1, page.model, &mesh, &mut startup)
+                .upload_page(
+                    &gpu.queue,
+                    None,
+                    1,
+                    page.model,
+                    if unit_raster { &unit_reference } else { &mesh },
+                    &mut reference_budget,
+                )
                 .unwrap();
         }
         let actual = frame(
@@ -2092,7 +2119,9 @@ fn sixty_four_pages_complete_one_thousand_incremental_edits_with_bounded_uploads
             "final 64-page sample coverage differs from canonical"
         );
         println!(
-            "H1_GPU_LOAD_OK resident_pages=64 edits={edits} logical_seconds={} capture_workers=2 submitted_edit_frames={frames} completed_edit_frames={completed_frames} owner_response_completed_frames=1 delayed_full_frames=12 rebases={rebases} peak_patch_pages={peak_overlays} reserved_patch_bytes={} arena_bytes=67108864 visibility_bytes=100663296 upload_total_bytes={upload_total} max_frame_upload_bytes={maximum_upload} frame_upload_limit_bytes=2097152 final_bitwise=true final_coverage_bitwise=true",
+            "H1_GPU_LOAD_OK unit_raster={unit_raster} peak_raster_instances={peak_raster_instances} peak_vertex_invocations={} peak_visible_bytes={} resident_pages=64 edits={edits} logical_seconds={} capture_workers=2 submitted_edit_frames={frames} completed_edit_frames={completed_frames} owner_response_completed_frames=1 delayed_full_frames=12 rebases={rebases} peak_patch_pages={peak_overlays} reserved_patch_bytes={} arena_bytes=67108864 visibility_bytes=100663296 upload_total_bytes={upload_total} max_frame_upload_bytes={maximum_upload} frame_upload_limit_bytes=2097152 final_bitwise=true final_coverage_bitwise=true",
+            u64::from(peak_raster_instances) * 4,
+            u64::from(peak_raster_instances) * 4,
             f32::from(frames) / 60.0,
             64 * 24576 * 16
         );
@@ -2127,6 +2156,11 @@ fn textured_floor_edit_at_runtime_camera_has_no_color_coverage_cracks() {
         };
         let mut actual = make();
         let mut reference = make();
+        let unit_raster = std::env::var_os("H1_GPU_UNIT_RASTER").is_some();
+        if unit_raster {
+            actual.prepare_unit_rasterization().unwrap();
+            reference.prepare_unit_rasterization().unwrap();
+        }
         let mut budget = UploadBudget::new(4_000_000);
         let classify = |raw| match raw {
             0 => CellMaterial::EMPTY,
@@ -2344,7 +2378,7 @@ fn textured_floor_edit_at_runtime_camera_has_no_color_coverage_cracks() {
         );
         save_rgba(&artifacts.join("h1-textured-before.png"), 780, 437, &before);
         println!(
-            "H1_TEXTURED_RUNTIME_GPU holes={holes} differing_pixels={differing} max_delta={maximum} FLIP_mean={mean:.9} old_negative_FLIP={negative:.9}"
+            "H1_TEXTURED_RUNTIME_GPU unit_raster={unit_raster} holes={holes} differing_pixels={differing} max_delta={maximum} FLIP_mean={mean:.9} old_negative_FLIP={negative:.9}"
         );
         assert_eq!(
             holes, 0,
@@ -2359,4 +2393,192 @@ fn textured_floor_edit_at_runtime_camera_has_no_color_coverage_cracks() {
             "old-floor negative control escaped perceptual rejection"
         );
     });
+}
+
+#[test]
+fn gpu_unit_raster_preserves_greedy_upload_and_rejects_visibility_overflow_atomically() {
+    use render::terrain_gpu::TerrainError;
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let atlas = AtlasImage::donor().unwrap();
+    let make = || {
+        TerrainGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            129,
+            97,
+            OutputTransfer::ShaderSrgb,
+            GpuConfig {
+                max_pages: 4,
+                max_quads: 65536,
+                occlusion: true,
+            },
+            &atlas,
+        )
+        .unwrap()
+    };
+    let mut actual = make();
+    let mut canonical = make();
+    assert_eq!(actual.prepare_unit_rasterization().unwrap(), 2);
+    assert_eq!(actual.unit_object_limit(), Some(2));
+    let old = cube(3);
+    let mut expanded = PageMesh::default();
+    render::terrain_unit::expand(&old, &mut expanded).unwrap();
+    actual.take_work();
+    canonical.take_work();
+    let mut budget = UploadBudget::new(2_000_000);
+    let base = actual
+        .upload_page(
+            &gpu.queue,
+            None,
+            1,
+            translation([80., 64., 80.]),
+            &old,
+            &mut budget,
+        )
+        .unwrap();
+    canonical
+        .upload_page(
+            &gpu.queue,
+            None,
+            1,
+            translation([80., 64., 80.]),
+            &expanded,
+            &mut budget,
+        )
+        .unwrap();
+    assert_eq!(actual.take_work().upload_bytes, 6 * 16 + 128);
+    assert_eq!(canonical.take_work().upload_bytes, 1536 * 16 + 128);
+    let camera = Camera::perspective(
+        [106., 95., 109.],
+        [88., 72., 88.],
+        [0., 1., 0.],
+        1.,
+        129. / 97.,
+        0.1,
+        200.,
+    );
+    let plain = frame(&gpu, &mut actual, &camera, CullingMode::None, 129, 97);
+    assert_eq!(plain.1, [1536, 0, 0]);
+    let hiz = frame(
+        &gpu,
+        &mut actual,
+        &camera,
+        CullingMode::FrustumAndHiZ,
+        129,
+        97,
+    );
+    assert_eq!(
+        plain.0, hiz.0,
+        "unit raster occlusion must preserve every visible pixel"
+    );
+    let reference = frame(
+        &gpu,
+        &mut canonical,
+        &camera,
+        CullingMode::FrustumAndHiZ,
+        129,
+        97,
+    );
+    assert_eq!(
+        plain.0, reference.0,
+        "GPU tile expansion must match independent CPU unit descriptors bitwise"
+    );
+    assert_eq!(
+        actual.prepare_unit_rasterization(),
+        Err(TerrainError::LatePreparation)
+    );
+    let mut mask = [0u32; 128];
+    mask[0] = 1;
+    let before_budget = budget.remaining_bytes;
+    assert_eq!(
+        actual.publish_composite(
+            &gpu.queue,
+            None,
+            2,
+            translation([0.; 3]),
+            &old,
+            None,
+            &mask,
+            &PageMesh::default(),
+            &mut budget
+        ),
+        Err(TerrainError::Capacity),
+        "two-slot composite must preflight conservative unit capacity before publishing its first slot"
+    );
+    assert_eq!(before_budget, budget.remaining_bytes);
+    assert_eq!(
+        frame(&gpu, &mut actual, &camera, CullingMode::None, 129, 97).0,
+        plain.0
+    );
+    let mut invalid = PageMesh::default();
+    invalid.opaque.push(
+        render::terrain_mesh::QuadDescriptor::new(
+            [0; 3],
+            render::terrain_mesh::Face::Down,
+            [2, 2],
+            3,
+            [0, 1, 2, 3],
+            u32::MAX,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        actual.upload_page(
+            &gpu.queue,
+            Some(base),
+            2,
+            translation([0.; 3]),
+            &invalid,
+            &mut budget
+        ),
+        Err(TerrainError::InvalidRasterMesh)
+    );
+    invalid.opaque = vec![old.opaque[0]; 97];
+    assert_eq!(
+        actual.upload_page(
+            &gpu.queue,
+            Some(base),
+            2,
+            translation([0.; 3]),
+            &invalid,
+            &mut budget
+        ),
+        Err(TerrainError::Capacity)
+    );
+    assert_eq!(before_budget, budget.remaining_bytes);
+    let second = actual
+        .upload_page(
+            &gpu.queue,
+            None,
+            1,
+            translation([200.; 3]),
+            &old,
+            &mut budget,
+        )
+        .unwrap();
+    let before_budget = budget.remaining_bytes;
+    assert_eq!(
+        actual.upload_page(&gpu.queue, None, 1, translation([0.; 3]), &old, &mut budget),
+        Err(TerrainError::Capacity)
+    );
+    assert_eq!(budget.remaining_bytes, before_budget);
+    actual
+        .release_page(&gpu.queue, second, &mut budget)
+        .unwrap();
+    assert!(
+        actual
+            .upload_page(
+                &gpu.queue,
+                None,
+                2,
+                translation([200.; 3]),
+                &old,
+                &mut budget
+            )
+            .is_ok()
+    );
+    println!(
+        "H1_GPU_UNIT_REFERENCE_OK greedy_descriptors=6 descriptor_upload_bytes=224 visible_instances=1536 vertex_invocations=6144 CPU_unit_reference_bitwise=true HiZ_bitwise=true object_limit=2 composite_overflow_atomic=true oversized_area_rejected=true"
+    );
 }

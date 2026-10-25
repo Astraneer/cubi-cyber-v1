@@ -8,6 +8,7 @@ pub mod capture;
 pub mod demo_interaction;
 pub mod edit_shell;
 pub mod entities;
+pub mod gi_source;
 pub mod lighting;
 pub mod lodcache;
 pub mod network;
@@ -19,7 +20,9 @@ mod scene;
 pub mod self_model;
 mod task;
 pub mod ui_bridge;
+pub mod ui_window;
 pub mod view;
+pub mod water;
 pub use overrides::{OverrideLimits, OverrideStats};
 pub use scene::*;
 #[cfg(not(target_arch = "wasm32"))]

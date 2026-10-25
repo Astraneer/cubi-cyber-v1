@@ -104,6 +104,9 @@ pub struct Motion {
 
 impl Motion {
     pub(crate) fn new(pos: [f64; 3]) -> Motion {
+        Self::with_buffers(pos, Bufs::default())
+    }
+    pub(crate) fn with_buffers(pos: [f64; 3], bufs: Bufs) -> Motion {
         Motion {
             pos,
             prev: pos,
@@ -145,7 +148,7 @@ impl Motion {
             swing: 0.0,
             last_swing: 0.0,
             ticks: 0,
-            bufs: Bufs::default(),
+            bufs,
         }
     }
 

@@ -4,16 +4,18 @@ set -euo pipefail
 cubi_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$cubi_root/tools/env.sh"
 cd "$cubi_root"
+cubi_native_args=("$@")
+if [[ ${#cubi_native_args[@]} -eq 0 ]]; then cubi_native_args=(--smoke-frames 3); fi
 if [[ -z "${VK_ICD_FILENAMES:-}" ]]; then
   for cubi_icd in "$cubi_root/.local/mesa/lvp-local.json" /usr/share/vulkan/icd.d/lvp_icd*.json; do
     if [[ -f "$cubi_icd" ]]; then export VK_ICD_FILENAMES="$cubi_icd"; break; fi
   done
 fi
 if [[ -n "${DISPLAY:-}" ]]; then
-  exec cargo run --locked -p client-native -- --smoke-frames 3
+  exec cargo run --locked -p client-native -- "${cubi_native_args[@]}"
 fi
 if command -v xvfb-run >/dev/null 2>&1; then
-  exec xvfb-run -a cargo run --locked -p client-native -- --smoke-frames 3
+  exec xvfb-run -a cargo run --locked -p client-native -- "${cubi_native_args[@]}"
 fi
 if ! command -v Xorg >/dev/null 2>&1 || ! command -v xdpyinfo >/dev/null 2>&1 || [[ ! -f /usr/lib/xorg/modules/drivers/dummy_drv.so ]]; then
   echo 'Native smoke needs an X11 display, Xvfb, or Xorg with the dummy driver.' >&2
@@ -84,4 +86,4 @@ if [[ "$cubi_ready" != true ]]; then
   echo 'Own Xorg smoke display failed to start.' >&2
   exit 1
 fi
-cargo run --locked -p client-native -- --smoke-frames 3
+cargo run --locked -p client-native -- "${cubi_native_args[@]}"

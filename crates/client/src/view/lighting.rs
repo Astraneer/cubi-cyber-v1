@@ -17,6 +17,9 @@ pub struct LightingStats {
     pub neighbors: u64,
     pub upload_bytes: u64,
     pub shadow_draws: u64,
+    pub static_shadow_draws: u64,
+    pub dynamic_shadow_draws: u64,
+    pub dynamic_shadow_copy_bytes: u64,
     pub shadow_updates: u64,
     pub shadow_texels: u64,
     pub pending_shadow_cascades: u32,
@@ -146,6 +149,9 @@ impl ViewLighting {
     }
     fn record_shadow(&mut self, work: ShadowWork) {
         self.stats.shadow_draws += u64::from(work.draw_calls + work.dynamic_draw_calls);
+        self.stats.static_shadow_draws += u64::from(work.draw_calls);
+        self.stats.dynamic_shadow_draws += u64::from(work.dynamic_draw_calls);
+        self.stats.dynamic_shadow_copy_bytes += work.dynamic_copy_bytes;
         self.stats.shadow_updates += u64::from(work.cascade_updates);
         self.stats.shadow_texels += work.clear_pixels;
         self.stats.pending_shadow_cascades = work.pending_cascades;

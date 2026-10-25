@@ -20,6 +20,92 @@ static ALLOCATOR: CountingAllocator = CountingAllocator::new(std::alloc::System)
 fn stack(item: u16, count: u16) -> ItemStack {
     ItemStack::new(item, count).unwrap()
 }
+
+#[test]
+fn section_random_tick_sampling_matches_donor_speed3000_growth_acceptance() {
+    use core_types::{LocalIdx, PageId, SpaceId, Tick};
+    let page = PageId {
+        space: SpaceId(0),
+        x: 0,
+        y: 0,
+        z: 0,
+    };
+    let mut samples = vec![LocalIdx::new(0).unwrap(); 3000];
+    let target = LocalIdx::new(2 * 256 + 2 * 16 + 2).unwrap();
+    let mut age = 0;
+    let mut attempts = 0;
+    for tick in 1..=400 {
+        assert_eq!(
+            farm::random_tick_indices(1337, page, Tick(tick), 3000, &mut samples).unwrap(),
+            3000
+        );
+        for &sample in &samples {
+            if sample != target {
+                continue;
+            }
+            attempts += 1;
+            let crop = Cell::from_parts(WHEAT, age);
+            let query = |p: [i32; 3]| {
+                Some(if p == [2, 2, 2] {
+                    crop
+                } else if p == [4, 1, 2] {
+                    Cell::from_parts(WATER, 0)
+                } else if p[1] == 1 {
+                    Cell::from_parts(FARMLAND, 7)
+                } else {
+                    Cell::AIR
+                })
+            };
+            let (moisture, _) = farm::moisture_factor(query, [2, 2, 2], WHEAT).unwrap();
+            let mut rng = DeterministicRng::from_key(1337, 0x47524f575448, attempts, tick);
+            let roll = rng
+                .below(u64::from(farm::growth_denominator(moisture)))
+                .unwrap() as u32;
+            if let Some(change) = farm::random_tick(query, [2, 2, 2], 15, roll)
+                .unwrap()
+                .change
+            {
+                age = change.after.state();
+            }
+        }
+    }
+    assert_eq!(age, 7);
+    assert!(
+        (200..400).contains(&attempts),
+        "selected {attempts} of1200000samples"
+    );
+    assert_eq!(farm::DEFAULT_RANDOM_TICK_SPEED, 3);
+}
+#[test]
+fn section_sampling_is_page_local_bounded_and_allocation_free() {
+    use core_types::{LocalIdx, PageId, SpaceId, Tick};
+    let page = PageId {
+        space: SpaceId(7),
+        x: -12,
+        y: 3,
+        z: 19,
+    };
+    let mut a = [LocalIdx::new(0).unwrap(); 3];
+    let mut b = a;
+    farm::random_tick_indices(17, page, Tick(99), 3, &mut a).unwrap();
+    for tick in 0..20 {
+        farm::random_tick_indices(17, PageId { x: 100, ..page }, Tick(tick), 3, &mut b).unwrap();
+    }
+    farm::random_tick_indices(17, page, Tick(99), 3, &mut b).unwrap();
+    assert_eq!(a, b);
+    assert_eq!(
+        farm::random_tick_indices(17, page, Tick(1), 4, &mut a),
+        Err(SurvivalError::Capacity)
+    );
+    let scope = AllocationScope::begin().unwrap();
+    for tick in 0..10_000 {
+        assert_eq!(
+            farm::random_tick_indices(17, page, Tick(tick), 3, black_box(&mut a)),
+            Ok(3)
+        );
+    }
+    assert_eq!(scope.finish(), AllocationCounts::ZERO);
+}
 fn unprotected() -> Health {
     let mut health = Health::new();
     health.set_spawn_protection(0);

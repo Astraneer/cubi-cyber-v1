@@ -14,8 +14,10 @@ use render::terrain_gpu::{
 use sim::{CameraMode, Keys, Permissions, Player, WorldQuery};
 use std::collections::{BTreeMap, VecDeque};
 use world::CellRead;
+mod entities;
 mod lighting;
 mod remote;
+pub use entities::{EntityStats, ViewEntities};
 pub use lighting::{LightingStats, ViewLighting};
 pub use remote::RemoteInput;
 
@@ -98,6 +100,15 @@ pub struct SettingsApplication {
     pub pending_render: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NearRasterization {
+    /// Greedy 16-byte storage; exact unit faces are expanded in GPU visibility.
+    #[default]
+    CompactUnit,
+    /// Explicit negative control for the old greedy/patch coverage mismatch.
+    LegacyGreedy,
+}
+
 #[derive(Clone, Copy)]
 struct Resident {
     handle: PageHandle,
@@ -118,6 +129,7 @@ pub struct ClientView {
     pub scene: ClientScene,
     renderer: TerrainGpu,
     lighting: Option<Box<ViewLighting>>,
+    entities: Option<Box<ViewEntities>>,
     player: Player,
     interactions: DemoInteractions,
     edit_shell: EditShell,
@@ -133,6 +145,8 @@ pub struct ClientView {
     demo_mesh_delay_ticks: u64,
     mesh_hold_until: Tick,
     demo_mesh_publication_paused: bool,
+    demo_unit_mesh: bool,
+    demo_gpu_unit_mesh: bool,
     gpu_revision: u64,
     base_rebases: u64,
     edit_revision: u64,
@@ -170,13 +184,34 @@ pub struct ClientView {
 }
 
 impl ClientView {
-    pub fn new(mut renderer: TerrainGpu, mut config: SceneConfig) -> Result<Self, String> {
+    pub fn new(renderer: TerrainGpu, config: SceneConfig) -> Result<Self, String> {
+        Self::new_with_rasterization(renderer, config, NearRasterization::CompactUnit)
+    }
+    pub fn new_with_rasterization(
+        mut renderer: TerrainGpu,
+        mut config: SceneConfig,
+        rasterization: NearRasterization,
+    ) -> Result<Self, String> {
+        let compact_unit = rasterization == NearRasterization::CompactUnit;
+        if compact_unit {
+            renderer
+                .prepare_unit_rasterization()
+                .map_err(|error| error.to_string())?;
+        }
+        let visible = (usize::from(config.horizontal_radius) * 2 + 1).pow(2)
+            * (usize::from(config.vertical_radius) * 2 + 1);
+        if visible + PART_COUNT > renderer.geometry().max_pages as usize {
+            return Err(
+                "renderer profile cannot retain all requested pages and avatar objects".into(),
+            );
+        }
         config.coherent_rebasing = true;
         let setup = renderer.take_work();
         Ok(Self {
             scene: ClientScene::new(config).map_err(|e| e.to_string())?,
             renderer,
             lighting: None,
+            entities: None,
             player: Player::new([
                 f64::from(config.center.x) + 0.5,
                 f64::from(config.center.y),
@@ -199,6 +234,8 @@ impl ClientView {
             demo_mesh_delay_ticks: 0,
             mesh_hold_until: Tick(0),
             demo_mesh_publication_paused: false,
+            demo_unit_mesh: false,
+            demo_gpu_unit_mesh: compact_unit,
             gpu_revision: 0,
             base_rebases: 0,
             edit_revision: 0,
@@ -256,6 +293,7 @@ impl ClientView {
         config: crate::lighting::ClientLightingConfig,
     ) -> Result<(), String> {
         if self.lighting.is_some()
+            || self.entities.is_some()
             || self.terrain_frames != 0
             || !self.resident.is_empty()
             || self.self_handles.iter().any(Option::is_some)
@@ -275,7 +313,10 @@ impl ClientView {
         let setup = self.renderer.take_work();
         self.pipeline_compilations = self
             .pipeline_compilations
-            .saturating_add(setup.pipeline_compilations);
+            .saturating_add(setup.pipeline_compilations)
+            .saturating_add(u64::from(
+                lighting.owner.shadows().startup_pipeline_compilations(),
+            ));
         self.lighting = Some(Box::new(lighting));
         self.invalidate();
         Ok(())
@@ -285,6 +326,71 @@ impl ClientView {
     }
     pub fn lighting_mut(&mut self) -> Option<&mut ViewLighting> {
         self.lighting.as_deref_mut()
+    }
+    /// Immutable catalogs and both color/shadow variants are prepared once.
+    /// When lighting is attached it must have dynamic casters enabled first.
+    pub fn prepare_entities(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(), String> {
+        if self.entities.is_some()
+            || self.terrain_frames != 0
+            || !self.resident.is_empty()
+            || self.self_handles.iter().any(Option::is_some)
+        {
+            return Err(
+                "entity pipelines must be prepared once before uploading scene geometry".into(),
+            );
+        }
+        if self
+            .lighting
+            .as_ref()
+            .is_some_and(|lighting| !lighting.owner.shadows().cache().config().dynamic_casters)
+        {
+            return Err("prepare lighting with dynamic model casters before entities".into());
+        }
+        let entities = ViewEntities::prepare(
+            device,
+            queue,
+            &self.renderer,
+            self.lighting
+                .as_ref()
+                .map(|lighting| lighting.owner.shadows()),
+        )
+        .map_err(|error| error.to_string())?;
+        self.pipeline_compilations = self
+            .pipeline_compilations
+            .saturating_add(u64::from(entities.stats.pipeline_compilations));
+        self.entities = Some(Box::new(entities));
+        self.invalidate();
+        Ok(())
+    }
+    pub fn entity_stats(&self) -> Option<EntityStats> {
+        self.entities.as_ref().map(|entities| entities.stats)
+    }
+    pub fn entities_mut(&mut self) -> Option<&mut ViewEntities> {
+        self.entities.as_deref_mut()
+    }
+    /// Install public interpolated records without scanning the world. Returns
+    /// false while this loading profile has no entity renderer attached.
+    pub fn set_remote_entities(
+        &mut self,
+        source: &[rules::entities::mob::Instance],
+        space: SpaceId,
+        origin: [i64; 3],
+    ) -> Result<bool, String> {
+        let Some(entities) = &mut self.entities else {
+            return Ok(false);
+        };
+        let work = entities
+            .set_remote_frame(source, self.scene.world(), space, origin)
+            .map_err(|error| format!("public entity frame: {error:?}"))?;
+        self.retained_foreground_work.record(telemetry::WorkCounts {
+            cells_scanned: work.light_reads,
+            ..telemetry::WorkCounts::ZERO
+        });
+        Ok(true)
     }
     pub fn apply_settings(&mut self, settings: &ui::settings::Settings) -> SettingsApplication {
         use ui::settings::{Section, Setting};
@@ -359,6 +465,33 @@ impl ClientView {
     }
     pub fn clear_keys(&mut self) {
         self.keys.fill(false);
+    }
+    pub fn input_buttons(&self) -> u32 {
+        self.keys
+            .iter()
+            .enumerate()
+            .fold(0, |bits, (index, pressed)| {
+                bits | (u32::from(*pressed) << index)
+            })
+    }
+    /// Explicit standalone benchmark setup. Reset the interpolation phase and
+    /// actor motion after warmup so pipeline/worker startup timing cannot shift
+    /// the deterministic input route by part of a simulation tick.
+    pub fn start_benchmark_route(&mut self) -> Result<(), String> {
+        if self.authoritative_remote() || self.edit_revision != 0 || !self.is_ready() {
+            return Err("benchmark requires an unedited, ready standalone fixture".into());
+        }
+        self.activate_player();
+        if !self.active {
+            return Err("benchmark fixture has no known safe spawn".into());
+        }
+        self.player = Player::new(self.player.pos);
+        self.player.yaw = 135.;
+        self.accumulator = 0.;
+        self.camera_mode = CameraMode::FirstPerson;
+        self.clear_keys();
+        self.invalidate();
+        Ok(())
     }
     pub fn mouse_delta(&mut self, dx: f64, dy: f64) {
         self.activate_player();
@@ -592,6 +725,54 @@ impl ClientView {
     pub fn set_demo_mesh_publication_paused(&mut self, paused: bool) {
         self.demo_mesh_publication_paused = paused;
     }
+    /// Raster diagnostic only: use identical unit tessellation for both the
+    /// initial base and every final replacement. Production retains greedy mesh.
+    pub fn set_demo_unit_mesh(&mut self, enabled: bool) -> Result<(), String> {
+        if self.terrain_frames != 0 || !self.resident.is_empty() {
+            return Err("unit-mesh diagnostic must be selected during loading".into());
+        }
+        if enabled && self.demo_gpu_unit_mesh {
+            return Err("CPU and GPU unit-mesh controls must be tested separately".into());
+        }
+        self.demo_unit_mesh = enabled;
+        Ok(())
+    }
+    pub const fn demo_unit_mesh(&self) -> bool {
+        self.demo_unit_mesh
+    }
+    pub fn prepare_gpu_unit_mesh(&mut self) -> Result<u32, String> {
+        if self.demo_unit_mesh {
+            return Err("CPU and GPU unit-mesh controls must be tested separately".into());
+        }
+        if self.terrain_frames != 0
+            || !self.resident.is_empty()
+            || self.self_handles.iter().any(Option::is_some)
+        {
+            return Err("GPU unit rasterization must be prepared during loading".into());
+        }
+        if self.demo_gpu_unit_mesh {
+            return Ok(self.renderer.geometry().max_pages);
+        }
+        let geometry = self.renderer.geometry();
+        let limit = geometry
+            .max_pages
+            .min(geometry.max_quads / render::terrain_mesh::MAX_PAGE_QUADS as u32);
+        if self.scene.visible_pages().count() + PART_COUNT > limit as usize {
+            return Err("GPU unit raster profile cannot retain all requested pages".into());
+        }
+        let limit = self
+            .renderer
+            .prepare_unit_rasterization()
+            .map_err(|error| error.to_string())?;
+        self.demo_gpu_unit_mesh = true;
+        Ok(limit)
+    }
+    pub const fn demo_gpu_unit_mesh(&self) -> bool {
+        self.demo_gpu_unit_mesh
+    }
+    pub fn gpu_object_limit(&self) -> u32 {
+        self.renderer.geometry().max_pages
+    }
     /// Standalone demo reconciliation only; multiplayer uses server changes.
     pub fn rollback_last_demo_edit(&mut self) -> Result<bool, String> {
         let Some(edit) = self
@@ -647,6 +828,32 @@ impl ClientView {
         queue: &wgpu::Queue,
         budget: &mut UploadBudget,
     ) -> Result<(), String> {
+        if let Some(entities) = &mut self.entities {
+            let reads_before = entities.stats.light_reads;
+            let update = match entities.upload_local(
+                queue,
+                self.active.then_some(&self.player),
+                self.accumulator / sim::TICK_SECONDS,
+                self.camera_mode,
+                self.scene.world(),
+                SpaceId(0),
+                [0; 3],
+                budget,
+            ) {
+                Ok(update) => update,
+                Err(render::entity_gpu::EntityError::UploadBudget) => return Ok(()),
+                Err(error) => return Err(error.to_string()),
+            };
+            self.retained_foreground_work.record(telemetry::WorkCounts {
+                upload_bytes: update.work.upload_bytes,
+                cells_scanned: entities.stats.light_reads - reads_before,
+                ..telemetry::WorkCounts::ZERO
+            });
+            if update.changed {
+                self.invalidate();
+            }
+            return Ok(());
+        }
         let mut pose = SelfModel::poses(
             &self.player,
             self.accumulator / sim::TICK_SECONDS,
@@ -836,9 +1043,28 @@ impl ClientView {
         }
         self.upload_model(queue, budget)?;
         while !self.demo_mesh_publication_paused && self.tick.0 >= self.mesh_hold_until.0 {
-            let Some(composite) = self.scene.take_composite() else {
+            let Some(mut composite) = self.scene.take_composite() else {
                 break;
             };
+            if self.demo_unit_mesh
+                && [
+                    &composite.base.mesh.opaque,
+                    &composite.base.mesh.cutout,
+                    &composite.base.mesh.water,
+                ]
+                .into_iter()
+                .flatten()
+                .any(|quad| quad.size() != [1, 1])
+            {
+                let mut unit_mesh = render::terrain_mesh::PageMesh::default();
+                let expanded = render::terrain_unit::expand(&composite.base.mesh, &mut unit_mesh)
+                    .map_err(|error| format!("unit-mesh diagnostic: {error:?}"))?;
+                self.retained_foreground_work.record(telemetry::WorkCounts {
+                    quads_emitted: expanded.emitted_quads,
+                    ..telemetry::WorkCounts::ZERO
+                });
+                composite.base.mesh = unit_mesh;
+            }
             let page = composite.base.page;
             if self
                 .edit_shell
@@ -1204,20 +1430,55 @@ impl ClientView {
         let camera = self.camera(width, height);
         let center = self.lighting_center();
         if let Some(lighting) = &mut self.lighting {
-            let work = lighting
-                .encode(queue, encoder, &mut self.renderer, center)
-                .map_err(|error| error.to_string())?;
+            let work = if let Some(entities) = &mut self.entities {
+                lighting.encode_models(
+                    queue,
+                    encoder,
+                    &mut self.renderer,
+                    center,
+                    &mut entities.gpu,
+                )
+            } else {
+                lighting.encode(queue, encoder, &mut self.renderer, center)
+            }
+            .map_err(|error| error.to_string())?;
             self.retained_foreground_work.record(telemetry::WorkCounts {
                 upload_bytes: work.uniform_upload_bytes,
                 ..telemetry::WorkCounts::ZERO
             });
         }
+        if let Some(entities) = &mut self.entities {
+            let work = entities
+                .prepare_camera(queue, encoder, camera)
+                .map_err(|error| error.to_string())?;
+            self.retained_foreground_work.record(telemetry::WorkCounts {
+                upload_bytes: work.camera_upload_bytes,
+                ..telemetry::WorkCounts::ZERO
+            });
+        }
+        let entities = self.entities.as_ref();
         let work = self
             .renderer
-            .encode_frame(queue, encoder, output, &camera, CullingMode::FrustumAndHiZ)
+            .encode_frame_with_extra(
+                queue,
+                encoder,
+                output,
+                &camera,
+                CullingMode::FrustumAndHiZ,
+                |pass| {
+                    entities
+                        .filter(|entities| entities.stats.active)
+                        .map_or(0, |entities| entities.draw(pass))
+                },
+            )
             .map_err(|e| e.to_string())?;
-        self.self_model_rendered = self.self_uploaded_pose.is_some_and(|pose| pose.visible)
-            && self.self_handles.iter().all(Option::is_some);
+        self.self_model_rendered = self.entities.as_ref().map_or_else(
+            || {
+                self.self_uploaded_pose.is_some_and(|pose| pose.visible)
+                    && self.self_handles.iter().all(Option::is_some)
+            },
+            |entities| entities.stats.primary_visible,
+        );
         if self.edit_shell.dirty_pages().next().is_none()
             && self.pending_patches.is_empty()
             && self.is_ready()
@@ -1247,6 +1508,13 @@ impl ClientView {
     /// uploads include camera writes. Mesh emissions count each CPU kernel once;
     /// renderer descriptor writes remain available separately in the details.
     pub fn take_frame_work(&mut self) -> telemetry::WorkCounts {
+        // Uploads may occur during a CPU iteration which retains the previous
+        // image, so drain writes even when encode was skipped by surface pacing.
+        let pending = self.renderer.take_work();
+        self.retained_gpu_work.record(pending);
+        self.pipeline_compilations = self
+            .pipeline_compilations
+            .saturating_add(pending.pipeline_compilations);
         let renderer = self.retained_gpu_work.take();
         let foreground = self.retained_foreground_work.take();
         let scene = self.scene.stats();

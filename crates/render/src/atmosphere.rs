@@ -115,6 +115,7 @@ pub struct AtmosphereGpu {
     sky_bind: wgpu::BindGroup,
     transmittance_dirty: bool,
     sky_dirty: bool,
+    timer: crate::gpu_time::GpuPassTimer<2>,
 }
 
 impl AtmosphereGpu {
@@ -273,6 +274,7 @@ impl AtmosphereGpu {
             sky_bind,
             transmittance_dirty: true,
             sky_dirty: true,
+            timer: crate::gpu_time::GpuPassTimer::new(device, queue, "atmosphere LUT pass timings"),
         })
     }
 
@@ -329,18 +331,21 @@ impl AtmosphereGpu {
         encoder: &mut wgpu::CommandEncoder,
         remaining_steps: &mut u64,
     ) -> Result<AtmosphereWork, AtmosphereError> {
+        self.timer.begin();
         let work = self.pending_work();
         if work.integration_steps > *remaining_steps {
             return Err(AtmosphereError::WorkBudget);
         }
-        for (dirty, pipeline, bind, size) in [
+        for (kind, dirty, pipeline, bind, size) in [
             (
+                1,
                 self.transmittance_dirty,
                 &self.transmittance_pipeline,
                 &self.transmittance_bind,
                 self.config.transmittance_size,
             ),
             (
+                2,
                 self.sky_dirty,
                 &self.sky_pipeline,
                 &self.sky_bind,
@@ -350,17 +355,25 @@ impl AtmosphereGpu {
             if dirty {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("bounded atmosphere LUT update"),
-                    timestamp_writes: None,
+                    timestamp_writes: self.timer.compute(kind),
                 });
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, bind, &[]);
                 pass.dispatch_workgroups(size[0].div_ceil(8), size[1].div_ceil(8), 1);
             }
         }
+        self.timer.finish(encoder);
         *remaining_steps -= work.integration_steps;
         self.transmittance_dirty = false;
         self.sky_dirty = false;
         Ok(work)
+    }
+
+    pub fn frame_graph(&self) -> crate::gpu_time::PassGraph<2> {
+        self.timer.graph()
+    }
+    pub fn timestamp_buffer(&self) -> Option<(&wgpu::Buffer, f32)> {
+        self.timer.timestamp_buffer()
     }
 
     pub fn transmittance_texture(&self) -> &wgpu::Texture {

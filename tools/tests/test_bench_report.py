@@ -39,6 +39,8 @@ class BenchReportTests(TestCase):
         self.assertEqual(summary["work"]["cells"], 500)
         self.assertEqual(summary["observations"]["Бюджет загрузки"], 1)
         self.assertEqual(summary["allocationSamples"], 0)
+        self.assertEqual(summary["hitches25"], 3)
+        self.assertEqual(summary["hitches50"], 0)
         self.assertIsNone(percentile([], .99))
 
     def test_comparison_requires_same_route_adapter_and_size(self):

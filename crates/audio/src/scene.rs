@@ -25,6 +25,47 @@ struct StepEmitter {
     last_tick: Option<u64>,
 }
 impl PreparedSounds {
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn empty() -> Result<Self, AudioError> {
+        Ok(Self {
+            mixer: Mixer::new(48000, 64, BANK_BYTES)?,
+            events: SoundEvents {
+                catalog: Catalog::new(),
+                local: BTreeMap::new(),
+                steps: [None; 64],
+            },
+        })
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn prepare_file(
+        &mut self,
+        path: &'static str,
+        bytes: &[u8],
+    ) -> Result<(), AudioError> {
+        self.events
+            .catalog
+            .prepare_file(&mut self.mixer, path, bytes)
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn prepare_local_variant(
+        &mut self,
+        local: &LocalResources,
+        event: &'static str,
+        variant: usize,
+    ) -> Result<(), AudioError> {
+        let clip = self.events.catalog.prepare_with_local(
+            &mut self.mixer,
+            local,
+            event,
+            variant as u64,
+            local.minecraft_index(),
+        )?;
+        self.events
+            .local
+            .entry(event)
+            .or_insert([clip; LOCAL_VARIANTS])[variant] = clip;
+        Ok(())
+    }
     /// Run during loading, or in a resource-preparation task. Failure preserves
     /// the previous active bank; a caller swaps only a complete prepared result.
     pub fn prepare(

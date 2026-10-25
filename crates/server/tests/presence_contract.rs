@@ -1,8 +1,7 @@
 use net::{ActionId, PlayerId, Role, presence};
 #[path = "../../client/src/network/presence.rs"]
 mod cache;
-#[path = "../src/presence.rs"]
-mod service;
+use server::presence as service;
 
 use cache::PresenceCache;
 use core_types::Tick;
@@ -110,6 +109,7 @@ fn chat_publication_follows_consumed_durable_permit_and_rate_survives_reconnect(
     cache.receive(event.clone()).unwrap();
     cache.receive(event).unwrap();
     assert_eq!(cache.pending_chats(), 1);
+    assert_eq!(cache.chats().next().unwrap().text, "Привет");
     assert_eq!(cache.pop_chat().unwrap().text, "Привет");
     assert!(
         service

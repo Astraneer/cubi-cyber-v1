@@ -96,11 +96,23 @@ fn native_websocket_pump_imports_real_authority_without_client_generation() {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut complete = false;
     let mut persisted = false;
+    let mut stalled = false;
     let started = Instant::now();
     for _ in 0..30_000 {
         assert!(Instant::now() < deadline, "real WebSocket/fsync deadline");
         let now = started.elapsed().as_millis() as u64;
         runtime.poll(now).unwrap();
+        if persisted && !stalled && now >= 500 {
+            // Reproduce a slow first GPU/pipeline frame: owner keeps ticking
+            // while the render thread does not drain its32-frame queue. TCP
+            // backpressure must retain all reliable pages and the session.
+            let resume = Instant::now() + Duration::from_millis(800);
+            while Instant::now() < resume {
+                runtime.poll(started.elapsed().as_millis() as u64).unwrap();
+                thread::sleep(Duration::from_millis(2));
+            }
+            stalled = true;
+        }
         socket.pump(&mut remote, now).unwrap();
         let loaded = scene.stats().loaded_pages;
         remote
@@ -149,6 +161,10 @@ fn native_websocket_pump_imports_real_authority_without_client_generation() {
         "loaded125 confirmed halo pages and moved using server-owned physics"
     );
     assert!(persisted);
+    assert!(
+        stalled,
+        "actual owner continued through the receive backpressure window"
+    );
     let ore = BlockPos {
         space: SpaceId(0),
         x: 8,

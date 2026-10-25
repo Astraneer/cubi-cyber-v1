@@ -7,6 +7,9 @@ use core_types::SpaceId;
 use net::{PlayerId, PlayerState};
 use save::SavedPlayer;
 use sim::{GameMode, Permissions, Player};
+mod living;
+pub(crate) use living::capture_living;
+use rules::{entities::combat::CombatStatus, survival::health::Health};
 
 const MAGIC: &[u8; 4] = b"PLYR";
 const VERSION: u16 = 1;
@@ -100,6 +103,13 @@ pub(crate) fn capture(
 }
 
 pub(crate) fn restore(saved: &SavedPlayer, allow_debug: bool) -> Result<Player, &'static str> {
+    restore_living(saved, allow_debug).map(|(player, _, _)| player)
+}
+
+pub(crate) fn restore_living(
+    saved: &SavedPlayer,
+    allow_debug: bool,
+) -> Result<(Player, Health, CombatStatus), &'static str> {
     validate_public(&saved.state)?;
     if saved.simulation.len() > MAX_BYTES {
         return Err("player continuation exceeds bound");
@@ -185,9 +195,7 @@ pub(crate) fn restore(saved: &SavedPlayer, allow_debug: bool) -> Result<Player, 
     } else {
         None
     };
-    if input.offset != input.bytes.len() {
-        return Err("trailing player continuation data");
-    }
+    let living = living::read(&mut input, saved.state.health)?;
     if player.fall < 0.0
         || player.fluid_h < 0.0
         || player.lava_h < 0.0
@@ -211,7 +219,11 @@ pub(crate) fn restore(saved: &SavedPlayer, allow_debug: bool) -> Result<Player, 
         player.revoke_debug_permission();
     }
     player.self_body.snap(player.yaw);
-    Ok(player)
+    let (health, combat) = match living {
+        Some(state) => state,
+        None => living::legacy(saved.state.health, player.ticks)?,
+    };
+    Ok((player, health, combat))
 }
 
 fn game_mode(mode: u8) -> Result<GameMode, &'static str> {

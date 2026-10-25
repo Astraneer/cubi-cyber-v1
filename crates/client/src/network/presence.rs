@@ -81,6 +81,9 @@ impl PresenceCache {
     pub fn pending_chats(&self) -> usize {
         self.chats.len()
     }
+    pub fn chats(&self) -> impl Iterator<Item = &ChatLine> {
+        self.chats.iter()
+    }
     pub fn pop_chat(&mut self) -> Option<ChatLine> {
         self.chats.pop_front()
     }

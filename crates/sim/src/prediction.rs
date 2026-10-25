@@ -2,7 +2,9 @@
 //! private grants, credentials, inventories and generation entropy are excluded.
 //! A server never accepts this state from a client: only authoritative messages
 //! may be installed by client prediction.
-use crate::{GameMode, Player};
+use crate::{GameMode, Motion, Player, SelfBody, collision::Bufs};
+mod audio;
+pub use audio::AudioMotion;
 
 pub const PREDICTION_VERSION: u16 = 1;
 pub const MAX_PREDICTION_BYTES: usize = 384;
@@ -86,7 +88,7 @@ impl PredictionState {
             bytes: out.bytes,
             len: out.len as u16,
         };
-        state.to_player()?;
+        state.read_player(Bufs::empty())?;
         Ok(state)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
@@ -98,7 +100,7 @@ impl PredictionState {
             len: bytes.len() as u16,
         };
         state.bytes[..bytes.len()].copy_from_slice(bytes);
-        state.to_player()?;
+        state.read_player(Bufs::empty())?;
         Ok(state)
     }
     pub fn as_bytes(&self) -> &[u8] {
@@ -112,10 +114,16 @@ impl PredictionState {
     /// Install a validated state received from the authority. This method is not
     /// a server-side permission or movement request API.
     pub fn apply_authoritative(&self, player: &mut Player) -> Result<(), &'static str> {
-        *player = self.to_player()?;
+        let mut next = self.read_player(Bufs::empty())?;
+        std::mem::swap(&mut next.motion.bufs, &mut player.motion.bufs);
+        next.motion.bufs.clear();
+        *player = next;
         Ok(())
     }
     pub fn to_player(&self) -> Result<Player, &'static str> {
+        self.read_player(Bufs::default())
+    }
+    fn read_player(&self, buffers: Bufs) -> Result<Player, &'static str> {
         let mut input = Reader {
             bytes: self.as_bytes(),
             offset: 0,
@@ -127,7 +135,12 @@ impl PredictionState {
             return Err("unsupported prediction version");
         }
         let position = [input.f64()?, input.f64()?, input.f64()?];
-        let mut player = Player::new(position);
+        let mut player = Player {
+            motion: Motion::with_buffers(position, buffers),
+            health: 20.0,
+            debug_permission: false,
+            self_body: SelfBody::default(),
+        };
         player.vel = [input.f64()?, input.f64()?, input.f64()?];
         player.yaw = input.f32()?;
         player.pitch = input.f32()?;

@@ -30,6 +30,8 @@ pub struct ProductUi {
     command: Option<Command>,
     ready_world: bool,
     sequence: u64,
+    ui_requests: std::collections::VecDeque<net::ActionId>,
+    sounds: client::audio_bridge::PredictionSounds,
 }
 fn preferences_storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok().flatten()
@@ -72,6 +74,8 @@ impl ProductUi {
             command: None,
             ready_world: false,
             sequence: 0,
+            ui_requests: std::collections::VecDeque::with_capacity(128),
+            sounds: client::audio_bridge::PredictionSounds::default(),
         };
         result.apply_sound()?;
         Ok(result)
@@ -128,9 +132,46 @@ impl ProductUi {
         captured
     }
     pub fn sync(&mut self, network: &Connection, view: &ClientView) -> Result<(), JsValue> {
+        if let Some(old) = self.sounds.bind(network) {
+            let _ = self.audio.forget_emitter(old);
+        }
+        if let Some(welcome) = network.welcome() {
+            let query = |[x, y, z]: [i32; 3]| {
+                view.scene.world().read(core_types::BlockPos {
+                    space: welcome.player.space,
+                    x,
+                    y,
+                    z,
+                })
+            };
+            let audio = &mut self.audio;
+            self.sounds
+                .visit(network, &query, |tick, body, emitter, position| {
+                    let _ = audio.steps(tick.0, body, emitter, position);
+                })
+                .map_err(js_error)?;
+            if let Some((event, emitter, position)) = self.sounds.health_event(network) {
+                let _ = self
+                    .audio
+                    .event(event, emitter, Some(position), view.tick().0);
+            }
+            if let Some(player) = network.player() {
+                let eye = player.view(1.0);
+                let _ = self.audio.listener(client::audio_bridge::listener(
+                    player,
+                    [eye[0], eye[1], eye[2]],
+                ));
+            }
+        }
         self.bridge
             .sync_authority(&mut self.layer.app, network)
             .map_err(js_error)?;
+        if network.welcome().is_some()
+            && !self.ready_world
+            && self.layer.app.status() == "Ожидание ответа мира…"
+        {
+            self.layer.app.set_status("Загрузка мира…");
+        }
         if network.player().is_some() && view.is_ready() && !self.ready_world {
             self.ready_world = true;
             self.layer.app.set_status("");
@@ -148,6 +189,11 @@ impl ProductUi {
     pub fn disconnected(&mut self, message: &str) {
         self.ready_world = false;
         self.bridge = UiBridge::default();
+        self.layer.app.clear_chat();
+        if let Some(emitter) = self.sounds.emitter() {
+            let _ = self.audio.forget_emitter(emitter);
+        }
+        self.sounds = client::audio_bridge::PredictionSounds::default();
         let _ = self.layer.app.set_snapshot(Snapshot::default());
         self.layer.app.open(Screen::Welcome);
         self.layer.app.set_status(message);
@@ -181,6 +227,40 @@ impl ProductUi {
         gesture: bool,
         now_ms: u64,
     ) -> Result<(), JsValue> {
+        if let Some(socket) = socket.as_deref_mut() {
+            for _ in 0..128 {
+                let Some(reply) = socket.session_mut().connection_mut().take_reply() else {
+                    break;
+                };
+                if !self.ui_requests.contains(&reply.id) {
+                    continue;
+                }
+                match reply.status {
+                    net::ActionStatus::Pending => {}
+                    net::ActionStatus::Accepted => {
+                        self.ui_requests.retain(|id| *id != reply.id);
+                        self.layer.app.set_status("");
+                    }
+                    net::ActionStatus::Rejected(reason) => {
+                        self.ui_requests.retain(|id| *id != reply.id);
+                        let message = match reason {
+                            net::RejectReason::Unauthorized => "Недостаточно прав",
+                            net::RejectReason::Stale => "Окно изменилось. Повторите действие",
+                            net::RejectReason::Unknown => "Область ещё загружается",
+                            net::RejectReason::RateLimited => "Слишком много действий. Подождите",
+                            net::RejectReason::Unsupported => "Действие не поддерживается миром",
+                            net::RejectReason::OutOfReach => "Слишком далеко",
+                            net::RejectReason::StorageUnavailable => {
+                                "Мир пока не может сохранить действие"
+                            }
+                            _ => "Мир отклонил действие",
+                        };
+                        self.layer.app.set_status(message);
+                        self.layer.app.message(message);
+                    }
+                }
+            }
+        }
         for _ in 0..64 {
             let Some(intent) = self.layer.app.take_intent() else {
                 break;
@@ -208,7 +288,8 @@ impl ProductUi {
                 Intent::SettingsChanged => {
                     self.apply_sound()?;
                     self.save_preferences();
-                    let _ = view.apply_settings(&self.layer.app.settings);
+                    let applied = view.apply_settings(&self.layer.app.settings);
+                    self.layer.app.set_pending_settings(applied.pending_render);
                     view.invalidate();
                 }
                 Intent::SavePreferences => self.save_preferences(),
@@ -216,7 +297,12 @@ impl ProductUi {
                 Intent::ImportMinecraft => self.imports.choose_minecraft(),
                 Intent::OpenCredits => download(
                     "CREDITS.txt",
-                    &format!("{}\n\n{}", ui::font::FONT_CREDITS, audio::catalog::CREDITS),
+                    &format!(
+                        "{}\n\n{}\n\n{}",
+                        ui::font::FONT_CREDITS,
+                        audio::catalog::CREDITS,
+                        include_str!("../../../ASSET_CREDITS.md")
+                    ),
                     "text/plain;charset=utf-8",
                 )?,
                 Intent::PersonalTime(_) => view.invalidate(),
@@ -227,7 +313,12 @@ impl ProductUi {
                             other,
                             now_ms,
                         ) {
-                            Ok(client::ui_bridge::Dispatch::Sent(_)) => {}
+                            Ok(client::ui_bridge::Dispatch::Sent(id)) => {
+                                if self.ui_requests.len() == 128 {
+                                    self.ui_requests.pop_front();
+                                }
+                                self.ui_requests.push_back(id);
+                            }
                             Ok(client::ui_bridge::Dispatch::Unsupported(_)) => {
                                 self.layer.app.set_status("Действие недоступно в этом окне")
                             }
@@ -262,4 +353,64 @@ pub fn download(name: &str, contents: &str, mime: &str) -> Result<(), JsValue> {
     anchor.click();
     web_sys::Url::revoke_object_url(&url)?;
     Ok(())
+}
+/// Local presentation diagnostics. No credential or imported byte/path field is
+/// present, and this object is never added to a network frame or F8 export.
+#[wasm_bindgen]
+pub fn product_ui_stats() -> JsValue {
+    super::ACTIVE_VIEW.with(|active| {
+        let Some(state) = active.borrow().as_ref().and_then(std::rc::Weak::upgrade) else {
+            return JsValue::UNDEFINED;
+        };
+        let state = state.borrow();
+        let Some(product) = &state.product else {
+            return JsValue::UNDEFINED;
+        };
+        let value = js_sys::Object::new();
+        let app = &product.layer.app;
+        let audio = product.audio.output().work();
+        for (name, text) in [
+            ("screen", format!("{:?}", app.screen)),
+            ("role", format!("{:?}", app.snapshot.role)),
+            ("windowId", format!("{:016x}", app.snapshot.window_id)),
+            (
+                "windowRevision",
+                format!("{:016x}", app.snapshot.window_revision),
+            ),
+            ("lastChat", app.last_chat().unwrap_or("").to_owned()),
+            (
+                "audioState",
+                format!("{:?}", product.audio.output().context_state()),
+            ),
+        ] {
+            let _ = js_sys::Reflect::set(&value, &name.into(), &text.into());
+        }
+        for (name, number) in [
+            (
+                "inventoryItems",
+                app.snapshot
+                    .inventory
+                    .iter()
+                    .map(|stack| u64::from(stack.count()))
+                    .sum(),
+            ),
+            ("chatMessages", app.chat_len() as u64),
+            ("players", app.snapshot.players.len() as u64),
+            ("audioStarted", audio.started),
+            ("audioLoopUpdates", audio.loop_updates),
+            ("audioStopped", audio.stopped),
+        ] {
+            let _ = js_sys::Reflect::set(&value, &name.into(), &(number as f64).into());
+        }
+        let _ = js_sys::Reflect::set(
+            &value,
+            &"pingMeasured".into(),
+            &app.snapshot
+                .players
+                .iter()
+                .any(|player| player.ping_ms.is_some())
+                .into(),
+        );
+        value.into()
+    })
 }

@@ -26,6 +26,12 @@ struct WebVoice {
     started: f64,
     duration: f64,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WebAudioWork {
+    pub started: u64,
+    pub loop_updates: u64,
+    pub stopped: u64,
+}
 pub struct WebOutput {
     context: AudioContext,
     master: GainNode,
@@ -33,9 +39,11 @@ pub struct WebOutput {
     clips: BTreeMap<ClipId, AudioBuffer>,
     clip_bytes: usize,
     voices: Vec<Option<WebVoice>>,
+    retired: VecDeque<(f64, WebVoice)>,
     listener: Listener,
     next_generation: u64,
     echo: Option<(ConvolverNode, GainNode)>,
+    work: WebAudioWork,
 }
 fn js_error(value: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&value.to_string())
@@ -67,9 +75,11 @@ impl WebOutput {
             clips: BTreeMap::new(),
             clip_bytes: 0,
             voices: (0..voice_limit).map(|_| None).collect(),
+            retired: VecDeque::with_capacity(voice_limit),
             listener: Listener::default(),
             next_generation: 1,
             echo: None,
+            work: WebAudioWork::default(),
         })
     }
     pub async fn resume(&self) -> Result<(), JsValue> {
@@ -100,12 +110,18 @@ impl WebOutput {
                 self.stop(handle)?;
             }
         }
+        while let Some((_, voice)) = self.retired.pop_front() {
+            disconnect_voice(&voice);
+        }
         self.clips = clips;
         self.clip_bytes = bytes;
         Ok(())
     }
     pub fn context_state(&self) -> web_sys::AudioContextState {
         self.context.state()
+    }
+    pub fn work(&self) -> WebAudioWork {
+        self.work
     }
     pub fn prepare_clip(&mut self, id: ClipId, pcm: &Pcm) -> Result<(), JsValue> {
         if !self.clips.contains_key(&id) {
@@ -180,6 +196,7 @@ impl WebOutput {
             voice.request = request;
             voice.source.playback_rate().set_value(request.pitch);
             let handle = voice.handle;
+            self.work.loop_updates += 1;
             self.position(self.voices[slot].as_ref().unwrap());
             return Ok(handle);
         }
@@ -237,6 +254,7 @@ impl WebOutput {
         self.position(&voice);
         voice.source.start()?;
         self.voices[slot] = Some(voice);
+        self.work.started += 1;
         Ok(handle)
     }
     pub fn stop_emitter(&mut self, emitter: crate::EmitterId) -> Result<usize, JsValue> {
@@ -268,10 +286,27 @@ impl WebOutput {
             .source
             .unchecked_ref::<web_sys::AudioScheduledSourceNode>()
             .stop_with_when(self.context.current_time() + 0.03)?;
+        if self.retired.len() == self.voices.len()
+            && let Some((_, old)) = self.retired.pop_front()
+        {
+            let _ = old
+                .source
+                .unchecked_ref::<web_sys::AudioScheduledSourceNode>()
+                .stop();
+            disconnect_voice(&old);
+        }
+        self.retired
+            .push_back((self.context.current_time() + 0.03, voice));
+        self.work.stopped += 1;
         Ok(true)
     }
     pub fn reap(&mut self) {
         let now = self.context.current_time();
+        while self.retired.front().is_some_and(|(until, _)| now >= *until) {
+            if let Some((_, voice)) = self.retired.pop_front() {
+                disconnect_voice(&voice);
+            }
+        }
         for slot in &mut self.voices {
             if slot
                 .as_ref()
@@ -319,6 +354,11 @@ impl WebOutput {
         Ok(())
     }
 }
+fn disconnect_voice(voice: &WebVoice) {
+    let _ = voice.source.disconnect();
+    let _ = voice.gain.disconnect();
+    let _ = voice.pan.disconnect();
+}
 
 thread_local! {static LOCAL:RefCell<LocalResources>=RefCell::new(LocalResources::new(ImportLimits::default()));}
 #[derive(Clone, Copy, Debug)]
@@ -356,6 +396,63 @@ pub fn take_import_event() -> Option<ImportEvent> {
 }
 pub fn with_local_resources<R>(read: impl FnOnce(&LocalResources) -> R) -> R {
     LOCAL.with(|resources| read(&resources.borrow()))
+}
+/// Yield between bounded clip decodes during an explicit import/loading task.
+/// This keeps the real socket/input owner pumping; no resource bytes leave LOCAL.
+pub async fn prepare_current_sound_bank() -> Result<crate::scene::PreparedSounds, JsValue> {
+    let revision = with_local_resources(|local| local.revision());
+    let mut prepared = crate::scene::PreparedSounds::empty().map_err(js_error)?;
+    let clock = web_sys::window()
+        .and_then(|window| window.performance())
+        .ok_or_else(|| js_error("Clock unavailable"))?;
+    let mut deadline = clock.now() + 4.0;
+    for (path, bytes) in Catalog::files() {
+        if with_local_resources(|local| local.revision()) != revision {
+            return Err(js_error("Superseded local import"));
+        }
+        prepared.prepare_file(path, bytes).map_err(js_error)?;
+        if clock.now() >= deadline {
+            yield_loading().await?;
+            deadline = clock.now() + 4.0;
+        }
+    }
+    for event in Catalog::events() {
+        let present = with_local_resources(|local| {
+            local
+                .sound_for_event(event, 0, local.minecraft_index())
+                .map(|value| value.is_some())
+        })
+        .map_err(js_error)?;
+        if !present {
+            if clock.now() >= deadline {
+                yield_loading().await?;
+                deadline = clock.now() + 4.0;
+            }
+            continue;
+        }
+        for variant in 0..3 {
+            if with_local_resources(|local| local.revision()) != revision {
+                return Err(js_error("Superseded local import"));
+            }
+            with_local_resources(|local| prepared.prepare_local_variant(local, event, variant))
+                .map_err(js_error)?;
+            if clock.now() >= deadline {
+                yield_loading().await?;
+                deadline = clock.now() + 4.0;
+            }
+        }
+    }
+    Ok(prepared)
+}
+async fn yield_loading() -> Result<(), JsValue> {
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
+        if let Some(window) = web_sys::window()
+            && let Err(error) = window.request_animation_frame(&resolve)
+        {
+            let _ = reject.call1(&JsValue::UNDEFINED, &error);
+        }
+    });
+    JsFuture::from(promise).await.map(|_| ())
 }
 /// Hidden native file-input glue for the GPU-drawn Rust UI. `choose_*` must be
 /// called while handling the user's click; status is a bounded Rust event queue.

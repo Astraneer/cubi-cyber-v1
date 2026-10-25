@@ -405,6 +405,20 @@ pub fn encode_client(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
                     out.u16(inventory.count);
                     out.u16(inventory.damage);
                 }
+                Action::Chat(text) => {
+                    if !presence::valid_chat(text) {
+                        return Err(CodecError::InvalidBounds);
+                    }
+                    out.byte(8);
+                    out.string(text);
+                }
+                Action::Window(intent) => {
+                    out.byte(10);
+                    write_blob(
+                        &mut out,
+                        &window::encode_intent(*intent).map_err(|_| CodecError::InvalidBounds)?,
+                    );
+                }
                 Action::Command(command) => {
                     if command.len() > MAX_COMMAND_BYTES || command.chars().any(char::is_control) {
                         return Err(CodecError::InvalidBounds);
@@ -438,6 +452,17 @@ pub fn encode_client(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
             if let Some(version) = known {
                 out.u64(version.0);
             }
+        }
+        ClientMessage::Presence(event) => {
+            out.byte(10);
+            write_blob(&mut out, &presence::encode_client(*event));
+        }
+        ClientMessage::Entities(request) => {
+            out.byte(11);
+            write_blob(
+                &mut out,
+                &entities::encode_request(*request).map_err(|_| CodecError::InvalidBounds)?,
+            );
         }
         ClientMessage::ForgetGeometry(page) => {
             out.byte(8);
@@ -559,6 +584,17 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
                         inventory,
                     }
                 }
+                8 => {
+                    let text = input.string(presence::MAX_CHAT_BYTES)?;
+                    if !presence::valid_chat(&text) {
+                        return Err(CodecError::InvalidBounds);
+                    }
+                    Action::Chat(text)
+                }
+                10 => Action::Window(
+                    window::decode_intent(read_blob(&mut input, window::MAX_WINDOW_BYTES)?)
+                        .map_err(|_| CodecError::InvalidBounds)?,
+                ),
                 _ => return Err(CodecError::InvalidEnum),
             };
             if let Some((yaw, pitch)) = aim {
@@ -599,6 +635,14 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
             ClientMessage::RequestGeometry { page, known }
         }
         8 => ClientMessage::ForgetGeometry(input.page()?),
+        10 => ClientMessage::Presence(
+            presence::decode_client(read_blob(&mut input, 64)?)
+                .map_err(|_| CodecError::InvalidBounds)?,
+        ),
+        11 => ClientMessage::Entities(
+            entities::decode_request(read_blob(&mut input, 64)?)
+                .map_err(|_| CodecError::InvalidBounds)?,
+        ),
         _ => return Err(CodecError::InvalidEnum),
     };
     finish(input)?;
@@ -718,6 +762,27 @@ pub fn encode_server(message: &ServerMessage) -> Result<Vec<u8>, CodecError> {
         ServerMessage::Geometry(geometry) => {
             out.byte(13);
             write_geometry(&mut out, geometry)?;
+        }
+        ServerMessage::Presence(event) => {
+            out.byte(15);
+            write_blob(
+                &mut out,
+                &presence::encode_server(event).map_err(|_| CodecError::InvalidBounds)?,
+            );
+        }
+        ServerMessage::Entities(frame) => {
+            out.byte(16);
+            write_blob(
+                &mut out,
+                &entities::encode_frame(frame).map_err(|_| CodecError::InvalidBounds)?,
+            );
+        }
+        ServerMessage::Window(state) => {
+            out.byte(17);
+            write_blob(
+                &mut out,
+                &window::encode_snapshot(state).map_err(|_| CodecError::InvalidBounds)?,
+            );
         }
         ServerMessage::GeometryUnavailable(page) => {
             out.byte(14);
@@ -1017,6 +1082,18 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, CodecError> {
         }
         13 => ServerMessage::Geometry(Box::new(read_geometry(&mut input)?)),
         14 => ServerMessage::GeometryUnavailable(input.page()?),
+        15 => ServerMessage::Presence(
+            presence::decode_server(read_blob(&mut input, presence::MAX_PRESENCE_BYTES)?)
+                .map_err(|_| CodecError::InvalidBounds)?,
+        ),
+        16 => ServerMessage::Entities(Box::new(
+            entities::decode_frame(read_blob(&mut input, entities::MAX_FRAME_BYTES)?)
+                .map_err(|_| CodecError::InvalidBounds)?,
+        )),
+        17 => ServerMessage::Window(Box::new(
+            window::decode_snapshot(read_blob(&mut input, window::MAX_WINDOW_BYTES)?)
+                .map_err(|_| CodecError::InvalidBounds)?,
+        )),
         _ => return Err(CodecError::InvalidEnum),
     };
     finish(input)?;
@@ -1085,4 +1162,16 @@ fn read_geometry(input: &mut Reader<'_>) -> Result<PublicGeometry, CodecError> {
     };
     geometry.validate().map_err(|_| CodecError::InvalidBounds)?;
     Ok(geometry)
+}
+
+fn write_blob(out: &mut Writer, bytes: &[u8]) {
+    out.u32(bytes.len() as u32);
+    out.0.extend(bytes);
+}
+fn read_blob<'a>(input: &mut Reader<'a>, maximum: usize) -> Result<&'a [u8], CodecError> {
+    let len = input.u32()? as usize;
+    if len > maximum {
+        return Err(CodecError::InvalidBounds);
+    }
+    input.take(len)
 }

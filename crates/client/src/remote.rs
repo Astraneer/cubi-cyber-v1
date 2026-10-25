@@ -27,6 +27,7 @@ pub struct RemoteSession {
     mining: Option<(BlockPos, Cell, ActionId)>,
     next_place_ms: u64,
     counters: RemoteCounters,
+    entity_instances: Vec<rules::entities::mob::Instance>,
 }
 impl RemoteSession {
     pub fn new(config: NetworkConfig) -> Result<Self, String> {
@@ -40,6 +41,10 @@ impl RemoteSession {
             mining: None,
             next_place_ms: 0,
             counters: RemoteCounters::default(),
+            entity_instances: vec![
+                rules::entities::mob::Instance::default();
+                net::entities::MAX_ENTITIES
+            ],
         })
     }
     pub fn scene_config() -> SceneConfig {
@@ -93,6 +98,16 @@ impl RemoteSession {
         }
         if let Some(player) = self.connection.player() {
             view.install_remote_player(player, self.connection.predicted_tick())?;
+        }
+        if let Some(welcome) = self.connection.welcome() {
+            let space = welcome.player.space;
+            let time = (self.connection.server_tick_time(now_ms) - 2.0).max(0.0);
+            let count = self
+                .connection
+                .entity_replica()
+                .instances(space, time, [0; 3], &mut self.entity_instances)
+                .map_err(|e| format!("public entity interpolation: {e:?}"))?;
+            view.set_remote_entities(&self.entity_instances[..count], space, [0; 3])?;
         }
         Ok(())
     }
@@ -345,6 +360,37 @@ impl RemoteSession {
             && now_ms >= self.next_place_ms
             && let Some(hit) = hit
         {
+            if hit.block.id() == rules::ids::CRAFTING_TABLE
+                || matches!(
+                    rules::blocks::bdef(hit.block.id()).be,
+                    Some(
+                        rules::blocks::BeKind::Chest
+                            | rules::blocks::BeKind::Furnace
+                            | rules::blocks::BeKind::Mek(_)
+                    )
+                )
+            {
+                let position = BlockPos {
+                    space,
+                    x: hit.cell[0],
+                    y: hit.cell[1],
+                    z: hit.cell[2],
+                };
+                self.connection
+                    .aimed_action(
+                        Action::Window(net::window::WindowIntent::OpenBlock {
+                            position,
+                            expected: hit.block,
+                        }),
+                        false,
+                        now_ms,
+                        input.yaw,
+                        input.pitch,
+                    )
+                    .map_err(error)?;
+                self.next_place_ms = now_ms.saturating_add(200);
+                return Ok(());
+            }
             let Some(inventory) = self.connection.predicted_inventory() else {
                 return Ok(());
             };

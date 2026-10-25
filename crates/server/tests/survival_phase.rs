@@ -418,3 +418,178 @@ fn accepted_edit_wake_is_detached_durable_and_codec_preserves_private_rng_seed()
     ));
     assert_eq!(runtime.snapshot(), before);
 }
+
+#[test]
+fn composed_tick_wakes_keep_retry_age_order_and_one_revision_boundary() {
+    let world = World::new(rules::properties, 4);
+    let mut runtime = SurvivalRuntime::new(4);
+    let old = Event::Fluid(pos(0, 1, 0), Liquid::Water);
+    runtime.register(old, Tick(1)).unwrap();
+    let before = runtime.snapshot();
+    let plan = runtime
+        .plan_tick(&world, Tick(9), Budget::default())
+        .unwrap();
+    assert_eq!(plan.work.unknown_deferred, 1);
+    let delta = runtime
+        .extend_registration(
+            plan.delta,
+            [
+                (old, Tick(2)),
+                (Event::Furnace(ComponentId(7)), Tick(20)),
+                (Event::Furnace(ComponentId(7)), Tick(10)),
+            ],
+        )
+        .unwrap();
+    assert_eq!(runtime.snapshot(), before);
+    assert!(!delta.is_empty());
+    runtime
+        .acknowledge(RuntimeDelta::decode(&delta.encode(), 4).unwrap())
+        .unwrap();
+    let after = runtime.snapshot();
+    assert_eq!(after.revision, before.revision + 1);
+    assert_eq!(after.events.len(), 2);
+    let retry = after.events.iter().find(|p| p.event == old).unwrap();
+    assert_eq!(
+        (retry.first_due, retry.due, retry.order),
+        (Tick(1), Tick(10), 0)
+    );
+    let new = after
+        .events
+        .iter()
+        .find(|p| p.event == Event::Furnace(ComponentId(7)))
+        .unwrap();
+    assert_eq!((new.first_due, new.due, new.order), (Tick(10), Tick(10), 1));
+}
+#[test]
+fn composed_registration_excludes_consumed_keys_and_capacity_failure_is_atomic() {
+    let mut world = scene();
+    let anchor = pos(0, 1, 0);
+    let id = ComponentId(41);
+    let mut tx = Transaction::new(Tick(0), SpaceId(0));
+    tx.set_cell(anchor, Cell::from_parts(FURNACE, 2));
+    tx.set_component(
+        id,
+        survival::furnace_component(anchor, &Furnace::default()),
+        ChannelMask::CONTENTS,
+    );
+    world.commit(tx).unwrap();
+    let mut runtime = SurvivalRuntime::new(1);
+    let event = Event::Furnace(id);
+    runtime.register(event, Tick(1)).unwrap();
+    let before = runtime.snapshot();
+    let plan = runtime
+        .plan_tick(&world, Tick(1), Budget::default())
+        .unwrap();
+    let original = plan.delta.clone();
+    let composed = runtime
+        .extend_registration(plan.delta, [(event, Tick(15))])
+        .unwrap();
+    assert_eq!(runtime.snapshot(), before);
+    runtime.acknowledge(composed.clone()).unwrap();
+    assert_eq!(runtime.snapshot().events[0].order, 1);
+    assert_eq!(runtime.snapshot().events[0].first_due, Tick(15));
+    assert!(matches!(
+        runtime.extend_registration(original, []),
+        Err(SurvivalError::StalePlan)
+    ));
+    let plan = runtime
+        .plan_tick(&world, Tick(2), Budget::default())
+        .unwrap();
+    let snapshot = runtime.snapshot();
+    assert!(matches!(
+        runtime.extend_registration(plan.delta, [(Event::Farm(pos(2, 1, 0)), Tick(3))]),
+        Err(SurvivalError::Capacity)
+    ));
+    assert_eq!(runtime.snapshot(), snapshot);
+}
+#[test]
+fn composing_two_wakes_does_not_clone_or_scan100000_cold_queue_entries() {
+    let world = World::new(rules::properties, 4);
+    let mut runtime = SurvivalRuntime::new(100_002);
+    for x in 0..100_000 {
+        runtime
+            .register(Event::Fluid(pos(x, 1, 0), Liquid::Water), Tick(1000))
+            .unwrap();
+    }
+    let plan = runtime
+        .plan_tick(&world, Tick(1), Budget::default())
+        .unwrap();
+    assert!(plan.delta.is_empty());
+    let scope = AllocationScope::begin().unwrap();
+    let delta = runtime
+        .extend_registration(
+            plan.delta,
+            [
+                (Event::Furnace(ComponentId(1)), Tick(2)),
+                (Event::Farm(pos(200_000, 1, 0)), Tick(3)),
+                (Event::Fluid(pos(0, 1, 0), Liquid::Water), Tick(2)),
+            ],
+        )
+        .unwrap();
+    let counts = scope.finish();
+    assert!(counts.allocated_bytes < 65_536, "{counts:?}");
+    assert_eq!(runtime.len(), 100_000);
+    runtime.acknowledge(delta).unwrap();
+    assert_eq!(runtime.len(), 100_002);
+}
+
+#[test]
+fn two_with_replacement_farm_samples_tick_same_crop_twice_and_survive_codec() {
+    let mut world = scene();
+    let crop = pos(0, 2, 0);
+    let mut tx = Transaction::new(Tick(0), SpaceId(0));
+    tx.set_cell(pos(0, 1, 0), Cell::from_parts(FARMLAND, 7));
+    tx.set_cell(pos(4, 1, 0), Cell::from_parts(WATER, 0));
+    tx.set_cell(crop, Cell::from_parts(WHEAT, 0));
+    tx.set_light(
+        crop,
+        world::LightSample {
+            sky: 15,
+            ..Default::default()
+        },
+    );
+    world.commit(tx).unwrap();
+    let seed = (0..10_000u64)
+        .find(|&seed| {
+            (0..2).all(|order| {
+                core_types::DeterministicRng::from_key(seed, 0x4641524d, order, 1).below(7)
+                    == Some(0)
+            })
+        })
+        .unwrap();
+    let mut runtime = SurvivalRuntime::with_seed(4, seed);
+    let a = Event::FarmSample(crop, survival::farm_sample_token(Tick(1), 0).unwrap());
+    let b = Event::FarmSample(crop, survival::farm_sample_token(Tick(1), 1).unwrap());
+    let delta = runtime
+        .plan_register([(a, Tick(1)), (b, Tick(1)), (a, Tick(1))])
+        .unwrap();
+    runtime
+        .acknowledge(RuntimeDelta::decode(&delta.encode(), 4).unwrap())
+        .unwrap();
+    assert_eq!(runtime.len(), 2);
+    let snapshot = RuntimeSnapshot::decode(&runtime.snapshot().encode(), 4).unwrap();
+    assert_eq!(
+        snapshot.events.iter().map(|p| p.event).collect::<Vec<_>>(),
+        [a, b]
+    );
+    let plan = runtime
+        .plan_tick(&world, Tick(1), Budget::default())
+        .unwrap();
+    assert_eq!(plan.work.events, 2);
+    for tx in plan.transactions {
+        world.commit(tx).unwrap();
+    }
+    runtime.acknowledge(plan.delta).unwrap();
+    assert_eq!(
+        world.read(crop),
+        CellRead::Known(Cell::from_parts(WHEAT, 2))
+    );
+    assert!(runtime.is_empty());
+    assert!(
+        runtime
+            .plan_register([(Event::FarmSample(crop, 1u64 << 56), Tick(2))])
+            .is_err()
+    );
+    assert!(survival::farm_sample_token(Tick(1u64 << 44), 0).is_err());
+    assert!(survival::farm_sample_token(Tick(1), 4096).is_err());
+}

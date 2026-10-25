@@ -53,7 +53,7 @@ pub enum PersonalTime {
 pub struct PlayerRow {
     pub name: String,
     pub role: Role,
-    pub ping_ms: u16,
+    pub ping_ms: Option<u16>,
 }
 #[derive(Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -126,6 +126,12 @@ pub enum Intent {
     OpenCredits,
     BugReport,
     SelectSlot(u8),
+    OpenInventory,
+    CloseWindow {
+        window: u64,
+        revision: u64,
+        inventory_revision: u64,
+    },
     Drop {
         all: bool,
     },
@@ -158,6 +164,7 @@ pub enum Intent {
     MachineSide {
         window: u64,
         revision: u64,
+        inventory_revision: u64,
         face: u8,
         mode: u8,
     },
@@ -262,6 +269,7 @@ pub struct UiApp {
     scale: f32,
     bookmark_scroll: usize,
     profiler: crate::profiler::ProfilerSnapshot,
+    pending_settings: u32,
 }
 impl UiApp {
     pub fn new() -> Result<Self, &'static str> {
@@ -309,6 +317,7 @@ impl UiApp {
             scale: 1.0,
             bookmark_scroll: 0,
             profiler: crate::profiler::ProfilerSnapshot::default(),
+            pending_settings: 0,
         })
     }
     pub fn revision(&self) -> u64 {
@@ -320,6 +329,13 @@ impl UiApp {
             if self.show_debug {
                 self.dirty();
             }
+        }
+    }
+    pub fn set_pending_settings(&mut self, mask: u32) {
+        let mask = mask & ((1u32 << crate::settings::COUNT) - 1);
+        if mask != self.pending_settings {
+            self.pending_settings = mask;
+            self.dirty();
         }
     }
     pub fn hits(&self) -> &[Hit] {
@@ -447,6 +463,24 @@ impl UiApp {
         self.dirty();
     }
     pub fn open(&mut self, screen: Screen) {
+        if matches!(screen, Screen::Game | Screen::Pause | Screen::Welcome)
+            && matches!(
+                self.screen,
+                Screen::Inventory
+                    | Screen::Workbench
+                    | Screen::Container
+                    | Screen::Furnace
+                    | Screen::Machine
+                    | Screen::Recipe
+            )
+            && self.snapshot.window_id != 0
+        {
+            self.intent(Intent::CloseWindow {
+                window: self.snapshot.window_id,
+                revision: self.snapshot.window_revision,
+                inventory_revision: self.snapshot.inventory_revision,
+            });
+        }
         self.previous = self.screen;
         self.screen = screen;
         self.focus = Focus::None;
@@ -478,7 +512,7 @@ impl UiApp {
         Ok(())
     }
     pub fn message(&mut self, message: &str) {
-        if message.len() > 256 || message.chars().any(|c| c.is_control() && c != '\n') {
+        if message.len() > 384 || message.chars().any(|c| c.is_control() && c != '\n') {
             return;
         }
         if self.chat.len() == 64 {
@@ -486,6 +520,18 @@ impl UiApp {
         }
         self.chat.push_back(message.to_owned());
         self.dirty();
+    }
+    pub fn clear_chat(&mut self) {
+        if !self.chat.is_empty() {
+            self.chat.clear();
+            self.dirty();
+        }
+    }
+    pub fn chat_len(&self) -> usize {
+        self.chat.len()
+    }
+    pub fn last_chat(&self) -> Option<&str> {
+        self.chat.back().map(String::as_str)
     }
     pub fn pointer(&mut self, x: f32, y: f32) {
         if !x.is_finite() || !y.is_finite() {
@@ -514,6 +560,12 @@ impl UiApp {
     }
     pub fn wheel(&mut self, delta: i32) {
         if delta == 0 {
+            return;
+        }
+        if self.screen == Screen::Game && self.focus == Focus::None && self.snapshot.connected {
+            self.intent(Intent::SelectSlot(
+                (i32::from(self.snapshot.selected) + delta.signum()).rem_euclid(9) as u8,
+            ));
             return;
         }
         if matches!(
@@ -682,10 +734,11 @@ impl UiApp {
         if let Some(action) = self.bindings.action(code, false) {
             match action {
                 Action::Inventory => {
-                    if !self.snapshot.connected {
+                    if !self.snapshot.connected || self.screen == Screen::Loading {
                         return true;
                     }
                     if self.screen == Screen::Game {
+                        self.intent(Intent::OpenInventory);
                         self.open(Screen::Inventory);
                     } else {
                         self.open(Screen::Game);
@@ -951,8 +1004,9 @@ impl UiApp {
             Widget::Side(face) => self.intent(Intent::MachineSide {
                 window: self.snapshot.window_id,
                 revision: self.snapshot.window_revision,
+                inventory_revision: self.snapshot.inventory_revision,
                 face,
-                mode: (self.snapshot.sides[usize::from(face)] + 1) % 5,
+                mode: (self.snapshot.sides[usize::from(face)] + 1) % 6,
             }),
         }
         self.dirty();
@@ -1242,6 +1296,9 @@ impl UiApp {
             let mut text = TextBuffer::default();
             let value = self.settings.get(def.id);
             let _ = write!(text, "{value}");
+            if self.pending_settings & (1 << def.id as u32) != 0 {
+                let _ = write!(text, "*");
+            }
             p.centered(
                 Rect::new((w - 130.0).max(210.0), y, 102.0, 30.0),
                 text.as_str(),
@@ -1299,7 +1356,17 @@ impl UiApp {
             Rect::new(w - 145.0, h - 64.0, 120.0, 27.0),
             "Готово",
         );
-        p.text(24.0, h - 28.0, &self.status, MUTED);
+        p.text(
+            24.0,
+            h - 28.0,
+            if section == Section::Graphics && self.pending_settings != 0 && self.status.is_empty()
+            {
+                "* сохранено, ещё не применено"
+            } else {
+                &self.status
+            },
+            MUTED,
+        );
     }
     fn hud(&mut self, p: &mut Painter<'_>, w: f32, h: f32) {
         let start = w * 0.5 - 9.0 * 18.0;
@@ -1532,6 +1599,7 @@ impl UiApp {
             }
         }
         self.nei(p, panel.x + 408.0, panel.y + 16.0);
+        p.text(panel.x + 20.0, panel.y + 340.0, &self.status, MUTED);
         self.button(
             p,
             Widget::Back,
@@ -1813,7 +1881,11 @@ impl UiApp {
         for (index, player) in self.snapshot.players.iter().take(12).enumerate() {
             p.text(x + 12.0, 82.0 + index as f32 * 25.0, &player.name, TEXT);
             let mut text = TextBuffer::default();
-            let _ = write!(text, "{} мс", player.ping_ms);
+            if let Some(ping) = player.ping_ms {
+                let _ = write!(text, "{ping} мс");
+            } else {
+                let _ = write!(text, "—");
+            }
             p.text(x + 250.0, 82.0 + index as f32 * 25.0, text.as_str(), MUTED);
         }
     }

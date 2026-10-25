@@ -24,6 +24,7 @@ struct Indirect {
 @group(0) @binding(4) var hiz: texture_2d<f32>;
 @group(0) @binding(5) var<storage,read> edit_masks:array<u32>;
 @group(0) @binding(6) var<storage,read> patch_states:array<u32>;
+@group(0) @binding(7) var<storage,read> quads:array<vec4<u32>>;
 
 @compute @workgroup_size(1)
 fn reset() {
@@ -44,7 +45,7 @@ fn corner(object:Object,index:u32)->vec4<f32> {
 }
 
 fn inside_frustum(object:Object)->bool {
-    if camera.params.z==0u {return true;}
+    if (camera.params.z&1u)==0u {return true;}
     var outside_left=true;var outside_right=true;var outside_down=true;
     var outside_up=true;var outside_near=true;var outside_far=true;
     let padding=vec2(2.0)/camera.viewport.xy;
@@ -112,7 +113,8 @@ fn publish(object:Object,slot:u32) {
                 if face_class==0u {continue;}
                 let bucket=face_class-1u;
                 let index=atomicAdd(&indirect[bucket].instance_count,1u);
-                visible[bucket*camera.params.y+index]=object.ranges[0].x+owner*6u+face;
+                let descriptor=object.ranges[0].x+owner*6u+face;
+                visible[bucket*camera.params.y+index]=select(descriptor,descriptor<<8u,(camera.params.z&2u)!=0u);
             }
             }
         }
@@ -122,9 +124,22 @@ fn publish(object:Object,slot:u32) {
     for (var bucket=0u;bucket<3u;bucket++) {
         let range=object.ranges[bucket];
         let destination=bucket+select(0u,3u,masked);
-        let start=atomicAdd(&indirect[destination].instance_count,range.y);
-        for (var index=0u;index<range.y;index++) {
-            visible[destination*camera.params.y+start+index]=range.x+index;
+        if (camera.params.z&2u)==0u {
+            let start=atomicAdd(&indirect[destination].instance_count,range.y);
+            for (var index=0u;index<range.y;index++) {
+                visible[destination*camera.params.y+start+index]=range.x+index;
+            }
+        } else {
+            // CPU-preflighted: <=24576 units/object, and the total allocated
+            // object count cannot overflow any one bucket's visible capacity.
+            for(var index=0u;index<range.y;index++) {
+                let descriptor=range.x+index;let bits=quads[descriptor].x;
+                let count=(((bits>>18u)&15u)+1u)*(((bits>>22u)&15u)+1u);
+                let start=atomicAdd(&indirect[destination].instance_count,count);
+                for(var tile=0u;tile<count;tile++) {
+                    visible[destination*camera.params.y+start+tile]=(descriptor<<8u)|tile;
+                }
+            }
         }
     }
 }

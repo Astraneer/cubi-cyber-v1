@@ -93,7 +93,24 @@ pub struct Presence {
     nonce: DeterministicRng,
     work: PresenceWork,
 }
+impl ChatReservation {
+    pub(crate) fn line(&self, tick: Tick) -> ChatLine {
+        ChatLine {
+            sequence: self.sequence,
+            tick,
+            identity: self.identity,
+            name: self.name.clone(),
+            text: self.text.clone(),
+        }
+    }
+}
 impl Presence {
+    pub(crate) fn set_chat_frontier(&mut self, frontier: u64) {
+        self.sequence = frontier;
+    }
+    pub(crate) fn identities(&self) -> impl Iterator<Item = PlayerId> + '_ {
+        self.peers.keys().copied()
+    }
     pub fn new(nonce_seed: u64) -> Self {
         Self {
             peers: BTreeMap::new(),

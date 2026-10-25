@@ -89,20 +89,14 @@ fn identity(key: &str) -> Result<(PlayerId, Option<SecretToken>), JsValue> {
         let mut fields = text.split(':');
         if let Some(id) = fields.next().and_then(unhex::<16>) {
             let credential = fields.next().and_then(unhex::<32>).map(SecretToken::new);
-            if fields.next().is_none() {
+            if fields.next().is_none() && credential.is_some() {
                 return Ok((PlayerId(id), credential));
             }
         }
     }
-    let mut id = [0u8; 16];
-    web_sys::window()
-        .ok_or_else(|| error("Window unavailable"))?
-        .crypto()?
-        .get_random_values_with_u8_array(&mut id)?;
-    if let Some(storage) = storage() {
-        let _ = storage.set_item(key, &hex(&id));
-    }
-    Ok((PlayerId(id), None))
+    // The authority creates new identities. A nonzero ID without its credential
+    // would request an unauthorized resume rather than a new player.
+    Ok((PlayerId::default(), None))
 }
 impl BrowserSocket {
     pub fn connect(address: &str, name: &str, now_ms: u64) -> Result<Self, JsValue> {
@@ -203,6 +197,9 @@ impl BrowserSocket {
             self.session.receive_frame(&bytes, now_ms)?;
         }
         self.session.pump(view, now_ms)?;
+        if let Some(welcome) = self.session.connection().welcome() {
+            self.identity = welcome.identity;
+        }
         if let Some(credential) = self.session.connection().credential() {
             let bytes = *credential.as_bytes();
             if self.saved_credential != Some(bytes) {

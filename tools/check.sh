@@ -42,6 +42,7 @@ run_check 'Native/WASM determinism' bash tools/check_determinism.sh
 run_check 'Web Worker SAB/transfer' node crates/jobs/tests/browser_smoke.mjs
 run_check 'WebGPU sky pixels' node tools/web_smoke.mjs
 run_check 'WebGPU forest and movement' node tools/terrain_smoke.mjs
+run_check 'Player edits, completed frames and image equality' node tools/player_smoke.mjs
 if ! command -v cargo-deny >/dev/null 2>&1 || [[ "$(cargo deny --version)" != 'cargo-deny 0.18.4' ]]; then
   CARGO_TARGET_DIR="$root/.local/tool-targets/cargo-deny" \
     cargo install cargo-deny --version '=0.18.4' --locked

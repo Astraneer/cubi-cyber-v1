@@ -7,6 +7,7 @@ struct Entity{position:vec3<f32>,yaw:f32,angles:vec4<f32>,codes:vec4<u32>,id_hig
 @group(0) @binding(4)var mob_faces:texture_2d_array<f32>;
 @group(0) @binding(5)var texels:sampler;
 @group(0) @binding(6)var block_faces:texture_2d_array<f32>;
+@group(0) @binding(7)var item_faces:texture_2d_array<f32>;
 // SHADOWS
 fn rx(p:vec3<f32>,a:f32)->vec3<f32>{let c=cos(a);let s=sin(a);return vec3(p.x,p.y*c-p.z*s,p.y*s+p.z*c);}
 fn ry(p:vec3<f32>,a:f32)->vec3<f32>{let c=cos(a);let s=sin(a);return vec3(p.x*c+p.z*s,p.y,-p.x*s+p.z*c);}
@@ -25,5 +26,5 @@ struct VertexOut{@builtin(position)position:vec4<f32>,@location(0)normal:vec3<f3
 }
 fn illumination(world:vec3<f32>,normal:vec3<f32>,light:vec4<f32>)->vec3<f32>{// ILLUMINATION
 }
-@fragment fn fragment(input:VertexOut)->@location(0)vec4<f32>{let du=dpdx(input.uv);let dv=dpdy(input.uv);var texel:vec4<f32>;if input.kind<6u{texel=textureSampleGrad(mob_faces,texels,input.uv,i32(input.layer),du,dv);}else{texel=textureSampleGrad(block_faces,texels,input.uv,i32(input.layer),du,dv);}if texel.a<0.001{discard;}var color=texel.rgb*input.tint;if input.kind==5u&&(input.part_flags&2u)!=0u&&color.g>color.r*1.3&&color.g>color.b*1.3{color=vec3(0.72,0.48,0.34)*(0.6+color.g*1.8);}color*=illumination(input.world,normalize(input.normal),input.light);if (input.flags&20u)!=0u{color=mix(color,vec3(1.,0.08,0.05),0.6);}if (input.flags&8u)!=0u{color+=vec3(0.2,0.03,0.);}return vec4(color,texel.a);}
-@fragment fn shadow_fragment(input:VertexOut){let du=dpdx(input.uv);let dv=dpdy(input.uv);var alpha:f32;if input.kind<6u{alpha=textureSampleGrad(mob_faces,texels,input.uv,i32(input.layer),du,dv).a;}else{alpha=textureSampleGrad(block_faces,texels,input.uv,i32(input.layer),du,dv).a;}if alpha<0.5{discard;}}
+@fragment fn fragment(input:VertexOut)->@location(0)vec4<f32>{let du=dpdx(input.uv);let dv=dpdy(input.uv);var texel:vec4<f32>;if input.kind<6u{texel=textureSampleGrad(mob_faces,texels,input.uv,i32(input.layer),du,dv);}else if input.kind==6u{texel=textureSampleGrad(block_faces,texels,input.uv,i32(input.layer),du,dv);}else{texel=textureSampleGrad(item_faces,texels,input.uv,i32(input.layer),du,dv);}if texel.a<0.001{discard;}var color=texel.rgb*input.tint;if input.kind==5u&&(input.part_flags&2u)!=0u&&color.g>color.r*1.3&&color.g>color.b*1.3{color=vec3(0.72,0.48,0.34)*(0.6+color.g*1.8);}color*=illumination(input.world,normalize(input.normal),input.light);if (input.flags&20u)!=0u{color=mix(color,vec3(1.,0.08,0.05),0.6);}if (input.flags&8u)!=0u{color+=vec3(0.2,0.03,0.);}return vec4(color,texel.a);}
+@fragment fn shadow_fragment(input:VertexOut){let du=dpdx(input.uv);let dv=dpdy(input.uv);var alpha:f32;if input.kind<6u{alpha=textureSampleGrad(mob_faces,texels,input.uv,i32(input.layer),du,dv).a;}else if input.kind==6u{alpha=textureSampleGrad(block_faces,texels,input.uv,i32(input.layer),du,dv).a;}else{alpha=textureSampleGrad(item_faces,texels,input.uv,i32(input.layer),du,dv).a;}if alpha<0.5{discard;}}

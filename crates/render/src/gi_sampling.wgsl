@@ -15,7 +15,9 @@ fn reflected_irradiance(world_position:vec3<f32>,world_normal:vec3<f32>)->vec3<f
     for(var corner=0u;corner<8u;corner++) {
         let offset=vec3<i32>(i32(corner&1u),i32((corner>>1u)&1u),i32((corner>>2u)&1u));
         let cell=low+offset;if any(cell<vec3(0))||any(vec3<u32>(cell)>=gi_params.probe_counts.xyz){continue;}
-        let p=vec3<u32>(cell);let index=p.x+gi_params.probe_counts.x*(p.z+gi_params.probe_counts.z*p.y);let probe=gi_probes[index];
+        let counts=gi_params.probe_counts.xyz;let ring_index=gi_params.probe_counts.w;
+        let ring=vec3(ring_index%counts.x,ring_index/(counts.x*counts.z),ring_index/counts.x%counts.z);
+        let p=(vec3<u32>(cell)+ring)%counts;let index=p.x+counts.x*(p.z+counts.z*p.y);let probe=gi_probes[index];
         if probe.stamps.z==0u{continue;}
         let delta=query-probe.position.xyz;
         let bound=vec3(select(probe.visibility_a.x,probe.visibility_a.y,delta.x>=0.0),select(probe.visibility_a.z,probe.visibility_a.w,delta.y>=0.0),select(probe.visibility_b.x,probe.visibility_b.y,delta.z>=0.0));

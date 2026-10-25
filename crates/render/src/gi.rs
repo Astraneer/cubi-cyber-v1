@@ -89,6 +89,13 @@ pub struct GiWork {
     pub pending_probes: u32,
     pub passes: u32,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GiScrollWork {
+    pub recycled_probes: u32,
+    pub retained_probes: u32,
+    pub cleared_pages: u32,
+    pub upload_bytes: u64,
+}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct ProbeSample {
@@ -165,6 +172,39 @@ pub struct GiGpu {
     dirty: u32,
     timer: crate::gpu_time::GpuPassTimer<2>,
 }
+fn grid_coordinate(index: usize, counts: [u32; 3]) -> [u32; 3] {
+    let index = index as u32;
+    [
+        index % counts[0],
+        index / (counts[0] * counts[2]),
+        index / counts[0] % counts[2],
+    ]
+}
+fn grid_index(coordinate: [u32; 3], counts: [u32; 3]) -> u32 {
+    coordinate[0] + counts[0] * (coordinate[2] + counts[2] * coordinate[1])
+}
+fn ring_index(coordinate: [u32; 3], counts: [u32; 3], ring: u32) -> usize {
+    let offset = grid_coordinate(ring as usize, counts);
+    grid_index(
+        std::array::from_fn(|axis| (coordinate[axis] + offset[axis]) % counts[axis]),
+        counts,
+    ) as usize
+}
+fn shift_ring(ring: u32, counts: [u32; 3], delta: [i64; 3]) -> u32 {
+    let prior = grid_coordinate(ring as usize, counts);
+    grid_index(
+        std::array::from_fn(|axis| {
+            (i64::from(prior[axis]) + delta[axis]).rem_euclid(i64::from(counts[axis])) as u32
+        }),
+        counts,
+    )
+}
+fn overlaps(coordinate: [u32; 3], delta: [i64; 3], counts: [u32; 3]) -> bool {
+    (0..3).all(|axis| {
+        (0..i64::from(counts[axis])).contains(&(i64::from(coordinate[axis]) + delta[axis]))
+    })
+}
+
 fn buffer_entry(binding: u32, uniform: bool, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -245,7 +285,7 @@ impl GiGpu {
                 config.probe_counts[0],
                 config.probe_counts[1],
                 config.probe_counts[2],
-                probe_count,
+                0, // Physical ring origin, encoded as a linear grid index.
             ],
             world_origin: [
                 config.world_origin_page[0],
@@ -257,7 +297,7 @@ impl GiGpu {
                 config.world_pages[0],
                 config.world_pages[1],
                 config.world_pages[2],
-                page_count,
+                0, // Physical brick-ring origin.
             ],
             trace: [config.max_distance, 0.0, 0.0, 0.0],
             stamps: [0, config.max_steps, config.max_jobs, 0],
@@ -395,6 +435,195 @@ impl GiGpu {
     pub fn probe_count(&self) -> usize {
         self.metadata.len()
     }
+    pub fn probe_position(&self, slot: usize) -> Option<[f32; 3]> {
+        self.metadata.get(slot).map(|probe| probe.position)
+    }
+    /// Logical grid coordinates map to stable physical slots until recycled.
+    pub fn probe_slot(&self, coordinate: [u32; 3]) -> Option<usize> {
+        coordinate
+            .iter()
+            .enumerate()
+            .all(|(axis, &v)| v < self.config.probe_counts[axis])
+            .then(|| {
+                ring_index(
+                    coordinate,
+                    self.config.probe_counts,
+                    self.parameters.probe_counts[3],
+                )
+            })
+    }
+
+    /// Scroll the source AOI and probe lattice without moving overlapping GPU data.
+    /// `probe_shift` is an integer number of spacings, independent of page motion.
+    /// Entering bricks become Unknown before any new traces; entering probes lose
+    /// validity and advance generation. The complete upload is preflighted.
+    pub fn recenter(
+        &mut self,
+        queue: &wgpu::Queue,
+        world_origin_page: [i32; 3],
+        probe_shift: [i32; 3],
+        tick: u64,
+        budget: &mut UploadBudget,
+    ) -> Result<GiScrollWork, GiError> {
+        if world_origin_page == self.config.world_origin_page && probe_shift == [0; 3] {
+            return Ok(GiScrollWork {
+                retained_probes: self.metadata.len() as u32,
+                ..GiScrollWork::default()
+            });
+        }
+        let origin = std::array::from_fn::<_, 3, _>(|axis| {
+            self.config.probe_origin[axis] + probe_shift[axis] as f32 * self.config.probe_spacing
+        });
+        if origin
+            .iter()
+            .any(|v| !v.is_finite() || v.abs() > 1_000_000.)
+        {
+            return Err(GiError::InvalidConfig);
+        }
+        let revision = self.parameters.stamps[0]
+            .checked_add(1)
+            .ok_or(GiError::Capacity)?;
+        let delta = std::array::from_fn::<_, 3, _>(|axis| {
+            i64::from(world_origin_page[axis]) - i64::from(self.config.world_origin_page[axis])
+        });
+        let world_ring = shift_ring(
+            self.parameters.world_counts[3],
+            self.config.world_pages,
+            delta,
+        );
+        let probe_ring = shift_ring(
+            self.parameters.probe_counts[3],
+            self.config.probe_counts,
+            probe_shift.map(i64::from),
+        );
+        let mut work = GiScrollWork::default();
+        for index in 0..self.metadata.len() {
+            let coordinate = grid_coordinate(index, self.config.probe_counts);
+            if !overlaps(
+                coordinate,
+                probe_shift.map(i64::from),
+                self.config.probe_counts,
+            ) {
+                let slot = ring_index(coordinate, self.config.probe_counts, probe_ring);
+                self.metadata[slot]
+                    .generation
+                    .checked_add(1)
+                    .ok_or(GiError::Capacity)?;
+                work.recycled_probes += 1;
+            }
+        }
+        for index in 0..self.page_versions.len() {
+            if !overlaps(
+                grid_coordinate(index, self.config.world_pages),
+                delta,
+                self.config.world_pages,
+            ) {
+                work.cleared_pages += 1;
+            }
+        }
+        work.retained_probes = self.metadata.len() as u32 - work.recycled_probes;
+        work.upload_bytes =
+            96 + u64::from(work.recycled_probes) * 128 + u64::from(work.cleared_pages) * 4096 * 4;
+        if budget.remaining_bytes < work.upload_bytes {
+            return Err(GiError::UploadBudget);
+        }
+        // A source revision can invalidate a previously encoded job even when
+        // its probe lies outside the changed page's influence. Requeue it.
+        self.invalidate_queued_jobs(tick);
+        for index in 0..self.page_versions.len() {
+            let coordinate = grid_coordinate(index, self.config.world_pages);
+            if !overlaps(coordinate, delta, self.config.world_pages) {
+                let slot = ring_index(coordinate, self.config.world_pages, world_ring);
+                self.page_staging.fill(0);
+                queue.write_buffer(
+                    &self.world,
+                    slot as u64 * 4096 * 4,
+                    bytemuck::cast_slice(&*self.page_staging),
+                );
+                self.page_versions[slot] = None;
+            }
+        }
+        for index in 0..self.metadata.len() {
+            let coordinate = grid_coordinate(index, self.config.probe_counts);
+            if !overlaps(
+                coordinate,
+                probe_shift.map(i64::from),
+                self.config.probe_counts,
+            ) {
+                let slot = ring_index(coordinate, self.config.probe_counts, probe_ring);
+                let prior = &self.metadata[slot];
+                let generation = prior.generation + 1;
+                let position = std::array::from_fn(|axis| {
+                    origin[axis] + coordinate[axis] as f32 * self.config.probe_spacing
+                });
+                if !prior.dirty {
+                    self.dirty += 1;
+                }
+                self.metadata[slot] = ProbeMeta {
+                    position,
+                    generation,
+                    dirty: true,
+                    visible: false,
+                    edited: false,
+                    dirty_since: tick,
+                };
+                let sample = ProbeSample {
+                    position: [
+                        position[0],
+                        position[1],
+                        position[2],
+                        self.config.probe_spacing,
+                    ],
+                    stamps: [generation, revision, 0, 0],
+                    ..ProbeSample::zeroed()
+                };
+                queue.write_buffer(&self.probes, slot as u64 * 128, bytemuck::bytes_of(&sample));
+            }
+        }
+        // Cached probes may have seen the entering/leaving slices. Keep their
+        // result until bounded recomputation; only affected probes become dirty.
+        for index in 0..self.page_versions.len() {
+            let coordinate = grid_coordinate(index, self.config.world_pages);
+            if !overlaps(coordinate, delta, self.config.world_pages) {
+                self.mark_page(
+                    std::array::from_fn(|axis| {
+                        (i64::from(world_origin_page[axis]) + i64::from(coordinate[axis])) as i32
+                    }),
+                    tick,
+                );
+            }
+            if !overlaps(coordinate, delta.map(|v| -v), self.config.world_pages) {
+                self.mark_page(
+                    std::array::from_fn(|axis| {
+                        (i64::from(self.config.world_origin_page[axis])
+                            + i64::from(coordinate[axis])) as i32
+                    }),
+                    tick,
+                );
+            }
+        }
+        self.config.world_origin_page = world_origin_page;
+        self.config.probe_origin = origin;
+        self.parameters.world_origin[..3].copy_from_slice(&world_origin_page);
+        self.parameters.origin_spacing[..3].copy_from_slice(&origin);
+        self.parameters.world_counts[3] = world_ring;
+        self.parameters.probe_counts[3] = probe_ring;
+        self.parameters.stamps[0] = revision;
+        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&self.parameters));
+        budget.remaining_bytes -= work.upload_bytes;
+        Ok(work)
+    }
+    fn invalidate_queued_jobs(&mut self, tick: u64) {
+        for job in &self.jobs {
+            let probe = &mut self.metadata[job.slot as usize];
+            if job.generation == probe.generation && !probe.dirty {
+                probe.dirty = true;
+                probe.dirty_since = tick;
+                self.dirty += 1;
+            }
+        }
+        self.jobs.clear();
+    }
     pub fn set_visible(&mut self, index: usize, visible: bool) -> Result<(), GiError> {
         self.metadata
             .get_mut(index)
@@ -434,10 +663,16 @@ impl GiGpu {
         {
             return Err(GiError::InvalidPage);
         }
-        Ok((coordinate[0]
-            + i64::from(self.config.world_pages[0])
-                * (coordinate[2] + i64::from(self.config.world_pages[2]) * coordinate[1]))
-            as usize)
+        Ok(ring_index(
+            coordinate.map(|v| v as u32),
+            self.config.world_pages,
+            self.parameters.world_counts[3],
+        ))
+    }
+    /// Identity of the source currently occupying this world page's ring slot.
+    /// A recycled/Unknown slot is None even if a CPU producer still caches it.
+    pub fn source_page_version(&self, page: [i32; 3]) -> Result<Option<u64>, GiError> {
+        Ok(self.page_versions[self.page_index(page)?])
     }
     fn mark_page(&mut self, page: [i32; 3], tick: u64) {
         let low = page.map(|v| v as f32 * 16.0);
@@ -486,6 +721,7 @@ impl GiGpu {
         if budget.remaining_bytes < 4096 * 4 + 96 {
             return Err(GiError::UploadBudget);
         }
+        self.invalidate_queued_jobs(tick);
         queue.write_buffer(
             &self.world,
             index as u64 * 4096 * 4,
@@ -532,6 +768,7 @@ impl GiGpu {
         if budget.remaining_bytes < bytes {
             return Err(GiError::UploadBudget);
         }
+        self.invalidate_queued_jobs(tick);
         for (word, update) in self.page_staging.iter_mut().zip(updates) {
             *word = update.value.0;
         }

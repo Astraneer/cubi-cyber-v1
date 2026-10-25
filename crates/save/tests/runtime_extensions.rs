@@ -97,6 +97,8 @@ fn inventory_window_and_runtime_roundtrip_preserve_cursor_context_bytes() {
         record(RUNTIME_MOBS),
         record(RUNTIME_ITEMS),
         record(RUNTIME_MACHINES),
+        record(RUNTIME_HEIGHT),
+        record(RUNTIME_CHAT),
     ];
     let current = encode_batch(&batch).unwrap();
     assert!(current.starts_with(&legacy));
@@ -141,7 +143,7 @@ fn window_works_without_inventory_and_rejects_oversize_duplicate_or_wrong_owner(
 }
 #[test]
 fn runtime_unknown_duplicate_empty_count_and_payload_bounds_rejected() {
-    for kinds in [vec![0], vec![5], vec![1, 1], vec![1, 2, 3, 4, 4]] {
+    for kinds in [vec![0], vec![7], vec![1, 1], vec![1, 2, 3, 4, 4]] {
         let mut batch = Batch::empty(Tick(1));
         batch.runtimes = kinds.into_iter().map(record).collect();
         assert!(encode_batch(&batch).is_err());
@@ -155,7 +157,7 @@ fn runtime_unknown_duplicate_empty_count_and_payload_bounds_rejected() {
     batch.runtimes[0].payload = vec![0; MAX_RUNTIME_BYTES + 1];
     assert!(matches!(encode_batch(&batch), Err(SaveError::Bounds(_))));
     let prefix = encode_batch(&Batch::empty(Tick(1))).unwrap();
-    for (kind, length) in [(0, 1), (5, 1), (1, MAX_RUNTIME_BYTES + 1)] {
+    for (kind, length) in [(0, 1), (7, 1), (1, MAX_RUNTIME_BYTES + 1)] {
         let mut bytes = prefix.clone();
         bytes.extend_from_slice(b"RUN1");
         bytes.extend_from_slice(&1u32.to_le_bytes());

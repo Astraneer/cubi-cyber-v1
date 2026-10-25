@@ -35,6 +35,20 @@ pub struct Bufs {
     pub b: Vec<Aabb>,
     pub candidates: Vec<f32>,
 }
+impl Bufs {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            a: Vec::new(),
+            b: Vec::new(),
+            candidates: Vec::new(),
+        }
+    }
+    pub(crate) fn clear(&mut self) {
+        self.a.clear();
+        self.b.clear();
+        self.candidates.clear();
+    }
+}
 
 impl Default for Bufs {
     fn default() -> Self {

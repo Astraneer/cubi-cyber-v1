@@ -3,12 +3,20 @@
 #![forbid(unsafe_code)]
 
 mod actor;
+pub mod block_loot;
+mod chat;
 pub mod entities;
 mod geometry;
 pub mod lod;
+pub mod machines;
+pub mod presence;
+mod runtime;
 pub mod survival;
 pub mod transport;
+pub mod ui;
 mod visibility;
+mod window_owner;
+pub mod windows;
 
 use core_types::{BlockPos, Cell, PageId, SpaceId, Tick, TxId, Version};
 use net::{
@@ -117,6 +125,23 @@ pub struct ServerCounters {
     pub geometry_cells: u64,
     pub geometry_tint_samples: u64,
     pub geometry_held_peak: usize,
+    pub items_imported: u64,
+    pub item_steps: u64,
+    pub item_pickups: u64,
+    pub entity_frames: u64,
+    pub entity_poses: u64,
+    pub entity_buckets: u64,
+    pub entity_overflows: u64,
+    pub survival_events: u64,
+    pub survival_reads: u64,
+    pub survival_writes: u64,
+    pub survival_wake_reads: u64,
+    pub random_tick_sections: u64,
+    pub random_tick_reads: u64,
+    pub machine_events: u64,
+    pub machine_steps: u64,
+    pub machine_reads: u64,
+    pub machine_transfers: u64,
 }
 struct MiningAction {
     id: ActionId,
@@ -132,6 +157,10 @@ struct Peer {
     welcome: Welcome,
     player: Player,
     inventory: rules::survival::Inventory,
+    health: rules::survival::health::Health,
+    combat: rules::entities::combat::CombatStatus,
+    window: windows::BoundWindow,
+    window_sent: Option<window_owner::Stamp>,
     inventory_sent: Option<u64>,
     space: SpaceId,
     input_sequence: u64,
@@ -152,12 +181,16 @@ struct Peer {
     geometry_subscriptions: BTreeMap<PageId, Version>,
     geometry_view: u64,
     last_view_position: [f64; 3],
+    roster_revision: Option<u64>,
+    entities: Option<entities::replication::EntityHistory>,
 }
 struct Pending {
     ticket: u64,
     outgoing: Vec<Outgoing>,
     changes: Vec<WorldChange>,
     checkpoint: bool,
+    runtimes: Vec<save::RuntimeRecord>,
+    chats: Vec<presence::ChatReservation>,
 }
 type ColumnPool = jobs::NativePool<(i32, i32), r#gen::GeneratedColumn>;
 struct Generation {
@@ -190,6 +223,11 @@ pub struct Server {
     recent_changes: VecDeque<WorldChange>,
     drop_seed: u64,
     authoritative_transactions: VecDeque<Transaction>,
+    runtimes: runtime::Runtimes,
+    presence: presence::Presence,
+    staged_chats: Vec<presence::ChatReservation>,
+    now_ms: u64,
+    recipe_book: rules::crafting::RecipeBook,
 }
 
 impl Server {
@@ -224,6 +262,7 @@ impl Server {
                 .try_into()
                 .expect("hash prefix"),
         );
+        let mut runtimes = runtime::Runtimes::new(&entropy)?;
         let mut identities = BTreeMap::new();
         let mut players = BTreeMap::new();
         let mut dedup = BTreeMap::new();
@@ -236,6 +275,7 @@ impl Server {
                 net::RULES_VERSION,
                 None,
             )?;
+            runtimes.restore(&snapshot.runtimes)?;
             public_seed = snapshot.public_seed;
             tick = snapshot.server_tick;
             identities.extend(snapshot.identities.into_iter().map(|i| (i.id, i)));
@@ -248,6 +288,7 @@ impl Server {
             initial_world
         };
         for (_, batch) in recovery.batches {
+            runtimes.replay(&batch.runtimes)?;
             for change in batch.changes {
                 world
                     .apply_recovered_change(&change)
@@ -276,6 +317,7 @@ impl Server {
             actor::restore(saved, allow_debug).map_err(ServerError::Invalid)?;
         }
         tick = Tick(tick.0.max(world.tick().0));
+        runtimes.bootstrap_drops(&world)?;
         // Fresh baselines, including fixture worlds, are saved before the first WAL
         // record. This also ensures private world bytes are never regenerated on load.
         if store.last_sequence() == 0 {
@@ -289,7 +331,7 @@ impl Server {
                 identities: identities.values().cloned().collect(),
                 players: players.values().cloned().collect(),
                 dedup: dedup.iter().map(|(id, d)| (*id, d.clone())).collect(),
-                runtimes: Vec::new(),
+                runtimes: runtimes.snapshots()?,
             })?;
         }
         let generator = std::sync::Arc::new(gen_authority::ServerGenerator::new(
@@ -347,6 +389,10 @@ impl Server {
             identities.insert(identity.id, identity);
         }
         let writer = SaveWorker::spawn(store, 2)?;
+        // Public ping nonces use independent entropy, never a reversible PRNG
+        // seeded by private loot/world generation state.
+        let mut presence = presence::Presence::new(u64::from_le_bytes(random::<8>()?));
+        presence.set_chat_frontier(runtimes.chat.frontier());
         Ok(Self {
             config,
             world,
@@ -369,10 +415,19 @@ impl Server {
             recent_changes: VecDeque::new(),
             drop_seed,
             authoritative_transactions: VecDeque::new(),
+            runtimes,
+            presence,
+            staged_chats: Vec::new(),
+            now_ms: 0,
+            recipe_book: rules::crafting::RecipeBook::standard()
+                .map_err(|_| ServerError::Invalid("standard crafting recipes"))?,
         })
     }
     pub fn world(&self) -> &World {
         &self.world
+    }
+    pub fn item_entities(&self) -> &rules::entities::item::ItemStore {
+        self.runtimes.items.entities()
     }
     pub fn current_tick(&self) -> Tick {
         self.tick
@@ -423,13 +478,23 @@ impl Server {
         self.tick(now_ms)
     }
     pub fn tick(&mut self, now_ms: u64) -> Vec<Outgoing> {
+        self.now_ms = self.now_ms.max(now_ms);
         let mut output = self.finish_durability();
+        output.extend(self.publish_presence());
         if self.failed {
             return output;
         }
         if self.pending.is_some() {
             self.counters.storage_stalls += 1;
             return output;
+        }
+        match self.import_items() {
+            Ok(true) => return output,
+            Ok(false) => {}
+            Err(_) => {
+                self.failed = true;
+                return output;
+            }
         }
         if self.tick.0.saturating_sub(self.last_checkpoint_tick) >= 200 && self.request_checkpoint()
         {
@@ -501,6 +566,20 @@ impl Server {
                         self.counters.input_steps += 1;
                     }
                 }
+                if !outcome.waiting_for_world {
+                    let position = BlockPos {
+                        space: peer.space,
+                        x: peer.player.pos[0].floor() as i32,
+                        y: peer.player.pos[1].floor() as i32,
+                        z: peer.player.pos[2].floor() as i32,
+                    };
+                    let inside_spawn = peer.space == SpaceId(0)
+                        && self.protected([position.x, position.y, position.z], Role::Player);
+                    if runtime::tick_health(&mut peer, outcome.fall_damage, inside_spawn).is_err() {
+                        self.failed = true;
+                        return output;
+                    }
+                }
                 // An absent sequence never becomes an invented movement input.
                 // Reliable redundant input history eventually fills loss gaps.
                 while self.dedup.get(&peer.identity).is_some_and(|d| {
@@ -530,17 +609,35 @@ impl Server {
                     );
                 }
                 self.advance_mining(connection, &mut peer, &mut batch, &mut deferred);
-                let mut saved =
-                    actor::capture(peer.identity, peer.space, peer.input_sequence, &peer.player);
-                saved.place_ready_at = peer.place_ready_at;
-                saved.break_ready_at = peer.break_ready_at;
-                saved.inventory = peer.inventory.encode().to_vec();
+                if self.maintain_window(&mut peer, &mut batch).is_err() {
+                    self.failed = true;
+                    return output;
+                }
+                let saved = match runtime::capture_peer(&peer) {
+                    Ok(saved) => saved,
+                    Err(_) => {
+                        self.failed = true;
+                        return output;
+                    }
+                };
                 self.saved_players.insert(peer.identity, saved.clone());
                 batch.players.push(saved);
             }
             if !self.identities[&peer.identity].banned {
                 self.peers.insert(connection, peer);
             }
+        }
+        if self.tick_machines(&mut batch).is_err() {
+            self.failed = true;
+            return output;
+        }
+        if self.tick_survival(&mut batch).is_err() {
+            self.failed = true;
+            return output;
+        }
+        if self.tick_items(&mut batch).is_err() {
+            self.failed = true;
+            return output;
         }
         if !batch.is_empty() {
             self.submit_batch(batch, deferred);
@@ -567,6 +664,12 @@ impl Server {
             }
             if pending.checkpoint {
                 continue;
+            }
+            if self.runtimes.replay(&pending.runtimes).is_err()
+                || self.runtimes.committed_changes(&pending.changes).is_err()
+            {
+                self.failed = true;
+                break;
             }
             self.counters.durable_batches += 1;
             if !pending.changes.is_empty() {
@@ -604,6 +707,41 @@ impl Server {
                     peer.ready = true;
                 }
             }
+            if self.synchronize_presence().is_err() {
+                self.failed = true;
+                break;
+            }
+            // Bootstrap must precede authenticated/public session frames on
+            // UDP as well as WebSocket, including replayed chat history.
+            for welcome in pending
+                .outgoing
+                .iter()
+                .filter(|o| matches!(o.message, ServerMessage::Welcome(_)))
+            {
+                output.push(welcome.clone());
+            }
+            for permit in pending.chats {
+                let event = self.presence.publish_chat(permit, self.tick);
+                output.extend(
+                    self.peers.iter().filter(|(_, p)| p.ready).map(|(c, _)| {
+                        Outgoing::reliable(*c, ServerMessage::Presence(event.clone()))
+                    }),
+                );
+            }
+            for welcome in pending
+                .outgoing
+                .iter()
+                .filter(|o| matches!(o.message, ServerMessage::Welcome(_)))
+            {
+                output.extend(self.runtimes.chat.rows().map(|e| {
+                    Outgoing::reliable(
+                        welcome.connection,
+                        ServerMessage::Presence(net::presence::PresenceServerEvent::Chat(
+                            e.line.clone(),
+                        )),
+                    )
+                }));
+            }
             let mut changed_spaces = BTreeSet::new();
             for change in pending.changes {
                 self.counters.committed_transactions += 1;
@@ -629,7 +767,12 @@ impl Server {
                     }));
                 }
             }
-            output.extend(pending.outgoing);
+            output.extend(
+                pending
+                    .outgoing
+                    .into_iter()
+                    .filter(|o| !matches!(o.message, ServerMessage::Welcome(_))),
+            );
             let players: Vec<_> = self
                 .peers
                 .values()
@@ -677,6 +820,8 @@ impl Server {
                 }
             }
             output.extend(self.publish_pages());
+            output.extend(self.publish_entities());
+            output.extend(self.publish_windows());
         }
         output
     }
@@ -684,11 +829,16 @@ impl Server {
         let ticket = self.next_ticket;
         self.next_ticket += 1;
         let changes = batch.changes.clone();
+        let runtimes = batch.runtimes.clone();
+        let chats = std::mem::take(&mut self.staged_chats);
         if self
             .writer
             .try_submit(WriteRequest::Batch { ticket, batch })
             .is_err()
         {
+            for permit in chats {
+                self.presence.cancel_chat(permit);
+            }
             self.failed = true;
             return;
         }
@@ -697,6 +847,8 @@ impl Server {
             outgoing,
             changes,
             checkpoint: false,
+            runtimes,
+            chats,
         });
     }
     pub fn request_checkpoint(&mut self) -> bool {
@@ -705,6 +857,13 @@ impl Server {
         }
         let ticket = self.next_ticket;
         self.next_ticket += 1;
+        let runtimes = match self.runtimes.snapshots() {
+            Ok(records) => records,
+            Err(_) => {
+                self.failed = true;
+                return false;
+            }
+        };
         let metadata = SnapshotMetadata {
             server_tick: self.tick,
             public_seed: self.config.public_seed,
@@ -713,7 +872,7 @@ impl Server {
             identities: self.identities.values().cloned().collect(),
             players: self.saved_players.values().cloned().collect(),
             dedup: self.dedup.iter().map(|(id, d)| (*id, d.clone())).collect(),
-            runtimes: Vec::new(),
+            runtimes,
         };
         if self
             .writer
@@ -731,6 +890,8 @@ impl Server {
             outgoing: Vec::new(),
             changes: Vec::new(),
             checkpoint: true,
+            runtimes: Vec::new(),
+            chats: Vec::new(),
         });
         self.last_checkpoint_tick = self.tick.0;
         true
@@ -782,6 +943,14 @@ impl Server {
             ClientMessage::Action { id, action } => {
                 let state = self.dedup.entry(peer.identity).or_default();
                 if let Some(reply) = state.replies.iter().find(|r| r.id == id) {
+                    if let Some(line) = self.runtimes.chat.get(peer.identity, id) {
+                        out.push(Outgoing::reliable(
+                            connection,
+                            ServerMessage::Presence(net::presence::PresenceServerEvent::Chat(
+                                line.clone(),
+                            )),
+                        ));
+                    }
                     out.push(Outgoing::reliable(
                         connection,
                         ServerMessage::Action(*reply),
@@ -860,6 +1029,25 @@ impl Server {
             ClientMessage::ForgetGeometry(page) => {
                 peer.geometry_subscriptions.remove(&page);
                 peer.geometry_requests.retain(|(p, _)| *p != page);
+            }
+            ClientMessage::Presence(event) => match event {
+                net::presence::PresenceClientEvent::Pong { nonce } => {
+                    let _ = self.presence.pong(peer.identity, nonce, self.now_ms);
+                }
+                net::presence::PresenceClientEvent::RosterRequest { known_revision } => {
+                    if let Some(event) = self.presence.roster_since(known_revision) {
+                        out.push(Outgoing::reliable(
+                            connection,
+                            ServerMessage::Presence(event),
+                        ));
+                    }
+                    peer.roster_revision = Some(self.presence.revision());
+                }
+            },
+            ClientMessage::Entities(request) => {
+                if let Some(history) = peer.entities.as_mut() {
+                    history.request(request);
+                }
             }
             ClientMessage::Ping(n) => {
                 out.push(Outgoing::reliable(connection, ServerMessage::Pong(n)))
@@ -971,16 +1159,21 @@ impl Server {
             ));
         }
         let allow_debug = self.config.server_debug && identity.role.can_admin();
-        let mut player = if let Some(saved) = self.saved_players.get(&identity.id) {
-            match actor::restore(saved, allow_debug) {
-                Ok(player) => player,
+        let (mut player, health, combat) = if let Some(saved) = self.saved_players.get(&identity.id)
+        {
+            match actor::restore_living(saved, allow_debug) {
+                Ok(living) => living,
                 Err(_) => {
                     self.failed = true;
                     return;
                 }
             }
         } else {
-            Player::new(self.spawn)
+            (
+                Player::new(self.spawn),
+                rules::survival::health::Health::new(),
+                rules::entities::combat::CombatStatus::default(),
+            )
         };
         if !allow_debug {
             player.revoke_debug_permission();
@@ -1036,7 +1229,26 @@ impl Server {
             .saved_players
             .get(&identity.id)
             .map_or(Tick(0), |s| s.break_ready_at);
-        let mut saved = actor::capture(identity.id, space, 0, &player);
+        let mut saved =
+            match actor::capture_living(identity.id, space, 0, &player, &health, &combat) {
+                Ok(saved) => saved,
+                Err(_) => {
+                    self.failed = true;
+                    return;
+                }
+            };
+        saved.window = self
+            .saved_players
+            .get(&identity.id)
+            .map_or_else(Vec::new, |s| s.window.clone());
+        let window = match window_owner::initial(&saved.window, &inventory) {
+            Ok(window) => window,
+            Err(_) => {
+                self.failed = true;
+                return;
+            }
+        };
+        saved.window = window.encode();
         saved.place_ready_at = place_ready_at;
         saved.break_ready_at = break_ready_at;
         saved.inventory = inventory.encode().to_vec();
@@ -1053,6 +1265,10 @@ impl Server {
                 welcome: welcome.clone(),
                 player,
                 inventory,
+                health,
+                combat,
+                window,
+                window_sent: None,
                 inventory_sent: None,
                 space,
                 input_sequence: 0,
@@ -1073,6 +1289,8 @@ impl Server {
                 geometry_subscriptions: BTreeMap::new(),
                 geometry_view: 0,
                 last_view_position: position,
+                roster_revision: None,
+                entities: None,
             },
         );
         out.push(Outgoing::reliable(
@@ -1227,7 +1445,9 @@ impl Server {
                             )
                         });
                     match prepared {
-                        Ok(tx) => match self.world.commit(tx) {
+                        Ok(mut tx) => match runtime::component_birth(&self.world, &mut tx, target)
+                            .and_then(|_| self.world.commit(tx).map_err(|_| RejectReason::Stale))
+                        {
                             Ok(change) => {
                                 transaction = Some(change.tx);
                                 if let CellRead::Known(actual) = self.world.read(target) {
@@ -1236,7 +1456,7 @@ impl Server {
                                 batch.changes.push(change);
                                 peer.place_ready_at = Tick(self.tick.0.saturating_add(4));
                             }
-                            Err(_) => status = ActionStatus::Rejected(RejectReason::Stale),
+                            Err(reason) => status = ActionStatus::Rejected(reason),
                         },
                         Err(error) => status = ActionStatus::Rejected(edit_reason(error)),
                     }
@@ -1359,6 +1579,16 @@ impl Server {
                 }
                 peer.interaction.mining.cancel();
             }
+            Action::Chat(text) => {
+                if let Err(reason) = self.queue_chat(peer, id, &text, batch) {
+                    status = ActionStatus::Rejected(reason)
+                }
+            }
+            Action::Window(intent) => {
+                if let Err(reason) = self.window_action(peer, id, intent, batch) {
+                    status = ActionStatus::Rejected(reason)
+                }
+            }
             Action::Command(command) => match self.command(peer, role, &command, batch, out) {
                 Ok(tx) => transaction = tx,
                 Err(reason) => status = ActionStatus::Rejected(reason),
@@ -1421,7 +1651,7 @@ impl Server {
             }
             self.precheck_edit(peer, position, Some(cell), role)
                 .map_err(edit_reason)?;
-            let tx = sim::prepare_edit(
+            let mut tx = sim::prepare_edit(
                 &self.world,
                 peer.space,
                 &peer.player,
@@ -1434,6 +1664,7 @@ impl Server {
                 |p| self.protected(p, role),
             )
             .map_err(edit_reason)?;
+            runtime::component_birth(&self.world, &mut tx, position)?;
             let change = self.world.commit(tx).map_err(|_| RejectReason::Stale)?;
             let transaction = change.tx;
             batch.changes.push(change);
@@ -1559,59 +1790,33 @@ impl Server {
                     );
                     return;
                 }
-                let mut inventory_after = peer.inventory;
-                if peer.player.mode == GameMode::Survival {
-                    let player_key = u64::from_le_bytes(
-                        blake3::hash(&peer.identity.0).as_bytes()[..8]
-                            .try_into()
-                            .expect("hash prefix"),
-                    );
-                    let mut rng = core_types::DeterministicRng::from_key(
-                        self.drop_seed,
-                        0x4d494e45,
-                        player_key,
-                        mining.id.0,
-                    );
-                    let plan = (|| {
-                        let plan =
-                            peer.inventory
-                                .plan_mine(mining.held, mining.expected, &mut rng)?;
-                        if !plan.drops.stacks().is_empty() {
-                            survival::plan_drops(
-                                &self.world,
-                                mining.position,
-                                peer.identity.0,
-                                mining.id.0,
-                                self.tick,
-                                plan.drops.stacks(),
-                                10,
+                let inventory_after = match runtime::prepare_break(
+                    &self.world,
+                    peer,
+                    &mining,
+                    self.drop_seed,
+                    &mut tx,
+                    self.tick,
+                ) {
+                    Ok(after) => after,
+                    Err(reason) => {
+                        self.terminal(
+                            connection,
+                            peer.identity,
+                            reply(
+                                mining.id,
+                                ActionStatus::Rejected(reason),
                                 None,
-                            )?
-                            .append_to(&mut tx);
-                        }
-                        Ok::<_, rules::survival::SurvivalError>(*plan.inventory.after())
-                    })();
-                    match plan {
-                        Ok(after) => inventory_after = after,
-                        Err(error) => {
-                            self.terminal(
-                                connection,
-                                peer.identity,
-                                reply(
-                                    mining.id,
-                                    ActionStatus::Rejected(survival_reason(error)),
-                                    None,
-                                    self.world.version(),
-                                    Some(mining.position),
-                                    None,
-                                ),
-                                batch,
-                                out,
-                            );
-                            return;
-                        }
+                                self.world.version(),
+                                Some(mining.position),
+                                None,
+                            ),
+                            batch,
+                            out,
+                        );
+                        return;
                     }
-                }
+                };
                 match self.world.commit(tx) {
                     Ok(change) => {
                         let tx = change.tx;
@@ -1824,11 +2029,8 @@ impl Server {
                     for target in self.peers.values_mut().filter(|p| p.identity == id) {
                         target.player.set_mode(GameMode::Survival);
                         target.player.revoke_debug_permission();
-                        let mut saved =
-                            actor::capture(id, target.space, target.input_sequence, &target.player);
-                        saved.place_ready_at = target.place_ready_at;
-                        saved.break_ready_at = target.break_ready_at;
-                        saved.inventory = target.inventory.encode().to_vec();
+                        let saved = runtime::capture_peer(target)
+                            .map_err(|_| RejectReason::StorageUnavailable)?;
                         self.saved_players.insert(id, saved.clone());
                         batch.players.retain(|p| p.state.identity != id);
                         batch.players.push(saved);

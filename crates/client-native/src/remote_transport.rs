@@ -122,6 +122,7 @@ fn run(
         .get_mut()
         .set_nonblocking(true)
         .map_err(|e| e.to_string())?;
+    let mut pending_incoming = None;
     while !stop.load(Ordering::Acquire) {
         for _ in 0..QUEUE {
             match rx.try_recv() {
@@ -139,11 +140,29 @@ fn run(
             Err(Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(e.to_string()),
         }
+        if let Some(frame) = pending_incoming.take() {
+            match tx.try_send(frame) {
+                Ok(()) => {}
+                Err(TrySendError::Full(frame)) => {
+                    pending_incoming = Some(frame);
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(TrySendError::Disconnected(_)) => return Ok(()),
+            }
+        }
         for _ in 0..QUEUE {
             match socket.read() {
-                Ok(Message::Binary(bytes)) => tx
-                    .try_send(Ok(bytes.to_vec()))
-                    .map_err(|_| "bounded WebSocket receive queue full")?,
+                Ok(Message::Binary(bytes)) => match tx.try_send(Ok(bytes.to_vec())) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(frame)) => {
+                        // Keep exactly one extra bounded frame; stop reading
+                        // TCP so shader/loading stalls apply backpressure.
+                        pending_incoming = Some(frame);
+                        break;
+                    }
+                    Err(TrySendError::Disconnected(_)) => return Ok(()),
+                },
                 Ok(Message::Close(_)) => return Err("server closed WebSocket".into()),
                 Ok(_) => {}
                 Err(Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => break,

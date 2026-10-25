@@ -42,13 +42,15 @@ struct VertexOut {
 fn vertex(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance: u32) -> VertexOut {
     let corner = vertex_id % 4u;
     let bucket = vertex_id / 4u;
-    let q = quads[visible[bucket * camera.params.y + instance]];
+    let entry=visible[bucket * camera.params.y + instance];
+    let unit_raster=(camera.params.z&2u)!=0u;
+    let q = quads[select(entry,entry>>8u,unit_raster)];
     let object = objects[q.w];
     let bits = q.x;
-    let origin = vec3<f32>(f32(bits & 31u), f32((bits >> 5u) & 31u), f32((bits >> 10u) & 31u));
+    var origin = vec3<f32>(f32(bits & 31u), f32((bits >> 5u) & 31u), f32((bits >> 10u) & 31u));
     let face = (bits >> 15u) & 7u;
-    let width = f32(((bits >> 18u) & 15u) + 1u);
-    let height = f32(((bits >> 22u) & 15u) + 1u);
+    var width = f32(((bits >> 18u) & 15u) + 1u);
+    var height = f32(((bits >> 22u) & 15u) + 1u);
     let tangent_u = array<vec3<f32>,6>(
         vec3(1.0,0.0,0.0), vec3(1.0,0.0,0.0), vec3(-1.0,0.0,0.0),
         vec3(1.0,0.0,0.0), vec3(0.0,0.0,1.0), vec3(0.0,0.0,-1.0));
@@ -58,6 +60,11 @@ fn vertex(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instan
     let normals = array<vec3<f32>,6>(
         vec3(0.0,-1.0,0.0), vec3(0.0,1.0,0.0), vec3(0.0,0.0,-1.0),
         vec3(0.0,0.0,1.0), vec3(-1.0,0.0,0.0), vec3(1.0,0.0,0.0));
+    if unit_raster {
+        let tile=entry&255u;let tile_u=tile%u32(width);let tile_v=tile/u32(width);
+        origin+=tangent_u[face]*f32(tile_u)+tangent_v[face]*f32(tile_v);
+        width=1.0;height=1.0;
+    }
     let uv = vec2<f32>(f32(corner & 1u) * width, f32(corner >> 1u) * height);
     var position = origin + tangent_u[face] * uv.x + tangent_v[face] * uv.y;
     var output: VertexOut;

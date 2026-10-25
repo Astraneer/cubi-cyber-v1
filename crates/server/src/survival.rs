@@ -1,6 +1,8 @@
 //! Detached survival phase planning. The single world owner persists the world
 //! transactions and RuntimeDelta, then calls acknowledge after WAL completion.
 //! No I/O, network publication, or world commits occur in this module.
+#[path = "survival/registration.rs"]
+mod registration;
 use core_types::{BlockPos, Cell, ChannelMask, ComponentId, SpaceId, Tick, Version};
 use rules::{
     ids::*,
@@ -22,6 +24,7 @@ pub enum Event {
     Fluid(BlockPos, Liquid),
     Furnace(ComponentId),
     Farm(BlockPos),
+    FarmSample(BlockPos, u64),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingEvent {
@@ -104,6 +107,7 @@ impl SurvivalRuntime {
         self.events.is_empty()
     }
     pub fn register(&mut self, event: Event, due: Tick) -> Result<bool, SurvivalError> {
+        validate_event(event)?;
         if self.keys.contains_key(&event) {
             return Ok(false);
         }
@@ -137,6 +141,7 @@ impl SurvivalRuntime {
     ) -> Result<RuntimeDelta, SurvivalError> {
         let mut pending = BTreeMap::new();
         for (event, due) in events {
+            validate_event(event)?;
             if !self.keys.contains_key(&event) {
                 schedule(&mut pending, event, due);
             }
@@ -250,6 +255,7 @@ impl SurvivalRuntime {
         runtime.next_order = snapshot.next_order;
         let mut orders = BTreeSet::new();
         for &event in &snapshot.events {
+            validate_event(event.event)?;
             if event.first_due > event.due
                 || event.order >= snapshot.next_order
                 || !orders.insert(event.order)
@@ -264,55 +270,7 @@ impl SurvivalRuntime {
     /// Apply only after the corresponding world transactions are durable. Exact
     /// revision guards reject duplicate or reordered WAL deltas without mutation.
     pub fn acknowledge(&mut self, delta: RuntimeDelta) -> Result<(), SurvivalError> {
-        if self.revision != delta.before
-            || delta.after
-                != delta
-                    .before
-                    .checked_add(1)
-                    .ok_or(SurvivalError::RevisionOverflow)?
-        {
-            return Err(SurvivalError::StalePlan);
-        }
-        let removed: BTreeSet<_> = delta.remove.iter().copied().collect();
-        if removed.len() != delta.remove.len()
-            || removed.iter().any(|key| !self.events.contains_key(key))
-            || self
-                .len()
-                .saturating_sub(removed.len())
-                .saturating_add(delta.add.len())
-                > self.capacity
-        {
-            return Err(SurvivalError::InvalidEncoding);
-        }
-        let mut seen = BTreeSet::new();
-        let mut orders = BTreeSet::new();
-        if delta.next_order < self.next_order {
-            return Err(SurvivalError::InvalidEncoding);
-        }
-        for event in &delta.add {
-            if !seen.insert(event.event)
-                || !orders.insert(event.order)
-                || event.first_due > event.due
-                || event.order >= delta.next_order
-                || self
-                    .keys
-                    .get(&event.event)
-                    .is_some_and(|key| !removed.contains(key))
-            {
-                return Err(SurvivalError::InvalidEncoding);
-            }
-            if event.order < self.next_order
-                && !removed.iter().any(|key| {
-                    self.events.get(key).is_some_and(|old| {
-                        old.event == event.event
-                            && old.order == event.order
-                            && old.first_due == event.first_due
-                    })
-                })
-            {
-                return Err(SurvivalError::InvalidEncoding);
-            }
-        }
+        self.validate_delta(&delta)?;
         for key in delta.remove {
             self.remove(key);
         }
@@ -350,7 +308,7 @@ impl SurvivalRuntime {
             let reserve = match event.event {
                 Event::Fluid(..) => 2048,
                 Event::Furnace(..) => 1,
-                Event::Farm(..) => 256,
+                Event::Farm(..) | Event::FarmSample(..) => 256,
             };
             let writes = match event.event {
                 Event::Fluid(..) => 48,
@@ -369,7 +327,7 @@ impl SurvivalRuntime {
                     stage.fluid_tick(position, now, &mut pending, &mut work)
                 }
                 Event::Furnace(id) => stage.furnace_tick(id, now, &mut pending, &mut work),
-                Event::Farm(position) => {
+                Event::Farm(position) | Event::FarmSample(position, _) => {
                     stage.farm_tick(position, now, event.order, &mut pending, &mut work)
                 }
             };
@@ -1094,6 +1052,11 @@ fn encode_event(event: PendingEvent) -> [u8; 48] {
             (1, None, None)
         }
         Event::Farm(position) => (2, Some(position), None),
+        Event::FarmSample(position, token) => {
+            debug_assert!(token <= FARM_SAMPLE_TOKEN_MAX);
+            bytes[41..48].copy_from_slice(&token.to_le_bytes()[..7]);
+            (3, Some(position), None)
+        }
     };
     bytes[24] = tag;
     if let Some(position) = position {
@@ -1145,6 +1108,11 @@ fn decode_event(bytes: &[u8]) -> Result<PendingEvent, SurvivalError> {
         ),
         1 => (Event::Furnace(ComponentId(read64(25))), 33),
         2 => (Event::Farm(position()), 41),
+        3 => {
+            let mut raw = [0; 8];
+            raw[..7].copy_from_slice(&bytes[41..48]);
+            (Event::FarmSample(position(), u64::from_le_bytes(raw)), 48)
+        }
         _ => return Err(SurvivalError::InvalidEncoding),
     };
     if bytes[reserved..].iter().any(|&value| value != 0) {
@@ -1156,4 +1124,22 @@ fn decode_event(bytes: &[u8]) -> Result<PendingEvent, SurvivalError> {
         order: read64(16),
         event,
     })
+}
+
+pub const FARM_SAMPLE_TOKEN_MAX: u64 = (1u64 << 56) - 1;
+pub fn farm_sample_token(now: Tick, ordinal: u16) -> Result<u64, SurvivalError> {
+    if ordinal >= 4096 {
+        return Err(SurvivalError::Capacity);
+    }
+    if now.0 > (FARM_SAMPLE_TOKEN_MAX >> 12) {
+        return Err(SurvivalError::RevisionOverflow);
+    }
+    Ok((now.0 << 12) | u64::from(ordinal))
+}
+fn validate_event(event: Event) -> Result<(), SurvivalError> {
+    if matches!(event,Event::FarmSample(_,token) if token>FARM_SAMPLE_TOKEN_MAX) {
+        Err(SurvivalError::InvalidEncoding)
+    } else {
+        Ok(())
+    }
 }

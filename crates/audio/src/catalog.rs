@@ -33,10 +33,19 @@ impl Catalog {
     /// select existing IDs, and never decode a compressed stream in a frame.
     pub fn prepare_all(&mut self, mixer: &mut Mixer) -> Result<(), AudioError> {
         for (path, bytes) in Self::files() {
-            if !self.loaded.contains_key(path) {
-                let clip = mixer.add_clip(Pcm::decode_ogg(bytes)?)?;
-                self.loaded.insert(path, clip);
-            }
+            self.prepare_file(mixer, path, bytes)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn prepare_file(
+        &mut self,
+        mixer: &mut Mixer,
+        path: &'static str,
+        bytes: &[u8],
+    ) -> Result<(), AudioError> {
+        if !self.loaded.contains_key(path) {
+            let clip = mixer.add_clip(Pcm::decode_ogg(bytes)?)?;
+            self.loaded.insert(path, clip);
         }
         Ok(())
     }

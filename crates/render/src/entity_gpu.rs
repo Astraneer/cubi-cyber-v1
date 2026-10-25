@@ -85,6 +85,7 @@ struct EntityShadow {
 }
 pub struct EntityGpu {
     config: EntityConfig,
+    item_layers: u32,
     instances: wgpu::Buffer,
     lights: wgpu::Buffer,
     vertices: wgpu::Buffer,
@@ -113,6 +114,27 @@ impl EntityGpu {
         geometry: TerrainGeometry<'_>,
         config: EntityConfig,
         shadows: Option<&ShadowGpu>,
+    ) -> Result<Self, EntityError> {
+        Self::build(device, queue, geometry, config, shadows, None)
+    }
+    /// Prepare an independent nonblock item texture array once during loading.
+    pub fn new_with_items(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        geometry: TerrainGeometry<'_>,
+        config: EntityConfig,
+        shadows: Option<&ShadowGpu>,
+        items: &crate::terrain_gpu::AtlasImage,
+    ) -> Result<Self, EntityError> {
+        Self::build(device, queue, geometry, config, shadows, Some(items))
+    }
+    fn build(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        geometry: TerrainGeometry<'_>,
+        config: EntityConfig,
+        shadows: Option<&ShadowGpu>,
+        items: Option<&crate::terrain_gpu::AtlasImage>,
     ) -> Result<Self, EntityError> {
         if config.max_entities == 0
             || config.atlas_layers == 0
@@ -163,6 +185,66 @@ impl EntityGpu {
             );
             asset_bytes += mip.rgba.len() as u64;
         }
+        let item_layers = items.map_or(0, |a| a.layers);
+        let item_view = if let Some(items) = items {
+            if items.tile_size != 16
+                || items.layers == 0
+                || items.layers > device.limits().max_texture_array_layers
+                || items.mips.len() != 5
+                || items.mips[0].size != 16
+                || items.mips[0].rgba.len() != items.layers as usize * 16 * 16 * 4
+            {
+                return Err(EntityError::InvalidConfig);
+            }
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("independent original nonblock item sprites"),
+                size: wgpu::Extent3d {
+                    width: 16,
+                    height: 16,
+                    depth_or_array_layers: items.layers,
+                },
+                mip_level_count: items.mips.len() as u32,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            for (level, mip) in items.mips.iter().enumerate() {
+                if mip.size != 16u32.checked_shr(level as u32).unwrap_or(0)
+                    || mip.rgba.len()
+                        != items.layers as usize * mip.size as usize * mip.size as usize * 4
+                {
+                    return Err(EntityError::InvalidConfig);
+                }
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &tex,
+                        mip_level: level as u32,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &mip.rgba,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(mip.size * 4),
+                        rows_per_image: Some(mip.size),
+                    },
+                    wgpu::Extent3d {
+                        width: mip.size,
+                        height: mip.size,
+                        depth_or_array_layers: items.layers,
+                    },
+                );
+                asset_bytes += mip.rgba.len() as u64;
+            }
+            Some(tex.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            }))
+        } else {
+            None
+        };
         let texture = texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
@@ -242,6 +324,7 @@ impl EntityGpu {
                 count: None,
             },
             texture_layout(6, f, wgpu::TextureSampleType::Float { filterable: true }),
+            texture_layout(7, f, wgpu::TextureSampleType::Float { filterable: true }),
         ];
         if shadows.is_some() {
             entries.extend([
@@ -285,6 +368,12 @@ impl EntityGpu {
             wgpu::BindGroupEntry {
                 binding: 6,
                 resource: wgpu::BindingResource::TextureView(geometry.colors),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(
+                    item_view.as_ref().unwrap_or(geometry.colors),
+                ),
             },
         ];
         if let Some(shadows) = shadows {
@@ -469,6 +558,7 @@ impl EntityGpu {
                         count: None,
                     },
                     texture_layout(6, f, wgpu::TextureSampleType::Float { filterable: true }),
+                    texture_layout(7, f, wgpu::TextureSampleType::Float { filterable: true }),
                 ],
             });
             let render_binds = std::array::from_fn(|i| {
@@ -491,6 +581,12 @@ impl EntityGpu {
                         wgpu::BindGroupEntry {
                             binding: 6,
                             resource: wgpu::BindingResource::TextureView(geometry.colors),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(
+                                item_view.as_ref().unwrap_or(geometry.colors),
+                            ),
                         },
                     ],
                 })
@@ -564,6 +660,7 @@ impl EntityGpu {
         };
         Ok(Self {
             config,
+            item_layers,
             instances,
             lights,
             vertices,
@@ -625,7 +722,8 @@ impl EntityGpu {
                     || i.flags & !2047 != 0
                     || (i.kind == 2 && i.color >= 6)
                     || ((i.kind == 3 || i.kind == 5) && !f32::from_bits(i.color).is_finite())
-                    || (i.kind >= 6 && i.color >= self.config.atlas_layers)
+                    || (i.kind == 6 && i.color >= self.config.atlas_layers)
+                    || (i.kind == 7 && i.color >= self.item_layers)
             })
         {
             return Err(EntityError::InvalidInstance);

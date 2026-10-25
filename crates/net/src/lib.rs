@@ -7,6 +7,7 @@ pub mod emulator;
 pub mod entities;
 pub mod geometry;
 pub mod presence;
+pub mod window;
 pub use geometry::{PublicGeometry, PublicSurface, PublicSurfaceKind};
 mod replication;
 pub mod udp;
@@ -145,6 +146,8 @@ pub enum Action {
     Flight(bool),
     DebugNoclip(bool),
     Command(String),
+    Chat(String),
+    Window(window::WindowIntent),
     SelectSlot(u8),
     PlaceOwned {
         position: BlockPos,
@@ -187,6 +190,8 @@ pub enum ClientMessage {
         known: Option<Version>,
     },
     ForgetGeometry(PageId),
+    Presence(presence::PresenceClientEvent),
+    Entities(entities::EntityRequest),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,6 +288,9 @@ pub enum ServerMessage {
     },
     Geometry(Box<PublicGeometry>),
     GeometryUnavailable(PageId),
+    Presence(presence::PresenceServerEvent),
+    Entities(Box<entities::EntityFrame>),
+    Window(Box<window::WindowSnapshot>),
     Players {
         tick: Tick,
         players: Vec<PlayerState>,
