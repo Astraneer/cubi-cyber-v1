@@ -1,0 +1,24 @@
+{
+  "checks": {
+    "linux": "failure",
+    "windows": "success"
+  },
+  "conclusion": "failure",
+  "delivery": {
+    "status": "blocked_checks"
+  },
+  "reported_at": "2026-10-25T18:48:55.834939+00:00",
+  "repository": "Astraneer/cubi-cyber-v1",
+  "schema_version": 1,
+  "source": {
+    "branch": "m1-world",
+    "sha": "780dd84c1259acf40d7302440847a72dc1dff819",
+    "stage": "M1"
+  },
+  "workflow": {
+    "name": "Acceptance",
+    "run_attempt": "1",
+    "run_id": "40222686792",
+    "url": "https://github.com/Astraneer/cubi-cyber-v1/actions/runs/40222686792"
+  }
+}
