@@ -75,9 +75,7 @@ jobs:
           source tools/env.sh
           cargo test --locked -p render --test software_sky -- --nocapture
       - name: Present three native Windows frames
-        run: |
-          source tools/env.sh
-          cargo run --locked -p client-native -- --smoke-frames 3
+        run: bash tools/windows_native_smoke.sh
 
   report:
     name: Relay actual CI evidence and stage delivery

@@ -703,7 +703,8 @@ impl EntityStore {
                 flags: u32::from(mob.baby)
                     | (u32::from(mob.sheared) << 1)
                     | (u32::from(!mob.life.alive()) << 2)
-                    | (u32::from(mob.life.fire() > 0) << 3) | (u32::from(mob.life.hurt_time()>0)<<4),
+                    | (u32::from(mob.life.fire() > 0) << 3)
+                    | (u32::from(mob.life.hurt_time() > 0) << 4),
                 color: u32::from(mob.color),
                 id_low: id.0 as u32,
                 id_high: (id.0 >> 32) as u32,

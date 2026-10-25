@@ -7,12 +7,12 @@ pub mod lighting;
 pub mod lodcache;
 pub mod network;
 mod overrides;
+pub mod presentation;
 mod rebase;
 mod scene;
 pub mod self_model;
 mod task;
 pub mod view;
-pub mod presentation;
 pub use overrides::{OverrideLimits, OverrideStats};
 pub use scene::*;
 #[cfg(not(target_arch = "wasm32"))]

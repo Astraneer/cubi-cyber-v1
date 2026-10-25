@@ -38,10 +38,33 @@ pub struct FluidEnvironment {
 }
 /// Bounded entity visibility ray against the same known collision shapes. This
 /// covers the zombie follow radius as well as the shorter authoritative PvP ray.
-pub fn line_of_sight(world:&impl QueryWorld,start:[f64;3],end:[f64;3])->Result<bool,EntityError> {
-    validate_position(start)?;validate_position(end)?;
-    if (0..3).map(|axis|(end[axis]-start[axis]).abs()).sum::<f64>()>120.0 {return Err(EntityError::Capacity);}
-    for (position,_) in crate::interaction::ray_cells(start,end) {let world::CellRead::Known(cell)=world.cell(position) else{return Err(EntityError::UnknownInput)};for shape in rules::blocks::collision_of(cell.raw()) {if crate::interaction::segment_box(start,end,shape.moved(position.map(f64::from))).is_some_and(|(t,_)|t<1.0) {return Ok(false);}}}Ok(true)
+pub fn line_of_sight(
+    world: &impl QueryWorld,
+    start: [f64; 3],
+    end: [f64; 3],
+) -> Result<bool, EntityError> {
+    validate_position(start)?;
+    validate_position(end)?;
+    if (0..3)
+        .map(|axis| (end[axis] - start[axis]).abs())
+        .sum::<f64>()
+        > 120.0
+    {
+        return Err(EntityError::Capacity);
+    }
+    for (position, _) in crate::interaction::ray_cells(start, end) {
+        let world::CellRead::Known(cell) = world.cell(position) else {
+            return Err(EntityError::UnknownInput);
+        };
+        for shape in rules::blocks::collision_of(cell.raw()) {
+            if crate::interaction::segment_box(start, end, shape.moved(position.map(f64::from)))
+                .is_some_and(|(t, _)| t < 1.0)
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 pub fn sample_environment(
     mob: &Mob,

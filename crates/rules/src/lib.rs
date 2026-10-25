@@ -5,12 +5,12 @@
 #![forbid(unsafe_code)]
 
 pub mod arms;
-pub mod entities;
 pub mod bindings;
 pub mod blocks;
 pub mod cell;
 pub mod crafting;
 mod crafting_data;
+pub mod entities;
 pub mod ids;
 pub mod items;
 pub mod machine_recipes;

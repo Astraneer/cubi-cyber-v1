@@ -140,7 +140,9 @@ impl Health {
     pub const fn fire(&self) -> u16 {
         self.fire
     }
-    pub const fn hurt_time(&self)->u8 {self.hurt_time}
+    pub const fn hurt_time(&self) -> u8 {
+        self.hurt_time
+    }
     pub const fn death_time(&self) -> u16 {
         self.death_time
     }
