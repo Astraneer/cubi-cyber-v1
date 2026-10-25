@@ -16,6 +16,7 @@ struct WebState {
     canvas: HtmlCanvasElement,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
+    output_format: wgpu::TextureFormat,
     gpu: render::Gpu,
     sky: render::SkyRenderer,
     recorder: telemetry::FrameRecorder<600>,
@@ -52,7 +53,11 @@ impl WebState {
             Err(wgpu::SurfaceError::Timeout) => return Ok(false),
             Err(error) => return Err(JsValue::from_str(&format!("WebGPU frame failed: {error}"))),
         };
-        let output = frame.texture.create_view(&Default::default());
+        let output = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("sRGB canvas output"),
+            format: Some(self.output_format),
+            ..Default::default()
+        });
         self.sky.render(&self.gpu.device, &self.gpu.queue, &output);
         frame.present();
         self.frames += 1;
@@ -134,13 +139,25 @@ pub async fn start() -> Result<JsValue, JsValue> {
     if let Some(format) = capabilities.formats.iter().find(|format| format.is_srgb()) {
         config.format = *format;
     }
+    // Canvas configurations expose unorm base formats. An explicitly allowed
+    // sRGB view applies the same linear-to-sRGB transfer as the native surface.
+    let output_format = config.format.add_srgb_suffix();
+    if !output_format.is_srgb() {
+        return Err(JsValue::from_str(
+            "WebGPU canvas requires an sRGB-compatible format",
+        ));
+    }
+    if output_format != config.format {
+        config.view_formats.push(output_format);
+    }
     surface.configure(&gpu.device, &config);
-    let mut sky = render::SkyRenderer::new(&gpu.device, config.format, width, height);
+    let mut sky = render::SkyRenderer::new(&gpu.device, output_format, width, height);
     let startup = sky.take_work();
     let mut state = WebState {
         canvas,
         surface,
         config,
+        output_format,
         gpu,
         sky,
         recorder: telemetry::FrameRecorder::new(),
@@ -189,6 +206,17 @@ pub async fn start() -> Result<JsValue, JsValue> {
     probe.buffer.unmap();
     let result = js_sys::Object::new();
     js_sys::Reflect::set(&result, &"ok".into(), &JsValue::TRUE)?;
+    js_sys::Reflect::set(&result, &"colorEncoding".into(), &"srgb".into())?;
+    js_sys::Reflect::set(
+        &result,
+        &"outputFormat".into(),
+        &format!("{:?}", state.output_format).into(),
+    )?;
+    js_sys::Reflect::set(
+        &result,
+        &"canvasFormat".into(),
+        &format!("{:?}", state.config.format).into(),
+    )?;
     js_sys::Reflect::set(
         &result,
         &"frames".into(),
