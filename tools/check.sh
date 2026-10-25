@@ -16,13 +16,18 @@ export WGPU_BACKEND=vulkan
 run_check() {
   local cubi_label="$1"
   shift
-  if "$@"; then
+  local cubi_log="$root/.local/artifacts/check_${cubi_label//[^[:alnum:]]/_}.log"
+  mkdir -p "$root/.local/artifacts"
+  if "$@" 2>&1 | tee "$cubi_log"; then
     printf 'ACCEPTANCE_OK %s\n' "$cubi_label"
   else
-    local cubi_status=$?
+    local -a cubi_pipe_status=("${PIPESTATUS[@]}")
+    local cubi_status="${cubi_pipe_status[0]}"
+    if [[ "$cubi_status" == 0 ]]; then cubi_status="${cubi_pipe_status[1]}"; fi
     # These labels are fixed strings, never command arguments or secret values.
     # The public Actions annotation is readable even when API logs are blocked.
     printf '::error title=Acceptance gate::%s failed (exit %s)\n' "$cubi_label" "$cubi_status" >&2
+    python3 tools/check_diagnostic.py "$cubi_log"
     return "$cubi_status"
   fi
 }
