@@ -8,9 +8,13 @@ pub mod arms;
 pub mod bindings;
 pub mod blocks;
 pub mod cell;
+pub mod crafting;
+mod crafting_data;
 pub mod ids;
 pub mod items;
+pub mod machine_recipes;
 pub mod shapes;
+pub mod stack;
 
 pub use blocks::BlockDef;
 use core_types::{Cell, CellProperties};

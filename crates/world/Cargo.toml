@@ -8,3 +8,9 @@ publish.workspace = true
 
 [dependencies]
 core-types.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+proptest = "=1.9.0"
+
+[lints]
+workspace = true

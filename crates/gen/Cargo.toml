@@ -8,3 +8,13 @@ publish.workspace = true
 
 [dependencies]
 core-types.workspace = true
+rules = { path = "../rules" }
+jobs = { path = "../jobs" }
+libm = "=0.2.16"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+world = { path = "../world" }
+telemetry.workspace = true

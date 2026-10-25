@@ -1,0 +1,22 @@
+[package]
+name = "gen-authority"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+golden-tools = []
+
+[dependencies]
+core-types.workspace = true
+terrain-gen = { package = "gen", path = "../gen" }
+rules = { path = "../rules" }
+jobs = { path = "../jobs" }
+libm = "=0.2.16"
+blake3 = "=1.8.2"
+
+[lints]
+workspace = true

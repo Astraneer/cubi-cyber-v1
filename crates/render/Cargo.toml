@@ -9,6 +9,8 @@ publish.workspace = true
 [dependencies]
 wgpu.workspace = true
 telemetry.workspace = true
+bytemuck = { version = "=1.25.2", features = ["derive"] }
+png = "=0.17.16"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 pollster.workspace = true

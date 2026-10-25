@@ -9,5 +9,8 @@ publish.workspace = true
 [dependencies]
 core-types.workspace = true
 
+[dev-dependencies]
+telemetry.workspace = true
+
 [lints]
 workspace = true

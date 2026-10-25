@@ -1,0 +1,14 @@
+[package]
+name = "unicode-ident"
+version = "1.0.27"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Cubi's project-local identifier compatibility API backed by unicode-xid 16"
+
+[dependencies]
+unicode-xid = "=0.2.6"
+
+[lints]
+workspace = true

@@ -13,5 +13,9 @@ cargo build --locked --target wasm32-unknown-unknown -p client-web
 dist="$root/.local/web-dist"
 mkdir -p "$dist/pkg"
 cp "$root/web/index.html" "$dist/index.html"
+if [[ -d "$root/web/workers" ]]; then
+  mkdir -p "$dist/workers"
+  cp "$root"/web/workers/*.js "$dist/workers/"
+fi
 wasm-bindgen --target web --out-dir "$dist/pkg" --out-name client_web "$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/client_web.wasm"
 printf '%s\n' "Web build ready in $dist"

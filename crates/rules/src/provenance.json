@@ -4,7 +4,10 @@
     "registry/ids.rs": "4fef9076c42f4f8401cd1855e89dd502bbe9d4e785f0f115efe72ace58ac47f9",
     "registry/blocks.rs": "ac13f78043c34a6c0a404b3af172c19f732c75b1baa7ab653a3a5f96ea2669c3",
     "registry/items.rs": "0f8dd2ad6d6531cbf2a305c7eb1aaaf6942f62fd2ba04dbb79d526444029c6de",
-    "registry/shapes.rs": "0fc2fc6a95931eff1275991a76f20af010fd991ce9c9a4cc58a7789dbe218400"
+    "registry/shapes.rs": "0fc2fc6a95931eff1275991a76f20af010fd991ce9c9a4cc58a7789dbe218400",
+    "game/crafting.rs": "48753a90e34af0364dcf0f8c80ae281d9d87bd0f6872a9c6bfd856796ca1cdc9",
+    "world/mek/recipes.rs": "606ef682a5dbdeba0d35ef244e0b2633f80ec74ef60c843d88a8605e305bb911",
+    "world/stack.rs": "e27f5f6b4535740f548ac37d876fe30b2c41bd5e46db089a1b45840f27d846ef"
   },
   "numeric_bindings": 265
 }

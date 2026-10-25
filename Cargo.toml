@@ -5,7 +5,13 @@ members = [
     "crates/rules", "crates/net", "crates/save", "crates/jobs",
     "crates/render", "crates/ui", "crates/audio", "crates/telemetry",
     "crates/client-native", "crates/client-web", "crates/server",
+    "crates/compat-libloading", "crates/compat-unicode-ident",
+    "crates/gen-authority", "tools/determinism-runner",
 ]
+
+[patch.crates-io]
+libloading = { path = "crates/compat-libloading" }
+unicode-ident = { path = "crates/compat-unicode-ident" }
 
 [workspace.package]
 version = "0.1.0"

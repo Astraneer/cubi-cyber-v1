@@ -1,6 +1,8 @@
 //! Thin WebGPU shell. No WebGL backend and no downloaded visual assets.
 #![cfg(target_arch = "wasm32")]
 
+mod generation_worker;
+
 use std::{cell::RefCell, rc::Rc};
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::JsFuture;

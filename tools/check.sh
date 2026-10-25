@@ -19,6 +19,8 @@ cargo test --locked --workspace
 python3 -m unittest discover -s tools -p 'test_*.py'
 bash tools/native_smoke.sh
 bash tools/build_web.sh
+bash tools/check_determinism.sh
+node crates/jobs/tests/browser_smoke.mjs
 node tools/web_smoke.mjs
 if ! command -v cargo-deny >/dev/null 2>&1 || [[ "$(cargo deny --version)" != 'cargo-deny 0.18.4' ]]; then
   CARGO_TARGET_DIR="$root/.local/tool-targets/cargo-deny" \
