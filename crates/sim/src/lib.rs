@@ -9,6 +9,7 @@ mod interaction;
 mod motion;
 pub mod prediction;
 mod query;
+pub mod replay;
 
 pub use camera::{CameraMode, CameraPose, CameraSettings, SelfBody, camera_clip};
 use collision::Solids;
