@@ -1,0 +1,2 @@
+# Empty TSV columns require trailing tab separators; they are meaningful data.
+crates/rules/tests/data/*.tsv text eol=lf whitespace=-blank-at-eol

@@ -1,14 +1,16 @@
-name: M0 acceptance
+name: Acceptance
 
 on:
   push:
+    branches-ignore:
+      - codex-ci-results
   pull_request:
 
 permissions:
   contents: read
 
 concurrency:
-  group: m0-${{ github.workflow }}-${{ github.ref }}
+  group: acceptance-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -72,3 +74,42 @@ jobs:
         run: |
           source tools/env.sh
           cargo run --locked -p client-native -- --smoke-frames 3
+
+  report:
+    name: Relay actual CI evidence and stage delivery
+    needs: [linux, windows]
+    if: >-
+      always() && github.event_name == 'push' &&
+      github.repository == 'Astraneer/cubi-cyber-v1' &&
+      (startsWith(github.ref_name, 'm0-') || startsWith(github.ref_name, 'm1-') ||
+       startsWith(github.ref_name, 'm2-') || startsWith(github.ref_name, 'm3-') ||
+       startsWith(github.ref_name, 'm4-') || startsWith(github.ref_name, 'm5-') ||
+       startsWith(github.ref_name, 'm6-') || startsWith(github.ref_name, 'm7-') ||
+       startsWith(github.ref_name, 'm8-') || startsWith(github.ref_name, 'm9-') ||
+       startsWith(github.ref_name, 'm10-') || startsWith(github.ref_name, 'm11-') ||
+       startsWith(github.ref_name, 'm12-') || startsWith(github.ref_name, 'm13-'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: true
+      - name: Publish exact source/run/check results through Git
+        env:
+          CI_REPORT_LINUX_RESULT: ${{ needs.linux.result }}
+          CI_REPORT_WINDOWS_RESULT: ${{ needs.windows.result }}
+          CI_REPORT_CREATE_PR: "1"
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tools/ci_report.py
+      - name: Preserve relay evidence if Git delivery fails
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: acceptance-ci-report
+          path: .local/ci-report/reports/*.json
+          include-hidden-files: true
+          if-no-files-found: ignore
