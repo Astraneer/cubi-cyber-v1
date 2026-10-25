@@ -1,0 +1,6 @@
+/.local/
+/target/
+/artifacts/
+/web/pkg/
+__pycache__/
+*.pyc
