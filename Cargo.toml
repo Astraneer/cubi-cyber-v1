@@ -7,11 +7,14 @@ members = [
     "crates/client-native", "crates/client-web", "crates/server",
     "crates/compat-libloading", "crates/compat-unicode-ident",
     "crates/gen-authority", "tools/determinism-runner",
+    "crates/client",
+    "crates/compat-nv-flip-sys",
 ]
 
 [patch.crates-io]
 libloading = { path = "crates/compat-libloading" }
 unicode-ident = { path = "crates/compat-unicode-ident" }
+nv-flip-sys = { path = "crates/compat-nv-flip-sys" }
 
 [workspace.package]
 version = "0.1.0"

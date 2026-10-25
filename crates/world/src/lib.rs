@@ -2,6 +2,9 @@
 //! a journal cursor. Only touched pages/components are staged for atomic commit.
 #![forbid(unsafe_code)]
 
+pub mod lighting;
+pub mod persistence;
+
 mod journal;
 mod storage;
 use core_types::{
@@ -53,6 +56,9 @@ pub struct Page {
     components: BTreeMap<LocalIdx, ComponentId>,
     version: Version,
     channel_versions: [Version; 10],
+    // Derived cache stamps, deliberately excluded from persistence and logical
+    // hashing. Non-centre regions are exactly one boundary plane/edge/corner.
+    rim_versions: [Version; 27],
     classified_cells: u64,
 }
 impl Page {
@@ -71,6 +77,7 @@ impl Page {
             components: BTreeMap::new(),
             version: Version(0),
             channel_versions: [Version(0); 10],
+            rim_versions: [Version(0); 27],
             classified_cells: PAGE_VOLUME as u64,
         }
     }
@@ -100,6 +107,38 @@ impl Page {
             .map(|(_, version)| *version)
             .max()
             .unwrap_or(Version(0))
+    }
+    pub fn sampled_version(&self, channels: ChannelMask, region: PageRegion) -> Version {
+        if region == PageRegion::WHOLE {
+            return self.channel_version(channels);
+        }
+        let geometry = channels & RIM_CHANNELS;
+        let other = ChannelMask(channels.0 & !RIM_CHANNELS.0);
+        let rim = if geometry.is_empty() {
+            Version(0)
+        } else {
+            self.rim_versions[region.index()]
+        };
+        rim.max(self.channel_version(other))
+    }
+    /// Restore starts a fresh derived-cache epoch; old fine-grained border
+    /// history is neither persisted nor required to recover logical state.
+    pub(crate) fn reset_rim_versions(&mut self) {
+        let geometry = self.channel_version(RIM_CHANNELS);
+        self.rim_versions.fill(geometry);
+    }
+    fn stamp_rim_cell(&mut self, index: LocalIdx, version: Version) -> usize {
+        let mut bits = PageRegion::cell_boundary_mask(index);
+        let mut updated = 0;
+        while bits != 0 {
+            let region = bits.trailing_zeros() as usize;
+            if self.rim_versions[region] != version {
+                self.rim_versions[region] = version;
+                updated += 1;
+            }
+            bits &= bits - 1;
+        }
+        updated
     }
     pub fn light(&self, index: LocalIdx) -> LightSample {
         self.lights
@@ -203,6 +242,8 @@ pub struct CommitWork {
     pub mask_cells_classified: u64,
     /// Registry calls including old/new channel comparisons.
     pub registry_queries: u64,
+    /// Existing-page boundary stamps updated; new-page initialization excluded.
+    pub rim_stamps_updated: usize,
 }
 #[derive(Clone, Debug)]
 pub struct WorldChange {
@@ -256,6 +297,75 @@ pub struct PageInput {
     pub channels: ChannelMask,
     pub version: Version,
 }
+
+const RIM_CHANNELS: ChannelMask = ChannelMask(ChannelMask::SHAPE.0 | ChannelMask::OPACITY.0);
+
+/// A source-page region sampled by a consumer. A negative component selects
+/// coordinate0, a positive one selects15; zero leaves that axis unconstrained.
+/// Thus [-1,0,0] is the minimum-X plane and [-1,1,1] is one corner cell.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PageRegion([i8; 3]);
+impl PageRegion {
+    pub const WHOLE: Self = Self([0; 3]);
+    pub const fn new(coordinates: [i8; 3]) -> Option<Self> {
+        let [x, y, z] = coordinates;
+        if x < -1 || x > 1 || y < -1 || y > 1 || z < -1 || z > 1 {
+            None
+        } else {
+            Some(Self(coordinates))
+        }
+    }
+    pub const fn coordinates(self) -> [i8; 3] {
+        self.0
+    }
+    const fn index(self) -> usize {
+        (self.0[0] + 1) as usize + 3 * (self.0[2] + 1) as usize + 9 * (self.0[1] + 1) as usize
+    }
+    fn cell_boundary_mask(index: LocalIdx) -> u32 {
+        let (x, y, z) = index.xyz();
+        let axes = |coordinate| match coordinate {
+            0 => [Some(0), Some(-1)],
+            15 => [Some(0), Some(1)],
+            _ => [Some(0), None],
+        };
+        let mut mask = 0;
+        for x in axes(x).into_iter().flatten() {
+            for y in axes(y).into_iter().flatten() {
+                for z in axes(z).into_iter().flatten() {
+                    let region = Self([x, y, z]);
+                    if region != Self::WHOLE {
+                        mask |= 1 << region.index();
+                    }
+                }
+            }
+        }
+        mask
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampledPageInput {
+    pub page: PageId,
+    pub channels: ChannelMask,
+    pub region: PageRegion,
+    pub version: Version,
+}
+
+/// Both whole-page consumers and sparse/halo consumers can validate snapshots
+/// through the same API without weakening the existing PageInput contract.
+pub trait SnapshotInput {
+    fn matches(&self, world: &World) -> bool;
+}
+impl SnapshotInput for PageInput {
+    fn matches(&self, world: &World) -> bool {
+        world.input_version(self.page, self.channels) == self.version
+    }
+}
+impl SnapshotInput for SampledPageInput {
+    fn matches(&self, world: &World) -> bool {
+        world.sampled_input_version(self.page, self.channels, self.region) == self.version
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub struct RegionSummary {
     pub loaded_pages: usize,
@@ -287,6 +397,28 @@ pub struct Transaction {
     transform: Option<SpaceTransform>,
 }
 impl Transaction {
+    /// Read-only resource preflight for a bounded client cache.
+    pub fn created_pages(&self) -> impl ExactSizeIterator<Item = PageId> + '_ {
+        self.create.keys().copied()
+    }
+    pub fn removed_pages(&self) -> impl ExactSizeIterator<Item = PageId> + '_ {
+        self.remove.iter().copied()
+    }
+    pub fn created_page_data(&self) -> impl Iterator<Item = (PageId, &[Cell])> {
+        self.create
+            .iter()
+            .map(|(page, values)| (*page, values.as_ref()))
+    }
+    pub fn cell_updates(&self) -> impl Iterator<Item = (BlockPos, Cell)> + '_ {
+        self.cells.iter().copied()
+    }
+    pub fn component_updates(
+        &self,
+    ) -> impl Iterator<Item = (ComponentId, Option<&ComponentData>, ChannelMask)> {
+        self.components
+            .iter()
+            .map(|(id, edit)| (*id, edit.value.as_ref(), edit.channels))
+    }
     pub fn new(tick: Tick, space: SpaceId) -> Self {
         Self {
             tick,
@@ -477,10 +609,32 @@ impl World {
             version: self.input_version(page, channels),
         }
     }
-    pub fn matches_inputs(&self, inputs: &[PageInput]) -> bool {
-        inputs
-            .iter()
-            .all(|input| self.input_version(input.page, input.channels) == input.version)
+    pub fn sampled_input_version(
+        &self,
+        page: PageId,
+        channels: ChannelMask,
+        region: PageRegion,
+    ) -> Version {
+        self.page(page).map_or_else(
+            || self.page_version(page),
+            |page| page.sampled_version(channels, region),
+        )
+    }
+    pub fn capture_sampled_input(
+        &self,
+        page: PageId,
+        channels: ChannelMask,
+        region: PageRegion,
+    ) -> SampledPageInput {
+        SampledPageInput {
+            page,
+            channels,
+            region,
+            version: self.sampled_input_version(page, channels, region),
+        }
+    }
+    pub fn matches_inputs<I: SnapshotInput>(&self, inputs: &[I]) -> bool {
+        inputs.iter().all(|input| input.matches(self))
     }
     pub fn matches_versions(&self, inputs: &[(PageId, Version)]) -> bool {
         inputs
@@ -693,6 +847,7 @@ impl World {
         let component_records_staged = tx.components.len();
         let mut component_changes = Vec::new();
         let mut page_channels = BTreeMap::<PageId, ChannelMask>::new();
+        let mut rim_stamps_updated = 0;
         // Remove old links first so moving/swapping components in one transaction
         // is independent of the numeric ordering of stable component IDs.
         for id in tx.components.keys() {
@@ -735,6 +890,15 @@ impl World {
                 };
                 for record in before.iter().chain(after.iter()) {
                     *page_channels.entry(record.data.anchor.page()).or_default() |= channels;
+                    if channels.intersects(RIM_CHANNELS)
+                        && self.pages.contains_key(&record.data.anchor.page())
+                        && let Some(page) = staged
+                            .get_mut(&record.data.anchor.page())
+                            .and_then(Option::as_mut)
+                    {
+                        rim_stamps_updated +=
+                            page.stamp_rim_cell(record.data.anchor.local_index(), revision);
+                    }
                 }
                 component_changes.push(ComponentChange {
                     id,
@@ -785,6 +949,7 @@ impl World {
                 component_records_staged,
                 mask_cells_classified,
                 registry_queries: mask_cells_classified,
+                rim_stamps_updated,
             },
         };
         for (id, index) in cell_keys {
@@ -798,10 +963,18 @@ impl World {
             let old = old_page.cell(index);
             let new = new_page.cell(index);
             if old != new {
-                *page_channels.entry(id).or_default() |= self
+                let channels = self
                     .registry
                     .properties(old)
                     .changed_channels(self.registry.properties(new));
+                *page_channels.entry(id).or_default() |= channels;
+                if channels.intersects(RIM_CHANNELS) {
+                    change.work.rim_stamps_updated += staged
+                        .get_mut(&id)
+                        .and_then(Option::as_mut)
+                        .expect("changed page remains staged")
+                        .stamp_rim_cell(index, revision);
+                }
                 change.cells.push(CellChange {
                     page: id,
                     index,
@@ -847,6 +1020,9 @@ impl World {
             if created || removed || !channels.is_empty() || cell_changed {
                 if let Some(page) = staged.get_mut(id).and_then(Option::as_mut) {
                     page.stamp(revision, channels);
+                    if created {
+                        page.reset_rim_versions();
+                    }
                 }
                 change.pages.push(PageChange {
                     page: *id,

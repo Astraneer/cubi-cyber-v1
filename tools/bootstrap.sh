@@ -5,6 +5,13 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$root/tools/env.sh"
 cd "$root"
 
+if [[ "$(uname -s)" == Linux ]] && ! pkg-config --exists alsa; then
+  # This helper preserves Debian signature/index/archive verification and writes
+  # only .local; other Linux hosts should install trusted libasound2-dev packages.
+  python3 tools/install_audio_deps.py
+  source "$root/tools/env.sh"
+fi
+
 if ! command -v rustup >/dev/null 2>&1; then
   case "$(uname -s):$(uname -m)" in
     Linux:x86_64) triple=x86_64-unknown-linux-gnu ;;

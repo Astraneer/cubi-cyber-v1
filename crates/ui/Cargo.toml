@@ -8,3 +8,18 @@ publish.workspace = true
 
 [dependencies]
 core-types.workspace = true
+rules = { path = "../rules" }
+net = { path = "../net" }
+wgpu.workspace = true
+bytemuck = { version = "=1.25.2", features = ["derive"] }
+fontdue = "=0.9.3"
+flate2 = "=1.1.10"
+png = "=0.17.16"
+
+[dev-dependencies]
+pollster.workspace = true
+render.workspace = true
+telemetry.workspace = true
+
+[lints]
+workspace = true

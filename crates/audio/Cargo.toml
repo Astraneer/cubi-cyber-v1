@@ -6,5 +6,28 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 core-types.workspace = true
+libm = "=0.2.16"
+lewton = "=0.10.2"
+zip = { version = "=0.6.6", default-features = false, features = ["deflate"] }
+serde_json = "=1.0.145"
+sha1 = "=0.10.7"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cpal = "=0.16.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = ["AudioContext", "AudioContextState", "AudioBuffer", "AudioBufferSourceNode", "AudioDestinationNode", "AudioNode", "AudioParam", "GainNode", "StereoPannerNode", "ConvolverNode", "OfflineAudioContext", "AudioScheduledSourceNode", "BaseAudioContext", "Document", "Element", "HtmlElement", "HtmlInputElement", "FileList", "File", "Blob", "Event", "EventTarget", "Window", "Navigator", "Storage", "Performance", "console"] }
+
+[dev-dependencies]
+telemetry.workspace = true
+
+[lints]
+workspace = true

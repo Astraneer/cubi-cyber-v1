@@ -26,7 +26,7 @@ jobs:
       - name: Install software graphics and virtual display
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 libx11-dev libxkbcommon-dev libxkbcommon-x11-0 xvfb xauth
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 libx11-dev libxkbcommon-dev libxkbcommon-x11-0 libasound2-dev xvfb xauth
       - name: Bootstrap locked toolchain and dependencies
         run: bash tools/bootstrap.sh
       - name: Verify imported donor without private network access
@@ -40,13 +40,17 @@ jobs:
         if: always() && hashFiles('.local/web-dist/index.html') != ''
         env:
           CHROMIUM: google-chrome
-        run: xvfb-run -a node tools/web_smoke.mjs --headed
-      - name: Preserve actual browser canvas
+        run: |
+          xvfb-run -a node tools/web_smoke.mjs --headed
+          xvfb-run -a node tools/terrain_smoke.mjs --headed
+      - name: Preserve actual browser and GPU evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: m0-webgpu-canvas
-          path: .local/artifacts/m0-web-*.png
+          name: acceptance-rendering-evidence
+          path: |
+            .local/artifacts/**/*.png
+            .local/artifacts/*smoke.json
           include-hidden-files: true
           if-no-files-found: ignore
 

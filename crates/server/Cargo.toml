@@ -9,3 +9,17 @@ publish.workspace = true
 [dependencies]
 core-types.workspace = true
 telemetry.workspace = true
+net = { path = "../net" }
+save = { path = "../save" }
+world = { path = "../world" }
+sim = { path = "../sim" }
+rules = { path = "../rules" }
+gen = { path = "../gen" }
+gen-authority = { path = "../gen-authority" }
+jobs = { path = "../jobs" }
+blake3 = { version = "=1.8.2", default-features = false, features = ["std", "pure"] }
+getrandom = "=0.3.4"
+tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
+
+[lints]
+workspace = true

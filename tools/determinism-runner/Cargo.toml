@@ -13,6 +13,8 @@ crate-type = ["cdylib", "rlib"]
 core-types.workspace = true
 world = { path = "../../crates/world" }
 rules = { path = "../../crates/rules" }
+terrain-gen = { package = "gen", path = "../../crates/gen" }
+sim = { path = "../../crates/sim" }
 authority = { package = "gen-authority", path = "../../crates/gen-authority", features = ["golden-tools"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

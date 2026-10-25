@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod arms;
+pub mod entities;
 pub mod bindings;
 pub mod blocks;
 pub mod cell;
@@ -13,8 +14,10 @@ mod crafting_data;
 pub mod ids;
 pub mod items;
 pub mod machine_recipes;
+pub mod machines;
 pub mod shapes;
 pub mod stack;
+pub mod survival;
 
 pub use blocks::BlockDef;
 use core_types::{Cell, CellProperties};

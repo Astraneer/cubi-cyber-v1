@@ -1,6 +1,14 @@
 //! Shared M0 sky pipeline. Platform shells own windows, surfaces, and event loops.
 //! Resources and pipelines are prepared at startup and on explicit resize only.
 
+pub mod atmosphere;
+pub mod light_volume;
+pub mod lod;
+pub mod lod_gpu;
+pub mod shadows;
+pub mod terrain_gpu;
+pub mod terrain_mesh;
+
 pub const MSAA_SAMPLES: u32 = 4;
 pub const MAX_FRAMES_IN_FLIGHT: u32 = 2;
 pub const PROBE_WIDTH: u32 = 64;
@@ -47,7 +55,7 @@ impl Gpu {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("cubi GPU"),
-                required_features: wgpu::Features::empty(),
+                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
                 trace: wgpu::Trace::Off,

@@ -10,6 +10,9 @@ export XDG_RUNTIME_DIR="$_cubi_root/.local/run"
 export TMPDIR="$_cubi_root/.local/tmp"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 export PATH="$CARGO_HOME/bin:$_cubi_root/.local/bin:$PATH"
+if [[ -f "$_cubi_root/.local/audio-deps/usr/lib/x86_64-linux-gnu/pkgconfig/alsa.pc" ]]; then
+  export PKG_CONFIG_PATH="$_cubi_root/.local/audio-deps/usr/lib/x86_64-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+fi
 mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_RUNTIME_DIR" "$TMPDIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 unset _cubi_root

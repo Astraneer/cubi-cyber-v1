@@ -52,4 +52,3 @@ impl ItemStack {
         self.max() > 1 && !self.damaged()
     }
 }
-

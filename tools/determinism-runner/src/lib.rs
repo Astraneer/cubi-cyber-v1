@@ -72,6 +72,13 @@ pub fn run_trace() -> String {
         }
         write!(out, "\"{:016x}\"", world.canonical_hash()).expect("write to String");
     }
+    out.push_str("],\"physics\":[");
+    for (index, hash) in sim::determinism_trace().into_iter().enumerate() {
+        if index != 0 {
+            out.push(',');
+        }
+        write!(out, "\"{hash:016x}\"").expect("write to String");
+    }
     out.push_str("]}");
     out
 }

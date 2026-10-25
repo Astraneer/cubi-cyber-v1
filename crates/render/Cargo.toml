@@ -14,6 +14,8 @@ png = "=0.17.16"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 pollster.workspace = true
+nv-flip = "=0.1.2"
+nv-flip-sys = { path = "../compat-nv-flip-sys" }
 
 [lints]
 workspace = true

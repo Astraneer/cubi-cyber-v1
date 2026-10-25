@@ -11,7 +11,7 @@ pub fn generate_public_page(
     let cancelled = || {
         control
             .as_ref()
-            .is_some_and(|flags| js_sys::Atomics::load(flags, 0).map_or(true, |value| value != 0))
+            .is_some_and(|flags| js_sys::Atomics::load(flags, 0) != Ok(0))
     };
     task.execute_with_cancellation(cancelled)
         .map(|page| page.encode())

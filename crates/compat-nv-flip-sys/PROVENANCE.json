@@ -1,0 +1,80 @@
+{
+  "upstream_crate": "nv-flip-sys",
+  "version": "0.1.0",
+  "archive_sha256": "77e10cce1a01f54728bb032457d7931bc9c5212c4cb9d8e01fbd89afaf6be183",
+  "source": "crates.io",
+  "files": [
+    {
+      "source_path": "extern/cpp/CPP/color.h",
+      "source_sha256": "7005a0c40d77d29bdb67b961e4765d37d85d144c89875153463be980f0be0665",
+      "local_path": "vendor/color.h",
+      "local_sha256": "bdf42a661a01bde797830027b0a9bb13111ccde9101c509da95552d71332fdb2",
+      "changes": []
+    },
+    {
+      "source_path": "extern/cpp/CPP/tensor.h",
+      "source_sha256": "a0818d96ee848bbc5f6b8e1c889db2784f58962692a9379bc5075981190e3305",
+      "local_path": "vendor/tensor.h",
+      "local_sha256": "8fe88adb82bd8ac4341b92838d5c8f2df2c94891608e4e299c8dcd5c8cfe096a",
+      "changes": [
+        "Removed TinyEXR/STB includes and load/imageLoad/pngSave/exrLoad methods; numerical tensor operations unchanged."
+      ]
+    },
+    {
+      "source_path": "extern/cpp/CPP/image.h",
+      "source_sha256": "e8f8c373049733506f1162e362bbc2fd123bc6e9db96d0a08d154a060465a5b6",
+      "local_path": "vendor/image.h",
+      "local_sha256": "c322f8635e677eb5eac02db8a20a96fe5a36a51b264c1f3ae0a3193a56645e3c",
+      "changes": [
+        "Removed filename constructor and EXR save methods/specialization; FLIP numerical kernels unchanged."
+      ]
+    },
+    {
+      "source_path": "extern/cpp/common/pooling.h",
+      "source_sha256": "ca41cdcc43731ab4a633491c266ba71b0c060b0669280eb4e63c8a613bd6edd3",
+      "local_path": "vendor/pooling.h",
+      "local_sha256": "ba3b4451f4ff7ffbecbdeb263c4a9b774c0a1c6966c4a2785c15d95eef9045cf",
+      "changes": []
+    },
+    {
+      "source_path": "extern/cpp/common/mapMagma.h",
+      "source_sha256": "a05e02b72690c3d9863e5727f2e392ba3e3ee340868a8297a008b8c6d3098825",
+      "local_path": "vendor/mapMagma.h",
+      "local_sha256": "075847859a845a19bfb70d97fc80862ffcba5e8e71ad71ca852ea5f5fa9b1838",
+      "changes": []
+    },
+    {
+      "source_path": "extern/cpp/common/sharedflip.h",
+      "source_sha256": "1a6030979de2770a02244327b462f2b4dc838da5663060c4ea3508ecdf1bc846",
+      "local_path": "vendor/sharedflip.h",
+      "local_sha256": "4455b7e1fb5313a02bb1a60dd9c16a1ea50b213e96c8a004045e536273366289",
+      "changes": [
+        "Use local CPU color include; numerical shared functions retained unchanged."
+      ]
+    },
+    {
+      "source_path": "src/bindings.cpp",
+      "source_sha256": "d76bfb24bf779c6fdfda8dd16167fa36ffa0457e4fee4d36eb5e715dcd976768",
+      "local_path": "src/bindings.cpp",
+      "local_sha256": "fa6511d0973302f07e8fdc8ae92d5fafe06b50872f278ddca26757c3cd99fef3",
+      "changes": [
+        "Add direct standard-library includes formerly supplied incidentally by excluded image codecs."
+      ]
+    },
+    {
+      "source_path": "src/bindings.hpp",
+      "source_sha256": "8a9b4beaeb5319857812319a6cd0cfa638edd98fa565013c69d2e65a1bb1f84c",
+      "local_path": "src/bindings.hpp",
+      "local_sha256": "08ba3d14e18875a0ea8b5414aeab52bcf84da1057d47c391efc8c735395f5f74",
+      "changes": []
+    },
+    {
+      "source_path": "src/bindings.rs",
+      "source_sha256": "accc73b3aa5699557707482552e9bd0439da7ca65893aa398ea18f8a7be0d0df",
+      "local_path": "src/bindings.rs",
+      "local_sha256": "7d1cbb0e6a717f88c95b7d6dcf3a1415add9c4c321cb4d3d4bdf876e3c457efe",
+      "changes": []
+    }
+  ],
+  "text_normalization": "UTF-8 without BOM and LF line endings; no numerical constants or FLIP kernel operations changed."
+}

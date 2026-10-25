@@ -1,0 +1,2 @@
+Эталон M2 «лес»: первая сцена с квад-дескрипторами и vertex pulling, HDR/MSAA4/reverse-Z, cutout A2C и массивом текстур донора.
+320×224, MSAA4, HDR, reverse-Z, sRGB; атлас закреплён donor/IMPORT.json.

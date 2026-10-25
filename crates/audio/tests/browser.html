@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="ru"><meta charset="utf-8"><title>Audio and local resource acceptance</title>
+<body><button id="import">Локальный набор</button><button id="minecraft">Звуки Minecraft</button><p id="status" role="status"></p>
+<script type="module">
+import init,*as audio from './audio-pkg/audio.js';
+await init();audio.bind_local_pack_picker('import','status');audio.bind_local_minecraft_picker('minecraft','status');
+window.__AUDIO=audio;document.documentElement.dataset.audio='ready';
+</script></body></html>

@@ -1,0 +1,13 @@
+[package]
+name = "nv-flip-sys"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+publish = false
+links = "nv-flip"
+license = "(MIT OR Apache-2.0 OR Zlib) AND BSD-3-Clause"
+description = "Project adaptation of NVIDIA FLIP CPU metric without optional image I/O"
+authors = ["the gfx-rs developers", "NVIDIA Corporation & Affiliates", "Cubi contributors"]
+
+[build-dependencies]
+cc = "=1.10.0"

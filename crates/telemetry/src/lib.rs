@@ -5,6 +5,7 @@
 //! worker threads must establish their own scope if their work is to be measured.
 
 pub mod allocator;
+pub mod flight;
 
 pub use allocator::{AllocationCounts, AllocationScope, CountingAllocator, ScopeError};
 

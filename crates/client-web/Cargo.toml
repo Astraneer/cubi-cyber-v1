@@ -10,6 +10,8 @@ publish.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+client = { path = "../client" }
+jobs = { path = "../jobs" }
 terrain-gen = { package = "gen", path = "../gen" }
 render = { path = "../render" }
 telemetry.workspace = true
@@ -19,7 +21,7 @@ wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 console_error_panic_hook.workspace = true
 web-sys = { workspace = true, features = [
-    "Document", "Window", "HtmlCanvasElement", "Element", "Node", "HtmlElement", "Performance", "console",
+    "Document", "Window", "HtmlCanvasElement", "Element", "Node", "HtmlElement", "Performance", "console", "Location", "Url", "UrlSearchParams", "Event", "EventTarget", "KeyboardEvent", "MouseEvent",
 ] }
 
 [lints]
