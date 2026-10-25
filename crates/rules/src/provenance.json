@@ -1,0 +1,10 @@
+{
+  "commit": "3992583213e1f00d95a3beef2bde43ae970192d4",
+  "files": {
+    "registry/ids.rs": "4fef9076c42f4f8401cd1855e89dd502bbe9d4e785f0f115efe72ace58ac47f9",
+    "registry/blocks.rs": "ac13f78043c34a6c0a404b3af172c19f732c75b1baa7ab653a3a5f96ea2669c3",
+    "registry/items.rs": "0f8dd2ad6d6531cbf2a305c7eb1aaaf6942f62fd2ba04dbb79d526444029c6de",
+    "registry/shapes.rs": "0fc2fc6a95931eff1275991a76f20af010fd991ce9c9a4cc58a7789dbe218400"
+  },
+  "numeric_bindings": 265
+}

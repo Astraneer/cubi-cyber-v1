@@ -1,0 +1,180 @@
+1	ItemDef { mc: "grass_block", name: "Блок травы", max_stack: 64, max_damage: 0, kind: Block(1), remainder: 0 }
+2	ItemDef { mc: "dirt", name: "Земля", max_stack: 64, max_damage: 0, kind: Block(2), remainder: 0 }
+3	ItemDef { mc: "stone", name: "Камень", max_stack: 64, max_damage: 0, kind: Block(3), remainder: 0 }
+4	ItemDef { mc: "sand", name: "Песок", max_stack: 64, max_damage: 0, kind: Block(4), remainder: 0 }
+5	ItemDef { mc: "gravel", name: "Гравий", max_stack: 64, max_damage: 0, kind: Block(5), remainder: 0 }
+6	ItemDef { mc: "snow_block", name: "Снежный блок", max_stack: 64, max_damage: 0, kind: Block(6), remainder: 0 }
+7	ItemDef { mc: "sandstone", name: "Песчаник", max_stack: 64, max_damage: 0, kind: Block(7), remainder: 0 }
+8	ItemDef { mc: "clay", name: "Глина", max_stack: 64, max_damage: 0, kind: Block(8), remainder: 0 }
+9	ItemDef { mc: "oak_log", name: "Дубовое бревно", max_stack: 64, max_damage: 0, kind: Block(9), remainder: 0 }
+10	ItemDef { mc: "oak_leaves", name: "Дубовая листва", max_stack: 64, max_damage: 0, kind: Block(10), remainder: 0 }
+11	ItemDef { mc: "birch_log", name: "Берёзовое бревно", max_stack: 64, max_damage: 0, kind: Block(11), remainder: 0 }
+12	ItemDef { mc: "birch_leaves", name: "Берёзовая листва", max_stack: 64, max_damage: 0, kind: Block(12), remainder: 0 }
+13	ItemDef { mc: "spruce_log", name: "Еловое бревно", max_stack: 64, max_damage: 0, kind: Block(13), remainder: 0 }
+14	ItemDef { mc: "spruce_leaves", name: "Еловая листва", max_stack: 64, max_damage: 0, kind: Block(14), remainder: 0 }
+16	ItemDef { mc: "cactus", name: "Кактус", max_stack: 64, max_damage: 0, kind: Block(16), remainder: 0 }
+17	ItemDef { mc: "short_grass", name: "Трава", max_stack: 64, max_damage: 0, kind: Block(17), remainder: 0 }
+18	ItemDef { mc: "dandelion", name: "Одуванчик", max_stack: 64, max_damage: 0, kind: Block(18), remainder: 0 }
+19	ItemDef { mc: "poppy", name: "Мак", max_stack: 64, max_damage: 0, kind: Block(19), remainder: 0 }
+20	ItemDef { mc: "dead_bush", name: "Мёртвый куст", max_stack: 64, max_damage: 0, kind: Block(20), remainder: 0 }
+21	ItemDef { mc: "cobblestone", name: "Булыжник", max_stack: 64, max_damage: 0, kind: Block(21), remainder: 0 }
+22	ItemDef { mc: "bedrock", name: "Бедрок", max_stack: 64, max_damage: 0, kind: Block(22), remainder: 0 }
+26	ItemDef { mc: "fern", name: "Папоротник", max_stack: 64, max_damage: 0, kind: Block(26), remainder: 0 }
+40	ItemDef { mc: "oak_planks", name: "Дубовые доски", max_stack: 64, max_damage: 0, kind: Block(40), remainder: 0 }
+41	ItemDef { mc: "birch_planks", name: "Берёзовые доски", max_stack: 64, max_damage: 0, kind: Block(41), remainder: 0 }
+42	ItemDef { mc: "spruce_planks", name: "Еловые доски", max_stack: 64, max_damage: 0, kind: Block(42), remainder: 0 }
+43	ItemDef { mc: "crafting_table", name: "Верстак", max_stack: 64, max_damage: 0, kind: Block(43), remainder: 0 }
+44	ItemDef { mc: "furnace", name: "Печь", max_stack: 64, max_damage: 0, kind: Block(44), remainder: 0 }
+45	ItemDef { mc: "coal_ore", name: "Угольная руда", max_stack: 64, max_damage: 0, kind: Block(45), remainder: 0 }
+46	ItemDef { mc: "iron_ore", name: "Железная руда", max_stack: 64, max_damage: 0, kind: Block(46), remainder: 0 }
+47	ItemDef { mc: "torch", name: "Факел", max_stack: 64, max_damage: 0, kind: Block(47), remainder: 0 }
+48	ItemDef { mc: "glass", name: "Стекло", max_stack: 64, max_damage: 0, kind: Block(48), remainder: 0 }
+49	ItemDef { mc: "iron_block", name: "Железный блок", max_stack: 64, max_damage: 0, kind: Block(49), remainder: 0 }
+50	ItemDef { mc: "raw_iron_block", name: "Блок сырого железа", max_stack: 64, max_damage: 0, kind: Block(50), remainder: 0 }
+51	ItemDef { mc: "coal_block", name: "Угольный блок", max_stack: 64, max_damage: 0, kind: Block(51), remainder: 0 }
+52	ItemDef { mc: "chest", name: "Сундук", max_stack: 64, max_damage: 0, kind: Block(52), remainder: 0 }
+53	ItemDef { mc: "ladder", name: "Лестница", max_stack: 64, max_damage: 0, kind: Block(53), remainder: 0 }
+54	ItemDef { mc: "snow", name: "Снег", max_stack: 64, max_damage: 0, kind: Block(54), remainder: 0 }
+57	ItemDef { mc: "osmium_ore", name: "Осмиевая руда", max_stack: 64, max_damage: 0, kind: Block(57), remainder: 0 }
+58	ItemDef { mc: "tin_ore", name: "Оловянная руда", max_stack: 64, max_damage: 0, kind: Block(58), remainder: 0 }
+59	ItemDef { mc: "copper_ore", name: "Медная руда", max_stack: 64, max_damage: 0, kind: Block(59), remainder: 0 }
+60	ItemDef { mc: "gold_ore", name: "Золотая руда", max_stack: 64, max_damage: 0, kind: Block(60), remainder: 0 }
+61	ItemDef { mc: "redstone_ore", name: "Редстоуновая руда", max_stack: 64, max_damage: 0, kind: Block(61), remainder: 0 }
+62	ItemDef { mc: "steel_casing", name: "Стальной корпус", max_stack: 64, max_damage: 0, kind: Block(62), remainder: 0 }
+63	ItemDef { mc: "heat_generator", name: "Тепловой генератор", max_stack: 64, max_damage: 0, kind: Block(63), remainder: 0 }
+64	ItemDef { mc: "metallurgic_infuser", name: "Металлургический инфузор", max_stack: 64, max_damage: 0, kind: Block(64), remainder: 0 }
+65	ItemDef { mc: "basic_universal_cable", name: "Универсальный кабель", max_stack: 64, max_damage: 0, kind: Block(65), remainder: 0 }
+66	ItemDef { mc: "basic_energy_cube", name: "Базовый куб энергии", max_stack: 64, max_damage: 0, kind: Block(66), remainder: 0 }
+67	ItemDef { mc: "block_steel", name: "Стальной блок", max_stack: 64, max_damage: 0, kind: Block(67), remainder: 0 }
+68	ItemDef { mc: "block_osmium", name: "Осмиевый блок", max_stack: 64, max_damage: 0, kind: Block(68), remainder: 0 }
+69	ItemDef { mc: "redstone_block", name: "Блок редстоуна", max_stack: 64, max_damage: 0, kind: Block(69), remainder: 0 }
+70	ItemDef { mc: "enrichment_chamber", name: "Обогатительная камера", max_stack: 64, max_damage: 0, kind: Block(70), remainder: 0 }
+71	ItemDef { mc: "energized_smelter", name: "Плавильня с энергией", max_stack: 64, max_damage: 0, kind: Block(71), remainder: 0 }
+72	ItemDef { mc: "wind_generator", name: "Ветряной генератор", max_stack: 64, max_damage: 0, kind: Block(72), remainder: 0 }
+74	ItemDef { mc: "crusher", name: "Дробилка", max_stack: 64, max_damage: 0, kind: Block(74), remainder: 0 }
+75	ItemDef { mc: "purification_chamber", name: "Очистительная камера", max_stack: 64, max_damage: 0, kind: Block(75), remainder: 0 }
+76	ItemDef { mc: "electrolytic_separator", name: "Электролитический сепаратор", max_stack: 64, max_damage: 0, kind: Block(76), remainder: 0 }
+77	ItemDef { mc: "basic_logistical_transporter", name: "Логистический транспортёр", max_stack: 64, max_damage: 0, kind: Block(77), remainder: 0 }
+78	ItemDef { mc: "basic_mechanical_pipe", name: "Механическая труба", max_stack: 64, max_damage: 0, kind: Block(78), remainder: 0 }
+79	ItemDef { mc: "basic_pressurized_tube", name: "Напорная трубка", max_stack: 64, max_damage: 0, kind: Block(79), remainder: 0 }
+80	ItemDef { mc: "electric_pump", name: "Электрический насос", max_stack: 64, max_damage: 0, kind: Block(80), remainder: 0 }
+100	ItemDef { mc: "white_wool", name: "Белая шерсть", max_stack: 64, max_damage: 0, kind: Block(100), remainder: 0 }
+101	ItemDef { mc: "black_wool", name: "Чёрная шерсть", max_stack: 64, max_damage: 0, kind: Block(101), remainder: 0 }
+102	ItemDef { mc: "gray_wool", name: "Серая шерсть", max_stack: 64, max_damage: 0, kind: Block(102), remainder: 0 }
+103	ItemDef { mc: "light_gray_wool", name: "Светло-серая шерсть", max_stack: 64, max_damage: 0, kind: Block(103), remainder: 0 }
+104	ItemDef { mc: "brown_wool", name: "Коричневая шерсть", max_stack: 64, max_damage: 0, kind: Block(104), remainder: 0 }
+105	ItemDef { mc: "pink_wool", name: "Розовая шерсть", max_stack: 64, max_damage: 0, kind: Block(105), remainder: 0 }
+110	ItemDef { mc: "obsidian", name: "Обсидиан", max_stack: 64, max_damage: 0, kind: Block(110), remainder: 0 }
+115	ItemDef { mc: "hay_block", name: "Стог сена", max_stack: 64, max_damage: 0, kind: Block(115), remainder: 0 }
+256	ItemDef { mc: "stick", name: "Палка", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+257	ItemDef { mc: "coal", name: "Уголь", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+258	ItemDef { mc: "charcoal", name: "Древесный уголь", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+259	ItemDef { mc: "raw_iron", name: "Сырое железо", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+260	ItemDef { mc: "iron_ingot", name: "Железный слиток", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+261	ItemDef { mc: "iron_nugget", name: "Железный самородок", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+262	ItemDef { mc: "flint", name: "Кремень", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+263	ItemDef { mc: "apple", name: "Яблоко", max_stack: 64, max_damage: 0, kind: Food { nutrition: 4 }, remainder: 0 }
+264	ItemDef { mc: "wheat_seeds", name: "Семена пшеницы", max_stack: 64, max_damage: 0, kind: Seed { crop: 112, nutrition: 0 }, remainder: 0 }
+265	ItemDef { mc: "snowball", name: "Снежок", max_stack: 16, max_damage: 0, kind: Plain, remainder: 0 }
+266	ItemDef { mc: "clay_ball", name: "Комок глины", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+267	ItemDef { mc: "leather", name: "Кожа", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+268	ItemDef { mc: "bucket", name: "Ведро", max_stack: 16, max_damage: 0, kind: Bucket { fluid: 0 }, remainder: 0 }
+269	ItemDef { mc: "water_bucket", name: "Ведро воды", max_stack: 1, max_damage: 0, kind: Bucket { fluid: 1 }, remainder: 268 }
+270	ItemDef { mc: "lava_bucket", name: "Ведро лавы", max_stack: 1, max_damage: 0, kind: Bucket { fluid: 2 }, remainder: 268 }
+271	ItemDef { mc: "wooden_pickaxe", name: "Деревянная кирка", max_stack: 1, max_damage: 59, kind: Tool { mask: 1, tier: Tier { level: 0, speed: 2.0, durability: 59 } }, remainder: 0 }
+272	ItemDef { mc: "wooden_axe", name: "Деревянный топор", max_stack: 1, max_damage: 59, kind: Tool { mask: 2, tier: Tier { level: 0, speed: 2.0, durability: 59 } }, remainder: 0 }
+273	ItemDef { mc: "wooden_shovel", name: "Деревянная лопата", max_stack: 1, max_damage: 59, kind: Tool { mask: 4, tier: Tier { level: 0, speed: 2.0, durability: 59 } }, remainder: 0 }
+274	ItemDef { mc: "wooden_hoe", name: "Деревянная мотыга", max_stack: 1, max_damage: 59, kind: Tool { mask: 8, tier: Tier { level: 0, speed: 2.0, durability: 59 } }, remainder: 0 }
+275	ItemDef { mc: "wooden_sword", name: "Деревянный меч", max_stack: 1, max_damage: 59, kind: Sword { tier: Tier { level: 0, speed: 2.0, durability: 59 } }, remainder: 0 }
+276	ItemDef { mc: "stone_pickaxe", name: "Каменная кирка", max_stack: 1, max_damage: 131, kind: Tool { mask: 1, tier: Tier { level: 1, speed: 4.0, durability: 131 } }, remainder: 0 }
+277	ItemDef { mc: "stone_axe", name: "Каменный топор", max_stack: 1, max_damage: 131, kind: Tool { mask: 2, tier: Tier { level: 1, speed: 4.0, durability: 131 } }, remainder: 0 }
+278	ItemDef { mc: "stone_shovel", name: "Каменная лопата", max_stack: 1, max_damage: 131, kind: Tool { mask: 4, tier: Tier { level: 1, speed: 4.0, durability: 131 } }, remainder: 0 }
+279	ItemDef { mc: "stone_hoe", name: "Каменная мотыга", max_stack: 1, max_damage: 131, kind: Tool { mask: 8, tier: Tier { level: 1, speed: 4.0, durability: 131 } }, remainder: 0 }
+280	ItemDef { mc: "stone_sword", name: "Каменный меч", max_stack: 1, max_damage: 131, kind: Sword { tier: Tier { level: 1, speed: 4.0, durability: 131 } }, remainder: 0 }
+281	ItemDef { mc: "iron_pickaxe", name: "Железная кирка", max_stack: 1, max_damage: 250, kind: Tool { mask: 1, tier: Tier { level: 2, speed: 6.0, durability: 250 } }, remainder: 0 }
+282	ItemDef { mc: "iron_axe", name: "Железный топор", max_stack: 1, max_damage: 250, kind: Tool { mask: 2, tier: Tier { level: 2, speed: 6.0, durability: 250 } }, remainder: 0 }
+283	ItemDef { mc: "iron_shovel", name: "Железная лопата", max_stack: 1, max_damage: 250, kind: Tool { mask: 4, tier: Tier { level: 2, speed: 6.0, durability: 250 } }, remainder: 0 }
+284	ItemDef { mc: "iron_hoe", name: "Железная мотыга", max_stack: 1, max_damage: 250, kind: Tool { mask: 8, tier: Tier { level: 2, speed: 6.0, durability: 250 } }, remainder: 0 }
+285	ItemDef { mc: "iron_sword", name: "Железный меч", max_stack: 1, max_damage: 250, kind: Sword { tier: Tier { level: 2, speed: 6.0, durability: 250 } }, remainder: 0 }
+286	ItemDef { mc: "leather_helmet", name: "Кожаный шлем", max_stack: 1, max_damage: 55, kind: Armor { slot: 3, points: 1 }, remainder: 0 }
+287	ItemDef { mc: "leather_chestplate", name: "Кожаная куртка", max_stack: 1, max_damage: 80, kind: Armor { slot: 2, points: 3 }, remainder: 0 }
+288	ItemDef { mc: "leather_leggings", name: "Кожаные штаны", max_stack: 1, max_damage: 75, kind: Armor { slot: 1, points: 2 }, remainder: 0 }
+289	ItemDef { mc: "leather_boots", name: "Кожаные ботинки", max_stack: 1, max_damage: 65, kind: Armor { slot: 0, points: 1 }, remainder: 0 }
+290	ItemDef { mc: "iron_helmet", name: "Железный шлем", max_stack: 1, max_damage: 165, kind: Armor { slot: 3, points: 2 }, remainder: 0 }
+291	ItemDef { mc: "iron_chestplate", name: "Железный нагрудник", max_stack: 1, max_damage: 240, kind: Armor { slot: 2, points: 6 }, remainder: 0 }
+292	ItemDef { mc: "iron_leggings", name: "Железные поножи", max_stack: 1, max_damage: 225, kind: Armor { slot: 1, points: 5 }, remainder: 0 }
+293	ItemDef { mc: "iron_boots", name: "Железные ботинки", max_stack: 1, max_damage: 195, kind: Armor { slot: 0, points: 2 }, remainder: 0 }
+294	ItemDef { mc: "shears", name: "Ножницы", max_stack: 1, max_damage: 238, kind: Shears, remainder: 0 }
+295	ItemDef { mc: "raw_osmium", name: "Сырой осмий", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+296	ItemDef { mc: "raw_tin", name: "Сырое олово", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+297	ItemDef { mc: "raw_copper", name: "Сырая медь", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+298	ItemDef { mc: "raw_gold", name: "Сырое золото", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+299	ItemDef { mc: "osmium_ingot", name: "Слиток осмия", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+300	ItemDef { mc: "tin_ingot", name: "Слиток олова", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+301	ItemDef { mc: "copper_ingot", name: "Медный слиток", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+302	ItemDef { mc: "gold_ingot", name: "Золотой слиток", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+303	ItemDef { mc: "steel_ingot", name: "Стальной слиток", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+304	ItemDef { mc: "steel_nugget", name: "Стальной самородок", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+305	ItemDef { mc: "redstone", name: "Редстоун", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+306	ItemDef { mc: "dust_iron", name: "Железная пыль", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+307	ItemDef { mc: "dust_steel", name: "Стальная пыль", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+308	ItemDef { mc: "enriched_carbon", name: "Обогащённый уголь", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+309	ItemDef { mc: "enriched_redstone", name: "Обогащённый редстоун", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+310	ItemDef { mc: "enriched_iron", name: "Обогащённое железо", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+311	ItemDef { mc: "basic_control_circuit", name: "Базовая схема управления", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+312	ItemDef { mc: "alloy_infused", name: "Пропитанный сплав", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+313	ItemDef { mc: "energy_tablet", name: "Планшет энергии", max_stack: 1, max_damage: 0, kind: Plain, remainder: 0 }
+314	ItemDef { mc: "steel_pickaxe", name: "Стальная кирка", max_stack: 1, max_damage: 500, kind: Tool { mask: 1, tier: Tier { level: 3, speed: 8.0, durability: 500 } }, remainder: 0 }
+315	ItemDef { mc: "steel_axe", name: "Стальной топор", max_stack: 1, max_damage: 500, kind: Tool { mask: 2, tier: Tier { level: 3, speed: 8.0, durability: 500 } }, remainder: 0 }
+316	ItemDef { mc: "steel_shovel", name: "Стальная лопата", max_stack: 1, max_damage: 500, kind: Tool { mask: 4, tier: Tier { level: 3, speed: 8.0, durability: 500 } }, remainder: 0 }
+317	ItemDef { mc: "steel_hoe", name: "Стальная мотыга", max_stack: 1, max_damage: 500, kind: Tool { mask: 8, tier: Tier { level: 3, speed: 8.0, durability: 500 } }, remainder: 0 }
+318	ItemDef { mc: "steel_sword", name: "Стальной меч", max_stack: 1, max_damage: 500, kind: Sword { tier: Tier { level: 3, speed: 8.0, durability: 500 } }, remainder: 0 }
+319	ItemDef { mc: "steel_helmet", name: "Стальной шлем", max_stack: 1, max_damage: 220, kind: Armor { slot: 3, points: 3 }, remainder: 0 }
+320	ItemDef { mc: "steel_chestplate", name: "Стальной нагрудник", max_stack: 1, max_damage: 320, kind: Armor { slot: 2, points: 8 }, remainder: 0 }
+321	ItemDef { mc: "steel_leggings", name: "Стальные поножи", max_stack: 1, max_damage: 300, kind: Armor { slot: 1, points: 6 }, remainder: 0 }
+322	ItemDef { mc: "steel_boots", name: "Стальные ботинки", max_stack: 1, max_damage: 260, kind: Armor { slot: 0, points: 3 }, remainder: 0 }
+323	ItemDef { mc: "dust_osmium", name: "Осмиевая пыль", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+324	ItemDef { mc: "dust_copper", name: "Медная пыль", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+325	ItemDef { mc: "dust_gold", name: "Золотая пыль", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+326	ItemDef { mc: "dust_tin", name: "Оловянная пыль", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+327	ItemDef { mc: "configurator", name: "Конфигуратор", max_stack: 1, max_damage: 0, kind: Plain, remainder: 0 }
+328	ItemDef { mc: "upgrade_speed", name: "Улучшение скорости", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+329	ItemDef { mc: "upgrade_energy", name: "Улучшение энергии", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+340	ItemDef { mc: "clump_iron", name: "Железный комок", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+341	ItemDef { mc: "clump_osmium", name: "Осмиевый комок", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+342	ItemDef { mc: "clump_copper", name: "Медный комок", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+343	ItemDef { mc: "clump_gold", name: "Золотой комок", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+344	ItemDef { mc: "clump_tin", name: "Оловянный комок", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+345	ItemDef { mc: "dirty_dust_iron", name: "Грязная железная пыль", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+346	ItemDef { mc: "dirty_dust_osmium", name: "Грязная осмиевая пыль", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+347	ItemDef { mc: "dirty_dust_copper", name: "Грязная медная пыль", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+348	ItemDef { mc: "dirty_dust_gold", name: "Грязная золотая пыль", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+349	ItemDef { mc: "dirty_dust_tin", name: "Грязная оловянная пыль", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+350	ItemDef { mc: "electrolytic_core", name: "Электролитическое ядро", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+351	ItemDef { mc: "advanced_control_circuit", name: "Продвинутая схема", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+352	ItemDef { mc: "upgrade_gas", name: "Улучшение газа", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+400	ItemDef { mc: "porkchop", name: "Сырая свинина", max_stack: 64, max_damage: 0, kind: Food { nutrition: 3 }, remainder: 0 }
+401	ItemDef { mc: "cooked_porkchop", name: "Жареная свинина", max_stack: 64, max_damage: 0, kind: Food { nutrition: 8 }, remainder: 0 }
+402	ItemDef { mc: "beef", name: "Сырая говядина", max_stack: 64, max_damage: 0, kind: Food { nutrition: 3 }, remainder: 0 }
+403	ItemDef { mc: "cooked_beef", name: "Стейк", max_stack: 64, max_damage: 0, kind: Food { nutrition: 8 }, remainder: 0 }
+404	ItemDef { mc: "mutton", name: "Сырая баранина", max_stack: 64, max_damage: 0, kind: Food { nutrition: 2 }, remainder: 0 }
+405	ItemDef { mc: "cooked_mutton", name: "Жареная баранина", max_stack: 64, max_damage: 0, kind: Food { nutrition: 6 }, remainder: 0 }
+406	ItemDef { mc: "chicken", name: "Сырая курица", max_stack: 64, max_damage: 0, kind: Food { nutrition: 2 }, remainder: 0 }
+407	ItemDef { mc: "cooked_chicken", name: "Жареная курица", max_stack: 64, max_damage: 0, kind: Food { nutrition: 6 }, remainder: 0 }
+408	ItemDef { mc: "feather", name: "Перо", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+409	ItemDef { mc: "egg", name: "Яйцо", max_stack: 16, max_damage: 0, kind: Plain, remainder: 0 }
+410	ItemDef { mc: "rotten_flesh", name: "Гнилая плоть", max_stack: 64, max_damage: 0, kind: Food { nutrition: 4 }, remainder: 0 }
+420	ItemDef { mc: "diamond", name: "Алмаз", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+421	ItemDef { mc: "golden_helmet", name: "Золотой шлем", max_stack: 1, max_damage: 77, kind: Armor { slot: 3, points: 2 }, remainder: 0 }
+422	ItemDef { mc: "golden_chestplate", name: "Золотой нагрудник", max_stack: 1, max_damage: 112, kind: Armor { slot: 2, points: 5 }, remainder: 0 }
+423	ItemDef { mc: "golden_leggings", name: "Золотые поножи", max_stack: 1, max_damage: 105, kind: Armor { slot: 1, points: 3 }, remainder: 0 }
+424	ItemDef { mc: "golden_boots", name: "Золотые ботинки", max_stack: 1, max_damage: 91, kind: Armor { slot: 0, points: 1 }, remainder: 0 }
+425	ItemDef { mc: "diamond_helmet", name: "Алмазный шлем", max_stack: 1, max_damage: 363, kind: Armor { slot: 3, points: 3 }, remainder: 0 }
+426	ItemDef { mc: "diamond_chestplate", name: "Алмазный нагрудник", max_stack: 1, max_damage: 528, kind: Armor { slot: 2, points: 8 }, remainder: 0 }
+427	ItemDef { mc: "diamond_leggings", name: "Алмазные поножи", max_stack: 1, max_damage: 495, kind: Armor { slot: 1, points: 6 }, remainder: 0 }
+428	ItemDef { mc: "diamond_boots", name: "Алмазные ботинки", max_stack: 1, max_damage: 429, kind: Armor { slot: 0, points: 3 }, remainder: 0 }
+429	ItemDef { mc: "wheat", name: "Пшеница", max_stack: 64, max_damage: 0, kind: Plain, remainder: 0 }
+430	ItemDef { mc: "bread", name: "Хлеб", max_stack: 64, max_damage: 0, kind: Food { nutrition: 5 }, remainder: 0 }
+431	ItemDef { mc: "carrot", name: "Морковь", max_stack: 64, max_damage: 0, kind: Seed { crop: 113, nutrition: 3 }, remainder: 0 }
+432	ItemDef { mc: "potato", name: "Картофель", max_stack: 64, max_damage: 0, kind: Seed { crop: 114, nutrition: 1 }, remainder: 0 }
+433	ItemDef { mc: "baked_potato", name: "Печёный картофель", max_stack: 64, max_damage: 0, kind: Food { nutrition: 5 }, remainder: 0 }

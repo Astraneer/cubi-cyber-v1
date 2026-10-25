@@ -8,3 +8,6 @@ publish.workspace = true
 
 [dependencies]
 core-types.workspace = true
+
+[lints]
+workspace = true
