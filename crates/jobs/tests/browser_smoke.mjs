@@ -123,7 +123,9 @@ async function run(isolated) {
     socket?.close();
     await stop(browser);
     await new Promise(resolve => server.close(resolve));
-    await rm(profile, { recursive: true, force: true });
+    // Chromium helpers can finish a profile write just after the parent exits.
+    // Retry that cleanup race; functional errors above still fail the smoke.
+    await rm(profile, { recursive: true, force: true, maxRetries: 8, retryDelay: 200 });
   }
 }
 await run(true);

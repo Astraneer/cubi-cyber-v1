@@ -102,7 +102,7 @@ try {
     await sleep(50);
   }
   if (!port) throw new Error(`Web server did not start: ${serverLog}`);
-  const url = `http://127.0.0.1:${port}/`;
+  const url = `http://127.0.0.1:${port}/?scene=sky`;
   const chrome = process.env.CHROMIUM ?? 'chromium';
   browser = spawn(chrome, [
     ...(headed ? [] : ['--headless=new']), '--no-sandbox', '--disable-dev-shm-usage',
@@ -292,5 +292,5 @@ try {
   if (socket) socket.close();
   await stop(browser);
   await stop(server);
-  await rm(profile, { recursive: true, force: true });
+  await rm(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 }
