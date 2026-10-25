@@ -1,0 +1,74 @@
+name: M0 acceptance
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m0-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux, software Vulkan and browser WebGPU
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+      - name: Install software graphics and virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 libx11-dev libxkbcommon-dev xvfb xauth
+      - name: Bootstrap locked toolchain and dependencies
+        run: bash tools/bootstrap.sh
+      - name: Verify imported donor without private network access
+        run: bash tools/import_donor.sh --verify
+      - name: Required checks, native window, WASM and actual WebGPU pixels
+        env:
+          # Google Chrome ships SwiftShader on GitHub-hosted Ubuntu runners.
+          CHROMIUM: google-chrome
+        run: bash tools/check.sh
+      - name: Verify visible WebGPU canvas in virtual X11
+        if: always() && hashFiles('.local/web-dist/index.html') != ''
+        env:
+          CHROMIUM: google-chrome
+        run: xvfb-run -a node tools/web_smoke.mjs --headed
+      - name: Preserve actual browser canvas
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: m0-webgpu-canvas
+          path: .local/artifacts/m0-web-*.png
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  windows:
+    name: Windows native compilation
+    runs-on: windows-2022
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Bootstrap locked toolchain
+        run: bash tools/bootstrap.sh
+      - name: Compile Windows shell and all native targets
+        run: |
+          source tools/env.sh
+          cargo check --locked --workspace --all-targets
+          cargo test --locked -p core-types -p telemetry
+      - name: Render shared sky with D3D12 WARP
+        run: |
+          source tools/env.sh
+          cargo test --locked -p render --test software_sky -- --nocapture
+      - name: Present three native Windows frames
+        run: |
+          source tools/env.sh
+          cargo run --locked -p client-native -- --smoke-frames 3
