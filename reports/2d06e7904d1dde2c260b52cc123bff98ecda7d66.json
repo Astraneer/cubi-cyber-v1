@@ -1,0 +1,25 @@
+{
+  "checks": {
+    "linux": "success",
+    "windows": "success"
+  },
+  "conclusion": "success",
+  "delivery": {
+    "http_status": 403,
+    "status": "denied"
+  },
+  "reported_at": "2026-10-25T21:03:16.070400+00:00",
+  "repository": "Astraneer/cubi-cyber-v1",
+  "schema_version": 1,
+  "source": {
+    "branch": "m2-terrain",
+    "sha": "2d06e7904d1dde2c260b52cc123bff98ecda7d66",
+    "stage": "M2"
+  },
+  "workflow": {
+    "name": "Acceptance",
+    "run_attempt": "1",
+    "run_id": "40232973153",
+    "url": "https://github.com/Astraneer/cubi-cyber-v1/actions/runs/40232973153"
+  }
+}
