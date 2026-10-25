@@ -4,6 +4,7 @@
 
 mod actor;
 pub mod entities;
+mod geometry;
 pub mod lod;
 pub mod survival;
 pub mod transport;
@@ -29,7 +30,7 @@ const INPUT_DELAY_MILLIS: u64 = 150;
 const MAX_INPUTS: usize = 256;
 const MAX_INBOX: usize = 512;
 const MAX_ACTIONS_PER_TICK: usize = 128;
-const MAX_AOI_PAGES: usize = 64;
+const MAX_AOI_PAGES: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -40,6 +41,7 @@ pub struct ServerConfig {
     pub spawn_override: Option<[f64; 3]>,
     pub spawn_protection_radius: i32,
     pub generation_enabled: bool,
+    pub geometry_result_delay_ticks: u8,
 }
 impl ServerConfig {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
@@ -51,6 +53,7 @@ impl ServerConfig {
             spawn_override: None,
             spawn_protection_radius: 32,
             generation_enabled: true,
+            geometry_result_delay_ticks: 0,
         }
     }
 }
@@ -108,6 +111,12 @@ pub struct ServerCounters {
     pub visibility_segments: u64,
     pub summary_cells: u64,
     pub rejected_transactions: u64,
+    pub geometry_submitted: u64,
+    pub geometry_published: u64,
+    pub geometry_discarded: u64,
+    pub geometry_cells: u64,
+    pub geometry_tint_samples: u64,
+    pub geometry_held_peak: usize,
 }
 struct MiningAction {
     id: ActionId,
@@ -129,7 +138,7 @@ struct Peer {
     inputs: BTreeMap<u64, InputFrame>,
     input_ready_at: Option<u64>,
     last_keys: u8,
-    actions: BTreeMap<ActionId, Action>,
+    actions: BTreeMap<ActionId, (Action, Option<[f32; 2]>)>,
     next_action_to_start: u64,
     mining: Option<MiningAction>,
     interaction: InteractionController,
@@ -139,6 +148,9 @@ struct Peer {
     pages: BTreeSet<PageId>,
     page_requests: VecDeque<(PageId, bool)>,
     summaries: VecDeque<PageId>,
+    geometry_requests: VecDeque<(PageId, Option<Version>)>,
+    geometry_subscriptions: BTreeMap<PageId, Version>,
+    geometry_view: u64,
     last_view_position: [f64; 3],
 }
 struct Pending {
@@ -172,6 +184,7 @@ pub struct Server {
     last_checkpoint_tick: u64,
     spawn: [f64; 3],
     generation: Option<Generation>,
+    geometry: geometry::GeometryWorker,
     failed: bool,
     counters: ServerCounters,
     recent_changes: VecDeque<WorldChange>,
@@ -190,6 +203,7 @@ impl Server {
         if config.maximum_players == 0
             || config.maximum_players > 32
             || config.spawn_protection_radius < 0
+            || config.geometry_result_delay_ticks > 20
         {
             return Err(ServerError::Invalid("player/protection bounds"));
         }
@@ -275,6 +289,7 @@ impl Server {
                 identities: identities.values().cloned().collect(),
                 players: players.values().cloned().collect(),
                 dedup: dedup.iter().map(|(id, d)| (*id, d.clone())).collect(),
+                runtimes: Vec::new(),
             })?;
         }
         let generator = std::sync::Arc::new(gen_authority::ServerGenerator::new(
@@ -311,6 +326,10 @@ impl Server {
         } else {
             None
         };
+        let geometry = geometry::GeometryWorker::new(
+            generator.terrain().clone(),
+            config.geometry_result_delay_ticks,
+        )?;
         let mut config = config;
         config.public_seed = public_seed;
         let owner = load_owner(&config.data_dir, &identities)?;
@@ -344,6 +363,7 @@ impl Server {
             last_checkpoint_tick: tick.0,
             spawn,
             generation,
+            geometry,
             failed: false,
             counters: ServerCounters::default(),
             recent_changes: VecDeque::new(),
@@ -494,7 +514,11 @@ impl Server {
                     peer.next_action_to_start = next;
                 }
                 let id = ActionId(peer.next_action_to_start);
-                if let Some(action) = peer.actions.remove(&id) {
+                if let Some((action, aim)) = peer.actions.remove(&id) {
+                    if let Some([yaw, pitch]) = aim {
+                        peer.player.yaw = yaw.rem_euclid(360.0);
+                        peer.player.pitch = pitch;
+                    }
                     peer.next_action_to_start = peer.next_action_to_start.saturating_add(1);
                     self.perform_action(
                         connection,
@@ -552,6 +576,23 @@ impl Server {
                     for page in &peer.pages {
                         if !peer.page_requests.iter().any(|(p, _)| p == page) {
                             peer.page_requests.push_back((*page, false));
+                        }
+                    }
+                    for page in pending.changes.iter().flat_map(|change| {
+                        change
+                            .pages
+                            .iter()
+                            .filter(|p| {
+                                p.created
+                                    || p.removed
+                                    || p.channels.intersects(geometry::channels())
+                            })
+                            .map(|p| p.page)
+                    }) {
+                        if peer.geometry_subscriptions.contains_key(&page)
+                            && !peer.geometry_requests.iter().any(|(p, _)| *p == page)
+                        {
+                            peer.geometry_requests.push_back((page, None));
                         }
                     }
                 }
@@ -672,6 +713,7 @@ impl Server {
             identities: self.identities.values().cloned().collect(),
             players: self.saved_players.values().cloned().collect(),
             dedup: self.dedup.iter().map(|(id, d)| (*id, d.clone())).collect(),
+            runtimes: Vec::new(),
         };
         if self
             .writer
@@ -702,6 +744,15 @@ impl Server {
         batch: &mut Batch,
         out: &mut Vec<Outgoing>,
     ) {
+        let (message, aim) = match message {
+            ClientMessage::AimedAction {
+                id,
+                action,
+                yaw,
+                pitch,
+            } => (ClientMessage::Action { id, action }, Some([yaw, pitch])),
+            other => (other, None),
+        };
         if let ClientMessage::Hello(hello) = message {
             self.hello(connection, hello, batch, out);
             return;
@@ -769,7 +820,7 @@ impl Server {
                         )),
                     ));
                 } else {
-                    peer.actions.insert(id, action);
+                    peer.actions.insert(id, (action, aim));
                 }
             }
             ClientMessage::RequestPage { page, acknowledged } => {
@@ -787,10 +838,33 @@ impl Server {
                     peer.summaries.push_back(page);
                 }
             }
+            ClientMessage::RequestGeometry { page, known } => {
+                if peer.geometry_subscriptions.len() >= 16
+                    && !peer.geometry_subscriptions.contains_key(&page)
+                {
+                    out.push(Outgoing::reliable(
+                        connection,
+                        ServerMessage::GeometryUnavailable(page),
+                    ));
+                } else {
+                    peer.geometry_subscriptions
+                        .entry(page)
+                        .or_insert(Version(0));
+                    if peer.geometry_requests.len() < 16
+                        && !peer.geometry_requests.iter().any(|(p, _)| *p == page)
+                    {
+                        peer.geometry_requests.push_back((page, known));
+                    }
+                }
+            }
+            ClientMessage::ForgetGeometry(page) => {
+                peer.geometry_subscriptions.remove(&page);
+                peer.geometry_requests.retain(|(p, _)| *p != page);
+            }
             ClientMessage::Ping(n) => {
                 out.push(Outgoing::reliable(connection, ServerMessage::Pong(n)))
             }
-            ClientMessage::Hello(_) => unreachable!(),
+            ClientMessage::Hello(_) | ClientMessage::AimedAction { .. } => unreachable!(),
         }
     }
 
@@ -995,6 +1069,9 @@ impl Server {
                 pages: BTreeSet::new(),
                 page_requests: VecDeque::new(),
                 summaries: VecDeque::new(),
+                geometry_requests: VecDeque::new(),
+                geometry_subscriptions: BTreeMap::new(),
+                geometry_view: 0,
                 last_view_position: position,
             },
         );
@@ -1133,18 +1210,22 @@ impl Server {
                 } else if target.space != peer.space {
                     status = ActionStatus::Rejected(RejectReason::OutOfReach);
                 } else {
-                    let prepared = sim::prepare_edit(
-                        &self.world,
-                        peer.space,
-                        &peer.player,
-                        sim::EditAction::Place {
-                            position: [target.x, target.y, target.z],
-                            expected,
-                            cell: value,
-                        },
-                        self.tick,
-                        |p| self.protected(p, role),
-                    );
+                    let prepared = self
+                        .precheck_edit(peer, target, Some(value), role)
+                        .and_then(|_| {
+                            sim::prepare_edit(
+                                &self.world,
+                                peer.space,
+                                &peer.player,
+                                sim::EditAction::Place {
+                                    position: [target.x, target.y, target.z],
+                                    expected,
+                                    cell: value,
+                                },
+                                self.tick,
+                                |p| self.protected(p, role),
+                            )
+                        });
                     match prepared {
                         Ok(tx) => match self.world.commit(tx) {
                             Ok(change) => {
@@ -1205,17 +1286,19 @@ impl Server {
                 let prepared = if target.space != peer.space {
                     Err(sim::EditError::OutOfReach)
                 } else {
-                    sim::prepare_edit(
-                        &self.world,
-                        peer.space,
-                        &peer.player,
-                        sim::EditAction::Break {
-                            position: [target.x, target.y, target.z],
-                            expected,
-                        },
-                        self.tick,
-                        |p| self.protected(p, role),
-                    )
+                    self.precheck_edit(peer, target, None, role).and_then(|_| {
+                        sim::prepare_edit(
+                            &self.world,
+                            peer.space,
+                            &peer.player,
+                            sim::EditAction::Break {
+                                position: [target.x, target.y, target.z],
+                                expected,
+                            },
+                            self.tick,
+                            |p| self.protected(p, role),
+                        )
+                    })
                 };
                 match prepared {
                     Ok(_) => {
@@ -1336,6 +1419,8 @@ impl Server {
             if position.space != peer.space {
                 return Err(RejectReason::OutOfReach);
             }
+            self.precheck_edit(peer, position, Some(cell), role)
+                .map_err(edit_reason)?;
             let tx = sim::prepare_edit(
                 &self.world,
                 peer.space,
@@ -1402,17 +1487,21 @@ impl Server {
         };
         let role = self.identities[&peer.identity].role;
         let current = self.world.read(mining.position);
-        let prepared = sim::prepare_edit(
-            &self.world,
-            peer.space,
-            &peer.player,
-            sim::EditAction::Break {
-                position: [mining.position.x, mining.position.y, mining.position.z],
-                expected: mining.expected,
-            },
-            self.tick,
-            |p| self.protected(p, role),
-        );
+        let prepared = self
+            .precheck_edit(peer, mining.position, None, role)
+            .and_then(|_| {
+                sim::prepare_edit(
+                    &self.world,
+                    peer.space,
+                    &peer.player,
+                    sim::EditAction::Break {
+                        position: [mining.position.x, mining.position.y, mining.position.z],
+                        expected: mining.expected,
+                    },
+                    self.tick,
+                    |p| self.protected(p, role),
+                )
+            });
         let error = prepared.err();
         if current != CellRead::Known(mining.expected)
             || error.is_some()
@@ -1585,6 +1674,80 @@ impl Server {
             }
             Ok(None) => {}
         }
+    }
+    // Check observability BEFORE comparing expected with private world IDs.
+    // Otherwise Stale versus Occluded becomes a hidden-ore probing oracle.
+    fn precheck_edit(
+        &self,
+        peer: &Peer,
+        position: BlockPos,
+        placing: Option<Cell>,
+        role: Role,
+    ) -> Result<(), sim::EditError> {
+        use sim::EditError as E;
+        if peer.player.mode == GameMode::Spectator {
+            return Err(E::Spectator);
+        }
+        if position.space != peer.space {
+            return Err(E::OutOfReach);
+        }
+        let target = [position.x, position.y, position.z];
+        if self.protected(target, role) {
+            return Err(E::Protected);
+        }
+        let reach = if peer.player.mode == GameMode::Creative || peer.player.noclip {
+            5.0
+        } else {
+            4.5
+        };
+        let eye = peer.player.eye(1.0);
+        let distance = (0..3)
+            .map(|axis| (f64::from(target[axis]) + 0.5 - eye[axis]).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if distance >= reach + 0.87 {
+            return Err(E::OutOfReach);
+        }
+        match sim::raycast(
+            &WorldQuery::new(&self.world, peer.space),
+            eye,
+            peer.player.look(),
+            reach,
+        ) {
+            sim::RayResult::Unknown(_) => return Err(E::Unknown),
+            sim::RayResult::Miss => return Err(E::Occluded),
+            sim::RayResult::Hit(hit) => {
+                let valid = if placing.is_some() {
+                    let direction = rules::cell::DIRS[hit.face as usize];
+                    hit.cell == target
+                        || std::array::from_fn::<_, 3, _>(|axis| hit.cell[axis] + direction[axis])
+                            == target
+                } else {
+                    hit.cell == target
+                };
+                if !valid {
+                    return Err(E::Occluded);
+                }
+            }
+        }
+        if let Some(cell) = placing {
+            if cell.id() == 0 || rules::block(cell.id()).is_none() {
+                return Err(E::InvalidCell);
+            }
+            match self.world.read(position) {
+                CellRead::Unknown => return Err(E::Unknown),
+                CellRead::Known(current)
+                    if !rules::blocks::replaceable_by(
+                        current.raw(),
+                        rules::items::block_item(cell.id()),
+                    ) =>
+                {
+                    return Err(E::Occupied);
+                }
+                CellRead::Known(_) => {}
+            }
+        }
+        Ok(())
     }
     fn protected(&self, p: [i32; 3], role: Role) -> bool {
         if role.can_admin() {
@@ -1831,7 +1994,7 @@ impl Server {
                 if let Some(page) = peer.summaries.pop_front() {
                     if self
                         .observer_page(&peer, page.space)
-                        .is_some_and(|center| net::aoi_contains(center, page, 64, 64, false))
+                        .is_some_and(|center| net::aoi_contains(center, page, 1024, 1024, false))
                     {
                         if let Some(data) = self.world.page(page) {
                             let (cells, work) = visibility::sanitize(
@@ -1848,7 +2011,7 @@ impl Server {
                                 connection,
                                 ServerMessage::Summary(visibility::summary(
                                     page,
-                                    data.version(),
+                                    geometry::source_version(data),
                                     &cells,
                                 )),
                             ));
@@ -1868,6 +2031,7 @@ impl Server {
             }
             self.peers.insert(connection, peer);
         }
+        output.extend(self.publish_geometry());
         output
     }
     fn observer_page(&self, peer: &Peer, space: SpaceId) -> Option<PageId> {

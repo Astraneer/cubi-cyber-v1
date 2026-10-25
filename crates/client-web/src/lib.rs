@@ -1,6 +1,8 @@
 //! Thin browser surface/input/worker transport. World and camera are shared Rust.
 #![cfg(target_arch = "wasm32")]
+mod browser_network;
 mod generation_worker;
+mod product_ui;
 mod sky;
 use client::view::{ClientView, InputKey};
 use jobs::{BrowserEvent, BrowserOutcome, BrowserWorkerPool, CancellationToken, JobId};
@@ -39,6 +41,15 @@ struct BrowserState {
     modifiers: [bool; 4],
     presentation_probe: client::presentation::PresentationProbe,
     presentation_completion: Arc<Mutex<client::presentation::FrameCompletion>>,
+    product: Option<product_ui::ProductUi>,
+    socket: Option<browser_network::BrowserSocket>,
+    resetting: bool,
+    recorder: Option<telemetry::flight::FlightRecorder>,
+    gpu_capture: Option<client::capture::FrameGpuCapture>,
+    last_present_ms: f64,
+    last_profiler_ms: f64,
+    ui_pending: bool,
+    connection_epoch: u64,
 }
 impl BrowserState {
     fn observe_presentations(&mut self) {
@@ -50,6 +61,32 @@ impl BrowserState {
     }
     fn stats(&self) -> JsValue {
         let value = stats_object(&self.view);
+        if let Some(product) = &self.product {
+            for (name, item) in [
+                ("uiScreen", format!("{:?}", product.layer.app.screen)),
+                ("uiStatus", product.layer.app.status().to_owned()),
+                (
+                    "scene",
+                    if self.socket.is_some() {
+                        "remote".into()
+                    } else {
+                        "welcome".into()
+                    },
+                ),
+            ] {
+                let _ = js_sys::Reflect::set(&value, &name.into(), &item.into());
+            }
+            let _ = js_sys::Reflect::set(
+                &value,
+                &"connected".into(),
+                &product.layer.app.snapshot.connected.into(),
+            );
+            let _ = js_sys::Reflect::set(
+                &value,
+                &"interactionMode".into(),
+                &"authoritative-remote".into(),
+            );
+        }
         for (name, number) in [
             ("submittedFrames", self.submitted),
             (
@@ -186,6 +223,10 @@ impl BrowserState {
         Ok(())
     }
     fn draw(&mut self) -> Result<bool, JsValue> {
+        let cpu_start = clock_ms();
+        if let (Some(capture), Some(recorder)) = (&mut self.gpu_capture, &mut self.recorder) {
+            capture.collect(recorder);
+        }
         self.observe_presentations();
         let completed_at_edit = u64::from(self.completed_submission.load(Ordering::Acquire));
         self.resize()?;
@@ -194,19 +235,69 @@ impl BrowserState {
             .map_or(self.last_ms, |clock| clock.now());
         let elapsed = (now - self.last_ms).max(0.0) / 1000.0;
         self.last_ms = now;
-        self.view.advance_input(elapsed).map_err(js_error)?;
+        if self.product.is_none()
+            || self
+                .socket
+                .as_ref()
+                .is_some_and(|socket| socket.session().connection().welcome().is_some())
+        {
+            self.view.advance_input(elapsed).map_err(js_error)?;
+        }
+        if !self.resetting
+            && let Some(socket) = &mut self.socket
+        {
+            if let Err(error) = socket.pump(&mut self.view, now as u64) {
+                self.socket = None;
+                self.view.clear_keys();
+                if let Some(product) = &mut self.product {
+                    product.disconnected(&error);
+                }
+            } else if let Some(product) = &mut self.product {
+                product.sync(socket.session().connection(), &self.view)?;
+            }
+        }
+        let simulation_end = clock_ms();
         self.presentation_probe
             .arm(self.view.edit_revision(), completed_at_edit);
-        self.pump()?;
+        if !self.resetting {
+            self.pump()?;
+        }
+        let jobs_end = clock_ms();
         self.view
             .upload_ready(&self.gpu.queue, &mut UploadBudget::new(512 * 1024))
             .map_err(js_error)?;
+        let mut ui_changed = false;
+        if let Some(product) = &mut self.product {
+            product.poll_imports();
+            product.drain(
+                &mut self.view,
+                self.socket.as_mut(),
+                &self.canvas,
+                false,
+                now as u64,
+            )?;
+            if product.layer.app.show_debug && now - self.last_profiler_ms >= 100.0 {
+                if let Some(recorder) = &self.recorder {
+                    product
+                        .layer
+                        .app
+                        .set_profiler(ui::profiler::ProfilerSnapshot::from_recorder(recorder));
+                }
+                self.last_profiler_ms = now;
+            }
+            ui_changed = product
+                .layer
+                .upload(&self.gpu.queue, self.config.width, self.config.height)
+                .map_err(js_error)?;
+        }
+        self.ui_pending |= ui_changed;
+        let upload_end = clock_ms();
         // Browser canvas presentation does not bound pending GPU submissions on
         // every implementation. Keep at most two owned frames in flight.
         if self
             .first_ready_submission
             .is_some_and(|id| self.completed_submission.load(Ordering::Acquire) >= id)
-            && self.view.is_ready()
+            && (self.product.is_some() || self.view.is_ready())
             && let Some(resolve) = self.resolve.take()
         {
             let _ = resolve.call1(&JsValue::UNDEFINED, &self.stats());
@@ -217,9 +308,16 @@ impl BrowserState {
         if self.in_flight.load(Ordering::Acquire) >= 1 {
             return Ok(false);
         }
-        if !self
-            .view
-            .needs_redraw(self.config.width, self.config.height)
+        let draw_world = self
+            .product
+            .as_ref()
+            .is_none_or(|product| product.layer.app.snapshot.connected && self.view.is_ready());
+        if !(self.ui_pending
+            || draw_world
+                && self
+                    .view
+                    .needs_redraw(self.config.width, self.config.height))
+            && self.first_ready_submission.is_some()
         {
             return Ok(false);
         }
@@ -240,16 +338,55 @@ impl BrowserState {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("shared forest frame"),
             });
-        self.view
-            .encode(
-                &self.gpu.queue,
-                &mut encoder,
-                &output,
-                self.config.width,
-                self.config.height,
-            )
-            .map_err(js_error)?;
+        let ticket = if draw_world {
+            self.view
+                .encode(
+                    &self.gpu.queue,
+                    &mut encoder,
+                    &output,
+                    self.config.width,
+                    self.config.height,
+                )
+                .map_err(js_error)?;
+            self.gpu_capture.as_mut().and_then(|capture| {
+                capture.encode(
+                    self.view.renderer_mut(),
+                    &mut encoder,
+                    u64::from(self.submitted) + 1,
+                )
+            })
+        } else {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("product menu background"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &output,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.02,
+                            g: 0.03,
+                            b: 0.04,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            None
+        };
+        if let Some(product) = &mut self.product {
+            product.layer.encode(&mut encoder, &output);
+        }
+        let encode_end = clock_ms();
         self.gpu.queue.submit([encoder.finish()]);
+        self.ui_pending = false;
+        if let (Some(capture), Some(ticket)) = (&mut self.gpu_capture, ticket) {
+            capture.submitted(ticket);
+        }
         frame.present();
         self.submitted = self
             .submitted
@@ -257,6 +394,33 @@ impl BrowserState {
             .ok_or("frame sequence exhausted")?;
         let submitted = self.submitted;
         self.in_flight.fetch_add(1, Ordering::AcqRel);
+        if let Some(recorder) = &mut self.recorder {
+            let finished = clock_ms();
+            let work = self.view.take_frame_work();
+            let stats = self.view.stats();
+            let ns = |ms: f64| (ms.max(0.0) * 1_000_000.0) as u64;
+            let _ = recorder.record_frame(telemetry::flight::Sample {
+                frame: u64::from(self.submitted),
+                monotonic_ns: ns(finished),
+                interval_ns: ns(finished - self.last_present_ms),
+                cpu_ns: Some(ns(finished - cpu_start)),
+                cpu_stages_ns: [
+                    None,
+                    Some(ns(simulation_end - cpu_start)),
+                    Some(ns(jobs_end - simulation_end)),
+                    None,
+                    Some(ns(upload_end - jobs_end)),
+                    Some(ns(encode_end - upload_end)),
+                    Some(ns(finished - encode_end)),
+                    None,
+                ],
+                work,
+                queued_jobs: stats.queued_jobs as u32,
+                in_flight: self.in_flight.load(Ordering::Acquire) as u8,
+                ..Default::default()
+            });
+            self.last_present_ms = finished;
+        }
         let in_flight = self.in_flight.clone();
         let completed = self.completed_submission.clone();
         let presentation = self.presentation_completion.clone();
@@ -275,12 +439,13 @@ impl BrowserState {
             completed.fetch_max(submitted, Ordering::Release);
             in_flight.fetch_sub(1, Ordering::AcqRel);
         });
-        if self.view.is_ready() && self.first_ready_submission.is_none() {
+        if (self.product.is_some() || self.view.is_ready()) && self.first_ready_submission.is_none()
+        {
             self.first_ready_submission = Some(submitted);
         }
         Ok(true)
     }
-    fn keyboard(&mut self, code: &str, pressed: bool) {
+    fn keyboard(&mut self, code: &str, key_text: &str, pressed: bool) {
         let modifier = match code {
             "ControlLeft" => Some(0),
             "ControlRight" => Some(1),
@@ -290,6 +455,24 @@ impl BrowserState {
         };
         if let Some(index) = modifier {
             self.modifiers[index] = pressed;
+        }
+        if let Some(product) = &mut self.product {
+            if pressed {
+                product.gesture();
+            }
+            let modifiers = ui::app::Modifiers {
+                shift: self.modifiers[2] || self.modifiers[3],
+                ctrl: self.modifiers[0] || self.modifiers[1],
+            };
+            product.keyboard(&mut self.view, code, key_text, pressed, modifiers);
+            let _ = product.drain(
+                &mut self.view,
+                self.socket.as_mut(),
+                &self.canvas,
+                true,
+                clock_ms() as u64,
+            );
+            return;
         }
         if let Some(key) = key(code) {
             let down = match key {
@@ -319,6 +502,176 @@ impl BrowserState {
 }
 fn js_error(error: impl ToString) -> JsValue {
     JsValue::from_str(&error.to_string())
+}
+fn clock_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map_or(0.0, |p| p.now())
+}
+fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
+    let command = state
+        .borrow_mut()
+        .product
+        .as_mut()
+        .and_then(|product| product.take_command());
+    let Some(command) = command else {
+        return;
+    };
+    match command {
+        product_ui::Command::Connect { address, name } => {
+            let (fresh, epoch) = {
+                let mut state = state.borrow_mut();
+                state.connection_epoch = state.connection_epoch.wrapping_add(1);
+                state.socket = None;
+                let fresh = state.view.authoritative_remote()
+                    && state.view.scene.world().version().0 == 0
+                    && state.running.is_empty();
+                state.resetting = !fresh;
+                (fresh, state.connection_epoch)
+            };
+            if fresh {
+                connect_socket(state, address, name);
+                return;
+            }
+            let weak = Rc::downgrade(state);
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = async {
+                    animation_frame().await?;
+                    animation_frame().await?;
+                    let state = weak.upgrade().ok_or("view released")?;
+                    let (device, queue, format, width, height) = {
+                        let state = state.borrow();
+                        (
+                            state.gpu.device.clone(),
+                            state.gpu.queue.clone(),
+                            state.config.format,
+                            state.config.width,
+                            state.config.height,
+                        )
+                    };
+                    let atlas = AtlasImage::donor().map_err(js_error)?;
+                    let renderer = TerrainGpu::new(
+                        &device,
+                        &queue,
+                        format,
+                        width,
+                        height,
+                        render::OutputTransfer::ShaderSrgb,
+                        client::view::terrain_gpu_config(),
+                        &atlas,
+                    )
+                    .map_err(js_error)?;
+                    let view =
+                        ClientView::new(renderer, client::remote::RemoteSession::scene_config())
+                            .map_err(js_error)?;
+                    let href = web_sys::window().ok_or("window")?.location().href()?;
+                    let worker = web_sys::Url::new_with_base("workers/jobs.js", &href)?.href();
+                    let module = web_sys::Url::new_with_base("pkg/client_web.js", &href)?.href();
+                    let workers = BrowserWorkerPool::new(
+                        &worker,
+                        &module,
+                        "execute_scene_task",
+                        2,
+                        32 * 1024 * 1024,
+                    )?;
+                    let mut borrowed = state.borrow_mut();
+                    if borrowed.connection_epoch != epoch {
+                        return Ok::<_, JsValue>(());
+                    }
+                    borrowed.view = view;
+                    borrowed.workers = workers;
+                    borrowed.running.clear();
+                    borrowed.resetting = false;
+                    drop(borrowed);
+                    connect_socket(&state, address, name);
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = result
+                    && let Some(state) = weak.upgrade()
+                {
+                    let mut state = state.borrow_mut();
+                    if state.connection_epoch == epoch {
+                        state.resetting = false;
+                        if let Some(product) = &mut state.product {
+                            product.disconnected(
+                                &error
+                                    .as_string()
+                                    .unwrap_or_else(|| "Не удалось подготовить новый мир".into()),
+                            );
+                        }
+                    }
+                }
+            });
+        }
+        product_ui::Command::Disconnect | product_ui::Command::Quit => {
+            let mut state = state.borrow_mut();
+            state.connection_epoch = state.connection_epoch.wrapping_add(1);
+            state.socket = None;
+            state.resetting = false;
+            state.view.clear_keys();
+            if let Some(product) = &mut state.product {
+                product.disconnected("");
+            }
+            if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+                document.exit_pointer_lock();
+            }
+        }
+        product_ui::Command::RebuildResources => {
+            let weak = Rc::downgrade(state);
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = animation_frame().await;
+                let _ = animation_frame().await;
+                let prepared = audio::browser::with_local_resources(|local| {
+                    audio::scene::PreparedSounds::prepare(Some(local), local.minecraft_index())
+                });
+                if let Some(state) = weak.upgrade()
+                    && let Some(product) = &mut state.borrow_mut().product
+                {
+                    let result = prepared
+                        .map_err(js_error)
+                        .and_then(|prepared| product.audio.replace_bank(prepared));
+                    product.layer.app.set_status(if result.is_ok() {
+                        "Локальные звуки подготовлены"
+                    } else {
+                        "Звуки набора отклонены; прежний звук сохранён"
+                    });
+                    let _ = product.apply_sound();
+                }
+            });
+        }
+        product_ui::Command::BugReport => {
+            let state = state.borrow();
+            if let Some(recorder) = &state.recorder {
+                let seed = state
+                    .socket
+                    .as_ref()
+                    .and_then(|socket| socket.session().connection().welcome())
+                    .map_or(0, |welcome| u64::from(welcome.public_seed));
+                let mut report = recorder.export_json("webgpu", seed, 0, state.view.tick().0);
+                report.insert_str(1,"\"replayAvailable\":false,\"replayUnavailableReason\":\"initial public world snapshot not captured\",");
+                let _ =
+                    product_ui::download("cubi-flight-recorder.json", &report, "application/json");
+            }
+        }
+    }
+}
+fn connect_socket(state: &Rc<RefCell<BrowserState>>, address: String, name: String) {
+    let mut state = state.borrow_mut();
+    match browser_network::BrowserSocket::connect(&address, &name, clock_ms() as u64) {
+        Ok(socket) => {
+            state.socket = Some(socket);
+        }
+        Err(error) => {
+            if let Some(product) = &mut state.product {
+                product.disconnected(
+                    &error
+                        .as_string()
+                        .unwrap_or_else(|| "Не удалось подключиться к миру".into()),
+                );
+            }
+        }
+    }
 }
 fn stats_object(view: &ClientView) -> JsValue {
     let stats = view.stats();
@@ -518,11 +871,27 @@ fn install_input(state: &Rc<RefCell<BrowserState>>) -> Result<(), JsValue> {
             let Some(event) = event.dyn_ref::<KeyboardEvent>() else {
                 return;
             };
-            if key(&event.code()).is_some() {
-                event.prevent_default();
-                if let Some(state) = weak.upgrade() {
-                    state.borrow_mut().keyboard(&event.code(), pressed);
+            if let Some(state) = weak.upgrade() {
+                let product = state.borrow().product.is_some();
+                if !product && key(&event.code()).is_none() {
+                    return;
                 }
+                if pressed
+                    && event.repeat()
+                    && state
+                        .borrow()
+                        .product
+                        .as_ref()
+                        .is_some_and(|p| p.layer.app.focus == ui::app::Focus::None)
+                {
+                    event.prevent_default();
+                    return;
+                }
+                event.prevent_default();
+                state
+                    .borrow_mut()
+                    .keyboard(&event.code(), &event.key(), pressed);
+                process_product_commands(&state);
             }
         })?;
     }
@@ -539,15 +908,34 @@ fn install_input(state: &Rc<RefCell<BrowserState>>) -> Result<(), JsValue> {
         let Some(event) = event.dyn_ref::<MouseEvent>() else {
             return;
         };
-        if let Some(state) = weak.upgrade()
-            && web_sys::window()
+        if let Some(state) = weak.upgrade() {
+            let locked = web_sys::window()
                 .and_then(|w| w.document())
-                .is_some_and(|d| d.pointer_lock_element().is_some())
-        {
-            state
-                .borrow_mut()
-                .view
-                .mouse_delta(f64::from(event.movement_x()), f64::from(event.movement_y()));
+                .is_some_and(|d| d.pointer_lock_element().is_some());
+            let mut state = state.borrow_mut();
+            if locked {
+                let delta = state.product.as_ref().map_or(
+                    Some([f64::from(event.movement_x()), f64::from(event.movement_y())]),
+                    |p| {
+                        client::ui_bridge::mouse_delta(
+                            &p.layer.app.settings,
+                            f64::from(event.movement_x()),
+                            f64::from(event.movement_y()),
+                        )
+                    },
+                );
+                if let Some([dx, dy]) = delta {
+                    state.view.mouse_delta(dx, dy);
+                }
+            } else {
+                let x = event.client_x() as f32 * state.config.width as f32
+                    / state.canvas.client_width().max(1) as f32;
+                let y = event.client_y() as f32 * state.config.height as f32
+                    / state.canvas.client_height().max(1) as f32;
+                if let Some(product) = &mut state.product {
+                    product.layer.app.pointer(x, y);
+                }
+            }
         }
     })?;
     let weak = Rc::downgrade(state);
@@ -564,6 +952,40 @@ fn install_input(state: &Rc<RefCell<BrowserState>>) -> Result<(), JsValue> {
             let locked = web_sys::window()
                 .and_then(|w| w.document())
                 .is_some_and(|d| d.pointer_lock_element().is_some());
+            {
+                let mut borrowed = state.borrow_mut();
+                let x = event.client_x() as f32 * borrowed.config.width as f32
+                    / borrowed.canvas.client_width().max(1) as f32;
+                let y = event.client_y() as f32 * borrowed.config.height as f32
+                    / borrowed.canvas.client_height().max(1) as f32;
+                let BrowserState {
+                    product,
+                    view,
+                    socket,
+                    canvas,
+                    ..
+                } = &mut *borrowed;
+                if let Some(product) = product {
+                    product.gesture();
+                    if product.layer.app.captures_keyboard() {
+                        product.layer.app.click(
+                            x,
+                            y,
+                            event.button() == 2,
+                            ui::app::Modifiers {
+                                shift: event.shift_key(),
+                                ctrl: event.ctrl_key(),
+                            },
+                        );
+                        product.click_sound();
+                        let _ =
+                            product.drain(view, socket.as_mut(), canvas, true, clock_ms() as u64);
+                        drop(borrowed);
+                        process_product_commands(&state);
+                        return;
+                    }
+                }
+            }
             if !locked {
                 state.borrow().canvas.request_pointer_lock();
                 state.borrow_mut().view.activate_player();
@@ -595,6 +1017,34 @@ fn install_input(state: &Rc<RefCell<BrowserState>>) -> Result<(), JsValue> {
             );
         }
     })?;
+    let weak = Rc::downgrade(state);
+    add_listener(state, target.as_ref(), "wheel", move |event| {
+        if let Some(event) = event.dyn_ref::<web_sys::WheelEvent>()
+            && let Some(state) = weak.upgrade()
+        {
+            let mut state = state.borrow_mut();
+            if let Some(product) = &mut state.product {
+                event.prevent_default();
+                product.layer.app.wheel(event.delta_y().signum() as i32);
+            }
+        }
+    })?;
+    let weak = Rc::downgrade(state);
+    add_listener(state, document.as_ref(), "pointerlockchange", move |_| {
+        if let Some(state) = weak.upgrade()
+            && web_sys::window()
+                .and_then(|w| w.document())
+                .is_some_and(|d| d.pointer_lock_element().is_none())
+        {
+            let mut state = state.borrow_mut();
+            state.view.clear_keys();
+            if let Some(product) = &mut state.product
+                && product.layer.app.screen == ui::app::Screen::Game
+            {
+                product.layer.app.open(ui::app::Screen::Pause);
+            }
+        }
+    })?;
     add_listener(state, target.as_ref(), "contextmenu", |event| {
         event.prevent_default()
     })?;
@@ -616,6 +1066,7 @@ fn animate(state: Rc<RefCell<BrowserState>>) -> Result<(), JsValue> {
     let retained = callback.clone();
     *callback.borrow_mut() = Some(Closure::wrap(Box::new(move || {
         let result = { state.borrow_mut().draw() };
+        process_product_commands(&state);
         if let Err(error) = result {
             state.borrow_mut().fail(error);
             return;
@@ -638,7 +1089,7 @@ fn animate(state: Rc<RefCell<BrowserState>>) -> Result<(), JsValue> {
         )?;
     Ok(())
 }
-async fn start_forest() -> Result<JsValue, JsValue> {
+async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
     console_error_panic_hook::set_once();
     let window = web_sys::window().ok_or("window missing")?;
     let document = window.document().ok_or("document missing")?;
@@ -691,7 +1142,34 @@ async fn start_forest() -> Result<JsValue, JsValue> {
         &atlas,
     )
     .map_err(|error| js_error(error.to_string()))?;
-    let mut view = ClientView::new(terrain, client::SceneConfig::forest()).map_err(js_error)?;
+    let mut view = ClientView::new(
+        terrain,
+        if diagnostic {
+            client::SceneConfig::forest()
+        } else {
+            client::remote::RemoteSession::scene_config()
+        },
+    )
+    .map_err(js_error)?;
+    let product = if diagnostic {
+        None
+    } else {
+        Some(product_ui::ProductUi::prepare(
+            &gpu.device,
+            &gpu.queue,
+            config.format,
+        )?)
+    };
+    let recorder = if diagnostic {
+        None
+    } else {
+        Some(telemetry::flight::FlightRecorder::new(4096, 2048).map_err(js_error)?)
+    };
+    let gpu_capture = if diagnostic {
+        None
+    } else {
+        Some(client::capture::FrameGpuCapture::new(&gpu.device))
+    };
     let params = web_sys::UrlSearchParams::new_with_str(&window.location().search()?)?;
     let delay_ms = params
         .get("meshDelayMs")
@@ -743,6 +1221,15 @@ async fn start_forest() -> Result<JsValue, JsValue> {
         submitted: 0,
         first_ready_submission: None,
         modifiers: [false; 4],
+        product,
+        socket: None,
+        resetting: false,
+        recorder,
+        gpu_capture,
+        last_present_ms: clock_ms(),
+        last_profiler_ms: 0.0,
+        ui_pending: false,
+        connection_epoch: 0,
         presentation_probe: client::presentation::PresentationProbe::new(0),
         presentation_completion: Arc::new(Mutex::new(
             client::presentation::FrameCompletion::default(),
@@ -763,6 +1250,6 @@ pub async fn start() -> Result<JsValue, JsValue> {
     if params.get("scene").as_deref() == Some("sky") {
         sky::start_sky().await
     } else {
-        start_forest().await
+        start_forest(params.get("scene").as_deref() == Some("forest")).await
     }
 }

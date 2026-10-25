@@ -297,6 +297,9 @@ impl PredictionOverlay {
             })
         });
     }
+    pub fn positions(&self) -> impl Iterator<Item = BlockPos> + '_ {
+        self.edits.values().map(|edit| edit.position)
+    }
     pub fn len(&self) -> usize {
         self.edits.len()
     }

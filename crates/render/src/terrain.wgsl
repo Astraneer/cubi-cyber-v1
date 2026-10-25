@@ -20,9 +20,10 @@ struct Object {
 @group(0) @binding(6) var tint_masks: texture_2d_array<f32>;
 @group(0) @binding(7) var texels: sampler;
 @group(0) @binding(8) var<storage,read> edit_masks: array<u32>;
+@group(0) @binding(16) var<storage,read> edit_neighbors:array<vec2<u32>>;
 
 struct VertexOut {
-    @builtin(position) position: vec4<f32>,
+    @invariant @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) ao: f32,
     @location(2) @interpolate(flat) normal: vec3<f32>,
@@ -58,10 +59,47 @@ fn vertex(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instan
         vec3(0.0,-1.0,0.0), vec3(0.0,1.0,0.0), vec3(0.0,0.0,-1.0),
         vec3(0.0,0.0,1.0), vec3(-1.0,0.0,0.0), vec3(1.0,0.0,0.0));
     let uv = vec2<f32>(f32(corner & 1u) * width, f32(corner >> 1u) * height);
-    let position = origin + tangent_u[face] * uv.x + tangent_v[face] * uv.y;
+    var position = origin + tangent_u[face] * uv.x + tangent_v[face] * uv.y;
     var output: VertexOut;
-    output.position = camera.view_projection * object.model * vec4(position,1.0);
-    output.world_position=(object.model*vec4(position,1.0)).xyz;
+    let world_position=object.model*vec4(position,1.0);
+    output.position = camera.view_projection * world_position;
+    output.world_position=world_position.xyz;
+    // Cover fixed-point rasterization disagreement at greedy T-junctions.
+    // The geometric descriptor and interpolated material coordinates stay exact.
+    let neighbour_u=position+tangent_u[face]*width*select(1.0,-1.0,(corner&1u)!=0u);
+    let neighbour_v=position+tangent_v[face]*height*select(1.0,-1.0,(corner&2u)!=0u);
+    let clip_u=camera.view_projection*(object.model*vec4(neighbour_u,1.0));
+    let clip_v=camera.view_projection*(object.model*vec4(neighbour_v,1.0));
+    if output.position.w>0.00001&&clip_u.w>0.00001&&clip_v.w>0.00001 {
+        let screen=output.position.xy/output.position.w*camera.viewport.xy*0.5;
+        let edge_u=screen-clip_u.xy/clip_u.w*camera.viewport.xy*0.5;
+        let edge_v=screen-clip_v.xy/clip_v.w*camera.viewport.xy*0.5;
+        if length(edge_u)>0.00001&&length(edge_v)>0.00001 {
+            var normal_u=normalize(vec2(-edge_v.y,edge_v.x));
+            var normal_v=normalize(vec2(-edge_u.y,edge_u.x));
+            normal_u*=select(-1.0,1.0,dot(normal_u,edge_u)>0.0);
+            normal_v*=select(-1.0,1.0,dot(normal_v,edge_v)>0.0);
+            let sum=normal_u+normal_v;
+            var offset=sum*(0.00390625/max(dot(sum,normal_u),0.0001));
+            offset*=min(1.0,0.125/max(length(offset),0.00001));
+            let ndc=output.position.xy/output.position.w+offset*2.0/camera.viewport.xy;
+            let delta_u=clip_u-output.position;let delta_v=clip_v-output.position;
+            let projected_u=delta_u.xy-ndc*delta_u.w;
+            let projected_v=delta_v.xy-ndc*delta_v.w;
+            let right=ndc*output.position.w-output.position.xy;
+            let determinant=projected_u.x*projected_v.y-projected_u.y*projected_v.x;
+            if abs(determinant)>0.0000001 {
+                let amount_u=(right.x*projected_v.y-right.y*projected_v.x)/determinant;
+                let amount_v=(projected_u.x*right.y-projected_u.y*right.x)/determinant;
+                position+=(neighbour_u-position)*amount_u+(neighbour_v-position)*amount_v;
+                let expanded_world=object.model*vec4(position,1.0);
+                output.position=camera.view_projection*expanded_world;
+                output.position.x=ndc.x*output.position.w;
+                output.position.y=ndc.y*output.position.w;
+                output.world_position=expanded_world.xyz;
+            }
+        }
+    }
     let rotation=(q.y>>24u)&3u;
     let anchored_uv=vec2(dot(position,tangent_u[face]),dot(position,tangent_v[face]));
     var texture_uv=anchored_uv;
@@ -92,6 +130,23 @@ fn owner_masked(slot:u32,point:vec3<u32>)->bool {
     return (edit_masks[slot*128u+index/32u]&(1u<<(index%32u)))!=0u;
 }
 
+fn unchanged_page_neighbor(input:VertexOut,point:vec3<u32>,axis:u32,positive:bool)->bool {
+    let base=objects[input.object_slot];let row=input.object_slot*7u;
+    if edit_neighbors[row].x!=base.generation{return false;}
+    let negative_face=array<u32,3>(4u,0u,2u);
+    let link=edit_neighbors[row+1u+negative_face[axis]+u32(positive)];
+    if link.y==0u{return false;}
+    let neighbor=objects[link.x];
+    if neighbor.generation!=link.y||(neighbor.enabled&1u)==0u||(neighbor.enabled&2u)!=0u{return false;}
+    // Links cannot justify a fringe after one object moves away independently.
+    let expected=base.model[3].xyz+base.model[axis].xyz*select(-16.0,16.0,positive);
+    if any(abs(neighbor.model[3].xyz-expected)>vec3(0.02)){return false;}
+    for(var column=0u;column<3u;column++){if any(abs(neighbor.model[column].xyz-base.model[column].xyz)>vec3(0.00001)){return false;}}
+    if (neighbor.enabled&4u)==0u{return true;}
+    var owner=point;owner[axis]=select(15u,0u,positive);
+    return !owner_masked(link.x,owner);
+}
+
 fn edited_owner(input:VertexOut)->bool {
     let uncertainty=clamp(fwidth(input.local_position)*0.5,vec3(0.00001),vec3(1.0));
     // Overlay bypasses the base mask. Normal pages with no edits do not fetch it.
@@ -105,13 +160,13 @@ fn edited_owner(input:VertexOut)->bool {
     for (var axis=0u;axis<3u;axis++) {
         if abs(input.local_normal[axis])>0.5 {continue;}
         let fraction=fract(local[axis]);
-        if fraction<uncertainty[axis]&&point[axis]>0u {
-            var neighbour=point;neighbour[axis]-=1u;
-            if !owner_masked(input.object_slot,neighbour) {return false;}
+        if fraction<uncertainty[axis] {
+            if point[axis]>0u {var neighbour=point;neighbour[axis]-=1u;if !owner_masked(input.object_slot,neighbour){return false;}}
+            else if unchanged_page_neighbor(input,point,axis,false){return false;}
         }
-        if 1.0-fraction<uncertainty[axis]&&point[axis]<15u {
-            var neighbour=point;neighbour[axis]+=1u;
-            if !owner_masked(input.object_slot,neighbour) {return false;}
+        if 1.0-fraction<uncertainty[axis] {
+            if point[axis]<15u {var neighbour=point;neighbour[axis]+=1u;if !owner_masked(input.object_slot,neighbour){return false;}}
+            else if unchanged_page_neighbor(input,point,axis,true){return false;}
         }
     }
     return true;

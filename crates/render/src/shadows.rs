@@ -11,6 +11,8 @@ pub struct ShadowConfig {
     pub depth_half_extent: f32,
     pub max_updates_per_frame: u32,
     pub sun_step_radians: f32,
+    /// Separate combined target is allocated only when moving model shadows are enabled.
+    pub dynamic_casters: bool,
 }
 impl Default for ShadowConfig {
     fn default() -> Self {
@@ -20,6 +22,7 @@ impl Default for ShadowConfig {
             depth_half_extent: 1024.,
             max_updates_per_frame: 1,
             sun_step_radians: std::f32::consts::PI / 720.,
+            dynamic_casters: false,
         }
     }
 }
@@ -27,6 +30,8 @@ impl Default for ShadowConfig {
 pub enum ShadowError {
     InvalidConfig,
     InvalidBounds,
+    DynamicDisabled,
+    CasterUnavailable,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WorldBounds {
@@ -81,6 +86,10 @@ struct Cascade {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShadowWork {
     pub cascade_updates: u32,
+    pub static_updated_mask: u32,
+    pub dynamic_copy_bytes: u64,
+    pub dynamic_draw_calls: u32,
+    pub dynamic_cull_dispatches: u32,
     pub clear_pixels: u64,
     pub caster_dispatches: u32,
     pub draw_calls: u32,
@@ -341,6 +350,69 @@ fn project_bounds(camera: Camera, bounds: WorldBounds, resolution: u32) -> Optio
     })
 }
 
+/// A prepared dynamic model pass uses independent visibility so it cannot
+/// overwrite the camera's color list or the cached terrain visibility.
+pub trait DynamicShadowCaster {
+    fn available(&self) -> bool;
+    fn shadow_revision(&self) -> u64;
+    /// Exact component versions; composites must preserve each counter separately.
+    fn shadow_key(&self) -> [u64; 4] {
+        [self.shadow_revision(), 0, 0, 0]
+    }
+    fn prepare_shadow(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        cascade: usize,
+        camera: Camera,
+    ) -> u32;
+    fn draw_shadow(&self, pass: &mut wgpu::RenderPass<'_>, cascade: usize) -> u32;
+}
+/// Borrow two prepared model backends for one combined depth pass. The exact
+/// pair of counters avoids collisions and works when recreated each frame.
+pub struct ShadowCasterPair<'a> {
+    pub first: &'a mut dyn DynamicShadowCaster,
+    pub second: &'a mut dyn DynamicShadowCaster,
+}
+impl DynamicShadowCaster for ShadowCasterPair<'_> {
+    fn available(&self) -> bool {
+        self.first.available() && self.second.available()
+    }
+    fn shadow_revision(&self) -> u64 {
+        0
+    }
+    fn shadow_key(&self) -> [u64; 4] {
+        [
+            self.first.shadow_revision(),
+            self.second.shadow_revision(),
+            2,
+            0,
+        ]
+    }
+    fn prepare_shadow(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        cascade: usize,
+        camera: Camera,
+    ) -> u32 {
+        self.first.prepare_shadow(queue, encoder, cascade, camera)
+            + self.second.prepare_shadow(queue, encoder, cascade, camera)
+    }
+    fn draw_shadow(&self, pass: &mut wgpu::RenderPass<'_>, cascade: usize) -> u32 {
+        self.first.draw_shadow(pass, cascade) + self.second.draw_shadow(pass, cascade)
+    }
+}
+struct CombinedDepth {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    layers: [wgpu::TextureView; CASCADES],
+}
+struct DynamicStamp {
+    revision: [u64; 4],
+    matrices: [[[f32; 4]; 4]; CASCADES],
+    valid: u32,
+}
 pub struct ShadowGpu {
     cache: ShadowCache,
     texture: wgpu::Texture,
@@ -361,6 +433,8 @@ pub struct ShadowGpu {
     max_pages: u32,
     max_quads: u32,
     sampling_dirty: bool,
+    combined: Option<CombinedDepth>,
+    last_dynamic: Option<DynamicStamp>,
 }
 impl ShadowGpu {
     pub fn new(
@@ -477,7 +551,7 @@ impl ShadowGpu {
             label: Some("shadow shared terrain tables"),
             entries: &[
                 storage_entry(0, vertex, true, true),
-                storage_entry(1, vertex, false, true),
+                storage_entry(1, vertex | fragment, false, true),
                 storage_entry(2, vertex, false, true),
                 storage_entry(3, vertex, false, true),
                 storage_entry(4, fragment, false, true),
@@ -490,6 +564,7 @@ impl ShadowGpu {
                     count: None,
                 },
                 storage_entry(8, fragment, false, true),
+                storage_entry(16, fragment, false, true),
             ],
         });
         let cull_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -527,6 +602,7 @@ impl ShadowGpu {
                         resource: wgpu::BindingResource::Sampler(geometry.sampler),
                     },
                     buffer_entry(8, geometry.edit_masks),
+                    buffer_entry(16, geometry.edit_neighbors),
                 ],
             })
         });
@@ -638,6 +714,42 @@ impl ShadowGpu {
             multiview: None,
             cache: None,
         });
+        let combined = config.dynamic_casters.then(|| {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("static cache plus moving model shadow depth"),
+                size: wgpu::Extent3d {
+                    width: config.resolution,
+                    height: config.resolution,
+                    depth_or_array_layers: 3,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+            let layers = std::array::from_fn(|i| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: i as u32,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            });
+            CombinedDepth {
+                texture,
+                view,
+                layers,
+            }
+        });
         Ok(Self {
             cache,
             texture,
@@ -658,6 +770,8 @@ impl ShadowGpu {
             max_pages: geometry.max_pages,
             max_quads: geometry.max_quads,
             sampling_dirty: false,
+            combined,
+            last_dynamic: None,
         })
     }
     pub fn cache(&self) -> &ShadowCache {
@@ -667,7 +781,9 @@ impl ShadowGpu {
         &self.sampling
     }
     pub fn depth_view(&self) -> &wgpu::TextureView {
-        &self.view
+        self.combined
+            .as_ref()
+            .map_or(&self.view, |combined| &combined.view)
     }
     pub fn sampler(&self) -> &wgpu::Sampler {
         &self.sampler
@@ -687,7 +803,146 @@ impl ShadowGpu {
     pub fn invalidate_all(&mut self) {
         self.cache.invalidate_all();
     }
+    pub fn sampled_texture(&self) -> &wgpu::Texture {
+        self.combined
+            .as_ref()
+            .map_or(&self.texture, |combined| &combined.texture)
+    }
+    /// Copy only changed cascade layers from static cache, then add the moving
+    /// caster depth. No static terrain is re-meshed or re-rendered for animation.
+    /// At4096² the worst moving frame copies192MiB on GPU; work is reported.
+    pub fn encode_dynamic(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        caster: &mut impl DynamicShadowCaster,
+    ) -> Result<ShadowWork, ShadowError> {
+        if self.combined.is_none() {
+            return Err(ShadowError::DynamicDisabled);
+        }
+        if !caster.available() {
+            return Err(ShadowError::CasterUnavailable);
+        }
+        let mut work = self.encode_static(queue, encoder);
+        let sampling = self.cache.sampling();
+        let revision = caster.shadow_key();
+        let combined = self.combined.as_ref().expect("enabled combined target");
+        for cascade in 0..CASCADES {
+            let bit = 1u32 << cascade;
+            if sampling.params[0] & bit == 0 {
+                continue;
+            }
+            let dirty = self.last_dynamic.as_ref().is_none_or(|old| {
+                old.revision != revision
+                    || old.valid & bit == 0
+                    || old.matrices[cascade] != sampling.matrices[cascade]
+            }) || work.static_updated_mask & bit != 0;
+            if !dirty {
+                continue;
+            }
+            let origin = wgpu::Origin3d {
+                x: 0,
+                y: 0,
+                z: cascade as u32,
+            };
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin,
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &combined.texture,
+                    mip_level: 0,
+                    origin,
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                },
+                wgpu::Extent3d {
+                    width: self.cache.config.resolution,
+                    height: self.cache.config.resolution,
+                    depth_or_array_layers: 1,
+                },
+            );
+            work.dynamic_copy_bytes += u64::from(self.cache.config.resolution).pow(2) * 4;
+            work.dynamic_cull_dispatches += caster.prepare_shadow(
+                queue,
+                encoder,
+                cascade,
+                Camera {
+                    view_projection: sampling.matrices[cascade],
+                },
+            );
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("moving model depth over static shadow cache"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &combined.layers[cascade],
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            work.dynamic_draw_calls += caster.draw_shadow(&mut pass, cascade);
+        }
+        self.last_dynamic = Some(DynamicStamp {
+            revision,
+            matrices: sampling.matrices,
+            valid: sampling.params[0],
+        });
+        Ok(work)
+    }
     pub fn encode(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> ShadowWork {
+        let mut work = self.encode_static(queue, encoder);
+        if let Some(combined) = &self.combined {
+            let sampling = self.cache.sampling();
+            let mask = if self.last_dynamic.take().is_some() {
+                sampling.params[0]
+            } else {
+                work.static_updated_mask
+            };
+            for cascade in 0..CASCADES {
+                if mask & (1 << cascade) == 0 {
+                    continue;
+                }
+                let origin = wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: cascade as u32,
+                };
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.texture,
+                        mip_level: 0,
+                        origin,
+                        aspect: wgpu::TextureAspect::DepthOnly,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &combined.texture,
+                        mip_level: 0,
+                        origin,
+                        aspect: wgpu::TextureAspect::DepthOnly,
+                    },
+                    wgpu::Extent3d {
+                        width: self.cache.config.resolution,
+                        height: self.cache.config.resolution,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                work.dynamic_copy_bytes += u64::from(self.cache.config.resolution).pow(2) * 4;
+            }
+        }
+        work
+    }
+    fn encode_static(
         &mut self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
@@ -763,6 +1018,7 @@ impl ShadowGpu {
             self.cache.commit(update);
             self.sampling_dirty = true;
             work.cascade_updates += 1;
+            work.static_updated_mask |= 1 << update.cascade;
             work.clear_pixels += update.rect.pixels();
             work.caster_dispatches += 1;
             work.draw_calls += 5;

@@ -588,3 +588,104 @@ fn instance_origin_is_subtracted_before_f32_and_active_cursor_is_detached() {
     store.publish_active_cursor(before, next).unwrap();
 }
 use std::collections::BTreeMap;
+
+#[test]
+fn donor_body_head_controller_wings_and_instance_pose_are_persisted() {
+    let mut pig = Mob::new(EntityId(1), MobKind::Pig, [0.0; 3]).unwrap();
+    pig.body.position[0] = 0.1;
+    pig.body.yaw = 100.0;
+    pig.body.head = -100.0;
+    pig.finish_pose();
+    assert_eq!(pig.render_yaw, 100.0);
+    assert_eq!(pig.body.head, 175.0);
+    pig.body.previous = pig.body.position;
+    pig.body.head = 130.0;
+    pig.finish_pose();
+    assert_eq!(pig.body_still, 0);
+    for _ in 0..20 {
+        pig.finish_pose();
+    }
+    assert_eq!(pig.render_yaw, 130.0);
+    assert_eq!(pig.body_still, 20);
+    let mut chicken = Mob::new(EntityId(2), MobKind::Chicken, [0.0; 3]).unwrap();
+    chicken.body.on_ground = false;
+    chicken.finish_pose();
+    assert_eq!(chicken.wing_deviation, 1.0);
+    assert_eq!(chicken.wing_speed, 0.9);
+    assert_eq!(chicken.wing_phase, 1.8);
+    chicken.body.on_ground = true;
+    chicken.finish_pose();
+    assert!((chicken.wing_deviation - 0.7).abs() < 1e-6);
+    assert!((chicken.wing_phase - 3.42).abs() < 1e-6);
+    assert_eq!(Mob::decode(&chicken.encode().unwrap()).unwrap(), chicken);
+    let mut store = EntityStore::new(2).unwrap();
+    store.insert(chicken, true).unwrap();
+    store.insert(pig, true).unwrap();
+    let mut poses = [Instance::default(); 2];
+    store
+        .instances(&[chicken.id, pig.id], 1.0, &mut poses)
+        .unwrap();
+    assert_eq!(poses[0].color, chicken.wing_phase.to_bits());
+    assert_eq!(poses[0].reserved, chicken.wing_deviation);
+    assert_eq!(poses[0].flags & 64, 64);
+    assert_eq!(poses[1].body_yaw, 130.0);
+}
+
+#[test]
+fn natural_sheep_six_colors_and_owned_shears_wool_are_atomic() {
+    let mut counts = [0; 6];
+    for id in 0..20_000 {
+        let sheep = Mob::spawned(
+            EntityId(id),
+            MobKind::Sheep,
+            core_types::SpaceId(0),
+            [0.0; 3],
+            17,
+        )
+        .unwrap();
+        counts[usize::from(sheep.color)] += 1;
+        assert_eq!(Mob::decode(&sheep.encode().unwrap()).unwrap(), sheep);
+    }
+    // Independent probability windows: 5% black/gray/light-gray, 3% brown,
+    // rare 82% * 1/500 pink; all other spawn results are white.
+    assert!((15_900..16_700).contains(&counts[0]));
+    for &count in &counts[1..4] {
+        assert!((850..1150).contains(&count));
+    }
+    assert!((450..750).contains(&counts[4]));
+    assert!((10..65).contains(&counts[5]));
+    let mut sheep = Mob::new(EntityId(1), MobKind::Sheep, [0.0; 3]).unwrap();
+    sheep.color = 5;
+    let mut inventory = Inventory::empty();
+    let shears = stack(I_SHEARS, 1);
+    assert_eq!(
+        mob::ShearPlan::prepare(&sheep, &inventory, shears, 5, 0),
+        Err(EntityError::NoEntitlement)
+    );
+    inventory.set_trusted(0, shears).unwrap();
+    let plan = mob::ShearPlan::prepare(&sheep, &inventory, shears, 5, 0).unwrap();
+    assert_eq!(plan.wool.item(), rules::ids::PINK_WOOL);
+    assert!((1..=3).contains(&plan.wool.count()));
+    assert!(!sheep.sheared);
+    let stale = plan;
+    plan.apply(&mut sheep, &mut inventory).unwrap();
+    assert!(sheep.sheared);
+    assert_eq!(inventory.hand().damage(), 1);
+    assert_eq!(
+        stale.apply(&mut sheep, &mut inventory),
+        Err(EntityError::StalePlan)
+    );
+    assert_eq!(
+        mob::ShearPlan::prepare(&sheep, &inventory, inventory.hand(), 5, 1),
+        Err(EntityError::NoEntitlement)
+    );
+}
+
+#[test]
+fn donor_push_vector_uses_max_axis_root_and_near_zero_guard() {
+    assert_eq!(combat::separation([0.0; 3], [0.009, 0.0, 0.009]), None);
+    let [x, z] = combat::separation([0.0; 3], [0.25, 0.0, 0.0]).unwrap();
+    assert_eq!([x, z], [0.025, 0.0]);
+    let [x, z] = combat::separation([0.0; 3], [4.0, 0.0, 2.0]).unwrap();
+    assert_eq!([x, z], [0.05, 0.025]);
+}

@@ -334,11 +334,20 @@ pub fn encode_client(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
                 out.f32(input.pitch);
             }
         }
-        ClientMessage::Action { id, action } => {
+        ClientMessage::Action { id, action } | ClientMessage::AimedAction { id, action, .. } => {
             if id.0 == 0 {
                 return Err(CodecError::InvalidBounds);
             }
-            out.byte(2);
+            if let ClientMessage::AimedAction { yaw, pitch, .. } = message {
+                if !yaw.is_finite() || !pitch.is_finite() || pitch.abs() > 90.0 {
+                    return Err(CodecError::InvalidBounds);
+                }
+                out.byte(9);
+                out.f32(*yaw);
+                out.f32(*pitch);
+            } else {
+                out.byte(2);
+            }
             out.u64(id.0);
             match action {
                 Action::Mine {
@@ -422,6 +431,18 @@ pub fn encode_client(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
             out.byte(5);
             out.page(*page);
         }
+        ClientMessage::RequestGeometry { page, known } => {
+            out.byte(7);
+            out.page(*page);
+            out.bool(known.is_some());
+            if let Some(version) = known {
+                out.u64(version.0);
+            }
+        }
+        ClientMessage::ForgetGeometry(page) => {
+            out.byte(8);
+            out.page(*page);
+        }
         ClientMessage::Ping(value) => {
             out.byte(6);
             out.u64(*value);
@@ -474,7 +495,17 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
             }
             ClientMessage::Inputs(inputs)
         }
-        2 => {
+        tag @ (2 | 9) => {
+            let aim = if tag == 9 {
+                let yaw = input.f32()?;
+                let pitch = input.f32()?;
+                if !yaw.is_finite() || !pitch.is_finite() || pitch.abs() > 90.0 {
+                    return Err(CodecError::InvalidBounds);
+                }
+                Some((yaw, pitch))
+            } else {
+                None
+            };
             let id = ActionId(input.u64()?);
             if id.0 == 0 {
                 return Err(CodecError::InvalidBounds);
@@ -530,7 +561,16 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
                 }
                 _ => return Err(CodecError::InvalidEnum),
             };
-            ClientMessage::Action { id, action }
+            if let Some((yaw, pitch)) = aim {
+                ClientMessage::AimedAction {
+                    id,
+                    action,
+                    yaw,
+                    pitch,
+                }
+            } else {
+                ClientMessage::Action { id, action }
+            }
         }
         3 => {
             let page = input.page()?;
@@ -549,6 +589,16 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
             page: input.page()?,
         },
         6 => ClientMessage::Ping(input.u64()?),
+        7 => {
+            let page = input.page()?;
+            let known = if input.bool()? {
+                Some(Version(input.u64()?))
+            } else {
+                None
+            };
+            ClientMessage::RequestGeometry { page, known }
+        }
+        8 => ClientMessage::ForgetGeometry(input.page()?),
         _ => return Err(CodecError::InvalidEnum),
     };
     finish(input)?;
@@ -664,6 +714,14 @@ pub fn encode_server(message: &ServerMessage) -> Result<Vec<u8>, CodecError> {
             out.byte(12);
             out.u16(data.len() as u16);
             out.0.extend(data);
+        }
+        ServerMessage::Geometry(geometry) => {
+            out.byte(13);
+            write_geometry(&mut out, geometry)?;
+        }
+        ServerMessage::GeometryUnavailable(page) => {
+            out.byte(14);
+            out.page(*page);
         }
         ServerMessage::Players { tick, players } => {
             if players.len() > 64 {
@@ -957,8 +1015,74 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, CodecError> {
                 data: input.take(len)?.to_vec(),
             }
         }
+        13 => ServerMessage::Geometry(Box::new(read_geometry(&mut input)?)),
+        14 => ServerMessage::GeometryUnavailable(input.page()?),
         _ => return Err(CodecError::InvalidEnum),
     };
     finish(input)?;
     Ok(message)
+}
+
+fn write_geometry(out: &mut Writer, geometry: &PublicGeometry) -> Result<(), CodecError> {
+    geometry.validate().map_err(|_| CodecError::InvalidBounds)?;
+    out.page(geometry.page);
+    out.u64(geometry.source_version.0);
+    out.u64(geometry.view_version);
+    out.0.extend(geometry.known);
+    out.0.extend(geometry.occupied);
+    out.u16(geometry.palette.len() as u16);
+    for surface in &geometry.palette {
+        out.u16(surface.atlas_layer);
+        out.u32(surface.tint);
+        out.byte(surface.kind as u8);
+    }
+    out.byte(geometry.index_bits);
+    out.u16(geometry.indices.len() as u16);
+    out.0.extend(&geometry.indices);
+    Ok(())
+}
+fn read_geometry(input: &mut Reader<'_>) -> Result<PublicGeometry, CodecError> {
+    let page = input.page()?;
+    let source_version = Version(input.u64()?);
+    let view_version = input.u64()?;
+    let known = input.array()?;
+    let occupied = input.array()?;
+    let count = usize::from(input.u16()?);
+    if count > 4096 || count > input.bytes.len().saturating_sub(input.offset) / 7 {
+        return Err(CodecError::InvalidBounds);
+    }
+    let mut palette = Vec::with_capacity(count);
+    for _ in 0..count {
+        let atlas_layer = input.u16()?;
+        let tint = input.u32()?;
+        let kind = match input.byte()? {
+            0 => PublicSurfaceKind::Opaque,
+            1 => PublicSurfaceKind::Cutout,
+            2 => PublicSurfaceKind::Water,
+            _ => return Err(CodecError::InvalidEnum),
+        };
+        palette.push(PublicSurface {
+            atlas_layer,
+            tint,
+            kind,
+        });
+    }
+    let index_bits = input.byte()?;
+    let len = usize::from(input.u16()?);
+    if len > 6144 {
+        return Err(CodecError::InvalidBounds);
+    }
+    let indices = input.take(len)?.to_vec();
+    let geometry = PublicGeometry {
+        page,
+        source_version,
+        view_version,
+        known,
+        occupied,
+        palette,
+        index_bits,
+        indices,
+    };
+    geometry.validate().map_err(|_| CodecError::InvalidBounds)?;
+    Ok(geometry)
 }

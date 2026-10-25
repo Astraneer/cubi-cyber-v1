@@ -14,25 +14,28 @@
 </head>
 <body>
   <canvas id="game" tabindex="0" aria-label="Мир Cubi Cyber"></canvas>
-  <p id="status" role="status">Подготовка мира…</p>
+  <p id="status" role="status">Подготовка игры…</p>
   <script>
     // Startup errors must remain visible even if the ES module fails to load.
     function clientFailure(error) {
       const scene=new URLSearchParams(location.search).get('scene')==='sky'?'m0':'m2';
       document.documentElement.dataset[scene]='error';
-      document.getElementById('status').textContent=`Не удалось запустить игру: ${error?.message||error}`;
+      const status=document.getElementById('status');status.hidden=false;
+      status.textContent=`Не удалось запустить игру: ${error?.message||error}`;
     }
     addEventListener('error',event=>clientFailure(event.error||event.message));
     addEventListener('unhandledrejection',event=>clientFailure(event.reason));
   </script>
   <script type="module">
-    const sky=new URLSearchParams(location.search).get('scene')==='sky';
+    const scene=new URLSearchParams(location.search).get('scene');
+    const sky=scene==='sky', diagnostic=scene==='forest';
     const status=document.getElementById('status');
     window.__CLIENT_READY=(async()=>{
       try {
         if(!navigator.gpu) throw new Error('Нужен Chrome или Edge с WebGPU. WebGL не поддерживается.');
         const module=await import('./pkg/client_web.js');
         await module.default();
+        window.__CUBI=module;
         const result=await module.start();
         if(sky) {
           window.__M0=result;window.__M0_RESULT=result;
@@ -42,10 +45,9 @@
         } else {
           window.__M2=result;window.__M2Stats=()=>module.scene_stats();
           document.documentElement.dataset.m2='ready';
-          status.textContent='Нажмите на мир, чтобы начать. WASD — движение · Пробел — прыжок · F — полёт · V — камера · ЛКМ — добывать · ПКМ — камень · Esc — мышь. Демо: деревянная кирка и камень.';
-          document.addEventListener('pointerlockchange',()=>{
-            status.textContent=document.pointerLockElement?'WASD · Ctrl — бег · Shift — присед/вниз · F — полёт · V — камера · ЛКМ/ПКМ — блоки':'Нажмите на мир, чтобы продолжить.';
-          });
+          document.documentElement.dataset.app='ready';
+          status.hidden=!diagnostic;
+          if(diagnostic)status.textContent='Нажмите на мир, чтобы начать. WASD — движение · Пробел — прыжок · F — полёт · V — камера · ЛКМ — добывать · ПКМ — камень · Esc — мышь. Демо: деревянная кирка и камень.';
         }
         return result;
       } catch(error) {

@@ -155,7 +155,7 @@ pub fn camera_clip(world: &mut impl Solids, eye: [f64; 3], direction: [f64; 3], 
     distance
 }
 /// Per-tick body animation; a renderer uploads only this pose to an existing model.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct SelfBody {
     body: f32,
     previous_body: f32,

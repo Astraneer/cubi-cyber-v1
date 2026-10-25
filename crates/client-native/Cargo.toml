@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 client = { path = "../client" }
+net = { path = "../net" }
+tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
 jobs = { path = "../jobs" }
 render = { path = "../render" }
 wgpu.workspace = true

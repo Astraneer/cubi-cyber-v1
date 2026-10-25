@@ -52,6 +52,8 @@ pub struct AiState {
     pub eating: u8,
     pub event: u64,
     pub speed_multiplier: f32,
+    pub revenge_at: Option<u64>,
+    pub revenge_mode: bool,
 }
 impl Default for AiState {
     fn default() -> Self {
@@ -65,6 +67,8 @@ impl Default for AiState {
             eating: 0,
             event: 0,
             speed_multiplier: 1.0,
+            revenge_at: None,
+            revenge_mode: false,
         }
     }
 }
@@ -79,11 +83,19 @@ pub struct Mob {
     pub age: u64,
     pub last_tick: Tick,
     pub loot_emitted: bool,
+    pub egg_remaining: u16,
+    pub last_player_hit: Option<(EntityId, Tick)>,
     pub baby: bool,
     pub sheared: bool,
     pub color: u8,
     pub limb_phase: f32,
     pub limb_amount: f32,
+    pub render_yaw: f32,
+    pub body_last_head: f32,
+    pub body_still: u8,
+    pub wing_deviation: f32,
+    pub wing_speed: f32,
+    pub wing_phase: f32,
 }
 impl Mob {
     pub fn new(id: EntityId, kind: MobKind, position: [f64; 3]) -> Result<Self, EntityError> {
@@ -114,11 +126,19 @@ impl Mob {
             age: 0,
             last_tick: Tick(0),
             loot_emitted: false,
+            egg_remaining: if kind == MobKind::Chicken { 6000 } else { 0 },
+            last_player_hit: None,
             baby: false,
             sheared: false,
             color: 0,
             limb_phase: 0.0,
             limb_amount: 0.0,
+            render_yaw: 0.0,
+            body_last_head: 0.0,
+            body_still: 0,
+            wing_deviation: 0.0,
+            wing_speed: 1.0,
+            wing_phase: 0.0,
         })
     }
     pub fn new_in_space(
@@ -131,6 +151,25 @@ impl Mob {
             space,
             ..Self::new(id, kind, position)?
         })
+    }
+    /// Spawn-time random values use their own entity domain and never draw from
+    /// map iteration order or the rendering loop.
+    pub fn spawned(
+        id: EntityId,
+        kind: MobKind,
+        space: SpaceId,
+        position: [f64; 3],
+        seed: u64,
+    ) -> Result<Self, EntityError> {
+        let mut mob = Self::new_in_space(id, kind, space, position)?;
+        let mut rng = DeterministicRng::from_key(seed, 0x4d4f42535041574e, id.0, 0);
+        if kind == MobKind::Chicken {
+            mob.egg_remaining = 6000 + rng.below(6000).expect("egg interval") as u16;
+        }
+        if kind == MobKind::Sheep {
+            mob.color = sheep_color(&mut rng);
+        }
+        Ok(mob)
     }
     pub fn dimensions(&self) -> (f64, f64) {
         let definition = self.kind.definition();
@@ -154,9 +193,40 @@ impl Mob {
     pub fn finish_pose(&mut self) {
         let delta = (self.body.position[0] - self.body.previous[0]).powi(2)
             + (self.body.position[2] - self.body.previous[2]).powi(2);
-        let target = (delta.sqrt() * 4.0).min(1.0) as f32;
+        let target = if self.life.alive() {
+            (delta.sqrt() * 4.0).min(1.0) as f32
+        } else {
+            0.0
+        };
         self.limb_amount += (target - self.limb_amount) * 0.4;
         self.limb_phase += self.limb_amount;
+        if delta > 2.5e-7 {
+            self.render_yaw = self.body.yaw;
+            self.body.head = clamp_angle(self.body.head, self.render_yaw, 75.0);
+            self.body_last_head = self.body.head;
+            self.body_still = 0;
+        } else if (self.body.head - self.body_last_head).abs() > 15.0 {
+            self.body_still = 0;
+            self.body_last_head = self.body.head;
+            self.render_yaw = clamp_angle(self.render_yaw, self.body.head, 75.0);
+        } else {
+            self.body_still = self.body_still.saturating_add(1).min(20);
+            if self.body_still > 10 {
+                let factor = f32::from(self.body_still - 10) / 10.0;
+                self.render_yaw =
+                    clamp_angle(self.render_yaw, self.body.head, 75.0 * (1.0 - factor));
+            }
+        }
+        if self.kind == MobKind::Chicken {
+            self.wing_deviation = (self.wing_deviation
+                + if self.body.on_ground { -0.3 } else { 1.2 })
+            .clamp(0.0, 1.0);
+            if !self.body.on_ground && self.wing_speed < 1.0 {
+                self.wing_speed = 1.0;
+            }
+            self.wing_speed *= 0.9;
+            self.wing_phase += self.wing_speed * 2.0;
+        }
     }
     /// The adapter must accept/reject this intent against known collision/path
     /// snapshots; a destination is never permission to walk through a block.
@@ -194,13 +264,53 @@ impl Mob {
         }
         let full = (mob.age.wrapping_add(mob.id.0)).is_multiple_of(2) || mob.age <= 1;
         if mob.kind == MobKind::Zombie {
-            let target = players.nearest_in_space(
-                mob.space,
-                mob.body.position,
-                mob.kind.definition().follow,
-                budget,
-                |player| player.alive && !player.creative && !player.spectator,
-            )?;
+            let valid = |player: &PlayerProbe| {
+                player.space == mob.space
+                    && player.alive
+                    && !player.creative
+                    && !player.spectator
+                    && (0..3)
+                        .map(|axis| (player.position[axis] - mob.body.position[axis]).powi(2))
+                        .sum::<f64>()
+                        <= mob.kind.definition().follow.powi(2)
+            };
+            let lookup_cost = players.players.len() as u64;
+            if (mob.last_player_hit.is_some() || mob.ai.target.is_some())
+                && budget.probes < lookup_cost * 2
+            {
+                return Err(EntityError::Capacity);
+            }
+            let revenge = mob
+                .last_player_hit
+                .filter(|(_, at)| mob.ai.revenge_at != Some(at.0))
+                .and_then(|(id, at)| players.get(id).filter(valid).map(|player| (player, at)));
+            let retained = mob
+                .ai
+                .target
+                .filter(|_| mob.ai.goal_until >= now)
+                .and_then(|id| players.get(id))
+                .filter(valid);
+            if mob.last_player_hit.is_some() || mob.ai.target.is_some() {
+                budget.probes -= lookup_cost * 2;
+            }
+            let target = if let Some((player, at)) = revenge {
+                mob.ai.revenge_at = Some(at.0);
+                mob.ai.revenge_mode = true;
+                mob.ai.goal_until = Tick(now.0.saturating_add(300));
+                Some(player)
+            } else if retained.is_some() {
+                retained
+            } else {
+                mob.ai.revenge_mode = false;
+                mob.ai.goal_until = Tick(now.0.saturating_add(60));
+                players.nearest_in_space(
+                    mob.space,
+                    mob.body.position,
+                    mob.kind.definition().follow,
+                    budget,
+                    valid,
+                )?
+            };
             mob.ai.target = target.map(|player| player.id);
             if let Some(target) = target {
                 mob.ai.goal = Goal::Melee;
@@ -319,6 +429,10 @@ pub fn validate_position(position: [f64; 3]) -> Result<(), EntityError> {
         Ok(())
     }
 }
+fn clamp_angle(angle: f32, center: f32, limit: f32) -> f32 {
+    let difference = (angle - center + 180.0).rem_euclid(360.0) - 180.0;
+    center + difference.clamp(-limit, limit)
+}
 fn random_destination(position: [f64; 3], rng: &mut DeterministicRng, radius: i32) -> [f64; 3] {
     let mut target = position;
     for axis in [0, 2] {
@@ -350,6 +464,80 @@ pub struct Control {
     pub look_at: Option<[f64; 3]>,
     pub attack: Option<EntityId>,
     pub eat_grass: bool,
+    pub lay_egg: bool,
+}
+pub fn sheep_color(rng: &mut DeterministicRng) -> u8 {
+    match rng.below(100).expect("hundred colors") {
+        0..=4 => 1,
+        5..=9 => 2,
+        10..=14 => 3,
+        15..=17 => 4,
+        _ => {
+            if rng.below(500) == Some(0) {
+                5
+            } else {
+                0
+            }
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[must_use = "Commit sheep state, tool wear and wool drop together"]
+pub struct ShearPlan {
+    before: Mob,
+    pub after: Mob,
+    pub inventory: crate::survival::InventoryPlan,
+    pub wool: ItemStack,
+}
+impl ShearPlan {
+    pub fn prepare(
+        mob: &Mob,
+        inventory: &crate::survival::Inventory,
+        expected: ItemStack,
+        seed: u64,
+        event: u64,
+    ) -> Result<Self, EntityError> {
+        if mob.kind != MobKind::Sheep
+            || mob.baby
+            || mob.sheared
+            || !mob.life.alive()
+            || mob.color > 5
+            || expected.item() != I_SHEARS
+            || inventory.hand() != expected
+        {
+            return Err(EntityError::NoEntitlement);
+        }
+        let inventory = inventory
+            .plan_wear_tool(expected, 1)
+            .map_err(|_| EntityError::NoEntitlement)?;
+        let mut after = *mob;
+        after.sheared = true;
+        let mut rng = DeterministicRng::from_key(seed, 0x5348454152574f4f, mob.id.0, event);
+        Ok(Self {
+            before: *mob,
+            after,
+            inventory,
+            wool: ItemStack::new(
+                WHITE_WOOL + u16::from(mob.color),
+                1 + rng.below(3).expect("sheep wool") as u16,
+            )
+            .map_err(|_| EntityError::InvalidEncoding)?,
+        })
+    }
+    pub fn apply(
+        self,
+        mob: &mut Mob,
+        inventory: &mut crate::survival::Inventory,
+    ) -> Result<(), EntityError> {
+        if *mob != self.before || inventory != self.inventory.before() {
+            return Err(EntityError::StalePlan);
+        }
+        self.inventory
+            .apply(inventory)
+            .map_err(|_| EntityError::StalePlan)?;
+        *mob = self.after;
+        Ok(())
+    }
 }
 #[derive(Clone, Copy, Debug)]
 pub struct AiBudget {
@@ -394,6 +582,36 @@ impl PlayerIndex {
     }
     pub fn get(&self, id: EntityId) -> Option<PlayerProbe> {
         self.players.iter().copied().find(|player| player.id == id)
+    }
+    pub fn overlapping(
+        &self,
+        space: SpaceId,
+        bounds: crate::shapes::Aabb,
+        budget: QueryBudget,
+        mut visit: impl FnMut(PlayerProbe),
+    ) -> Result<super::spatial::QueryWork, EntityError> {
+        if self.players.is_empty() {
+            return Ok(super::spatial::QueryWork::default());
+        }
+        self.spatial.query(
+            [bounds.lo[0] - 0.3, bounds.lo[1] - 1.8, bounds.lo[2] - 0.3],
+            [bounds.hi[0] + 0.3, bounds.hi[1], bounds.hi[2] + 0.3],
+            budget,
+            |index| {
+                let player = self.players[index];
+                if player.space == space
+                    && player.alive
+                    && !player.spectator
+                    && super::combat::body_box(
+                        player.position,
+                        player.eye[1] - player.position[1] < 1.5,
+                    )
+                    .intersects(&bounds)
+                {
+                    visit(player);
+                }
+            },
+        )
     }
     pub fn rebuild(&mut self, players: &[PlayerProbe]) -> Result<(), EntityError> {
         if players.len() > self.capacity {
@@ -694,7 +912,7 @@ impl EntityStore {
                         + (mob.body.position[axis] - mob.body.previous[axis]) * alpha)
                         as f32
                 }),
-                body_yaw: mob.body.yaw,
+                body_yaw: mob.render_yaw,
                 head_yaw: mob.body.head,
                 pitch: mob.body.pitch,
                 limb_phase: mob.limb_phase,
@@ -704,17 +922,32 @@ impl EntityStore {
                     | (u32::from(mob.sheared) << 1)
                     | (u32::from(!mob.life.alive()) << 2)
                     | (u32::from(mob.life.fire() > 0) << 3)
-                    | (u32::from(mob.life.hurt_time() > 0) << 4),
-                color: u32::from(mob.color),
+                    | (u32::from(mob.life.hurt_time() > 0) << 4)
+                    | (u32::from(mob.body.on_ground) << 6)
+                    | (u32::from(mob.body.in_water) << 7)
+                    | (u32::from(mob.ai.eating > 0) << 9),
+                color: if mob.kind == MobKind::Chicken {
+                    mob.wing_phase.to_bits()
+                } else {
+                    u32::from(mob.color)
+                },
                 id_low: id.0 as u32,
                 id_high: (id.0 >> 32) as u32,
                 death_roll: if mob.life.alive() {
                     0.0
                 } else {
-                    (f32::from(mob.life.death_time()) / 20.0).min(1.0) * 90.0
+                    (((f32::from(mob.life.death_time()) - 1.0) / 20.0 * 1.6)
+                        .max(0.0)
+                        .sqrt())
+                    .min(1.0)
+                        * 90.0
                 },
                 scale: if mob.baby { 0.5 } else { 1.0 },
-                reserved: 0.0,
+                reserved: match mob.kind {
+                    MobKind::Chicken => mob.wing_deviation,
+                    MobKind::Sheep if mob.ai.eating > 0 => f32::from(40 - mob.ai.eating),
+                    _ => 0.0,
+                },
             };
         }
         Ok(visible.len())

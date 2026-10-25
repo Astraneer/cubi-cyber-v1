@@ -17,6 +17,9 @@ pub struct NativeOutput {
 }
 impl NativeOutput {
     pub fn open(voices: usize, memory_limit: usize) -> Result<Self, AudioError> {
+        Self::from_prepared(Mixer::new(48000, voices, memory_limit)?)
+    }
+    pub fn from_prepared(mut prepared: Mixer) -> Result<Self, AudioError> {
         let device = cpal::default_host()
             .default_output_device()
             .ok_or(AudioError::DeviceUnavailable)?;
@@ -27,11 +30,8 @@ impl NativeOutput {
         if channels == 0 || channels > 8 {
             return Err(AudioError::UnsupportedDevice);
         }
-        let mixer = Arc::new(Mutex::new(Mixer::new(
-            config.sample_rate().0,
-            voices,
-            memory_limit,
-        )?));
+        prepared.endpoint_rate(config.sample_rate().0)?;
+        let mixer = Arc::new(Mutex::new(prepared));
         let errors = Arc::new(AtomicU64::new(0));
         let missed = Arc::new(AtomicU64::new(0));
         let stream = match config.sample_format() {

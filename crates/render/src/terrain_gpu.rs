@@ -81,6 +81,9 @@ pub struct Camera {
 }
 
 impl Camera {
+    pub fn inverse_view_projection(&self) -> Option<[[f32; 4]; 4]> {
+        crate::atmosphere::inverse(self.view_projection)
+    }
     pub fn perspective(
         eye: [f32; 3],
         target: [f32; 3],
@@ -233,6 +236,7 @@ struct Slot {
     span: Option<Span>,
     allocated: bool,
     object: ObjectGpu,
+    neighbours: [[u32; 2]; 6],
 }
 
 struct Targets {
@@ -270,6 +274,7 @@ pub struct TerrainGeometry<'a> {
     pub tint_masks: &'a wgpu::TextureView,
     pub sampler: &'a wgpu::Sampler,
     pub edit_masks: &'a wgpu::Buffer,
+    pub edit_neighbors: &'a wgpu::Buffer,
     pub patch_states: &'a wgpu::Buffer,
     pub max_pages: u32,
     pub max_quads: u32,
@@ -285,6 +290,7 @@ pub struct TerrainGpu {
     visible: wgpu::Buffer,
     indirect: wgpu::Buffer,
     edit_masks: wgpu::Buffer,
+    edit_neighbors: wgpu::Buffer,
     patch_states: wgpu::Buffer,
     patch_clear: Box<[u32; 4096]>,
     patch_state_staging: Vec<u32>,
@@ -416,6 +422,11 @@ impl TerrainGpu {
             u64::from(config.max_pages) * EDIT_MASK_BYTES,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
+        let edit_neighbors = storage(
+            "generational page neighbor links",
+            u64::from(config.max_pages) * 56,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
         let patch_states = storage(
             "six-face owner patch states",
             u64::from(config.max_pages) * PATCH_STATE_BYTES,
@@ -511,6 +522,7 @@ impl TerrainGpu {
                     resource: wgpu::BindingResource::Sampler(&sampler),
                 },
                 buffer_binding(8, &edit_masks),
+                buffer_binding(16, &edit_neighbors),
             ],
         });
         let frustum_bind = compute_bind(
@@ -612,7 +624,7 @@ impl TerrainGpu {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &sky_shader,
-                entry_point: Some("fragment"),
+                entry_point: Some("fragment_hdr_sky"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: HDR_FORMAT,
@@ -784,6 +796,7 @@ impl TerrainGpu {
             visible,
             indirect,
             edit_masks,
+            edit_neighbors,
             patch_states,
             patch_clear: Box::new([0; 4096]),
             patch_state_staging: Vec::with_capacity(4096),
@@ -821,6 +834,7 @@ impl TerrainGpu {
                     span: None,
                     allocated: false,
                     object: ObjectGpu::zeroed(),
+                    neighbours: [[0; 2]; 6],
                 })
                 .collect(),
             free_slots: (0..config.max_pages).rev().collect(),
@@ -884,6 +898,7 @@ impl TerrainGpu {
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
                 buffer_binding(8, &self.edit_masks),
+                buffer_binding(16, &self.edit_neighbors),
                 buffer_binding(9, shadows.sampling_buffer()),
                 wgpu::BindGroupEntry {
                     binding: 10,
@@ -971,6 +986,7 @@ impl TerrainGpu {
             tint_masks: &self.tint_masks,
             sampler: &self.sampler,
             edit_masks: &self.edit_masks,
+            edit_neighbors: &self.edit_neighbors,
             patch_states: &self.patch_states,
             max_pages: self.config.max_pages,
             max_quads: self.config.max_quads,
@@ -981,6 +997,30 @@ impl TerrainGpu {
     /// Valid after a submitted `FrustumAndHiZ` frame; mip zero is padded to powers of two.
     pub fn conservative_depth_texture(&self) -> Option<&wgpu::Texture> {
         self.hiz.as_ref().map(|hiz| &hiz._texture)
+    }
+
+    /// Linear HDR source. In the basic opaque/cutout graph, alpha records actual
+    /// color-pass geometry coverage (sky zero), independent of prepass depth.
+    pub fn resolved_hdr_texture(&self) -> &wgpu::Texture {
+        &self.targets._resolved
+    }
+
+    /// Diagnostic readback preparation after color rendering: replace Hi-Z mip
+    /// zero with minimum depth from the final color pass, rather than assuming
+    /// the prepass and color pass produced the same covered samples. Higher mips
+    /// are deliberately unused afterwards and rebuilt by the next frame.
+    pub fn encode_final_depth_coverage(&self, encoder: &mut wgpu::CommandEncoder) -> bool {
+        let (Some(hiz), Some(pipeline)) = (&self.hiz, &self.hiz_base_pipeline) else {
+            return false;
+        };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("diagnostic final color sample coverage"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &hiz.base_bind, &[]);
+        pass.dispatch_workgroups(hiz.width.div_ceil(8), hiz.height.div_ceil(8), 1);
+        true
     }
     pub fn output_format(&self) -> wgpu::TextureFormat {
         self.output_format
@@ -1105,6 +1145,11 @@ impl TerrainGpu {
                 .ok_or(TerrainError::Capacity)?;
             (slot, generation, None, ENABLED)
         };
+        let neighbours = if handle.is_some() {
+            self.slots[slot as usize].neighbours
+        } else {
+            [[0; 2]; 6]
+        };
         let span = if len == 0 {
             None
         } else if old_span.is_some_and(|span| span.len >= len as u32) {
@@ -1160,6 +1205,7 @@ impl TerrainGpu {
             span,
             allocated: true,
             object,
+            neighbours,
         };
         budget.remaining_bytes -= bytes;
         self.invalidate();
@@ -1284,6 +1330,51 @@ impl TerrainGpu {
         }
         object.active = flags;
         self.write_object(queue, handle, object, budget)
+    }
+
+    /// Page links use mesher Face order: Down, Up, North, South, West, East.
+    /// Unchanged rows upload nothing. Header and target generations prevent ABA.
+    pub fn set_page_neighbors(
+        &mut self,
+        queue: &wgpu::Queue,
+        base: PageHandle,
+        neighbors: [Option<PageHandle>; 6],
+        budget: &mut UploadBudget,
+    ) -> Result<u64, TerrainError> {
+        if self.live_object(base)?.active & OVERLAY != 0 {
+            return Err(TerrainError::InvalidEdit);
+        }
+        let mut links = [[0u32; 2]; 6];
+        for (target, handle) in links.iter_mut().zip(neighbors) {
+            if let Some(handle) = handle {
+                if self.live_object(handle)?.active & OVERLAY != 0 {
+                    return Err(TerrainError::InvalidEdit);
+                }
+                *target = [handle.slot, handle.generation];
+            }
+        }
+        if self.slots[base.slot as usize].neighbours == links {
+            return Ok(0);
+        }
+        if budget.remaining_bytes < 56 {
+            return Err(TerrainError::UploadBudget);
+        }
+        let mut words = [[0u32; 2]; 7];
+        words[0] = [base.generation, 0];
+        words[1..].copy_from_slice(&links);
+        queue.write_buffer(
+            &self.edit_neighbors,
+            u64::from(base.slot) * 56,
+            bytemuck::cast_slice(&words),
+        );
+        self.slots[base.slot as usize].neighbours = links;
+        budget.remaining_bytes -= 56;
+        self.work.record(telemetry::WorkCounts {
+            upload_bytes: 56,
+            ..telemetry::WorkCounts::ZERO
+        });
+        self.invalidate();
+        Ok(56)
     }
 
     /// Overlay geometry must not be clipped by the base page's edit mask.
@@ -1870,6 +1961,7 @@ impl TerrainGpu {
             span: Some(span),
             allocated: true,
             object,
+            neighbours: [[0; 2]; 6],
         };
         budget.remaining_bytes -= overlay_bytes;
         self.work.record(telemetry::WorkCounts {
@@ -2234,7 +2326,7 @@ fn terrain_render_layout(device: &wgpu::Device, lighting: bool) -> wgpu::BindGro
     let fragment = wgpu::ShaderStages::FRAGMENT;
     let mut entries = vec![
         buffer_entry(0, vertex, true, true),
-        buffer_entry(1, vertex, false, true),
+        buffer_entry(1, vertex | fragment, false, true),
         buffer_entry(2, vertex, false, true),
         buffer_entry(3, vertex, false, true),
         buffer_entry(4, fragment, false, true),
@@ -2259,6 +2351,7 @@ fn terrain_render_layout(device: &wgpu::Device, lighting: bool) -> wgpu::BindGro
             count: None,
         },
         buffer_entry(8, fragment, false, true),
+        buffer_entry(16, fragment, false, true),
     ];
     if lighting {
         entries.extend([
@@ -2510,7 +2603,9 @@ fn create_targets(
         "resolved linear HDR",
         HDR_FORMAT,
         1,
-        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
     );
     let depth = texture(
         "actual reverse-Z MSAA4",

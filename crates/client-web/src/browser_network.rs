@@ -1,0 +1,247 @@
+//! Bounded WebSocket transport for the shared Rust remote owner. Only encoded
+//! protocol frames reach the socket; local resource bytes have no route here.
+use client::{network::NetworkConfig, remote::RemoteSession, view::ClientView};
+use net::{PlayerId, SecretToken};
+use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+use wasm_bindgen::{JsCast, prelude::*};
+use web_sys::{BinaryType, Event, MessageEvent, WebSocket};
+const INBOX_FRAMES: usize = 64;
+const INBOX_BYTES: usize = 8 * 1024 * 1024;
+const SOCKET_BACKLOG: u32 = 2 * 1024 * 1024;
+struct Inbox {
+    frames: VecDeque<Vec<u8>>,
+    bytes: usize,
+    fault: Option<&'static str>,
+    open: bool,
+    closed: bool,
+}
+pub struct BrowserSocket {
+    socket: WebSocket,
+    session: RemoteSession,
+    inbox: Rc<RefCell<Inbox>>,
+    pending: Option<Vec<u8>>,
+    identity: PlayerId,
+    saved_credential: Option<[u8; 32]>,
+    storage_key: String,
+    started_ms: u64,
+    _listeners: [Closure<dyn FnMut(Event)>; 4],
+}
+fn error(value: impl ToString) -> JsValue {
+    JsValue::from_str(&value.to_string())
+}
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        result.push(DIGITS[usize::from(byte >> 4)] as char);
+        result.push(DIGITS[usize::from(byte & 15)] as char);
+    }
+    result
+}
+fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    if text.len() != N * 2 {
+        return None;
+    }
+    let mut bytes = [0; N];
+    for (i, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+        let nibble = |c| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            _ => None,
+        };
+        bytes[i] = nibble(pair[0])? * 16 + nibble(pair[1])?;
+    }
+    Some(bytes)
+}
+pub fn socket_url(address: &str) -> Result<String, JsValue> {
+    if address.is_empty() || address.len() > 256 || address.chars().any(char::is_control) {
+        return Err(error("Некорректный адрес мира"));
+    }
+    let window = web_sys::window().ok_or_else(|| error("Window unavailable"))?;
+    let scheme = if window.location().protocol()? == "https:" {
+        "wss://"
+    } else {
+        "ws://"
+    };
+    let absolute = if address.starts_with("ws://") || address.starts_with("wss://") {
+        address.to_owned()
+    } else {
+        format!("{scheme}{}", address.trim())
+    };
+    let url = web_sys::Url::new(&absolute)?;
+    if !matches!(url.protocol().as_str(), "ws:" | "wss:")
+        || !url.username().is_empty()
+        || !url.password().is_empty()
+        || !url.search().is_empty()
+        || !url.hash().is_empty()
+    {
+        return Err(error("Некорректный адрес мира"));
+    }
+    Ok(url.href())
+}
+fn storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok().flatten()
+}
+fn identity(key: &str) -> Result<(PlayerId, Option<SecretToken>), JsValue> {
+    if let Some(text) = storage().and_then(|storage| storage.get_item(key).ok().flatten())
+        && text.len() <= 100
+    {
+        let mut fields = text.split(':');
+        if let Some(id) = fields.next().and_then(unhex::<16>) {
+            let credential = fields.next().and_then(unhex::<32>).map(SecretToken::new);
+            if fields.next().is_none() {
+                return Ok((PlayerId(id), credential));
+            }
+        }
+    }
+    let mut id = [0u8; 16];
+    web_sys::window()
+        .ok_or_else(|| error("Window unavailable"))?
+        .crypto()?
+        .get_random_values_with_u8_array(&mut id)?;
+    if let Some(storage) = storage() {
+        let _ = storage.set_item(key, &hex(&id));
+    }
+    Ok((PlayerId(id), None))
+}
+impl BrowserSocket {
+    pub fn connect(address: &str, name: &str, now_ms: u64) -> Result<Self, JsValue> {
+        let url = socket_url(address)?;
+        let storage_key = format!("cubi.identity.{url}");
+        let (identity, credential) = identity(&storage_key)?;
+        let mut session = RemoteSession::new(NetworkConfig::remote_scene()).map_err(error)?;
+        session
+            .connection_mut()
+            .hello(name.to_owned(), identity, credential)
+            .map_err(|_| error("Имя или данные входа отклонены"))?;
+        let socket = WebSocket::new(&url)?;
+        socket.set_binary_type(BinaryType::Arraybuffer);
+        let inbox = Rc::new(RefCell::new(Inbox {
+            frames: VecDeque::with_capacity(INBOX_FRAMES),
+            bytes: 0,
+            fault: None,
+            open: false,
+            closed: false,
+        }));
+        let messages = inbox.clone();
+        let message = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
+            let Some(event) = event.dyn_ref::<MessageEvent>() else {
+                return;
+            };
+            let Ok(buffer) = event.data().dyn_into::<js_sys::ArrayBuffer>() else {
+                messages.borrow_mut().fault = Some("Мир прислал неподдерживаемый кадр");
+                return;
+            };
+            let length = buffer.byte_length() as usize;
+            let mut inbox = messages.borrow_mut();
+            if length > net::MAX_FRAME_BYTES
+                || inbox.frames.len() >= INBOX_FRAMES
+                || length > INBOX_BYTES.saturating_sub(inbox.bytes)
+            {
+                inbox.fault = Some("Очередь мира переполнена");
+                return;
+            }
+            let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+            inbox.bytes += bytes.len();
+            inbox.frames.push_back(bytes);
+        });
+        socket.set_onmessage(Some(message.as_ref().unchecked_ref()));
+        let opened = inbox.clone();
+        let open = Closure::<dyn FnMut(Event)>::new(move |_| opened.borrow_mut().open = true);
+        socket.set_onopen(Some(open.as_ref().unchecked_ref()));
+        let closed = inbox.clone();
+        let close = Closure::<dyn FnMut(Event)>::new(move |_| {
+            let mut inbox = closed.borrow_mut();
+            inbox.closed = true;
+            inbox.open = false;
+        });
+        socket.set_onclose(Some(close.as_ref().unchecked_ref()));
+        let failed = inbox.clone();
+        let failure = Closure::<dyn FnMut(Event)>::new(move |_| {
+            failed.borrow_mut().fault = Some("Не удалось подключиться к миру")
+        });
+        socket.set_onerror(Some(failure.as_ref().unchecked_ref()));
+        Ok(Self {
+            socket,
+            session,
+            inbox,
+            pending: None,
+            identity,
+            saved_credential: credential.map(|value| *value.as_bytes()),
+            storage_key,
+            started_ms: now_ms,
+            _listeners: [message, open, close, failure],
+        })
+    }
+    pub fn session(&self) -> &RemoteSession {
+        &self.session
+    }
+    pub fn session_mut(&mut self) -> &mut RemoteSession {
+        &mut self.session
+    }
+    pub fn pump(&mut self, view: &mut ClientView, now_ms: u64) -> Result<(), String> {
+        if let Some(fault) = self.inbox.borrow_mut().fault.take() {
+            return Err(fault.to_owned());
+        }
+        if self.inbox.borrow().closed {
+            return Err("Соединение с миром закрыто".into());
+        }
+        if self.session.connection().welcome().is_none()
+            && now_ms.saturating_sub(self.started_ms) > 15_000
+        {
+            return Err("Мир не ответил вовремя".into());
+        }
+        for _ in 0..32 {
+            let bytes = {
+                let mut inbox = self.inbox.borrow_mut();
+                let Some(bytes) = inbox.frames.pop_front() else {
+                    break;
+                };
+                inbox.bytes -= bytes.len();
+                bytes
+            };
+            self.session.receive_frame(&bytes, now_ms)?;
+        }
+        self.session.pump(view, now_ms)?;
+        if let Some(credential) = self.session.connection().credential() {
+            let bytes = *credential.as_bytes();
+            if self.saved_credential != Some(bytes) {
+                if let Some(storage) = storage() {
+                    let _ = storage.set_item(
+                        &self.storage_key,
+                        &format!("{}:{}", hex(&self.identity.0), hex(&bytes)),
+                    );
+                }
+                self.saved_credential = Some(bytes);
+            }
+        }
+        if !self.inbox.borrow().open {
+            return Ok(());
+        }
+        for _ in 0..16 {
+            if self.socket.buffered_amount() > SOCKET_BACKLOG {
+                break;
+            }
+            if self.pending.is_none() {
+                self.pending = self.session.take_outgoing();
+            }
+            let Some(bytes) = self.pending.as_ref() else {
+                break;
+            };
+            self.socket
+                .send_with_u8_array(bytes)
+                .map_err(|_| "Не удалось отправить кадр миру".to_owned())?;
+            self.pending = None;
+        }
+        Ok(())
+    }
+}
+impl Drop for BrowserSocket {
+    fn drop(&mut self) {
+        self.socket.set_onmessage(None);
+        self.socket.set_onopen(None);
+        self.socket.set_onclose(None);
+        self.socket.set_onerror(None);
+        let _ = self.socket.close();
+    }
+}

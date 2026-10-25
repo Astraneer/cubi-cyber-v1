@@ -102,6 +102,35 @@ impl Catalog {
         seed: u64,
     ) -> Result<VoiceRequest, AudioError> {
         let clip = self.prepare(mixer, event, seed)?;
+        Ok(Self::voice_request(clip, event, emitter, position, seed))
+    }
+    /// Loading must have called `prepare_all`. This path cannot decode or grow
+    /// the bank, and is suitable for real game-event handling.
+    pub fn request_prepared(
+        &self,
+        event: &str,
+        emitter: EmitterId,
+        position: Option<[f64; 3]>,
+        seed: u64,
+    ) -> Result<VoiceRequest, AudioError> {
+        let files = data::EVENTS
+            .iter()
+            .find_map(|(name, files)| (*name == event).then_some(*files))
+            .ok_or(AudioError::MissingClip)?;
+        let mut rng = DeterministicRng::from_seed(seed);
+        let path = files[rng
+            .below(files.len() as u64)
+            .ok_or(AudioError::MissingClip)? as usize];
+        let clip = *self.loaded.get(path).ok_or(AudioError::MissingClip)?;
+        Ok(Self::voice_request(clip, event, emitter, position, seed))
+    }
+    fn voice_request(
+        clip: ClipId,
+        event: &str,
+        emitter: EmitterId,
+        position: Option<[f64; 3]>,
+        seed: u64,
+    ) -> VoiceRequest {
         let category = if event.starts_with("ui.") {
             Category::Ui
         } else if event.starts_with("machine.") {
@@ -128,6 +157,6 @@ impl Catalog {
         request.pitch = 0.95 + (rng.below(1001).unwrap() as f32 / 1000.0) * 0.1;
         request.looping = event.contains("loop");
         request.priority = if request.looping { 32 } else { 128 };
-        Ok(request)
+        request
     }
 }

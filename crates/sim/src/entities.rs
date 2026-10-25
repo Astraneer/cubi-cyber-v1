@@ -1,6 +1,8 @@
 //! Generic-AABB mob movement and bounded navigation. Entity values/rules live in
 //! `rules`; this adapter shares the player's actual collision solver.
+pub mod item;
 pub mod path;
+pub mod trace;
 
 use crate::{
     Aabb, QueryWorld,
@@ -222,6 +224,9 @@ pub fn tick_solids(
         let dy = at[1] - mob.body.position[1] - mob.kind.definition().eye;
         mob.body.pitch =
             (-(libm::atan2(dy, (dx * dx + dz * dz).sqrt()).to_degrees() as f32)).clamp(-40.0, 40.0);
+    } else {
+        mob.body.head = turn_angle(mob.body.head, mob.render_yaw, 10.0);
+        mob.body.pitch = 0.0;
     }
     mob.body.jump_cooldown = mob.body.jump_cooldown.saturating_sub(1);
     for value in &mut mob.body.velocity {

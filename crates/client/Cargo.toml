@@ -16,6 +16,8 @@ render.workspace = true
 telemetry.workspace = true
 sim = { path = "../sim" }
 net = { path = "../net" }
+ui = { path = "../ui" }
+audio = { path = "../audio" }
 wgpu.workspace = true
 libm = "=0.2.16"
 
@@ -27,3 +29,4 @@ pollster.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 server = { path = "../server" }
+tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }

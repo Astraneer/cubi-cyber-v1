@@ -1,4 +1,5 @@
 //! Thin native window/input shell; shared client owns world, budgets and camera.
+mod remote_transport;
 use client::view::{ClientView, InputKey};
 use render::terrain_gpu::{AtlasImage, TerrainGpu, UploadBudget};
 use std::{
@@ -22,6 +23,65 @@ enum SceneMode {
     #[default]
     Forest,
 }
+#[derive(Clone)]
+struct ConnectOptions {
+    url: String,
+    identity: std::path::PathBuf,
+    name: String,
+}
+struct RemoteNative {
+    session: client::remote::RemoteSession,
+    socket: remote_transport::Socket,
+    identity: std::path::PathBuf,
+    name: String,
+    persisted: bool,
+}
+impl RemoteNative {
+    fn new(options: ConnectOptions) -> Result<Self, String> {
+        let mut session = client::remote::RemoteSession::new(client::network::NetworkConfig {
+            input_lead_ticks: 2,
+            ..client::network::NetworkConfig::remote_scene()
+        })?;
+        let hello = remote_transport::load_identity(&options.identity)?.unwrap_or(net::Hello {
+            identity: net::PlayerId::default(),
+            name: options.name,
+            credential: None,
+        });
+        session
+            .connection_mut()
+            .hello(hello.name.clone(), hello.identity, hello.credential)
+            .map_err(|e| format!("identity handshake: {e:?}"))?;
+        Ok(Self {
+            socket: remote_transport::Socket::connect(options.url)?,
+            session,
+            identity: options.identity,
+            name: hello.name,
+            persisted: hello.credential.is_some(),
+        })
+    }
+    fn pump_socket(&mut self, now: u64) -> Result<(), String> {
+        self.socket.pump(&mut self.session, now)?;
+        if !self.persisted
+            && let Some(welcome) = self.session.connection().welcome()
+            && let Some(credential) = self.session.connection().credential()
+        {
+            remote_transport::save_identity(
+                &self.identity,
+                &net::Hello {
+                    identity: welcome.identity,
+                    name: self.name.clone(),
+                    credential: Some(credential),
+                },
+            )?;
+            self.persisted = true;
+            println!(
+                "NATIVE_AUTHORITY_CONNECTED tick={} role={:?}",
+                welcome.tick.0, welcome.role
+            );
+        }
+        Ok(())
+    }
+}
 struct NativeState {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -33,36 +93,54 @@ struct NativeState {
     loading: Option<mpsc::Receiver<Result<TerrainGpu, String>>>,
     loading_thread: Option<std::thread::JoinHandle<()>>,
     workers: Option<jobs::NativePool<client::SceneTask, client::SceneOutput>>,
-    recorder: telemetry::FrameRecorder<600>,
+    // The history is 43 KiB. Keeping it inline duplicates that storage across
+    // async return slots and window-event state moves on the 1 MiB Windows stack.
+    recorder: Box<telemetry::FrameRecorder<600>>,
     frames: u64,
     last_frame: Instant,
     captured: bool,
     reported_ready: bool,
     modifiers: [bool; 4],
     demo_mesh_delay_ticks: u64,
+    remote: Option<RemoteNative>,
+    network_started: Instant,
 }
 impl NativeState {
-    async fn new(window: Arc<Window>, software: bool, mode: SceneMode) -> Result<Self, String> {
+    async fn new(
+        window: Arc<Window>,
+        software: bool,
+        mode: SceneMode,
+        connection: Option<ConnectOptions>,
+    ) -> Result<Self, String> {
         #[cfg(target_os = "windows")]
         {
-            match Self::new_backend(window.clone(), software, mode, wgpu::Backends::DX12).await {
+            match Self::new_backend(
+                window.clone(),
+                software,
+                mode,
+                wgpu::Backends::DX12,
+                connection.clone(),
+            )
+            .await
+            {
                 Ok(state) => Ok(state),
                 Err(dx12) => {
                     eprintln!("D3D12 initialization failed; trying Vulkan: {dx12}");
-                    Self::new_backend(window, software, mode, wgpu::Backends::VULKAN)
+                    Self::new_backend(window, software, mode, wgpu::Backends::VULKAN, connection)
                         .await
                         .map_err(|vulkan| format!("D3D12:{dx12}; Vulkan:{vulkan}"))
                 }
             }
         }
         #[cfg(not(target_os = "windows"))]
-        Self::new_backend(window, software, mode, wgpu::Backends::VULKAN).await
+        Self::new_backend(window, software, mode, wgpu::Backends::VULKAN, connection).await
     }
     async fn new_backend(
         window: Arc<Window>,
         software: bool,
         mode: SceneMode,
         backend: wgpu::Backends,
+        connection: Option<ConnectOptions>,
     ) -> Result<Self, String> {
         let instance = render::instance_for(backend);
         let surface = instance
@@ -140,13 +218,15 @@ impl NativeState {
             loading,
             loading_thread,
             workers,
-            recorder: telemetry::FrameRecorder::new(),
+            recorder: Box::new(telemetry::FrameRecorder::new()),
             frames: 0,
             last_frame: Instant::now(),
             captured: false,
             reported_ready: false,
             modifiers: [false; 4],
             demo_mesh_delay_ticks: 0,
+            remote: connection.map(RemoteNative::new).transpose()?,
+            network_started: Instant::now(),
         })
     }
     fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
@@ -172,7 +252,12 @@ impl NativeState {
                 terrain
                     .resize(&self.gpu.device, self.config.width, self.config.height)
                     .map_err(|error| error.to_string())?;
-                let mut view = ClientView::new(terrain, client::SceneConfig::forest())?;
+                let scene = if self.remote.is_some() {
+                    client::remote::RemoteSession::scene_config()
+                } else {
+                    client::SceneConfig::forest()
+                };
+                let mut view = ClientView::new(terrain, scene)?;
                 view.set_demo_mesh_delay_ticks(self.demo_mesh_delay_ticks);
                 self.view = Some(view);
                 self.loading = None;
@@ -192,11 +277,23 @@ impl NativeState {
         let elapsed = self.last_frame.elapsed().as_secs_f64();
         self.last_frame = Instant::now();
         self.poll_loading()?;
+        let now = self
+            .network_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        if let Some(remote) = self.remote.as_mut() {
+            remote.pump_socket(now)?;
+        }
         let size = self.window.inner_size();
         if size.width == 0 || size.height == 0 {
             return Ok(None);
         }
         if let Some(view) = self.view.as_mut() {
+            if let Some(remote) = self.remote.as_mut() {
+                remote.session.pump(view, now)?;
+                remote.pump_socket(now)?;
+            }
             view.advance_input(elapsed)?;
             let mut budget = client::ClientScene::default_budget();
             let tick = view.tick();
@@ -246,7 +343,7 @@ impl NativeState {
                 self.config.height,
             )?;
             self.gpu.queue.submit([encoder.finish()]);
-            telemetry::WorkCounts::ZERO
+            view.take_frame_work()
         } else {
             self.sky.render(&self.gpu.device, &self.gpu.queue, &output);
             self.sky.take_work()
@@ -339,7 +436,7 @@ impl Drop for NativeState {
     }
 }
 struct App {
-    state: Option<NativeState>,
+    state: Option<Box<NativeState>>,
     scene: SceneMode,
     smoke_frames: Option<u32>,
     frames: u32,
@@ -347,6 +444,7 @@ struct App {
     started: Instant,
     next_redraw: Instant,
     mesh_delay_ticks: u64,
+    connection: Option<ConnectOptions>,
 }
 impl App {
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: String) {
@@ -375,10 +473,11 @@ impl ApplicationHandler for App {
             window,
             self.smoke_frames.is_some(),
             self.scene,
+            self.connection.clone(),
         )) {
             Ok(mut state) => {
                 state.demo_mesh_delay_ticks = self.mesh_delay_ticks;
-                self.state = Some(state);
+                self.state = Some(Box::new(state));
             }
             Err(error) => self.fail(event_loop, error),
         }
@@ -517,10 +616,37 @@ fn main() -> Result<(), String> {
         started: Instant::now(),
         next_redraw: Instant::now(),
         mesh_delay_ticks: 0,
+        connection: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--connect" => {
+                let url = args.next().ok_or("--connect requires ws://loopback:port")?;
+                app.connection = Some(ConnectOptions {
+                    url,
+                    identity: std::path::PathBuf::from(".local/client/identity.cubi"),
+                    name: "Player".into(),
+                });
+            }
+            "--identity" => {
+                let path = args
+                    .next()
+                    .ok_or("--identity requires a path after --connect")?;
+                app.connection
+                    .as_mut()
+                    .ok_or("--identity must follow --connect")?
+                    .identity = path.into();
+            }
+            "--name" => {
+                let name = args
+                    .next()
+                    .ok_or("--name requires a name after --connect")?;
+                app.connection
+                    .as_mut()
+                    .ok_or("--name must follow --connect")?
+                    .name = name;
+            }
             "--scene" => {
                 app.scene = match args.next().as_deref() {
                     Some("sky") => SceneMode::Sky,
@@ -570,4 +696,16 @@ fn main() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_state_moves_exclude_the_frame_history_storage() {
+        assert!(std::mem::size_of::<telemetry::FrameRecorder<600>>() > 40 * 1024);
+        assert!(std::mem::size_of::<NativeState>() < 16 * 1024);
+        assert!(std::mem::size_of::<App>() < 1024);
+    }
 }

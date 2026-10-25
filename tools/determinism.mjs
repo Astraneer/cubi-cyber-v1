@@ -18,7 +18,9 @@ assert.deepEqual(wasm.probe, native.probe, 'WASM generator differs from donor re
 assert.deepEqual(wasm.ticks, native.ticks, 'native/WASM state diverged on a tick');
 assert.equal(native.physics.length, 256, 'physics trace did not execute');
 assert.deepEqual(wasm.physics, native.physics, 'native/WASM player physics diverged on a tick');
+assert.equal(native.entities.length, 256, 'entity trace did not execute');
+assert.deepEqual(wasm.entities, native.entities, 'native/WASM AI, mob/item physics, inventory or navigation diverged on a tick');
 const directory = join(root, '.local', 'artifacts');
 await mkdir(directory, { recursive: true });
 await writeFile(join(directory, 'm1-determinism.json'), JSON.stringify({ native, wasm }, null, 2) + '\n');
-console.log(`DETERMINISM_OK ticks=${native.ticks.length} physicsTicks=${native.physics.length} goldenColumns=${native.probe.length} runtimes=native,wasm final=${native.ticks.at(-1)}`);
+console.log(`DETERMINISM_OK ticks=${native.ticks.length} physicsTicks=${native.physics.length} entityTicks=${native.entities.length} goldenColumns=${native.probe.length} runtimes=native,wasm final=${native.ticks.at(-1)}`);

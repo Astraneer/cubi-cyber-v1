@@ -6,7 +6,10 @@ use crate::{
     echo::Cavity,
     resources::{ImportLimits, LocalResources},
 };
-use std::{cell::RefCell, collections::BTreeMap};
+use std::{
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, VecDeque},
+};
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
@@ -28,6 +31,7 @@ pub struct WebOutput {
     master: GainNode,
     categories: Vec<GainNode>,
     clips: BTreeMap<ClipId, AudioBuffer>,
+    clip_bytes: usize,
     voices: Vec<Option<WebVoice>>,
     listener: Listener,
     next_generation: u64,
@@ -61,6 +65,7 @@ impl WebOutput {
             master,
             categories,
             clips: BTreeMap::new(),
+            clip_bytes: 0,
             voices: (0..voice_limit).map(|_| None).collect(),
             listener: Listener::default(),
             next_generation: 1,
@@ -71,12 +76,46 @@ impl WebOutput {
         JsFuture::from(self.context.resume()?).await?;
         Ok(())
     }
+    pub fn resume_request(&self) -> Result<js_sys::Promise, JsValue> {
+        self.context.resume()
+    }
+    /// Prepare all buffers before publishing a replacement. Old voices and the
+    /// active bank survive any failed preparation; the AudioContext is reused.
+    pub fn replace_bank(&mut self, mixer: &crate::Mixer) -> Result<(), JsValue> {
+        let mut clips = BTreeMap::new();
+        let mut bytes = 0usize;
+        for index in 0..crate::mixer::MAX_CLIPS {
+            let id = ClipId(index as u16);
+            let Some(pcm) = mixer.clip(id) else {
+                break;
+            };
+            bytes = bytes
+                .checked_add(pcm.bytes())
+                .filter(|n| *n <= 256 * 1024 * 1024)
+                .ok_or_else(|| js_error(AudioError::Capacity))?;
+            clips.insert(id, buffer(self.context.as_ref(), pcm)?);
+        }
+        for slot in 0..self.voices.len() {
+            if let Some(handle) = self.voices[slot].as_ref().map(|voice| voice.handle) {
+                self.stop(handle)?;
+            }
+        }
+        self.clips = clips;
+        self.clip_bytes = bytes;
+        Ok(())
+    }
     pub fn context_state(&self) -> web_sys::AudioContextState {
         self.context.state()
     }
     pub fn prepare_clip(&mut self, id: ClipId, pcm: &Pcm) -> Result<(), JsValue> {
         if !self.clips.contains_key(&id) {
+            if self.clips.len() == crate::mixer::MAX_CLIPS
+                || pcm.bytes() > (256 * 1024 * 1024usize).saturating_sub(self.clip_bytes)
+            {
+                return Err(js_error(AudioError::Capacity));
+            }
             self.clips.insert(id, buffer(self.context.as_ref(), pcm)?);
+            self.clip_bytes += pcm.bytes();
         }
         Ok(())
     }
@@ -92,49 +131,23 @@ impl WebOutput {
         Ok(())
     }
     pub fn listener(&mut self, listener: Listener) -> Result<(), JsValue> {
-        if listener.position.iter().any(|v| !v.is_finite())
-            || listener.right.iter().any(|v| !v.is_finite())
-        {
-            return Err(js_error(AudioError::Invalid));
-        }
-        let length = libm::sqrtf(listener.right.iter().map(|v| v * v).sum());
-        if length < 0.001 {
-            return Err(js_error(AudioError::Invalid));
-        }
-        self.listener = Listener {
-            position: listener.position,
-            right: listener.right.map(|v| v / length),
-        };
+        self.listener = crate::mixer::normalized_listener(listener).map_err(js_error)?;
         for voice in self.voices.iter().flatten() {
             self.position(voice);
         }
         Ok(())
     }
     fn position(&self, voice: &WebVoice) {
-        let (pan, distance) = if let Some(position) = voice.request.position {
-            let delta = std::array::from_fn::<_, 3, _>(|i| {
-                (position[i] - self.listener.position[i]) as f32
-            });
-            let distance = libm::sqrtf(delta.iter().map(|v| v * v).sum());
-            let pan = if distance > 0.001 {
-                delta
-                    .iter()
-                    .zip(self.listener.right)
-                    .map(|(v, r)| v * r)
-                    .sum::<f32>()
-                    / distance
-            } else {
-                0.0
-            };
-            (pan.clamp(-1.0, 1.0), distance)
+        let (pan, attenuation) = if let Some(position) = voice.request.position {
+            crate::mixer::spatial_parameters(self.listener, position, voice.request.range)
         } else {
-            (0.0, 0.0)
+            (0.0, 1.0)
         };
         voice.pan.pan().set_value(pan);
         voice
             .gain
             .gain()
-            .set_value(voice.request.gain * (1.0 - distance / voice.request.range).clamp(0.0, 1.0));
+            .set_value(voice.request.gain * attenuation);
     }
     pub fn play(&mut self, request: VoiceRequest) -> Result<VoiceHandle, JsValue> {
         if !request.gain.is_finite()
@@ -226,6 +239,19 @@ impl WebOutput {
         self.voices[slot] = Some(voice);
         Ok(handle)
     }
+    pub fn stop_emitter(&mut self, emitter: crate::EmitterId) -> Result<usize, JsValue> {
+        let mut stopped = 0;
+        for slot in 0..self.voices.len() {
+            let handle = self.voices[slot]
+                .as_ref()
+                .filter(|voice| voice.request.emitter == emitter)
+                .map(|voice| voice.handle);
+            if let Some(handle) = handle {
+                stopped += usize::from(self.stop(handle)?);
+            }
+        }
+        Ok(stopped)
+    }
     pub fn stop(&mut self, handle: VoiceHandle) -> Result<bool, JsValue> {
         let Some(slot) = self.voices.get_mut(usize::from(handle.slot)) else {
             return Ok(false);
@@ -295,27 +321,124 @@ impl WebOutput {
 }
 
 thread_local! {static LOCAL:RefCell<LocalResources>=RefCell::new(LocalResources::new(ImportLimits::default()));}
+#[derive(Clone, Copy, Debug)]
+pub enum ImportEvent {
+    Loading,
+    Ready(crate::resources::ImportSummary),
+    Rejected,
+}
+thread_local! {static IMPORT_EVENTS:RefCell<VecDeque<ImportEvent>>=const{RefCell::new(VecDeque::new())};}
+thread_local! {static IMPORT_EPOCH:Cell<u64>=const{Cell::new(0)};}
+fn begin_import() -> Result<u64, JsValue> {
+    IMPORT_EPOCH.with(|epoch| {
+        let next = epoch
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| js_error("Import generation exhausted"))?;
+        epoch.set(next);
+        Ok(next)
+    })
+}
+fn current_import(epoch: u64) -> bool {
+    IMPORT_EPOCH.with(|current| current.get() == epoch)
+}
+fn import_event(event: ImportEvent) {
+    IMPORT_EVENTS.with(|events| {
+        let mut events = events.borrow_mut();
+        if events.len() == 4 {
+            events.pop_front();
+        }
+        events.push_back(event);
+    });
+}
+pub fn take_import_event() -> Option<ImportEvent> {
+    IMPORT_EVENTS.with(|events| events.borrow_mut().pop_front())
+}
+pub fn with_local_resources<R>(read: impl FnOnce(&LocalResources) -> R) -> R {
+    LOCAL.with(|resources| read(&resources.borrow()))
+}
+/// Hidden native file-input glue for the GPU-drawn Rust UI. `choose_*` must be
+/// called while handling the user's click; status is a bounded Rust event queue.
+pub struct BrowserImports {
+    pack: web_sys::HtmlElement,
+    minecraft: web_sys::HtmlElement,
+}
+impl BrowserImports {
+    pub fn prepare() -> Result<Self, JsValue> {
+        let document = web_sys::window()
+            .and_then(|w| w.document())
+            .ok_or_else(|| js_error("Document unavailable"))?;
+        if let (Some(pack), Some(minecraft)) = (
+            document.get_element_by_id("cubi-local-pack-action"),
+            document.get_element_by_id("cubi-local-minecraft-action"),
+        ) {
+            return Ok(Self {
+                pack: pack.dyn_into()?,
+                minecraft: minecraft.dyn_into()?,
+            });
+        }
+        let body = document
+            .body()
+            .ok_or_else(|| js_error("Body unavailable"))?;
+        let pack = document
+            .create_element("button")?
+            .dyn_into::<web_sys::HtmlElement>()?;
+        pack.set_id("cubi-local-pack-action");
+        pack.set_hidden(true);
+        body.append_child(&pack)?;
+        let minecraft = document
+            .create_element("button")?
+            .dyn_into::<web_sys::HtmlElement>()?;
+        minecraft.set_id("cubi-local-minecraft-action");
+        minecraft.set_hidden(true);
+        body.append_child(&minecraft)?;
+        let status = document
+            .create_element("span")?
+            .dyn_into::<web_sys::HtmlElement>()?;
+        status.set_id("cubi-local-import-status");
+        status.set_hidden(true);
+        body.append_child(&status)?;
+        install_pack_picker("cubi-local-pack-action", "cubi-local-import-status")?;
+        bind_local_minecraft_picker("cubi-local-minecraft-action", "cubi-local-import-status")?;
+        Ok(Self { pack, minecraft })
+    }
+    pub fn choose_pack(&self) {
+        self.pack.click();
+    }
+    pub fn choose_minecraft(&self) {
+        self.minecraft.click();
+    }
+}
 thread_local! {static LIVE:RefCell<Option<WebOutput>>=const{RefCell::new(None)};}
 fn summary_json(summary: crate::resources::ImportSummary) -> String {
     format!(
-        "{{\"files\":{},\"bytes\":{},\"sounds\":{},\"textures\":{},\"notices\":{},\"revision\":{}}}",
+        "{{\"files\":{},\"bytes\":{},\"sounds\":{},\"textures\":{},\"notices\":{},\"revision\":{},\"ignored\":{}}}",
         summary.files,
         summary.bytes,
         summary.sounds,
         summary.textures,
         summary.notices,
-        summary.revision
+        summary.revision,
+        summary.ignored
     )
 }
 #[wasm_bindgen]
 pub fn import_local_pack(bytes: &[u8]) -> Result<String, JsValue> {
-    LOCAL.with(|store| {
-        store
-            .borrow_mut()
-            .import_zip(bytes)
-            .map(summary_json)
-            .map_err(js_error)
-    })
+    begin_import()?;
+    finish_pack_import(bytes)
+}
+fn finish_pack_import(bytes: &[u8]) -> Result<String, JsValue> {
+    let result = LOCAL.with(|store| store.borrow_mut().import_zip(bytes));
+    match result {
+        Ok(summary) => {
+            import_event(ImportEvent::Ready(summary));
+            Ok(summary_json(summary))
+        }
+        Err(error) => {
+            import_event(ImportEvent::Rejected);
+            Err(js_error(error))
+        }
+    }
 }
 #[wasm_bindgen]
 pub fn local_resource_summary() -> String {
@@ -337,6 +460,9 @@ pub fn bind_local_minecraft_picker(button_id: &str, status_id: &str) -> Result<(
     let button = document
         .get_element_by_id(button_id)
         .ok_or_else(|| js_error("Import action missing"))?;
+    if button.has_attribute("data-cubi-minecraft-picker") {
+        return Ok(());
+    }
     let status = document
         .get_element_by_id(status_id)
         .ok_or_else(|| js_error("Import status missing"))?;
@@ -357,8 +483,18 @@ pub fn bind_local_minecraft_picker(button_id: &str, status_id: &str) -> Result<(
             return;
         };
         let status = status.clone();
+        let Ok(epoch) = begin_import() else {
+            return;
+        };
+        import_event(ImportEvent::Loading);
         spawn_local(async move {
-            let result = read_minecraft_selection(files, status.clone()).await;
+            let result = read_minecraft_selection(files, status.clone(), epoch).await;
+            if !current_import(epoch) {
+                return;
+            }
+            if result.is_err() {
+                import_event(ImportEvent::Rejected);
+            }
             status.set_text_content(Some(&match result {
                 Ok(summary) => format!("Звуки Minecraft загружены локально: {summary}"),
                 Err(_) => "Локальные звуки отклонены; прежние ресурсы сохранены".into(),
@@ -370,11 +506,13 @@ pub fn bind_local_minecraft_picker(button_id: &str, status_id: &str) -> Result<(
     let click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| input.click());
     button.add_event_listener_with_callback("click", click.as_ref().unchecked_ref())?;
     click.forget();
+    button.set_attribute("data-cubi-minecraft-picker", "")?;
     Ok(())
 }
 async fn read_minecraft_selection(
     files: web_sys::FileList,
     status: web_sys::Element,
+    epoch: u64,
 ) -> Result<String, JsValue> {
     use crate::resources::{minecraft_sound_objects, selected_minecraft_asset};
     if files.length() > 250000 {
@@ -388,6 +526,9 @@ async fn read_minecraft_selection(
     };
     let mut indexes = Vec::new();
     for i in 0..files.length() {
+        if !current_import(epoch) {
+            return Err(js_error("Superseded local selection"));
+        }
         let Some(file) = files.get(i) else {
             continue;
         };
@@ -428,6 +569,9 @@ async fn read_minecraft_selection(
             return Err(js_error("Sound byte limit"));
         }
         let data = js_sys::Uint8Array::new(&JsFuture::from(file.array_buffer()).await?).to_vec();
+        if !current_import(epoch) {
+            return Err(js_error("Superseded local selection"));
+        }
         total += data.len();
         selected.push((path, data));
         status.set_text_content(Some(&format!(
@@ -436,11 +580,15 @@ async fn read_minecraft_selection(
         )));
     }
     LOCAL.with(|store| {
-        store
+        if !current_import(epoch) {
+            return Err(js_error("Superseded local selection"));
+        }
+        let summary = store
             .borrow_mut()
             .import_directory(selected)
-            .map(summary_json)
-            .map_err(js_error)
+            .map_err(js_error)?;
+        import_event(ImportEvent::Ready(summary));
+        Ok(summary_json(summary))
     })
 }
 
@@ -512,6 +660,9 @@ pub fn install_pack_picker(button_id: &str, status_id: &str) -> Result<(), JsVal
     let button = document
         .get_element_by_id(button_id)
         .ok_or_else(|| js_error("Import action missing"))?;
+    if button.has_attribute("data-cubi-pack-picker") {
+        return Ok(());
+    }
     let status = document
         .get_element_by_id(status_id)
         .ok_or_else(|| js_error("Import status missing"))?;
@@ -531,17 +682,38 @@ pub fn install_pack_picker(button_id: &str, status_id: &str) -> Result<(), JsVal
             return;
         };
         let status = status.clone();
+        let Ok(epoch) = begin_import() else {
+            return;
+        };
         if file.size() > ImportLimits::default().archive_bytes as f64 {
+            import_event(ImportEvent::Rejected);
             status.set_text_content(Some("Файл превышает локальный лимит"));
             return;
         }
+        import_event(ImportEvent::Loading);
         spawn_local(async move {
             let result = async {
                 let bytes = JsFuture::from(file.array_buffer()).await?;
+                if !current_import(epoch) {
+                    return Err(js_error("Superseded local selection"));
+                }
                 let bytes = js_sys::Uint8Array::new(&bytes).to_vec();
-                import_local_pack(&bytes)
+                finish_pack_import(&bytes)
             }
             .await;
+            if !current_import(epoch) {
+                return;
+            }
+            if result.is_err() {
+                // `finish_pack_import` already emitted rejection; read failures
+                // also need a bounded status event for the Rust UI adapter.
+                if !matches!(
+                    IMPORT_EVENTS.with(|events| events.borrow().back().copied()),
+                    Some(ImportEvent::Rejected)
+                ) {
+                    import_event(ImportEvent::Rejected);
+                }
+            }
             status.set_text_content(Some(&match result {
                 Ok(summary) => format!("Набор загружен локально: {summary}"),
                 Err(_) => "Набор отклонён; прежние ресурсы сохранены".into(),
@@ -553,6 +725,7 @@ pub fn install_pack_picker(button_id: &str, status_id: &str) -> Result<(), JsVal
     let click = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| input.click());
     button.add_event_listener_with_callback("click", click.as_ref().unchecked_ref())?;
     click.forget();
+    button.set_attribute("data-cubi-pack-picker", "")?;
     Ok(())
 }
 

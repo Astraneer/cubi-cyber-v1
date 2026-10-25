@@ -95,6 +95,18 @@ fn resampling_pitch_completion_and_bad_inputs_are_bounded() {
     assert_eq!(mixer.volume(None, 2.0), Err(AudioError::Invalid));
     assert!(Pcm::mono(vec![f32::NAN], 48000).is_err());
     assert!(Pcm::decode_ogg(b"not ogg").is_err());
+    mixer
+        .listener(Listener {
+            position: [f64::MAX; 3],
+            right: [f32::MAX; 3],
+        })
+        .unwrap();
+    let mut distant = request;
+    distant.position = Some([-f64::MAX; 3]);
+    mixer.play(distant).unwrap();
+    let mut output = [0.0; 16];
+    mixer.mix_stereo(&mut output);
+    assert!(output.iter().all(|v| v.is_finite()));
 }
 #[test]
 fn sixty_four_active_loops_allocate_nothing_for_ten_thousand_callbacks() {
@@ -210,9 +222,19 @@ fn local_labpbr_preserves_notices_and_failed_import_is_atomic() {
             b"LOCAL_PRIVATE_SPECULAR",
         ),
         ("CREDITS.md", b"Local author license"),
+        (
+            "assets/minecraft/optifine/material.properties",
+            b"Ignored optional metadata",
+        ),
     ]);
     let summary = store.import_zip(&bytes).unwrap();
     assert_eq!((summary.textures, summary.notices), (3, 1));
+    assert_eq!((summary.files, summary.ignored), (4, 1));
+    assert!(
+        store
+            .get_local("assets/minecraft/optifine/material.properties")
+            .is_none()
+    );
     let pbr = store.labpbr("minecraft", "block/stone").unwrap();
     assert_eq!(pbr.normal, Some(&b"LOCAL_PRIVATE_NORMAL"[..]));
     assert_eq!(

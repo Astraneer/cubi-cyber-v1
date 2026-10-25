@@ -228,3 +228,31 @@ fn unknown_geometry_stays_unknown_and_cannot_build_a_sky_hole() {
         ProxyError::UnknownData
     );
 }
+#[test]
+fn actual_wire_dto_keeps_atlas_palette_and_has_no_raw_cells() {
+    let mut occupied = [0; 512];
+    occupied[0] = 1;
+    let dto = net::PublicGeometry {
+        page: page(0),
+        source_version: Version(1),
+        view_version: 1,
+        known: [255; 512],
+        occupied,
+        palette: vec![net::PublicSurface {
+            atlas_layer: 3,
+            tint: 0xff123456,
+            kind: net::PublicSurfaceKind::Opaque,
+        }],
+        index_bits: 0,
+        indices: vec![],
+    };
+    let mut cache = PublicLodCache::new(LodCacheConfig::default()).unwrap();
+    assert!(cache.ingest_wire_geometry(&dto).unwrap().accepted);
+    let selection = selected(&cache, &[0]);
+    cache.queue_selection(&selection).unwrap();
+    let built = cache.take_task().unwrap().execute().unwrap();
+    assert_eq!(
+        built.payload.voxel([0; 3]),
+        PublicVoxel::solid(3, 0xff123456)
+    );
+}

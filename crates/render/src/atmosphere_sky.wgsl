@@ -12,5 +12,5 @@ struct SkyVertex { @builtin(position) position:vec4<f32>, @location(0) ndc:vec2<
     let far=view.inverse_view_projection*vec4(input.ndc,0.0,1.0);
     let direction=normalize(far.xyz/far.w-near.xyz/near.w);
     let uv=vec2(atan2(direction.z,direction.x)/(2.0*3.141592653589793)+0.5,direction.y*0.5+0.5);
-    return vec4(textureSampleLevel(sky_view,sky_filter,uv,0.0).rgb,1.0);
+    return vec4(textureSampleLevel(sky_view,sky_filter,uv,0.0).rgb,0.0);
 }

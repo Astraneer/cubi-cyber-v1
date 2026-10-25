@@ -79,6 +79,16 @@ pub fn run_trace() -> String {
         }
         write!(out, "\"{hash:016x}\"").expect("write to String");
     }
+    out.push_str("],\"entities\":[");
+    for (index, hash) in sim::entities::trace::determinism_trace()
+        .into_iter()
+        .enumerate()
+    {
+        if index != 0 {
+            out.push(',');
+        }
+        write!(out, "\"{hash:016x}\"").expect("write to String");
+    }
     out.push_str("]}");
     out
 }

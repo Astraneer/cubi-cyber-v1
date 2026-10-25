@@ -94,6 +94,7 @@ pub(crate) fn capture(
         place_ready_at: core_types::Tick(0),
         break_ready_at: core_types::Tick(0),
         inventory: Vec::new(),
+        window: Vec::new(),
         simulation: out.0,
     }
 }

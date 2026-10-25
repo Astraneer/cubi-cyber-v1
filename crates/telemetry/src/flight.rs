@@ -20,7 +20,7 @@ pub const GPU_PASSES: [&str; 16] = [
     "occlusion",
     "shadows",
     "sky",
-    "opaque",
+    "terrain",
     "cutout",
     "water",
     "clouds",
@@ -88,6 +88,7 @@ pub struct FlightRecorder {
     last_capacity_loss_ns: Option<u64>,
     started_ns: Option<u64>,
     last_ns: u64,
+    window_ns: Option<u64>,
 }
 impl FlightRecorder {
     pub fn new(frame_limit: usize, input_limit: usize) -> Result<Self, &'static str> {
@@ -103,7 +104,14 @@ impl FlightRecorder {
             last_capacity_loss_ns: None,
             started_ns: None,
             last_ns: 0,
+            window_ns: Some(WINDOW_NS),
         })
+    }
+    /// Benchmarks retain the complete bounded route; F8 keeps the default 10 s.
+    pub fn new_full_capture(frame_limit: usize, input_limit: usize) -> Result<Self, &'static str> {
+        let mut recorder = Self::new(frame_limit, input_limit)?;
+        recorder.window_ns = None;
+        Ok(recorder)
     }
     pub fn frames(&self) -> impl ExactSizeIterator<Item = &Sample> {
         self.frames.iter()
@@ -114,7 +122,28 @@ impl FlightRecorder {
     pub fn loss(&self) -> Loss {
         self.loss
     }
+    /// A nonblocking GPU readback may finish after newer CPU samples. Associate
+    /// it with its submitted frame only; expired or duplicate results do nothing.
+    pub fn complete_gpu(
+        &mut self,
+        frame: u64,
+        total_ns: u64,
+        passes_ns: [Option<u64>; 16],
+    ) -> bool {
+        let Some(sample) = self.frames.iter_mut().find(|sample| sample.frame == frame) else {
+            return false;
+        };
+        if sample.gpu_ns.is_some() {
+            return false;
+        }
+        sample.gpu_ns = Some(total_ns);
+        sample.gpu_passes_ns = passes_ns;
+        true
+    }
     pub fn complete_window(&self) -> bool {
+        if self.window_ns.is_none() {
+            return !self.frames.is_empty() && self.loss == Loss::default();
+        }
         self.started_ns
             .is_some_and(|start| self.last_ns.saturating_sub(start) >= WINDOW_NS)
             && self
@@ -131,7 +160,10 @@ impl FlightRecorder {
     fn advance(&mut self, time: u64) {
         self.started_ns.get_or_insert(time);
         self.last_ns = time;
-        let threshold = time.saturating_sub(WINDOW_NS);
+        let Some(window) = self.window_ns else {
+            return;
+        };
+        let threshold = time.saturating_sub(window);
         while self
             .frames
             .front()
@@ -215,9 +247,18 @@ impl FlightRecorder {
             String::with_capacity(self.frames.len() * 400 + self.inputs.len() * 100 + 512);
         let _ = write!(out, "{{\"schemaVersion\":1,\"backend\":");
         quote(&mut out, backend);
+        let window = self.window_ns.unwrap_or_else(|| {
+            self.last_ns
+                .saturating_sub(self.started_ns.unwrap_or(self.last_ns))
+        });
+        let mode = if self.window_ns.is_some() {
+            "window"
+        } else {
+            "route"
+        };
         let _ = write!(
             out,
-            ",\"windowNs\":{WINDOW_NS},\"completeWindow\":{},\"lostFrames\":{},\"lostInputs\":{},\"publicSeed\":\"{public_seed:016x}\",\"initialHash\":\"{initial_hash:016x}\",\"startTick\":{start_tick},\"simulationHz\":20,\"cpuStages\":[",
+            ",\"captureMode\":\"{mode}\",\"windowNs\":{window},\"completeWindow\":{},\"lostFrames\":{},\"lostInputs\":{},\"publicSeed\":\"{public_seed:016x}\",\"initialHash\":\"{initial_hash:016x}\",\"startTick\":{start_tick},\"simulationHz\":20,\"cpuStages\":[",
             self.complete_window(),
             self.loss.frames,
             self.loss.inputs

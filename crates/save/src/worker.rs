@@ -12,6 +12,7 @@ pub struct SnapshotMetadata {
     pub identities: Vec<Identity>,
     pub players: Vec<SavedPlayer>,
     pub dedup: Vec<(PlayerId, DedupState)>,
+    pub runtimes: Vec<RuntimeRecord>,
 }
 pub enum WriteRequest {
     Batch {
@@ -82,6 +83,7 @@ impl SaveWorker {
                                     identities: metadata.identities,
                                     players: metadata.players,
                                     dedup: metadata.dedup,
+                                    runtimes: metadata.runtimes,
                                 };
                                 store
                                     .checkpoint(&snapshot)

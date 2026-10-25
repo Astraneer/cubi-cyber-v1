@@ -524,7 +524,7 @@ impl AtmosphereSkyGpu {
         pass.draw(0..3, 0..1);
     }
 }
-fn inverse(matrix: [[f32; 4]; 4]) -> Option<[[f32; 4]; 4]> {
+pub(crate) fn inverse(matrix: [[f32; 4]; 4]) -> Option<[[f32; 4]; 4]> {
     let mut rows = [[0.0f64; 8]; 4];
     for (row_index, row) in rows.iter_mut().enumerate() {
         for (column_index, column) in matrix.iter().enumerate() {

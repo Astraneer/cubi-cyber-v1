@@ -49,6 +49,11 @@ impl Mob {
                 self.limb_phase,
                 self.limb_amount,
                 self.ai.speed_multiplier,
+                self.render_yaw,
+                self.body_last_head,
+                self.wing_deviation,
+                self.wing_speed,
+                self.wing_phase,
             ]
             .iter()
             .any(|value| !value.is_finite())
@@ -56,8 +61,13 @@ impl Mob {
             || self.body.jump_cooldown > 10
             || !(0.0..=2.0).contains(&self.limb_amount)
             || !(0.0..=8.0).contains(&self.ai.speed_multiplier)
+            || (self.ai.revenge_mode && self.ai.revenge_at.is_none())
             || self.ai.eating > 40
-            || self.color > 15
+            || self.color > 5
+            || self.egg_remaining > 11999
+            || self.body_still > 20
+            || !(0.0..=1.0).contains(&self.wing_deviation)
+            || !(0.0..=1.0).contains(&self.wing_speed)
             || (self.loot_emitted && self.life.alive())
             || self.life.maximum() != self.kind.definition().health
         {
@@ -129,13 +139,33 @@ impl Mob {
         writer.put(&self.space.0.to_le_bytes());
         writer.put(&self.last_tick.0.to_le_bytes());
         writer.put(&[u8::from(self.loot_emitted)]);
-        debug_assert_eq!(writer.cursor, 265);
+        writer.put(&self.egg_remaining.to_le_bytes());
+        for value in [
+            self.render_yaw,
+            self.body_last_head,
+            self.wing_deviation,
+            self.wing_speed,
+            self.wing_phase,
+        ] {
+            writer.put(&value.to_bits().to_le_bytes());
+        }
+        writer.put(&[self.body_still]);
+        writer.put(&[u8::from(self.last_player_hit.is_some())]);
+        let (attacker, at) = self.last_player_hit.unwrap_or((EntityId(0), Tick(0)));
+        writer.put(&attacker.0.to_le_bytes());
+        writer.put(&at.0.to_le_bytes());
+        writer.put(&[
+            u8::from(self.ai.revenge_at.is_some()),
+            u8::from(self.ai.revenge_mode),
+        ]);
+        writer.put(&self.ai.revenge_at.unwrap_or(0).to_le_bytes());
+        debug_assert_eq!(writer.cursor, 315);
         Ok(writer.bytes)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, EntityError> {
         if bytes.len() != MOB_BYTES
             || &bytes[..4] != b"MOB1"
-            || bytes[265..].iter().any(|&value| value != 0)
+            || bytes[315..].iter().any(|&value| value != 0)
         {
             return Err(EntityError::InvalidEncoding);
         }
@@ -201,6 +231,26 @@ impl Mob {
         if loot_emitted > 1 {
             return Err(EntityError::InvalidEncoding);
         }
+        let egg_remaining = u16::from_le_bytes(reader.take()?);
+        let mut pose = [0.0; 5];
+        for value in &mut pose {
+            *value = f32::from_bits(u32::from_le_bytes(reader.take()?));
+        }
+        let [body_still] = reader.take()?;
+        let [has_attacker] = reader.take()?;
+        let attacker = EntityId(u64::from_le_bytes(reader.take()?));
+        let attacker_at = Tick(u64::from_le_bytes(reader.take()?));
+        if has_attacker > 1 || (has_attacker == 0 && (attacker.0 != 0 || attacker_at.0 != 0)) {
+            return Err(EntityError::InvalidEncoding);
+        }
+        let [has_revenge, revenge_mode] = reader.take()?;
+        let revenge_at = u64::from_le_bytes(reader.take()?);
+        if has_revenge > 1
+            || revenge_mode > 1
+            || (has_revenge == 0 && (revenge_at != 0 || revenge_mode != 0))
+        {
+            return Err(EntityError::InvalidEncoding);
+        }
         let mob = Self {
             id,
             space,
@@ -230,15 +280,25 @@ impl Mob {
                 eating,
                 event,
                 speed_multiplier,
+                revenge_at: (has_revenge == 1).then_some(revenge_at),
+                revenge_mode: revenge_mode == 1,
             },
             age,
             last_tick,
             loot_emitted: loot_emitted == 1,
+            egg_remaining,
+            last_player_hit: (has_attacker == 1).then_some((attacker, attacker_at)),
             baby: flags & 8 != 0,
             sheared: flags & 16 != 0,
             color,
             limb_phase,
             limb_amount,
+            render_yaw: pose[0],
+            body_last_head: pose[1],
+            wing_deviation: pose[2],
+            wing_speed: pose[3],
+            wing_phase: pose[4],
+            body_still,
         };
         mob.validate()?;
         Ok(mob)

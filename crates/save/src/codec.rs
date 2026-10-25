@@ -507,6 +507,8 @@ pub fn encode_batch(batch: &Batch) -> Result<Vec<u8>, SaveError> {
         w.action(*reply);
     }
     write_inventories(&mut w, &batch.players);
+    write_windows(&mut w, &batch.players);
+    write_runtimes(&mut w, &batch.runtimes)?;
     w.finish()
 }
 pub fn decode_batch(bytes: &[u8]) -> Result<Batch, SaveError> {
@@ -531,6 +533,7 @@ pub fn decode_batch(bytes: &[u8]) -> Result<Batch, SaveError> {
             place_ready_at: Tick(r.u64()?),
             break_ready_at: Tick(r.u64()?),
             inventory: Vec::new(),
+            window: Vec::new(),
         });
     }
     let count = r.count(65_536, 20)?;
@@ -539,6 +542,8 @@ pub fn decode_batch(bytes: &[u8]) -> Result<Batch, SaveError> {
         actions.push((PlayerId(r.array()?), r.action()?));
     }
     read_inventories(&mut r, &mut players)?;
+    read_windows(&mut r, &mut players)?;
+    let runtimes = read_runtimes(&mut r)?;
     r.finish()?;
     Ok(Batch {
         tick,
@@ -546,6 +551,7 @@ pub fn decode_batch(bytes: &[u8]) -> Result<Batch, SaveError> {
         identities,
         players,
         actions,
+        runtimes,
     })
 }
 
@@ -627,6 +633,8 @@ pub fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>, SaveError> {
         }
     }
     write_inventories(&mut w, &snapshot.players);
+    write_windows(&mut w, &snapshot.players);
+    write_runtimes(&mut w, &snapshot.runtimes)?;
     w.finish()
 }
 pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, SaveError> {
@@ -728,6 +736,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, SaveError> {
             place_ready_at: Tick(r.u64()?),
             break_ready_at: Tick(r.u64()?),
             inventory: Vec::new(),
+            window: Vec::new(),
         });
     }
     let count = r.count(MAX_IDENTITIES, 36)?;
@@ -751,6 +760,8 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, SaveError> {
         ));
     }
     read_inventories(&mut r, &mut players)?;
+    read_windows(&mut r, &mut players)?;
+    let runtimes = read_runtimes(&mut r)?;
     r.finish()?;
     Ok(Snapshot {
         record_sequence,
@@ -772,6 +783,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, SaveError> {
         identities,
         players,
         dedup,
+        runtimes,
     })
 }
 
@@ -794,7 +806,7 @@ fn write_inventories(w: &mut Writer, players: &[SavedPlayer]) {
     }
 }
 fn read_inventories(r: &mut Reader<'_>, players: &mut [SavedPlayer]) -> Result<(), SaveError> {
-    if r.offset == r.bytes.len() {
+    if !next_tag(r, b"INV1") {
         return Ok(());
     }
     if r.array::<4>()? != *b"INV1" {
@@ -814,4 +826,107 @@ fn read_inventories(r: &mut Reader<'_>, players: &mut [SavedPlayer]) -> Result<(
         players[index].inventory = r.bytes(512)?;
     }
     Ok(())
+}
+
+fn next_tag(r: &Reader<'_>, tag: &[u8; 4]) -> bool {
+    r.bytes.get(r.offset..r.offset + 4) == Some(tag.as_slice())
+}
+fn write_windows(w: &mut Writer, players: &[SavedPlayer]) {
+    let count = players
+        .iter()
+        .filter(|player| !player.window.is_empty())
+        .count();
+    if count == 0 {
+        return;
+    }
+    w.raw(b"WND1");
+    w.count(count, MAX_IDENTITIES);
+    for (index, player) in players.iter().enumerate() {
+        if !player.window.is_empty() {
+            w.u32(index as u32);
+            w.bytes(&player.window, 4096);
+        }
+    }
+}
+fn read_windows(r: &mut Reader<'_>, players: &mut [SavedPlayer]) -> Result<(), SaveError> {
+    if !next_tag(r, b"WND1") {
+        return Ok(());
+    }
+    r.take(4)?;
+    let count = r.count(MAX_IDENTITIES, 8)?;
+    let mut seen = vec![false; players.len()];
+    for _ in 0..count {
+        let index = r.u32()? as usize;
+        let entry = seen
+            .get_mut(index)
+            .ok_or(SaveError::Invalid("window owner index"))?;
+        if *entry {
+            return Err(SaveError::Invalid("duplicate window extension"));
+        }
+        *entry = true;
+        let window = r.bytes(4096)?;
+        if window.is_empty() {
+            return Err(SaveError::Invalid("empty window extension"));
+        }
+        players[index].window = window;
+    }
+    Ok(())
+}
+fn write_runtimes(w: &mut Writer, records: &[RuntimeRecord]) -> Result<(), SaveError> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    if records.len() > MAX_RUNTIME_RECORDS {
+        return Err(SaveError::Bounds("runtime records"));
+    }
+    let mut seen = 0u16;
+    for record in records {
+        if !(RUNTIME_SURVIVAL..=RUNTIME_MACHINES).contains(&record.kind) {
+            return Err(SaveError::Invalid("runtime kind"));
+        }
+        let bit = 1u16 << record.kind;
+        if seen & bit != 0 {
+            return Err(SaveError::Invalid("duplicate runtime kind"));
+        }
+        seen |= bit;
+        if record.payload.len() > MAX_RUNTIME_BYTES {
+            return Err(SaveError::Bounds("runtime payload"));
+        }
+        if record.payload.is_empty() {
+            return Err(SaveError::Invalid("empty runtime payload"));
+        }
+    }
+    w.raw(b"RUN1");
+    w.count(records.len(), MAX_RUNTIME_RECORDS);
+    for kind in RUNTIME_SURVIVAL..=RUNTIME_MACHINES {
+        if let Some(record) = records.iter().find(|record| record.kind == kind) {
+            w.u16(kind);
+            w.bytes(&record.payload, MAX_RUNTIME_BYTES);
+        }
+    }
+    Ok(())
+}
+fn read_runtimes(r: &mut Reader<'_>) -> Result<Vec<RuntimeRecord>, SaveError> {
+    if r.offset == r.bytes.len() {
+        return Ok(Vec::new());
+    }
+    if r.array::<4>()? != *b"RUN1" {
+        return Err(SaveError::Invalid("unknown runtime extension"));
+    }
+    let count = r.count(MAX_RUNTIME_RECORDS, 6)?;
+    let mut records = Vec::with_capacity(count);
+    let mut previous = 0u16;
+    for _ in 0..count {
+        let kind = r.u16()?;
+        if !(RUNTIME_SURVIVAL..=RUNTIME_MACHINES).contains(&kind) || kind <= previous {
+            return Err(SaveError::Invalid("runtime kind/order"));
+        }
+        previous = kind;
+        let payload = r.bytes(MAX_RUNTIME_BYTES)?;
+        if payload.is_empty() {
+            return Err(SaveError::Invalid("empty runtime payload"));
+        }
+        records.push(RuntimeRecord { kind, payload });
+    }
+    Ok(records)
 }

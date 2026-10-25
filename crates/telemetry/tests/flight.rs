@@ -3,6 +3,37 @@ use telemetry::{AllocationCounts, AllocationScope, CountingAllocator, flight::*}
 #[global_allocator]
 static ALLOCATOR: CountingAllocator<System> = CountingAllocator::new(System);
 #[test]
+fn complete_route_survives_more_than_ten_seconds_but_capacity_loss_is_visible() {
+    let mut recorder = FlightRecorder::new_full_capture(32, 32).unwrap();
+    for frame in 0..24 {
+        recorder
+            .record_frame(Sample {
+                frame,
+                monotonic_ns: frame * 1_000_000_000,
+                ..Sample::default()
+            })
+            .unwrap();
+    }
+    assert_eq!(recorder.frames().len(), 24);
+    assert_eq!(recorder.frames().next().unwrap().monotonic_ns, 0);
+    assert!(recorder.complete_window());
+    let json: serde_json::Value =
+        serde_json::from_str(&recorder.export_json("test", 0, 0, 0)).unwrap();
+    assert_eq!(json["captureMode"], "route");
+    assert_eq!(json["windowNs"], 23_000_000_000_u64);
+    for frame in 24..34 {
+        recorder
+            .record_frame(Sample {
+                frame,
+                monotonic_ns: frame * 1_000_000_000,
+                ..Sample::default()
+            })
+            .unwrap();
+    }
+    assert_eq!(recorder.loss().frames, 2);
+    assert!(!recorder.complete_window());
+}
+#[test]
 fn history_is_ten_seconds_at_variable_frame_rates_and_json_keeps_unknowns() {
     let mut recorder = FlightRecorder::new(4096, 256).unwrap();
     let mut expected = Vec::new();
@@ -50,6 +81,33 @@ fn history_is_ten_seconds_at_variable_frame_rates_and_json_keeps_unknowns() {
     assert!(value["frames"][0]["allocations"].is_null());
     assert_eq!(value["cpuStages"].as_array().unwrap().len(), 8);
     assert_eq!(value["gpuPasses"].as_array().unwrap().len(), 16);
+}
+#[test]
+fn asynchronous_gpu_results_update_only_their_original_retained_frame() {
+    let mut recorder = FlightRecorder::new_full_capture(3, 3).unwrap();
+    for frame in 1..=4 {
+        recorder
+            .record_frame(Sample {
+                frame,
+                monotonic_ns: frame,
+                ..Sample::default()
+            })
+            .unwrap();
+    }
+    let mut passes = [None; 16];
+    passes[6] = Some(70);
+    assert!(!recorder.complete_gpu(1, 70, passes));
+    assert!(recorder.complete_gpu(3, 70, passes));
+    assert!(recorder.frames().last().unwrap().gpu_ns.is_none());
+    assert_eq!(
+        recorder.frames().find(|s| s.frame == 3).unwrap().gpu_ns,
+        Some(70)
+    );
+    assert!(!recorder.complete_gpu(3, 900, [Some(900); 16]));
+    assert_eq!(
+        recorder.frames().find(|s| s.frame == 3).unwrap().gpu_ns,
+        Some(70)
+    );
 }
 #[test]
 fn capacity_loss_and_warmup_are_reported_instead_of_claiming_a_full_window() {

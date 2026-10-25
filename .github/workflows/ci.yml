@@ -51,6 +51,8 @@ jobs:
           path: |
             .local/artifacts/**/*.png
             .local/artifacts/*smoke.json
+            .local/artifacts/bench/*.json
+            .local/artifacts/bench/*.html
           include-hidden-files: true
           if-no-files-found: ignore
 

@@ -6,6 +6,14 @@ use render::terrain_mesh::{Face, PageMesh, QuadDescriptor};
 use sim::{CameraMode, GameMode, Player};
 
 pub const PART_COUNT: usize = 6;
+pub const PART_EXTENTS: [[u8; 3]; PART_COUNT] = [
+    [8, 8, 8],
+    [8, 12, 4],
+    [3, 12, 4],
+    [3, 12, 4],
+    [4, 12, 4],
+    [4, 12, 4],
+];
 /// The standing skeleton is 32 pixels tall, matching the 1.8-block player body.
 pub const MODEL_HEIGHT: f32 = 1.8;
 const PIXEL: f32 = MODEL_HEIGHT / 32.0;
@@ -59,11 +67,14 @@ impl Default for SelfModel {
 }
 impl SelfModel {
     pub fn new() -> Self {
-        let meshes = BodyPart::ALL.map(|part| match part {
-            BodyPart::Head => cuboid([8, 8, 8], [SKIN, HAIR, HAIR, SKIN, HAIR, HAIR]),
-            BodyPart::Torso => cuboid([8, 12, 4], [SHIRT; 6]),
-            BodyPart::LeftArm | BodyPart::RightArm => cuboid([3, 12, 4], [SKIN; 6]),
-            BodyPart::LeftLeg | BodyPart::RightLeg => cuboid([4, 12, 4], [TROUSERS; 6]),
+        let meshes = BodyPart::ALL.map(|part| {
+            let colors = match part {
+                BodyPart::Head => [SKIN, HAIR, HAIR, SKIN, HAIR, HAIR],
+                BodyPart::Torso => [SHIRT; 6],
+                BodyPart::LeftArm | BodyPart::RightArm => [SKIN; 6],
+                BodyPart::LeftLeg | BodyPart::RightLeg => [TROUSERS; 6],
+            };
+            cuboid(PART_EXTENTS[part as usize], colors)
         });
         Self { meshes }
     }

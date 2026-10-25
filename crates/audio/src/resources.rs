@@ -45,6 +45,7 @@ pub struct LocalResources {
     bytes: usize,
     limits: ImportLimits,
     revision: u64,
+    ignored: usize,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ImportSummary {
@@ -54,6 +55,7 @@ pub struct ImportSummary {
     pub textures: usize,
     pub notices: usize,
     pub revision: u64,
+    pub ignored: usize,
 }
 pub struct LabPbr<'a> {
     pub albedo: Option<&'a [u8]>,
@@ -67,6 +69,7 @@ impl LocalResources {
             bytes: 0,
             limits,
             revision: 0,
+            ignored: 0,
         }
     }
     pub fn summary(&self) -> ImportSummary {
@@ -81,6 +84,7 @@ impl LocalResources {
             textures: self.files.keys().filter(|p| p.ends_with(".png")).count(),
             notices: self.files.keys().filter(|p| is_notice(p)).count(),
             revision: self.revision,
+            ignored: self.ignored,
         }
     }
     pub fn get_local(&self, name: &str) -> Option<&[u8]> {
@@ -88,6 +92,12 @@ impl LocalResources {
     }
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+    pub fn minecraft_index(&self) -> Option<&str> {
+        self.files
+            .keys()
+            .find(|name| name.starts_with("indexes/") && name.ends_with(".json"))
+            .map(String::as_str)
     }
     /// Resolve a local resource-pack sound declaration, including bounded event
     /// aliases. No URL is accepted and no missing asset triggers a download.
@@ -203,12 +213,13 @@ impl LocalResources {
         preflight_zip(bytes, self.limits)?;
         let mut zip =
             zip::ZipArchive::new(Cursor::new(bytes)).map_err(|_| ImportError::InvalidArchive)?;
-        if zip.len() > self.limits.entries {
+        if zip.len() > self.limits.entries.saturating_mul(4).min(65534) {
             return Err(ImportError::Limit);
         }
         let mut files = BTreeMap::new();
         let mut keys = BTreeSet::new();
         let mut total = 0usize;
+        let mut ignored = 0;
         for index in 0..zip.len() {
             let mut entry = zip
                 .by_index(index)
@@ -228,7 +239,13 @@ impl LocalResources {
                 continue;
             }
             if !allowed(&name) {
-                return Err(ImportError::Unsupported);
+                // Resource packs may contain optional metadata/shaders. They
+                // are neither read, retained nor executed by this importer.
+                ignored += 1;
+                continue;
+            }
+            if files.len() == self.limits.entries {
+                return Err(ImportError::Limit);
             }
             if entry.size() > self.limits.entry_bytes as u64
                 || entry.size() > self.limits.total_bytes.saturating_sub(total) as u64
@@ -257,6 +274,7 @@ impl LocalResources {
         self.files = files;
         self.bytes = total;
         self.revision = revision;
+        self.ignored = ignored;
         Ok(self.summary())
     }
     /// A directory picker supplies only requested files to this local store.
@@ -293,6 +311,7 @@ impl LocalResources {
         self.files = staged;
         self.bytes = total;
         self.revision = revision;
+        self.ignored = 0;
         Ok(self.summary())
     }
     /// Resolve Mojang's local assets/indexes JSON against local content-addressed
@@ -500,7 +519,7 @@ fn preflight_zip(bytes: &[u8], limits: ImportLimits) -> Result<(), ImportError> 
     {
         return Err(ImportError::Unsupported);
     }
-    if usize::from(word(10)) > limits.entries
+    if usize::from(word(10)) > limits.entries.saturating_mul(4).min(65534)
         || dword(12) as usize > limits.archive_bytes
         || offset + 22 + usize::from(word(20)) != bytes.len()
         || dword(16) as u64 + dword(12) as u64 > offset as u64

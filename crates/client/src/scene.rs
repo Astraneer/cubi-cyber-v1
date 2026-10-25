@@ -11,6 +11,9 @@ use jobs::{
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use terrain_gen::{GenerationTask, TerrainSeed};
 use world::{CursorId, PageRegion, SampledPageInput as PageInput, Transaction, World, WorldChange};
+#[path = "remote_scene.rs"]
+mod remote;
+pub use remote::*;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SceneConfig {
@@ -29,6 +32,7 @@ pub struct SceneConfig {
     /// Permit publication only through `take_composite`: stale immutable bases
     /// must be paired atomically with the exact current post-capture overlay.
     pub coherent_rebasing: bool,
+    pub authoritative_remote: bool,
 }
 impl SceneConfig {
     pub fn forest() -> Self {
@@ -57,6 +61,7 @@ impl SceneConfig {
             overrides: crate::OverrideLimits::default(),
             max_evictions_per_phase: 2,
             coherent_rebasing: false,
+            authoritative_remote: false,
         }
     }
 }
@@ -77,6 +82,15 @@ pub enum SceneError {
     OverrideLimit,
     HiddenPageLimit,
     Wire(crate::WireError),
+    AuthorityMode,
+    InvalidAuthoritativeUpdate,
+    UnrequestedPage(PageId),
+    MissingAuthoritativeBase {
+        page: PageId,
+        have: Option<u64>,
+        expected: u64,
+    },
+    PredictionConflict,
 }
 impl std::fmt::Display for SceneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -200,6 +214,8 @@ pub struct ClientScene {
     hidden_pages: BTreeSet<PageId>,
     pending_evictions: VecDeque<PageId>,
     rebases: crate::rebase::RebaseTracker,
+    confirmed_versions: BTreeMap<PageId, ConfirmedPageVersion>,
+    remote_biomes: Option<terrain_gen::Generator>,
 }
 impl ClientScene {
     pub fn new(config: SceneConfig) -> Result<Self, SceneError> {
@@ -305,6 +321,10 @@ impl ClientScene {
             hidden_pages: BTreeSet::new(),
             pending_evictions: VecDeque::with_capacity(config.max_loaded_pages),
             rebases: crate::rebase::RebaseTracker::default(),
+            confirmed_versions: BTreeMap::new(),
+            remote_biomes: config
+                .authoritative_remote
+                .then(|| terrain_gen::Generator::new(config.seed)),
         })
     }
     /// Move the bounded near cache. Terrain is never generated here; obsolete
@@ -437,7 +457,7 @@ impl ClientScene {
     /// GPU owner releases object-table slots for these pages before reusing them.
     pub fn take_hidden_page(&mut self) -> Option<PageId> {
         while let Some(page) = self.hidden_pages.pop_first() {
-            if !self.visible.contains(&page) {
+            if !self.visible.contains(&page) || self.world.page(page).is_none() {
                 return Some(page);
             }
         }
@@ -543,6 +563,9 @@ impl ClientScene {
         )
     }
     pub fn apply_transaction(&mut self, tx: Transaction) -> Result<WorldChange, SceneError> {
+        if self.config.authoritative_remote {
+            return Err(SceneError::AuthorityMode);
+        }
         self.apply_internal(tx, true)
     }
     fn apply_internal(
@@ -573,6 +596,13 @@ impl ClientScene {
             None
         };
         let change = self.world.commit(tx)?;
+        if self.config.authoritative_remote {
+            for page in &change.pages {
+                if page.removed {
+                    self.confirmed_versions.remove(&page.page);
+                }
+            }
+        }
         if let Some(prepared) = prepared {
             self.overrides.commit(prepared);
         }
@@ -849,6 +879,9 @@ impl ClientScene {
                     break;
                 }
             }
+        }
+        if self.config.authoritative_remote {
+            return;
         }
         while work.enqueued < self.config.max_new_jobs_per_phase {
             let Some(page) = self.pending_generation.front().copied() else {

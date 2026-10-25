@@ -1,19 +1,16 @@
 //! Optional real endpoint check. Exit2 means unavailable, never successful audio.
 fn main() {
-    match audio::native::NativeOutput::open(32, 32 * 1024 * 1024) {
-        Ok(output) => {
-            let mut catalog = audio::catalog::Catalog::new();
-            output
-                .with_mixer(|mixer| {
-                    let request = catalog
-                        .request(mixer, "ui.click", audio::EmitterId(1), None, 1)
-                        .unwrap();
-                    mixer.play(request).unwrap();
-                })
+    let prepared = audio::scene::PreparedSounds::prepare(None, None)
+        .expect("prepare default sound bank before starting endpoint");
+    match audio::scene::NativeScene::open(prepared) {
+        Ok(scene) => {
+            scene
+                .event("ui.click", audio::EmitterId(1), None, 1)
                 .unwrap();
+            let output = scene.output();
             std::thread::sleep(std::time::Duration::from_millis(500));
             let work = output.with_mixer(|mixer| mixer.take_work()).unwrap();
-            if output.callback_errors() != 0 || work.frames == 0 {
+            if output.callback_errors() != 0 || work.frames == 0 || work.voice_samples == 0 {
                 eprintln!(
                     "NATIVE_AUDIO_FAILED callback_errors={} missed={}",
                     output.callback_errors(),

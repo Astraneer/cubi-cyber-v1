@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cubi_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${1:-}" == run ]]; then
+  shift
+  source "$cubi_root/tools/env.sh"
+  cd "$cubi_root"
+  exec cargo run --locked --release -p client --example benchmark -- "$@"
+fi
+exec python3 "$cubi_root/tools/bench_report.py" "$@"

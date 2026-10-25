@@ -2,9 +2,17 @@
 //! Resources and pipelines are prepared at startup and on explicit resize only.
 
 pub mod atmosphere;
+pub mod block_models;
+pub mod entity_gpu;
+pub mod entity_models;
+pub mod gi;
+pub mod gpu_time;
+pub mod height_gpu;
+pub mod height_tile;
 pub mod light_volume;
 pub mod lod;
 pub mod lod_gpu;
+pub mod post;
 pub mod shadows;
 pub mod terrain_gpu;
 pub mod terrain_mesh;

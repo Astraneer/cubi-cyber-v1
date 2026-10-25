@@ -4,6 +4,10 @@
 mod codec;
 pub mod commands;
 pub mod emulator;
+pub mod entities;
+pub mod geometry;
+pub mod presence;
+pub use geometry::{PublicGeometry, PublicSurface, PublicSurfaceKind};
 mod replication;
 pub mod udp;
 pub use codec::{CodecError, decode_client, decode_server, encode_client, encode_server};
@@ -158,6 +162,14 @@ pub enum ClientMessage {
         id: ActionId,
         action: Action,
     },
+    /// Camera orientation attached to the same idempotent action. Position and
+    /// velocity remain server-owned; delayed movement frames cannot stale aim.
+    AimedAction {
+        id: ActionId,
+        action: Action,
+        yaw: f32,
+        pitch: f32,
+    },
     RequestPage {
         page: PageId,
         acknowledged: Option<u64>,
@@ -170,6 +182,11 @@ pub enum ClientMessage {
         page: PageId,
     },
     Ping(u64),
+    RequestGeometry {
+        page: PageId,
+        known: Option<Version>,
+    },
+    ForgetGeometry(PageId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,6 +281,8 @@ pub enum ServerMessage {
     Inventory {
         data: Vec<u8>,
     },
+    Geometry(Box<PublicGeometry>),
+    GeometryUnavailable(PageId),
     Players {
         tick: Tick,
         players: Vec<PlayerState>,

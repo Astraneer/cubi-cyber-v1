@@ -47,12 +47,13 @@ fn inside_frustum(object:Object)->bool {
     if camera.params.z==0u {return true;}
     var outside_left=true;var outside_right=true;var outside_down=true;
     var outside_up=true;var outside_near=true;var outside_far=true;
+    let padding=vec2(2.0)/camera.viewport.xy;
     for (var index=0u;index<8u;index++) {
         let p=corner(object,index);
-        outside_left=outside_left&&(p.x < -p.w);
-        outside_right=outside_right&&(p.x > p.w);
-        outside_down=outside_down&&(p.y < -p.w);
-        outside_up=outside_up&&(p.y > p.w);
+        outside_left=outside_left&&(p.x < -p.w*(1.0+padding.x));
+        outside_right=outside_right&&(p.x > p.w*(1.0+padding.x));
+        outside_down=outside_down&&(p.y < -p.w*(1.0+padding.y));
+        outside_up=outside_up&&(p.y > p.w*(1.0+padding.y));
         outside_far=outside_far&&(p.z < 0.0);
         outside_near=outside_near&&(p.z > p.w);
     }

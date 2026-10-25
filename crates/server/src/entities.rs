@@ -1,7 +1,10 @@
 //! Single-owner mob phase with actual snapshot path workers and detached durable
 //! ledger updates. The caller commits world edits/drops/player hits with the same
 //! WAL batch, acknowledges this delta, then sends public poses.
+pub mod interactions;
+pub mod items;
 pub mod path_jobs;
+pub mod replication;
 use core_types::{BlockPos, Cell, ChannelMask, PageId, SpaceId, Tick, Version};
 use jobs::{WorkBudget, WorkCost};
 use path_jobs::{PathJobs, PathResult};
@@ -25,7 +28,7 @@ use sim::{
 };
 use std::{
     cell::{Cell as Counter, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
 };
 use world::{CellRead, Transaction, World};
 
@@ -60,6 +63,9 @@ pub struct Budget {
     pub snapshot_cells: u64,
     pub path_dispatch: WorkCost,
     pub sky_darkness: u8,
+    pub push_candidates: u64,
+    pub push_probes: u64,
+    pub push_buckets: u64,
 }
 impl Default for Budget {
     fn default() -> Self {
@@ -79,6 +85,9 @@ impl Default for Budget {
                 rays: 0,
             },
             sky_darkness: 0,
+            push_candidates: 16_384,
+            push_probes: 131_072,
+            push_buckets: 16_384,
         }
     }
 }
@@ -91,6 +100,11 @@ pub struct Work {
     pub deferred_actors: u64,
     pub oldest_age: u64,
     pub budget_exhausted: bool,
+    pub push_candidates: u64,
+    pub push_probes: u64,
+    pub push_buckets: u64,
+    pub push_pairs: u64,
+    pub push_deferred: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MobAttack {
@@ -139,6 +153,8 @@ pub struct MobRuntime {
     players: PlayerIndex,
     bufs: Bufs,
     maximum: usize,
+    scratch: rules::entities::spatial::SpatialHash,
+    scratch_ids: Vec<EntityId>,
 }
 impl MobRuntime {
     pub fn new(config: Config) -> Result<Self, EntityError> {
@@ -151,6 +167,8 @@ impl MobRuntime {
             players: PlayerIndex::new(64)?,
             bufs: Bufs::default(),
             maximum: config.maximum_entities,
+            scratch: rules::entities::spatial::SpatialHash::new(config.maximum_entities, 8.0)?,
+            scratch_ids: Vec::with_capacity(config.maximum_entities),
         })
     }
     pub fn entities(&self) -> &EntityStore {
@@ -170,6 +188,26 @@ impl MobRuntime {
             before_active: false,
             after_active: active,
         }];
+        self.store.validate_patches(&patches)?;
+        self.delta(patches, self.store.active_cursor())
+    }
+    /// AOI changes are explicit events, never a cold world scan in the tick.
+    pub fn plan_activity(&self, changes: &[(EntityId, bool)]) -> Result<MobDelta, EntityError> {
+        if changes.len() > 1024 {
+            return Err(EntityError::Capacity);
+        }
+        let patches = changes
+            .iter()
+            .map(|&(id, active)| {
+                let mob = *self.store.get(id).ok_or(EntityError::UnknownId)?;
+                Ok(EntityPatch {
+                    before: Some(mob),
+                    after: Some(mob),
+                    before_active: self.store.is_active(id),
+                    after_active: active,
+                })
+            })
+            .collect::<Result<Vec<_>, EntityError>>()?;
         self.store.validate_patches(&patches)?;
         self.delta(patches, self.store.active_cursor())
     }
@@ -265,6 +303,20 @@ impl MobRuntime {
             match result {
                 Ok((after, control)) => {
                     work.actors += 1;
+                    if control.lay_egg {
+                        drops.push(DeathDrops {
+                            actor: id,
+                            space: after.space,
+                            position: after.body.position,
+                            action: after.age | 1u64 << 63,
+                            stacks: [
+                                ItemStack::new(rules::items::I_EGG, 1)
+                                    .map_err(|_| EntityError::InvalidEncoding)?,
+                                ItemStack::EMPTY,
+                                ItemStack::EMPTY,
+                            ],
+                        });
+                    }
                     if let Some(target) = control.attack {
                         attacks.push(MobAttack {
                             attacker: id,
@@ -313,7 +365,13 @@ impl MobRuntime {
                             space: after.space,
                             position: after.body.position,
                             action: after.age,
-                            stacks: mob::mob_loot(&after, false, &mut rng),
+                            stacks: mob::mob_loot(
+                                &after,
+                                after
+                                    .last_player_hit
+                                    .is_some_and(|(_, at)| now.0.saturating_sub(at.0) <= 100),
+                                &mut rng,
+                            ),
                         });
                         after.loot_emitted = true;
                     }
@@ -349,11 +407,7 @@ impl MobRuntime {
         } else {
             (self.store.active_cursor() + admitted) % self.store.active_len()
         };
-        let inputs: Vec<_> = inputs
-            .into_inner()
-            .into_iter()
-            .map(|(page, version)| jobs::InputVersion { page, version })
-            .collect();
+        let mut inputs = inputs.into_inner();
         let mut transactions = BTreeMap::<SpaceId, Transaction>::new();
         for (position, value) in edits {
             transactions
@@ -362,6 +416,21 @@ impl MobRuntime {
                 .expect_page(position.page(), world.page_version(position.page()))
                 .set_cell(position, value);
         }
+        let patches = self.push_apart(
+            world,
+            patches,
+            rules::entities::spatial::QueryBudget {
+                candidates: budget.push_candidates,
+                probes: budget.push_probes,
+                buckets: budget.push_buckets,
+            },
+            &mut inputs,
+            &mut work,
+        )?;
+        let inputs = inputs
+            .into_iter()
+            .map(|(page, version)| jobs::InputVersion { page, version })
+            .collect();
         Ok(PhasePlan {
             delta: self.delta(patches, cursor)?,
             transactions: transactions.into_values().collect(),
@@ -370,6 +439,142 @@ impl MobRuntime {
             inputs,
             work,
         })
+    }
+    fn push_apart(
+        &mut self,
+        world: &World,
+        patches: Vec<EntityPatch>,
+        mut remaining: rules::entities::spatial::QueryBudget,
+        inputs: &mut BTreeMap<PageId, Option<Version>>,
+        work: &mut Work,
+    ) -> Result<Vec<EntityPatch>, EntityError> {
+        if patches.is_empty() {
+            return Ok(patches);
+        }
+        for index in 0..self.scratch_ids.len() {
+            self.scratch.remove(index)?;
+        }
+        self.scratch_ids.clear();
+        let mut staged: BTreeMap<_, _> = patches
+            .into_iter()
+            .map(|patch| Ok((patch.id()?, patch)))
+            .collect::<Result<_, EntityError>>()?;
+        for (&id, patch) in &staged {
+            if let Some(after) = patch.after.filter(|mob| mob.life.alive()) {
+                let index = self.scratch_ids.len();
+                self.scratch.update(index, after.body.position)?;
+                self.scratch_ids.push(id);
+            }
+        }
+        let mut pairs = BTreeSet::new();
+        let mut deltas = BTreeMap::<EntityId, [f64; 2]>::new();
+        for id in self.scratch_ids.iter().copied() {
+            if remaining.candidates == 0 || remaining.probes == 0 || remaining.buckets == 0 {
+                work.push_deferred += 1;
+                break;
+            }
+            let Some(mob) = current_mob(&self.store, &staged, id) else {
+                continue;
+            };
+            let bounds = mob.bbox();
+            let low = [bounds.lo[0] - 0.5, bounds.lo[1] - 2.0, bounds.lo[2] - 0.5];
+            let high = [bounds.hi[0] + 0.5, bounds.hi[1], bounds.hi[2] + 0.5];
+            let mut ids = [EntityId(0); 256];
+            let (len, source) = self.store.query_ids(
+                low,
+                high,
+                rules::entities::spatial::QueryBudget {
+                    buckets: remaining.buckets.min(128),
+                    probes: remaining.probes.min(1024),
+                    candidates: remaining.candidates.min(256),
+                },
+                &mut ids,
+            )?;
+            charge_push(source, &mut remaining, work);
+            let mut candidates: BTreeSet<_> = ids[..len].iter().copied().collect();
+            let scratch = self.scratch.query(
+                low,
+                high,
+                rules::entities::spatial::QueryBudget {
+                    buckets: remaining.buckets.min(128),
+                    probes: remaining.probes.min(1024),
+                    candidates: remaining.candidates.min(256),
+                },
+                |index| {
+                    candidates.insert(self.scratch_ids[index]);
+                },
+            )?;
+            charge_push(scratch, &mut remaining, work);
+            for other in candidates {
+                if other == id || !self.store.is_active(other) {
+                    continue;
+                }
+                let pair = if id < other { (id, other) } else { (other, id) };
+                if !pairs.insert(pair) {
+                    continue;
+                }
+                let Some(target) = current_mob(&self.store, &staged, other) else {
+                    continue;
+                };
+                if !target.life.alive()
+                    || target.space != mob.space
+                    || !target.bbox().intersects(&bounds)
+                {
+                    continue;
+                }
+                if !staged.contains_key(&other)
+                    && !known_push_body(world, target, &mut remaining, inputs, work)
+                {
+                    work.push_deferred += 1;
+                    continue;
+                }
+                if let Some([x, z]) =
+                    rules::entities::combat::separation(mob.body.position, target.body.position)
+                {
+                    let a = deltas.entry(id).or_default();
+                    a[0] -= 2.0 * x;
+                    a[1] -= 2.0 * z;
+                    let b = deltas.entry(other).or_default();
+                    b[0] += 2.0 * x;
+                    b[1] += 2.0 * z;
+                    work.push_pairs += 1;
+                }
+            }
+            let players = self.players.overlapping(
+                mob.space,
+                bounds,
+                rules::entities::spatial::QueryBudget {
+                    buckets: remaining.buckets.min(128),
+                    probes: remaining.probes.min(1024),
+                    candidates: remaining.candidates.min(64),
+                },
+                |player| {
+                    if let Some([x, z]) =
+                        rules::entities::combat::separation(player.position, mob.body.position)
+                    {
+                        let velocity = deltas.entry(id).or_default();
+                        velocity[0] += 2.0 * x;
+                        velocity[1] += 2.0 * z;
+                    }
+                },
+            )?;
+            charge_push(players, &mut remaining, work);
+        }
+        for (id, delta) in deltas {
+            let Some(mut after) = current_mob(&self.store, &staged, id) else {
+                continue;
+            };
+            after.body.velocity[0] = (after.body.velocity[0] + delta[0]).clamp(-64.0, 64.0);
+            after.body.velocity[2] = (after.body.velocity[2] + delta[1]).clamp(-64.0, 64.0);
+            let patch = staged.entry(id).or_insert_with(|| EntityPatch {
+                before: self.store.get(id).copied(),
+                after: Some(after),
+                before_active: self.store.is_active(id),
+                after_active: self.store.is_active(id),
+            });
+            patch.after = Some(after);
+        }
+        Ok(staged.into_values().collect())
     }
     fn plan_actor(
         &mut self,
@@ -415,6 +620,23 @@ impl MobRuntime {
             }
         }
         after.life.base_tick_end();
+        let lay_egg = if after.kind == MobKind::Chicken && !after.baby && after.life.alive() {
+            after.egg_remaining = after.egg_remaining.saturating_sub(1);
+            if after.egg_remaining == 0 {
+                let mut rng = core_types::DeterministicRng::from_key(
+                    self.seed,
+                    0x434849434b454747,
+                    after.id.0,
+                    after.age,
+                );
+                after.egg_remaining = 6000 + rng.below(6000).expect("egg interval") as u16;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let feet = after.body.position.map(|value| value.floor() as i32);
         let CellRead::Known(ground) = world.cell([feet[0], feet[1] - 1, feet[2]]) else {
             return Err(EntityError::UnknownInput);
@@ -442,15 +664,25 @@ impl MobRuntime {
             },
             &mut budget.ai,
         )?;
-        if let Some(target) = control.attack {
-            let probe = self.players_snapshot_target(target);
-            if let Some(target) = probe {
+        control.lay_egg = lay_egg;
+        if after.kind == MobKind::Zombie {
+            if let Some(target) = after
+                .ai
+                .target
+                .and_then(|id| self.players_snapshot_target(id))
+            {
                 let eye = [
                     after.body.position[0],
                     after.body.position[1] + after.kind.definition().eye,
                     after.body.position[2],
                 ];
-                if !movement::line_of_sight(world, eye, target.eye)? {
+                if movement::line_of_sight(world, eye, target.eye)? {
+                    after.ai.goal_until =
+                        Tick(
+                            now.0
+                                .saturating_add(if after.ai.revenge_mode { 300 } else { 60 }),
+                        );
+                } else if control.attack.is_some() {
                     control.attack = None;
                     after.ai.attack_cooldown = before.ai.attack_cooldown.saturating_sub(1);
                 }
@@ -572,6 +804,52 @@ impl MobRuntime {
         runtime.revision = snapshot.revision;
         Ok(runtime)
     }
+}
+fn known_push_body(
+    world: &World,
+    mob: Mob,
+    budget: &mut rules::entities::spatial::QueryBudget,
+    inputs: &mut BTreeMap<PageId, Option<Version>>,
+    work: &mut Work,
+) -> bool {
+    let bounds = mob.bbox();
+    let low = bounds.lo.map(|v| (v.floor() as i32).div_euclid(16));
+    let high = bounds.hi.map(|v| (v.ceil() as i32 - 1).div_euclid(16));
+    for z in low[2]..=high[2] {
+        for y in low[1]..=high[1] {
+            for x in low[0]..=high[0] {
+                if budget.probes == 0 {
+                    return false;
+                }
+                budget.probes -= 1;
+                work.push_probes += 1;
+                let page = PageId {
+                    space: mob.space,
+                    x,
+                    y,
+                    z,
+                };
+                if world.page(page).is_none() {
+                    return false;
+                }
+                inputs.insert(page, Some(world.input_version(page, CHANNELS)));
+            }
+        }
+    }
+    true
+}
+fn charge_push(
+    query: rules::entities::spatial::QueryWork,
+    budget: &mut rules::entities::spatial::QueryBudget,
+    work: &mut Work,
+) {
+    budget.buckets = budget.buckets.saturating_sub(query.buckets);
+    budget.probes = budget.probes.saturating_sub(query.probes);
+    budget.candidates = budget.candidates.saturating_sub(query.candidates);
+    work.push_candidates += query.candidates;
+    work.push_buckets += query.buckets;
+    work.push_probes += query.probes;
+    work.push_deferred += u64::from(query.overflow);
 }
 struct Tracked<'a> {
     world: &'a World,
@@ -745,4 +1023,14 @@ impl MobDelta {
             patches,
         })
     }
+}
+
+fn current_mob(
+    store: &EntityStore,
+    staged: &BTreeMap<EntityId, EntityPatch>,
+    id: EntityId,
+) -> Option<Mob> {
+    staged
+        .get(&id)
+        .map_or_else(|| store.get(id).copied(), |patch| patch.after)
 }

@@ -29,6 +29,7 @@ pub struct ItemEntity {
     pub thrown: bool,
     pub offset: f32,
     pub last_tick: Tick,
+    pub merge_debt: bool,
 }
 impl ItemEntity {
     pub fn new(
@@ -66,6 +67,7 @@ impl ItemEntity {
             thrown: false,
             offset: unit(&mut rng) * std::f32::consts::TAU,
             last_tick: Tick(0),
+            merge_debt: false,
         })
     }
     pub fn bbox(&self) -> crate::shapes::Aabb {
@@ -133,6 +135,7 @@ impl ItemEntity {
             | (u8::from(self.no_clip) << 1)
             | (u8::from(self.in_water) << 2)
             | (u8::from(self.thrown) << 3);
+        bytes[112] |= u8::from(self.merge_debt) << 4;
         bytes[113..121].copy_from_slice(&self.last_tick.0.to_le_bytes());
         Ok(bytes)
     }
@@ -140,7 +143,7 @@ impl ItemEntity {
         if bytes.len() != ITEM_BYTES
             || &bytes[..4] != b"ITM1"
             || bytes[121..].iter().any(|&value| value != 0)
-            || bytes[112] & !15 != 0
+            || bytes[112] & !31 != 0
         {
             return Err(EntityError::InvalidEncoding);
         }
@@ -173,6 +176,7 @@ impl ItemEntity {
             in_water: bytes[112] & 4 != 0,
             thrown: bytes[112] & 8 != 0,
             last_tick: Tick(read64(113)),
+            merge_debt: bytes[112] & 16 != 0,
         };
         item.validate()?;
         Ok(item)
@@ -226,6 +230,35 @@ impl ItemStore {
     }
     pub fn active_ids(&self) -> impl Iterator<Item = EntityId> + '_ {
         self.active.iter().copied()
+    }
+    pub fn active_len(&self) -> usize {
+        self.active.len()
+    }
+    pub fn active_batch(&self, cursor: Option<EntityId>, out: &mut [EntityId]) -> usize {
+        let mut count = 0;
+        let limit = out.len().min(self.active.len());
+        let mut put = |id: &EntityId| {
+            out[count] = *id;
+            count += 1;
+        };
+        if let Some(cursor) = cursor {
+            for id in self
+                .active
+                .range((
+                    std::ops::Bound::Excluded(cursor),
+                    std::ops::Bound::Unbounded,
+                ))
+                .chain(self.active.range(..=cursor))
+                .take(limit)
+            {
+                put(id);
+            }
+        } else {
+            for id in self.active.iter().take(limit) {
+                put(id);
+            }
+        }
+        count
     }
     pub fn is_active(&self, id: EntityId) -> bool {
         self.active.contains(&id)
@@ -333,6 +366,130 @@ impl ItemStore {
         })?;
         work.overflow |= overflow;
         Ok((len, work))
+    }
+    /// CPU value payload; the client maps ItemId in color to a permitted atlas
+    /// layer before uploading. GPU performs item spin/bob from age and offset.
+    pub fn instances_at(
+        &self,
+        visible: &[EntityId],
+        alpha: f64,
+        origin: [i32; 3],
+        out: &mut [super::mob::Instance],
+    ) -> Result<usize, EntityError> {
+        if visible.len() > out.len() || !alpha.is_finite() {
+            return Err(EntityError::Capacity);
+        }
+        let alpha = alpha.clamp(0.0, 1.0);
+        for (&id, instance) in visible.iter().zip(out.iter_mut()) {
+            let item = self.get(id).ok_or(EntityError::UnknownId)?;
+            let block = matches!(
+                crate::items::idef(item.stack.item()).kind,
+                crate::items::ItemKind::Block(_)
+            );
+            *instance = super::mob::Instance {
+                position: std::array::from_fn(|axis| {
+                    (item.previous[axis] - f64::from(origin[axis])
+                        + (item.position[axis] - item.previous[axis]) * alpha)
+                        as f32
+                }),
+                body_yaw: 0.0,
+                head_yaw: 0.0,
+                pitch: 0.0,
+                limb_phase: item.spin_age as f32 + alpha as f32,
+                limb_amount: 0.0,
+                kind: if block { 6 } else { 7 },
+                flags: 32,
+                color: u32::from(item.stack.item()),
+                id_low: id.0 as u32,
+                id_high: (id.0 >> 32) as u32,
+                death_roll: 0.0,
+                scale: if block { 0.25 } else { 0.5 },
+                reserved: item.offset,
+            };
+        }
+        Ok(visible.len())
+    }
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct ItemSnapshot {
+    pub items: Vec<ItemEntity>,
+    pub active: Vec<EntityId>,
+}
+impl ItemStore {
+    pub fn snapshot(&self) -> ItemSnapshot {
+        ItemSnapshot {
+            items: self.rows.clone(),
+            active: self.active.iter().copied().collect(),
+        }
+    }
+    pub fn restore(capacity: usize, snapshot: &ItemSnapshot) -> Result<Self, EntityError> {
+        if snapshot.items.len() > capacity || snapshot.active.len() > snapshot.items.len() {
+            return Err(EntityError::Capacity);
+        }
+        let active: BTreeSet<_> = snapshot.active.iter().copied().collect();
+        if active.len() != snapshot.active.len() {
+            return Err(EntityError::DuplicateId);
+        }
+        let mut store = Self::new(capacity)?;
+        for &item in &snapshot.items {
+            store.insert(item, active.contains(&item.id))?;
+        }
+        if active.iter().any(|&id| store.get(id).is_none()) {
+            return Err(EntityError::UnknownId);
+        }
+        Ok(store)
+    }
+}
+impl ItemSnapshot {
+    pub fn encode(&self) -> Result<Vec<u8>, EntityError> {
+        if self.items.len() > 1_000_000 || self.active.len() > self.items.len() {
+            return Err(EntityError::Capacity);
+        }
+        let mut bytes =
+            Vec::with_capacity(12 + self.items.len() * ITEM_BYTES + self.active.len() * 8);
+        bytes.extend_from_slice(b"ITS1");
+        bytes.extend_from_slice(&(self.items.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(self.active.len() as u32).to_le_bytes());
+        for item in &self.items {
+            bytes.extend_from_slice(&item.encode()?);
+        }
+        for id in &self.active {
+            bytes.extend_from_slice(&id.0.to_le_bytes());
+        }
+        Ok(bytes)
+    }
+    pub fn decode(bytes: &[u8], capacity: usize) -> Result<Self, EntityError> {
+        if bytes.len() < 12 || &bytes[..4] != b"ITS1" {
+            return Err(EntityError::InvalidEncoding);
+        }
+        let count = u32::from_le_bytes(bytes[4..8].try_into().expect("header length")) as usize;
+        let active = u32::from_le_bytes(bytes[8..12].try_into().expect("header length")) as usize;
+        if count > capacity || active > count {
+            return Err(EntityError::Capacity);
+        }
+        let boundary = count
+            .checked_mul(ITEM_BYTES)
+            .and_then(|value| value.checked_add(12))
+            .ok_or(EntityError::InvalidEncoding)?;
+        if active
+            .checked_mul(8)
+            .and_then(|value| value.checked_add(boundary))
+            != Some(bytes.len())
+        {
+            return Err(EntityError::InvalidEncoding);
+        }
+        let snapshot = Self {
+            items: bytes[12..boundary]
+                .chunks_exact(ITEM_BYTES)
+                .map(ItemEntity::decode)
+                .collect::<Result<_, _>>()?,
+            active: bytes[boundary..]
+                .chunks_exact(8)
+                .map(|raw| EntityId(u64::from_le_bytes(raw.try_into().expect("fixed ID"))))
+                .collect(),
+        };
+        ItemStore::restore(capacity, &snapshot)?;
+        Ok(snapshot)
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]

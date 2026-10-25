@@ -325,7 +325,7 @@ fn authority_rejects_unknown_reach_roles_spawn_protection_and_unauthorized_h() {
             }
         )
         .status,
-        ActionStatus::Rejected(RejectReason::Unknown)
+        ActionStatus::Rejected(RejectReason::OutOfReach)
     );
     assert_eq!(
         h.action(
@@ -663,7 +663,7 @@ fn survival_placement_consumes_owned_stack_atomically_and_never_reconsumes_a_rep
             }
         )
         .status,
-        ActionStatus::Rejected(RejectReason::Unknown)
+        ActionStatus::Rejected(RejectReason::OutOfReach)
     );
     let placement = Action::PlaceOwned {
         position: pos(8, 2, 9),
@@ -785,4 +785,163 @@ fn mining_uses_owned_tool_and_persists_wear_and_one_durable_drop_bundle() {
         .status,
         ActionStatus::Rejected(RejectReason::Unauthorized)
     );
+}
+
+#[test]
+fn hidden_ore_cannot_be_probed_through_expected_id_error_priority() {
+    let directory = Directory::new();
+    let mut h = Harness::new(&directory);
+    h.join(1, directory.owner());
+    let mut tx = Transaction::new(Tick(h.server.current_tick().0 + 1), SpaceId(0));
+    tx.set_cell(pos(8, 2, 13), cell(rules::ids::STONE));
+    h.server
+        .queue_transaction(tx)
+        .unwrap_or_else(|_| panic!("owner queue"));
+    for _ in 0..20 {
+        h.advance();
+    }
+    let ore = h.action(
+        1,
+        1,
+        Action::Mine {
+            position: pos(8, 2, 12),
+            expected: cell(rules::ids::STONE),
+            tool: 0,
+        },
+    );
+    let stone = h.action(
+        1,
+        2,
+        Action::Mine {
+            position: pos(8, 2, 13),
+            expected: cell(rules::ids::STONE),
+            tool: 0,
+        },
+    );
+    let guessed = h.action(
+        1,
+        3,
+        Action::Mine {
+            position: pos(8, 2, 12),
+            expected: cell(rules::ids::IRON_ORE),
+            tool: 0,
+        },
+    );
+    assert_eq!(ore.status, ActionStatus::Rejected(RejectReason::Occluded));
+    assert_eq!(stone.status, ore.status);
+    assert_eq!(guessed.status, ore.status);
+    accepted(h.action(1, 4, Action::Command("/tp 15.5 1 8.5".into())));
+    h.send(
+        1,
+        ClientMessage::Inputs(vec![InputFrame {
+            sequence: 1,
+            yaw: 270.0,
+            ..Default::default()
+        }]),
+    );
+    h.until(|o| matches!(o.message,ServerMessage::State{player,..} if player.input_sequence==1));
+    assert_eq!(
+        h.action(
+            1,
+            5,
+            Action::Mine {
+                position: pos(16, 2, 8),
+                expected: Cell::AIR,
+                tool: 0
+            }
+        )
+        .status,
+        ActionStatus::Rejected(RejectReason::Unknown)
+    );
+    accepted(h.action(
+        1,
+        6,
+        Action::Command(format!(
+            "/give {} 1",
+            rules::items::block_item(rules::ids::STONE)
+        )),
+    ));
+    let owned = inventory(&mut h, 1, 1);
+    assert_eq!(
+        h.action(
+            1,
+            7,
+            Action::PlaceOwned {
+                position: pos(16, 2, 8),
+                expected: Cell::AIR,
+                cell: cell(rules::ids::STONE),
+                inventory: guard(&owned)
+            }
+        )
+        .status,
+        ActionStatus::Rejected(RejectReason::Unknown)
+    );
+    drop(h);
+    let mut h = Harness {
+        server: Server::open(directory.config()).unwrap(),
+        now: 0,
+        outputs: Vec::new(),
+    };
+    h.join(2, directory.owner());
+    assert_eq!(
+        inventory(&mut h, 2, 1).hand().count(),
+        1,
+        "Unknown placement consumed nothing"
+    );
+}
+
+#[test]
+fn aimed_click_uses_its_validated_camera_and_keeps_action_id_idempotence() {
+    let directory = Directory::new();
+    let mut h = Harness::new(&directory);
+    let owner = directory.owner();
+    h.join(1, owner);
+    accepted(h.action(1, 1, Action::Command("/gamemode creative".into())));
+    // The last movement input faces away from the wall. A click carries only
+    // its new camera orientation, never a client-authored position or velocity.
+    h.send(
+        1,
+        ClientMessage::Inputs(vec![InputFrame {
+            sequence: 1,
+            target_tick: Tick(0),
+            keys: 0,
+            yaw: 180.0,
+            pitch: 0.0,
+        }]),
+    );
+    h.until(|o| matches!(o.message, ServerMessage::State { player, .. } if player.input_sequence == 1 && player.yaw == 180.0));
+    let position = pos(8, 2, 10);
+    let action = Action::Place {
+        position,
+        expected: Cell::AIR,
+        cell: cell(rules::ids::DIRT),
+    };
+    h.send(
+        1,
+        ClientMessage::AimedAction {
+            id: ActionId(2),
+            action: action.clone(),
+            yaw: 0.0,
+            pitch: 0.0,
+        },
+    );
+    let first = h.final_reply(1, 2);
+    accepted(first);
+    assert_eq!(
+        h.server.world().read(position),
+        CellRead::Known(cell(rules::ids::DIRT))
+    );
+    let version = h.server.world().version();
+    // An altered retry of the same action cannot reapply it or change its aim.
+    h.send(
+        1,
+        ClientMessage::AimedAction {
+            id: ActionId(2),
+            action,
+            yaw: 180.0,
+            pitch: 45.0,
+        },
+    );
+    assert_eq!(h.final_reply(1, 2), first);
+    assert_eq!(h.server.world().version(), version);
 }

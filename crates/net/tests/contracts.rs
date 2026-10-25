@@ -81,6 +81,12 @@ fn all_client_messages_roundtrip_and_secrets_are_redacted() {
                 },
             },
         },
+        ClientMessage::AimedAction {
+            id: ActionId(8),
+            action: Action::StopMining,
+            yaw: 271.5,
+            pitch: -30.0,
+        },
         ClientMessage::RequestPage {
             page: page(0),
             acknowledged: Some(4),
@@ -450,4 +456,24 @@ fn simulated_link_and_pending_histories_apply_backpressure() {
         [2, 3]
     );
     let _ = Tick(0);
+}
+
+#[test]
+fn aimed_actions_reject_nonfinite_or_out_of_range_angles() {
+    for (yaw, pitch) in [
+        (f32::NAN, 0.0),
+        (f32::INFINITY, 0.0),
+        (0.0, 91.0),
+        (0.0, f32::NEG_INFINITY),
+    ] {
+        assert!(
+            encode_client(&ClientMessage::AimedAction {
+                id: ActionId(1),
+                action: Action::StopMining,
+                yaw,
+                pitch
+            })
+            .is_err()
+        );
+    }
 }

@@ -37,6 +37,13 @@ fn fragment(input: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(sky_linear(input.uv), 1.0);
 }
 
+// The terrain HDR alpha records geometry coverage for independent diagnostics.
+// Final presentation remains opaque; the standalone M0 sky keeps alpha one.
+@fragment
+fn fragment_hdr_sky(input: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(sky_linear(input.uv), 0.0);
+}
+
 // WebGPU unorm canvas: explicit final transfer avoids backend sRGB-view resolve
 // inconsistencies. Selected once at startup; the shared sky remains linear.
 @fragment

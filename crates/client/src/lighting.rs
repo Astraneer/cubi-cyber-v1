@@ -889,6 +889,25 @@ impl ClientLighting {
             && self.record.is_none();
         Ok(work)
     }
+    /// Enable ShadowConfig.dynamic_casters during loading, then use this route
+    /// for animated model casters. Static terrain cache remains independent.
+    #[allow(clippy::too_many_arguments)] // One frame owner supplies its prepared terrain/caster pair.
+    pub fn encode_lighting_dynamic(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        terrain: &mut TerrainGpu,
+        center: [f32; 3],
+        sun: [f32; 3],
+        caster: &mut impl render::shadows::DynamicShadowCaster,
+    ) -> Result<ShadowWork, ClientLightingError> {
+        self.shadows.update_view(center, sun)?;
+        let work = self.shadows.encode_dynamic(queue, encoder, caster)?;
+        if work.cascade_updates > 0 || work.dynamic_copy_bytes > 0 {
+            terrain.invalidate();
+        }
+        Ok(work)
+    }
     pub fn encode_lighting(
         &mut self,
         queue: &wgpu::Queue,
@@ -899,7 +918,7 @@ impl ClientLighting {
     ) -> Result<ShadowWork, ClientLightingError> {
         self.shadows.update_view(center, sun)?;
         let work = self.shadows.encode(queue, encoder);
-        if work.cascade_updates > 0 {
+        if work.cascade_updates > 0 || work.dynamic_copy_bytes > 0 {
             terrain.invalidate();
         }
         Ok(work)

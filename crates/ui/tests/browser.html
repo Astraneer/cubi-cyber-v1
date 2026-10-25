@@ -1,0 +1,14 @@
+<!doctype html><html lang="ru"><meta charset="utf-8"><title>Shared Rust UI acceptance</title>
+<style>html,body{margin:0;background:#13191f}canvas{display:block;width:780px;height:437px}</style>
+<canvas id="ui-canvas" width="780" height="437"></canvas>
+<script type="module">
+import init,*as ui from './ui-pkg/ui.js';await init();await ui.ui_browser_start();
+window.__UI=ui;const canvas=document.querySelector('canvas');
+canvas.addEventListener('mousemove',event=>ui.ui_browser_pointer(event.offsetX,event.offsetY));
+canvas.addEventListener('click',event=>ui.ui_browser_click(event.offsetX,event.offsetY,false,event.shiftKey,event.ctrlKey));
+canvas.addEventListener('contextmenu',event=>{event.preventDefault();ui.ui_browser_click(event.offsetX,event.offsetY,true,event.shiftKey,event.ctrlKey)});
+canvas.addEventListener('wheel',event=>{event.preventDefault();ui.ui_browser_wheel(Math.sign(event.deltaY))},{passive:false});
+document.addEventListener('keydown',event=>{if(ui.ui_browser_key(event.code,event.key,true,event.shiftKey,event.ctrlKey))event.preventDefault()});
+document.addEventListener('keyup',event=>ui.ui_browser_key(event.code,event.key,false,event.shiftKey,event.ctrlKey));
+document.documentElement.dataset.ui='ready';
+</script></html>

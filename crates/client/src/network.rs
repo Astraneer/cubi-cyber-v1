@@ -1,6 +1,7 @@
 //! Transport-independent client authority/prediction owner. Platform sockets feed
 //! bounded net frames here; only confirmed, sanitized pages enter its world view.
 //! Rendering integration consumes `take_page_updates` at the scene owner boundary.
+pub mod entities;
 use core_types::{BlockPos, Cell, PageId, SpaceId, SpaceTransform, Tick, Version};
 use net::{
     Action, ActionId, ActionReply, ActionStatus, ClientMessage, FarSummary, Hello, InputFrame,
@@ -15,6 +16,7 @@ const MAX_INPUTS: usize = 256;
 const MAX_ACTIONS: usize = 128;
 const MAX_OUTBOX: usize = 256;
 const MAX_PAGE_UPDATES: usize = 128;
+const MAX_PAGE_REMOVALS: usize = 512;
 const MAX_SPACES: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
@@ -33,6 +35,17 @@ impl Default for NetworkConfig {
             retain_radius: 2,
             input_lead_ticks: 6,
             simulation_steps_per_poll: 32,
+        }
+    }
+}
+impl NetworkConfig {
+    /// 3³ visible pages plus the one-page meshing halo require5³ confirmed pages.
+    pub fn remote_scene() -> Self {
+        Self {
+            maximum_pages: 256,
+            near_radius: 2,
+            retain_radius: 3,
+            ..Self::default()
         }
     }
 }
@@ -75,6 +88,7 @@ struct PageInterest {
 #[derive(Clone)]
 struct PendingAction {
     action: Action,
+    aim: Option<[f32; 2]>,
     last_sent: u64,
     inventory_before: Option<u64>,
 }
@@ -113,20 +127,26 @@ pub struct Connection {
     remote_tick: Tick,
     inventory: Option<rules::survival::Inventory>,
     page_updates: VecDeque<PageUpdate>,
+    page_removals: VecDeque<PageId>,
+    geometry_interest: BTreeMap<PageId, PageInterest>,
+    geometries: BTreeMap<PageId, net::PublicGeometry>,
+    geometry_updates: VecDeque<net::PublicGeometry>,
+    geometry_removals: VecDeque<PageId>,
     counters: NetworkCounters,
 }
 
 impl Connection {
     pub fn new(config: NetworkConfig) -> Result<Self, NetworkError> {
         if config.maximum_pages == 0
-            || config.maximum_pages > 512
-            || config.near_radius > 3
+            || config.maximum_pages > 256
+            || config.near_radius > 2
             || config.retain_radius < config.near_radius
             || config.retain_radius > 4
             || config.input_lead_ticks == 0
             || config.input_lead_ticks > 32
             || config.simulation_steps_per_poll == 0
             || config.simulation_steps_per_poll > 64
+            || (2 * usize::from(config.near_radius) + 1).pow(3) > config.maximum_pages
         {
             return Err(NetworkError::Capacity);
         }
@@ -164,6 +184,11 @@ impl Connection {
             remote_tick: Tick(0),
             inventory: None,
             page_updates: VecDeque::new(),
+            page_removals: VecDeque::new(),
+            geometry_interest: BTreeMap::new(),
+            geometries: BTreeMap::new(),
+            geometry_updates: VecDeque::new(),
+            geometry_removals: VecDeque::new(),
             counters: NetworkCounters::default(),
         })
     }
@@ -258,6 +283,43 @@ impl Connection {
         }
         Some(inventory)
     }
+    pub fn geometry(&self, page: PageId) -> Option<&net::PublicGeometry> {
+        self.geometries.get(&page)
+    }
+    pub fn take_geometry_updates(&mut self, limit: usize) -> Vec<net::PublicGeometry> {
+        (0..limit.min(32))
+            .filter_map(|_| self.geometry_updates.pop_front())
+            .collect()
+    }
+    pub fn take_geometry_removal(&mut self) -> Option<PageId> {
+        self.geometry_removals.pop_front()
+    }
+    pub fn request_geometry(&mut self, page: PageId, now_ms: u64) -> Result<(), NetworkError> {
+        if !self.geometry_interest.contains_key(&page) && self.geometry_interest.len() >= 16 {
+            return Err(NetworkError::Capacity);
+        }
+        let known = self.geometries.get(&page).map(|g| g.source_version);
+        self.queue(ClientMessage::RequestGeometry { page, known })?;
+        self.geometry_interest.insert(
+            page,
+            PageInterest {
+                received: known.is_some(),
+                last_request: now_ms,
+            },
+        );
+        Ok(())
+    }
+    pub fn release_geometry(&mut self, page: PageId) -> Result<(), NetworkError> {
+        if self.outbox.len() >= MAX_OUTBOX || self.geometry_removals.len() >= 32 {
+            return Err(NetworkError::Capacity);
+        }
+        self.queue(ClientMessage::ForgetGeometry(page))?;
+        self.geometry_interest.remove(&page);
+        if self.geometries.remove(&page).is_some() {
+            self.geometry_removals.push_back(page);
+        }
+        Ok(())
+    }
     pub fn take_reply(&mut self) -> Option<ActionReply> {
         self.replies.pop_front()
     }
@@ -265,6 +327,17 @@ impl Connection {
         (0..limit.min(MAX_PAGE_UPDATES))
             .filter_map(|_| self.page_updates.pop_front())
             .collect()
+    }
+    pub fn take_page_removal(&mut self) -> Option<PageId> {
+        self.page_removals.pop_front()
+    }
+    pub fn take_page_removals(&mut self, limit: usize) -> Vec<PageId> {
+        (0..limit.min(MAX_PAGE_REMOVALS))
+            .filter_map(|_| self.page_removals.pop_front())
+            .collect()
+    }
+    pub fn predicted_positions(&self) -> impl Iterator<Item = BlockPos> + '_ {
+        self.overlay.positions()
     }
     pub fn take_outgoing(&mut self, limit: usize) -> Vec<ClientMessage> {
         (0..limit.min(MAX_OUTBOX))
@@ -448,7 +521,13 @@ impl Connection {
                     interest.received = false;
                     interest.last_request = now_ms;
                 }
+                if self.replica.page(page).is_some()
+                    && self.page_removals.len() >= MAX_PAGE_REMOVALS
+                {
+                    return Err(NetworkError::Capacity);
+                }
                 if self.replica.remove(page) {
+                    self.page_removals.push_back(page);
                     self.world_changed = true;
                 }
             }
@@ -500,6 +579,41 @@ impl Connection {
                     return Err(NetworkError::Capacity);
                 }
                 self.transforms.insert(space, (version, transform));
+            }
+            ServerMessage::Geometry(geometry) => {
+                let geometry = *geometry;
+                if !self.geometry_interest.contains_key(&geometry.page) {
+                    return Ok(());
+                }
+                geometry.validate().map_err(|_| NetworkError::Protocol)?;
+                if self.geometries.get(&geometry.page).is_some_and(|old| {
+                    old.view_version >= geometry.view_version
+                        || old.source_version > geometry.source_version
+                }) {
+                    return Ok(());
+                }
+                if self.geometry_updates.len() >= 32 {
+                    return Err(NetworkError::Capacity);
+                }
+                self.geometry_interest
+                    .get_mut(&geometry.page)
+                    .expect("interest checked")
+                    .received = true;
+                self.geometries.insert(geometry.page, geometry.clone());
+                self.geometry_updates.push_back(geometry);
+            }
+            ServerMessage::GeometryUnavailable(page) => {
+                if let Some(interest) = self.geometry_interest.get_mut(&page) {
+                    interest.received = false;
+                    interest.last_request = now_ms;
+                }
+                if self.geometries.contains_key(&page) {
+                    if self.geometry_removals.len() >= 32 {
+                        return Err(NetworkError::Capacity);
+                    }
+                    self.geometries.remove(&page);
+                    self.geometry_removals.push_back(page);
+                }
             }
             ServerMessage::Summary(summary) => {
                 if self
@@ -691,9 +805,31 @@ impl Connection {
     }
     pub fn action(
         &mut self,
+        action: Action,
+        predict_edit: bool,
+        now_ms: u64,
+    ) -> Result<ActionId, NetworkError> {
+        self.queue_action(action, predict_edit, now_ms, None)
+    }
+    pub fn aimed_action(
+        &mut self,
+        action: Action,
+        predict_edit: bool,
+        now_ms: u64,
+        yaw: f32,
+        pitch: f32,
+    ) -> Result<ActionId, NetworkError> {
+        self.queue_action(action, predict_edit, now_ms, Some([yaw, pitch]))
+    }
+    pub fn action_pending(&self, id: ActionId) -> bool {
+        self.actions.contains_key(&id)
+    }
+    fn queue_action(
+        &mut self,
         mut action: Action,
         predict_edit: bool,
         now_ms: u64,
+        aim: Option<[f32; 2]>,
     ) -> Result<ActionId, NetworkError> {
         if self.welcome.is_none() {
             return Err(NetworkError::NotConnected);
@@ -728,10 +864,7 @@ impl Connection {
             };
         }
         let id = ActionId(self.next_action);
-        let message = ClientMessage::Action {
-            id,
-            action: action.clone(),
-        };
+        let message = action_message(id, action.clone(), aim);
         net::encode_client(&message).map_err(|_| NetworkError::Protocol)?;
         if predict_edit {
             let edit = match &action {
@@ -764,6 +897,7 @@ impl Connection {
             id,
             PendingAction {
                 action,
+                aim,
                 last_sent: now_ms,
                 inventory_before: projected_inventory.map(|i| i.revision()),
             },
@@ -796,11 +930,21 @@ impl Connection {
             .iter()
             .filter(|(_, a)| now_ms.saturating_sub(a.last_sent) >= 250)
             .take(8)
-            .map(|(id, a)| (*id, a.action.clone()))
+            .map(|(id, a)| (*id, a.action.clone(), a.aim))
             .collect();
-        for (id, action) in retry {
-            self.queue(ClientMessage::Action { id, action })?;
+        for (id, action, aim) in retry {
+            self.queue(action_message(id, action, aim))?;
             self.actions.get_mut(&id).expect("pending retry").last_sent = now_ms;
+        }
+        let geometry: Vec<_> = self
+            .geometry_interest
+            .iter()
+            .filter(|(_, i)| !i.received && now_ms.saturating_sub(i.last_request) >= 500)
+            .take(2)
+            .map(|(page, _)| *page)
+            .collect();
+        for page in geometry {
+            self.request_geometry(page, now_ms)?;
         }
         let pages: Vec<_> = self
             .interest
@@ -845,9 +989,18 @@ impl Connection {
             })
             .copied()
             .collect();
+        let removals = evict
+            .iter()
+            .filter(|p| self.replica.page(**p).is_some())
+            .count();
+        if removals > MAX_PAGE_REMOVALS - self.page_removals.len() {
+            return Err(NetworkError::Capacity);
+        }
         for page in evict {
             self.interest.remove(&page);
-            self.replica.remove(page);
+            if self.replica.remove(page) {
+                self.page_removals.push_back(page);
+            }
             self.counters.evicted_pages += 1;
         }
         let r = i32::from(self.config.near_radius);
@@ -868,6 +1021,46 @@ impl Connection {
             }
         }
         candidates.sort_unstable();
+        let needed =
+            (self.interest.len() + candidates.len()).saturating_sub(self.config.maximum_pages);
+        if needed > 0 {
+            let mut retained: Vec<_> = self
+                .interest
+                .keys()
+                .filter(|page| {
+                    !net::aoi_contains(
+                        center,
+                        **page,
+                        self.config.near_radius,
+                        self.config.near_radius,
+                        false,
+                    )
+                })
+                .copied()
+                .collect();
+            retained.sort_by_key(|page| {
+                std::cmp::Reverse(
+                    (i64::from(page.x) - i64::from(center.x)).pow(2)
+                        + (i64::from(page.y) - i64::from(center.y)).pow(2)
+                        + (i64::from(page.z) - i64::from(center.z)).pow(2),
+                )
+            });
+            let selected: Vec<_> = retained.into_iter().take(needed).collect();
+            let removals = selected
+                .iter()
+                .filter(|p| self.replica.page(**p).is_some())
+                .count();
+            if removals > MAX_PAGE_REMOVALS - self.page_removals.len() {
+                return Err(NetworkError::Capacity);
+            }
+            for page in selected {
+                self.interest.remove(&page);
+                if self.replica.remove(page) {
+                    self.page_removals.push_back(page);
+                }
+                self.counters.evicted_pages += 1;
+            }
+        }
         for (_, page) in candidates {
             if self.interest.len() >= self.config.maximum_pages {
                 break;
@@ -898,4 +1091,17 @@ fn matches_public(player: &Player, state: PlayerState) -> bool {
         && player.on_ground == state.on_ground
         && player.flying == state.flying
         && player.noclip == state.noclip
+}
+
+fn action_message(id: ActionId, action: Action, aim: Option<[f32; 2]>) -> ClientMessage {
+    if let Some([yaw, pitch]) = aim {
+        ClientMessage::AimedAction {
+            id,
+            action,
+            yaw,
+            pitch,
+        }
+    } else {
+        ClientMessage::Action { id, action }
+    }
 }

@@ -4,7 +4,7 @@ use crate::{
     ClientScene, SceneConfig,
     demo_interaction::{DemoInteractions, PreparedDemoEdit},
     edit_shell::{EditOwnerUpdates, EditShell, ShellError},
-    self_model::{PART_COUNT, SelfModel, SelfPose},
+    self_model::{PART_COUNT, PART_EXTENTS, SelfModel, SelfPose},
 };
 use core_types::{BlockPos, PageId, SpaceId, Tick, Version};
 use render::terrain_gpu::{
@@ -14,6 +14,10 @@ use render::terrain_gpu::{
 use sim::{CameraMode, Keys, Permissions, Player, WorldQuery};
 use std::collections::{BTreeMap, VecDeque};
 use world::CellRead;
+mod lighting;
+mod remote;
+pub use lighting::{LightingStats, ViewLighting};
+pub use remote::RemoteInput;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -75,6 +79,25 @@ pub struct ViewStats {
     pub rendered_edit_revision: u64,
 }
 
+/// Known logical work for one consumed interval. Worker counters are completed
+/// reports (including stale results); unreported partial cancellations and
+/// physics/ray query timings are deliberately not inferred.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameWorkDetails {
+    pub renderer: telemetry::WorkCounts,
+    pub workers: telemetry::WorkCounts,
+    pub foreground: telemetry::WorkCounts,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SettingsApplication {
+    /// Bits use ui::settings::Setting discriminants.
+    pub applied: u32,
+    /// Requested graphics controls whose backend is not attached yet. They must
+    /// not be shown as effective quality choices merely because they are saved.
+    pub pending_render: u32,
+}
+
 #[derive(Clone, Copy)]
 struct Resident {
     handle: PageHandle,
@@ -94,6 +117,7 @@ struct Overlay {
 pub struct ClientView {
     pub scene: ClientScene,
     renderer: TerrainGpu,
+    lighting: Option<Box<ViewLighting>>,
     player: Player,
     interactions: DemoInteractions,
     edit_shell: EditShell,
@@ -114,12 +138,22 @@ pub struct ClientView {
     edit_revision: u64,
     rendered_edit_revision: u64,
     keys: [bool; 12],
+    remote_controls: VecDeque<InputKey>,
+    remote_look: Option<[f32; 2]>,
+    remote_signature: Option<u64>,
+    retained_gpu_work: telemetry::WorkCounters,
+    retained_foreground_work: telemetry::WorkCounters,
+    last_reported_mesh_cells: u64,
+    last_reported_mesh_quads: u64,
+    last_frame_work: telemetry::WorkCounts,
+    last_frame_work_details: FrameWorkDetails,
     active: bool,
     activation_requested: bool,
     camera_mode: CameraMode,
     accumulator: f64,
     tick: Tick,
     resident: BTreeMap<PageId, Resident>,
+    page_links_dirty: bool,
     terrain_frames: u64,
     upload_bytes_total: u64,
     pipeline_compilations: u64,
@@ -128,6 +162,8 @@ pub struct ClientView {
     denied_debug_requests: u64,
     edit_rejected: u64,
     cached_camera: Option<Camera>,
+    field_of_view: f32,
+    view_bob: bool,
     cached_world_version: Version,
     cached_upload_bytes: u64,
     force_redraw: bool,
@@ -140,6 +176,7 @@ impl ClientView {
         Ok(Self {
             scene: ClientScene::new(config).map_err(|e| e.to_string())?,
             renderer,
+            lighting: None,
             player: Player::new([
                 f64::from(config.center.x) + 0.5,
                 f64::from(config.center.y),
@@ -167,12 +204,22 @@ impl ClientView {
             edit_revision: 0,
             rendered_edit_revision: 0,
             keys: [false; 12],
+            remote_controls: VecDeque::new(),
+            remote_look: None,
+            remote_signature: None,
+            retained_gpu_work: telemetry::WorkCounters::new(),
+            retained_foreground_work: telemetry::WorkCounters::new(),
+            last_reported_mesh_cells: 0,
+            last_reported_mesh_quads: 0,
+            last_frame_work: telemetry::WorkCounts::ZERO,
+            last_frame_work_details: FrameWorkDetails::default(),
             active: false,
             activation_requested: false,
             camera_mode: CameraMode::FirstPerson,
             accumulator: 0.0,
             tick: Tick(0),
             resident: BTreeMap::new(),
+            page_links_dirty: false,
             terrain_frames: 0,
             upload_bytes_total: 0,
             pipeline_compilations: setup.pipeline_compilations,
@@ -181,6 +228,8 @@ impl ClientView {
             denied_debug_requests: 0,
             edit_rejected: 0,
             cached_camera: None,
+            field_of_view: 70.,
+            view_bob: false,
             cached_world_version: Version(0),
             cached_upload_bytes: 0,
             force_redraw: true,
@@ -198,6 +247,73 @@ impl ClientView {
     pub fn renderer_mut(&mut self) -> &mut TerrainGpu {
         &mut self.renderer
     }
+    /// Attach the CPU light owner and all GPU pipelines during loading. Callers
+    /// choose the standalone sky proof or the remote Unknown-is-dark policy.
+    pub fn prepare_lighting(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: crate::lighting::ClientLightingConfig,
+    ) -> Result<(), String> {
+        if self.lighting.is_some()
+            || self.terrain_frames != 0
+            || !self.resident.is_empty()
+            || self.self_handles.iter().any(Option::is_some)
+        {
+            return Err("lighting must be prepared once before uploading scene geometry".into());
+        }
+        let center = self.lighting_center();
+        let lighting = ViewLighting::prepare(
+            device,
+            queue,
+            &mut self.renderer,
+            &mut self.scene,
+            config,
+            center,
+        )
+        .map_err(|error| error.to_string())?;
+        let setup = self.renderer.take_work();
+        self.pipeline_compilations = self
+            .pipeline_compilations
+            .saturating_add(setup.pipeline_compilations);
+        self.lighting = Some(Box::new(lighting));
+        self.invalidate();
+        Ok(())
+    }
+    pub fn lighting_stats(&self) -> Option<LightingStats> {
+        self.lighting.as_ref().map(|lighting| lighting.stats)
+    }
+    pub fn lighting_mut(&mut self) -> Option<&mut ViewLighting> {
+        self.lighting.as_deref_mut()
+    }
+    pub fn apply_settings(&mut self, settings: &ui::settings::Settings) -> SettingsApplication {
+        use ui::settings::{Section, Setting};
+        let fov = settings.get(Setting::Fov) as f32;
+        let bob = settings.get(Setting::Bob) != 0;
+        if self.field_of_view != fov || self.view_bob != bob {
+            self.field_of_view = fov;
+            self.view_bob = bob;
+            self.invalidate();
+        }
+        let mut pending_render = 0;
+        for setting in ui::settings::SCHEMA {
+            if setting.section == Section::Graphics && setting.id != Setting::Fov {
+                pending_render |= 1 << setting.id as u32;
+            }
+        }
+        SettingsApplication {
+            applied: (1 << Setting::Fov as u32) | (1 << Setting::Bob as u32),
+            pending_render,
+        }
+    }
+    fn lighting_center(&self) -> [f32; 3] {
+        if self.active {
+            self.player.pos.map(|value| value as f32)
+        } else {
+            let center = self.scene.config().center;
+            [center.x as f32, center.y as f32, center.z as f32]
+        }
+    }
 
     pub fn set_key(&mut self, key: InputKey, down: bool) {
         let rising = down && !self.keys[key as usize];
@@ -206,6 +322,12 @@ impl ClientView {
             self.activate_player();
         }
         if !rising {
+            return;
+        }
+        if self.authoritative_remote() && matches!(key, InputKey::Flight | InputKey::Noclip) {
+            if self.active && self.remote_controls.len() < 32 {
+                self.remote_controls.push_back(key);
+            }
             return;
         }
         match key {
@@ -240,10 +362,20 @@ impl ClientView {
     }
     pub fn mouse_delta(&mut self, dx: f64, dy: f64) {
         self.activate_player();
+        if self.authoritative_remote() && !self.active {
+            return;
+        }
         self.player.turn(dx, dy, 0.5);
+        if self.authoritative_remote() {
+            self.player.yaw = self.player.yaw.rem_euclid(360.0);
+            self.remote_look = Some([self.player.yaw, self.player.pitch]);
+        }
     }
     pub fn activate_player(&mut self) {
         self.activation_requested = true;
+        if self.authoritative_remote() {
+            return;
+        }
         if self.active || !self.is_ready() {
             return;
         }
@@ -312,6 +444,9 @@ impl ClientView {
                 .0
                 .checked_add(1)
                 .ok_or("simulation tick exhausted")?;
+            if self.authoritative_remote() {
+                continue;
+            }
             if self.active {
                 let query = WorldQuery::new(self.scene.world(), SpaceId(0));
                 self.player.tick(
@@ -396,6 +531,13 @@ impl ClientView {
         self.rendered_edit_revision
     }
     fn note_edit_change(&mut self, change: &world::WorldChange) -> Result<(), String> {
+        if change.cells.is_empty()
+            || !change
+                .channels
+                .intersects(core_types::ChannelMask::SHAPE | core_types::ChannelMask::OPACITY)
+        {
+            return Ok(());
+        }
         self.edit_revision = self
             .edit_revision
             .checked_add(1)
@@ -403,6 +545,13 @@ impl ClientView {
         self.edit_shell
             .mark_changes(change)
             .map_err(|error| error.to_string())?;
+        if let Some(lighting) = &mut self.lighting {
+            for page in &change.pages {
+                lighting
+                    .dirty(page.page)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         self.mesh_hold_until = Tick(self.tick.0.saturating_add(self.demo_mesh_delay_ticks));
         self.edit_pending_since.get_or_insert(self.terrain_frames);
         self.invalidate();
@@ -487,6 +636,7 @@ impl ClientView {
             Err(error) => return Err(error.to_string()),
         };
         for patch in patches {
+            self.retained_foreground_work.record(patch.work.work);
             self.pending_patches.retain(|old| old.page != patch.page);
             self.pending_patches.push_back(patch);
         }
@@ -538,6 +688,27 @@ impl ClientView {
             self.renderer
                 .set_enabled(queue, handle, pose.visible, budget)
                 .map_err(|error| error.to_string())?;
+            if pose.visible
+                && let Some(lighting) = &mut self.lighting
+            {
+                let bounds = lighting::rigid_bounds(*model, PART_EXTENTS[index].map(f32::from))
+                    .map_err(|error| error.to_string())?;
+                let center = std::array::from_fn::<_, 3, _>(|axis| {
+                    ((bounds.min[axis] + bounds.max[axis]) * 0.5).floor() as i32
+                });
+                lighting
+                    .register_rigid(
+                        handle,
+                        BlockPos {
+                            space: SpaceId(0),
+                            x: center[0],
+                            y: center[1],
+                            z: center[2],
+                        },
+                        bounds,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
         }
         self.self_uploaded_pose = Some(pose);
         Ok(())
@@ -556,11 +727,18 @@ impl ClientView {
                 self.renderer
                     .release_page(queue, overlay.handle, budget)
                     .map_err(|error| error.to_string())?;
+                if let Some(lighting) = &mut self.lighting {
+                    lighting.unregister(overlay.handle);
+                }
             }
             if let Some(resident) = self.resident.remove(&page) {
                 self.renderer
                     .release_page(queue, resident.handle, budget)
                     .map_err(|error| error.to_string())?;
+                if let Some(lighting) = &mut self.lighting {
+                    lighting.unregister(resident.handle);
+                }
+                self.page_links_dirty = true;
             }
             self.edit_shell.clear_page(page);
             self.pending_patches.retain(|patch| patch.page != page);
@@ -583,7 +761,13 @@ impl ClientView {
                 .gpu_revision
                 .checked_add(1)
                 .ok_or("GPU representation revision exhausted")?;
-            match self.renderer.publish_owner_patches(
+            let alias_reserve = if self.lighting.is_some() { 4 } else { 0 };
+            if budget.remaining_bytes < alias_reserve {
+                self.pending_patches.push_front(patch);
+                break;
+            }
+            budget.remaining_bytes -= alias_reserve;
+            let result = self.renderer.publish_owner_patches(
                 queue,
                 base.handle,
                 self.overlays.get(&patch.page).map(|o| o.handle),
@@ -592,9 +776,12 @@ impl ClientView {
                 patch.mask.words(),
                 &patch.updates,
                 budget,
-            ) {
+            );
+            budget.remaining_bytes += alias_reserve;
+            match result {
                 Ok(handle) => {
                     self.gpu_revision = revision;
+                    self.register_lit_page(queue, patch.page, base.handle, Some(handle), budget)?;
                     if !self
                         .edit_shell
                         .ack_owner_updates(&patch, self.scene.world())
@@ -692,7 +879,10 @@ impl ClientView {
                     scene.world(),
                     &|page, x, z| scene.biome_tint(page, x, z).unwrap_or(u16::MAX),
                 ) {
-                    Ok(patch) => Some(patch),
+                    Ok(patch) => {
+                        self.retained_foreground_work.record(patch.work.work);
+                        Some(patch)
+                    }
                     Err(ShellError::UnknownPage(_)) => {
                         self.scene
                             .return_composite(composite)
@@ -723,6 +913,14 @@ impl ClientView {
                 .gpu_revision
                 .checked_add(1)
                 .ok_or("GPU representation revision exhausted")?;
+            let alias_reserve = if self.lighting.is_some() { 4 } else { 0 };
+            if budget.remaining_bytes < alias_reserve {
+                self.scene
+                    .return_composite(composite)
+                    .map_err(|_| "cannot retain lighting-budget-blocked composite".to_string())?;
+                break;
+            }
+            budget.remaining_bytes -= alias_reserve;
             let result = self.renderer.publish_owner_composite(
                 queue,
                 prior.map(|resident| resident.handle),
@@ -734,6 +932,7 @@ impl ClientView {
                 patch.as_ref().map_or(&[], |patch| patch.updates.as_slice()),
                 budget,
             );
+            budget.remaining_bytes += alias_reserve;
             match result {
                 Ok((handle, overlay)) => {
                     // No world mutation can interleave this single foreground
@@ -745,6 +944,9 @@ impl ClientView {
                         );
                     }
                     self.gpu_revision = revision;
+                    if prior.map(|resident| resident.handle) != Some(handle) {
+                        self.page_links_dirty = true;
+                    }
                     self.resident.insert(
                         page,
                         Resident {
@@ -758,6 +960,13 @@ impl ClientView {
                         .replace_page_mask(page, composite.changed_owners)
                         .map_err(|error| error.to_string())?;
                     let previous = self.overlays.remove(&page);
+                    if let Some(previous) = &previous
+                        && Some(previous.handle) != overlay
+                        && let Some(lighting) = &mut self.lighting
+                    {
+                        lighting.unregister(previous.handle);
+                    }
+                    self.register_lit_page(queue, page, handle, overlay, budget)?;
                     if let Some(handle) = overlay {
                         let mut state = if let Some(old) = previous {
                             old
@@ -819,23 +1028,119 @@ impl ClientView {
                 }
             }
         }
+        self.upload_page_links(queue, budget)?;
+        if let Some(lighting) = &mut self.lighting {
+            let light_before = budget.remaining_bytes;
+            let work = lighting
+                .pump(
+                    queue,
+                    &mut self.renderer,
+                    &mut self.scene,
+                    self.tick,
+                    budget,
+                    !self.active,
+                )
+                .map_err(|error| error.to_string())?;
+            self.retained_foreground_work.record(telemetry::WorkCounts {
+                cells_scanned: work
+                    .cpu_cells
+                    .saturating_add(work.cpu_neighbors)
+                    .saturating_add(work.sample_reads),
+                upload_bytes: light_before - budget.remaining_bytes,
+                ..telemetry::WorkCounts::ZERO
+            });
+        }
         self.upload_bytes_total = self
             .upload_bytes_total
             .saturating_add(before - budget.remaining_bytes);
         Ok(())
     }
+    fn upload_page_links(
+        &mut self,
+        queue: &wgpu::Queue,
+        budget: &mut UploadBudget,
+    ) -> Result<(), String> {
+        if !self.page_links_dirty {
+            return Ok(());
+        }
+        for (page, resident) in &self.resident {
+            let neighbors = [
+                [0, -1, 0],
+                [0, 1, 0],
+                [0, 0, -1],
+                [0, 0, 1],
+                [-1, 0, 0],
+                [1, 0, 0],
+            ]
+            .map(|[dx, dy, dz]| {
+                let page = PageId {
+                    space: page.space,
+                    x: page.x.checked_add(dx)?,
+                    y: page.y.checked_add(dy)?,
+                    z: page.z.checked_add(dz)?,
+                };
+                self.resident.get(&page).map(|resident| resident.handle)
+            });
+            match self
+                .renderer
+                .set_page_neighbors(queue, resident.handle, neighbors, budget)
+            {
+                Ok(_) => {}
+                Err(TerrainError::UploadBudget) => return Ok(()),
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        self.page_links_dirty = false;
+        Ok(())
+    }
+    fn register_lit_page(
+        &mut self,
+        queue: &wgpu::Queue,
+        page: PageId,
+        base: PageHandle,
+        overlay: Option<PageHandle>,
+        budget: &mut UploadBudget,
+    ) -> Result<(), String> {
+        if let Some(lighting) = &mut self.lighting {
+            lighting
+                .register_base(page, base)
+                .map_err(|error| error.to_string())?;
+            let before = budget.remaining_bytes;
+            if let Some(overlay) = overlay {
+                lighting
+                    .register_overlay(queue, page, overlay, budget)
+                    .map_err(|error| error.to_string())?;
+            }
+            self.retained_foreground_work.record(telemetry::WorkCounts {
+                upload_bytes: before - budget.remaining_bytes,
+                ..telemetry::WorkCounts::ZERO
+            });
+        }
+        Ok(())
+    }
     fn camera(&self, width: u32, height: u32) -> Camera {
-        let (eye, target, fov) = if self.active {
+        let (eye, target, up, fov) = if self.active {
             let query = WorldQuery::new(self.scene.world(), SpaceId(0));
             let camera = self.player.camera(
                 self.accumulator / sim::TICK_SECONDS,
                 self.camera_mode,
                 &query,
             );
+            let (eye, look, up) = if self.view_bob && self.camera_mode == CameraMode::FirstPerson {
+                camera_bob(
+                    camera.eye,
+                    camera.look,
+                    self.player.yaw,
+                    self.player.view(self.accumulator / sim::TICK_SECONDS),
+                )
+            } else {
+                (camera.eye, camera.look, [0., 1., 0.])
+            };
             (
-                camera.eye.map(|v| v as f32),
-                std::array::from_fn(|i| (camera.eye[i] + camera.look[i]) as f32),
-                70.0 * camera.fov_multiplier,
+                eye.map(|v| v as f32),
+                std::array::from_fn(|i| (eye[i] + look[i]) as f32),
+                up.map(|v| v as f32),
+                self.field_of_view * camera.fov_multiplier,
             )
         } else {
             let center = self.scene.config().center;
@@ -846,13 +1151,14 @@ impl ClientView {
                     center.z as f32 + 24.0,
                 ],
                 [center.x as f32, center.y as f32 - 5.0, center.z as f32],
-                70.0,
+                [0., 1., 0.],
+                self.field_of_view,
             )
         };
         Camera::perspective(
             eye,
             target,
-            [0.0, 1.0, 0.0],
+            up,
             fov.to_radians(),
             width.max(1) as f32 / height.max(1) as f32,
             0.05,
@@ -875,9 +1181,14 @@ impl ClientView {
     /// iteration keeps the presented image and allocates no GPU dispatch handles.
     pub fn needs_redraw(&self, width: u32, height: u32) -> bool {
         self.force_redraw
+            || self.page_links_dirty
             || self.cached_camera != Some(self.camera(width, height))
             || self.cached_world_version != self.scene.world().version()
             || self.cached_upload_bytes != self.upload_bytes_total
+            || self
+                .lighting
+                .as_ref()
+                .is_some_and(|lighting| lighting.owner.needs_work(self.scene.world()))
     }
     pub fn invalidate(&mut self) {
         self.force_redraw = true;
@@ -891,6 +1202,16 @@ impl ClientView {
         height: u32,
     ) -> Result<TerrainFrameWork, String> {
         let camera = self.camera(width, height);
+        let center = self.lighting_center();
+        if let Some(lighting) = &mut self.lighting {
+            let work = lighting
+                .encode(queue, encoder, &mut self.renderer, center)
+                .map_err(|error| error.to_string())?;
+            self.retained_foreground_work.record(telemetry::WorkCounts {
+                upload_bytes: work.uniform_upload_bytes,
+                ..telemetry::WorkCounts::ZERO
+            });
+        }
         let work = self
             .renderer
             .encode_frame(queue, encoder, output, &camera, CullingMode::FrustumAndHiZ)
@@ -915,23 +1236,76 @@ impl ClientView {
             self.terrain_frames += 1;
         }
         let measured = self.renderer.take_work();
+        self.retained_gpu_work.record(measured);
         self.frame_pipeline_compilations = measured.pipeline_compilations;
         self.pipeline_compilations = self
             .pipeline_compilations
             .saturating_add(measured.pipeline_compilations);
         Ok(work)
     }
+    /// Consume known work since the previous submitted-frame boundary. GPU
+    /// uploads include camera writes. Mesh emissions count each CPU kernel once;
+    /// renderer descriptor writes remain available separately in the details.
+    pub fn take_frame_work(&mut self) -> telemetry::WorkCounts {
+        let renderer = self.retained_gpu_work.take();
+        let foreground = self.retained_foreground_work.take();
+        let scene = self.scene.stats();
+        let workers = telemetry::WorkCounts {
+            cells_scanned: scene
+                .mesh_cells_scanned
+                .saturating_sub(self.last_reported_mesh_cells),
+            quads_emitted: scene
+                .mesh_quads
+                .saturating_sub(self.last_reported_mesh_quads),
+            ..telemetry::WorkCounts::ZERO
+        };
+        self.last_reported_mesh_cells = scene.mesh_cells_scanned;
+        self.last_reported_mesh_quads = scene.mesh_quads;
+        let mut total = renderer;
+        total.cells_scanned = total
+            .cells_scanned
+            .saturating_add(workers.cells_scanned)
+            .saturating_add(foreground.cells_scanned);
+        total.quads_emitted = workers
+            .quads_emitted
+            .saturating_add(foreground.quads_emitted);
+        total.upload_bytes = total.upload_bytes.saturating_add(foreground.upload_bytes);
+        total.pipeline_compilations = total
+            .pipeline_compilations
+            .saturating_add(foreground.pipeline_compilations);
+        total.synchronous_generations = total
+            .synchronous_generations
+            .saturating_add(foreground.synchronous_generations);
+        self.last_frame_work = total;
+        self.last_frame_work_details = FrameWorkDetails {
+            renderer,
+            workers,
+            foreground,
+        };
+        total
+    }
+    pub const fn last_frame_work(&self) -> telemetry::WorkCounts {
+        self.last_frame_work
+    }
+    pub const fn last_frame_work_details(&self) -> FrameWorkDetails {
+        self.last_frame_work_details
+    }
     pub fn is_ready(&self) -> bool {
-        self.scene.visible_pages().all(|p| {
-            self.resident.get(&p).is_some_and(|resident| {
-                (resident.version == self.scene.world().input_version(p, crate::MESH_CHANNELS)
-                    && self.scene.world().matches_inputs(&resident.inputs))
-                    || self.overlays.get(&p).is_some_and(|overlay| {
-                        self.scene.world().matches_inputs(&overlay.inputs)
-                            && self.edit_shell.mask(p) == Some(&overlay.mask)
-                    })
+        !self.page_links_dirty
+            && self.scene.visible_pages().all(|p| {
+                self.resident.get(&p).is_some_and(|resident| {
+                    (resident.version == self.scene.world().input_version(p, crate::MESH_CHANNELS)
+                        && self.scene.world().matches_inputs(&resident.inputs))
+                        || self.overlays.get(&p).is_some_and(|overlay| {
+                            self.scene.world().matches_inputs(&overlay.inputs)
+                                && self.edit_shell.mask(p) == Some(&overlay.mask)
+                        })
+                })
             })
-        }) && self.resident.values().any(|p| p.quads > 0)
+            && self.lighting.as_ref().is_none_or(|lighting| {
+                lighting.stats.ready && lighting.owner.shadows().cache().pending() == 0
+            })
+            && self.resident.values().any(|p| p.quads > 0)
             && self.terrain_frames > 0
     }
     pub fn stats(&self) -> ViewStats {
@@ -988,6 +1362,42 @@ impl ClientView {
     }
 }
 
+/// Inverse of the Java-style local view bob transform. The simulation owns the
+/// interpolated coefficients; this changes presentation without changing aim,
+/// movement, interaction reach or the replicated player checkpoint.
+fn camera_bob(
+    eye: [f64; 3],
+    look: [f64; 3],
+    yaw: f32,
+    view: [f64; 10],
+) -> ([f64; 3], [f64; 3], [f64; 3]) {
+    let yaw = f64::from(yaw).to_radians();
+    let right = [-libm::cos(yaw), 0., -libm::sin(yaw)];
+    let up = [
+        right[1] * look[2] - right[2] * look[1],
+        right[2] * look[0] - right[0] * look[2],
+        right[0] * look[1] - right[1] * look[0],
+    ];
+    let eye = std::array::from_fn(|axis| eye[axis] - right[axis] * view[6] - up[axis] * view[7]);
+    let pitch = view[9].to_radians();
+    let look =
+        std::array::from_fn(|axis| look[axis] * libm::cos(pitch) - up[axis] * libm::sin(pitch));
+    let pitched_up: [f64; 3] = std::array::from_fn(|axis| {
+        // The original forward can be recovered from orthonormal right/up.
+        let forward = [
+            up[1] * right[2] - up[2] * right[1],
+            up[2] * right[0] - up[0] * right[2],
+            up[0] * right[1] - up[1] * right[0],
+        ];
+        up[axis] * libm::cos(pitch) + forward[axis] * libm::sin(pitch)
+    });
+    let roll = view[8].to_radians();
+    let up = std::array::from_fn(|axis| {
+        pitched_up[axis] * libm::cos(roll) + right[axis] * libm::sin(roll)
+    });
+    (eye, look, up)
+}
+
 fn camera_signature(camera: Camera) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for value in camera.view_projection.iter().flatten() {
@@ -1005,5 +1415,29 @@ pub fn terrain_gpu_config() -> render::terrain_gpu::GpuConfig {
     render::terrain_gpu::GpuConfig {
         max_quads: 4_194_304,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::camera_bob;
+
+    #[test]
+    fn view_bob_inverse_has_known_local_translation_and_rotation() {
+        let mut coefficients = [0.; 10];
+        coefficients[6] = 0.2;
+        coefficients[7] = -0.1;
+        let (eye, look, up) = camera_bob([1., 2., 3.], [0., 0., 1.], 0., coefficients);
+        assert_eq!(eye, [1.2, 2.1, 3.]);
+        assert_eq!(look, [0., 0., 1.]);
+        assert_eq!(up, [0., 1., 0.]);
+        coefficients[6] = 0.;
+        coefficients[7] = 0.;
+        coefficients[9] = 30.;
+        let (_, look, up) = camera_bob([0.; 3], [0., 0., 1.], 0., coefficients);
+        assert!((look[1] + 0.5).abs() < 1e-12);
+        assert!((look[2] - 0.8660254037844386).abs() < 1e-12);
+        assert!((up[1] - 0.8660254037844386).abs() < 1e-12);
+        assert!((up[2] - 0.5).abs() < 1e-12);
     }
 }

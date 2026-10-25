@@ -1,4 +1,5 @@
 //! Shared PvP/mob strike rules from the approved donor, Java 1.21.1 arithmetic.
+pub mod mob;
 use super::{EntityError, EntityId};
 use crate::{
     items::tool_attack,
@@ -89,6 +90,21 @@ pub fn knockback(velocity: [f64; 3], ground: bool, strength: f64, from: [f64; 2]
         },
         velocity[2] / 2.0 - z,
     ]
+}
+/// Entity.pushAwayFrom reference vector for b; a receives its negation. The
+/// living-entity phase applies it twice per pair, matching the donor tick order.
+pub fn separation(a: [f64; 3], b: [f64; 3]) -> Option<[f64; 2]> {
+    let mut x = b[0] - a[0];
+    let mut z = b[2] - a[2];
+    let maximum = x.abs().max(z.abs());
+    if !maximum.is_finite() || maximum < 0.01 {
+        return None;
+    }
+    let root = maximum.sqrt();
+    x /= root;
+    z /= root;
+    let inverse = (1.0 / root).min(1.0);
+    Some([x * inverse * 0.05, z * inverse * 0.05])
 }
 pub fn body_box(feet: [f64; 3], crouching: bool) -> Aabb {
     Aabb {

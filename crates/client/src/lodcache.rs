@@ -237,6 +237,39 @@ impl PublicLodCache {
             work,
         })
     }
+    /// Protocol palettes contain atlas materials, never authority Cell/state.
+    /// Run on the LOD background owner after Connection's bounded frame queue.
+    pub fn ingest_wire_geometry(
+        &mut self,
+        input: &net::PublicGeometry,
+    ) -> Result<CacheUpdate, LodCacheError> {
+        input
+            .validate()
+            .map_err(|_| LodCacheError::MalformedGeometry)?;
+        let palette = input
+            .palette
+            .iter()
+            .map(|surface| PublicVoxel::Solid {
+                material: surface.atlas_layer,
+                tint: surface.tint,
+                kind: match surface.kind {
+                    net::PublicSurfaceKind::Opaque => SurfaceKind::Opaque,
+                    net::PublicSurfaceKind::Cutout => SurfaceKind::Cutout,
+                    net::PublicSurfaceKind::Water => SurfaceKind::Water,
+                },
+            })
+            .collect::<Vec<_>>();
+        self.ingest_geometry(GeometryInput {
+            page: input.page,
+            source: input.source_version,
+            view: input.view_version,
+            known: &input.known,
+            occupied: &input.occupied,
+            palette: &palette,
+            index_bits: input.index_bits,
+            indices: &input.indices,
+        })
+    }
     pub fn ingest_geometry(
         &mut self,
         input: GeometryInput<'_>,

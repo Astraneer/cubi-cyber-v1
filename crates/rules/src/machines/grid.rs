@@ -1,9 +1,13 @@
 //! Incremental connected resource networks. A block edit visits its neighboring
 //! components only; unrelated networks are never rebuilt. Allocation is confined
 //! to topology/endpoint edits, with fixed configured node/endpoint bounds.
+mod persistence;
 use super::{
     logistics::fair_share,
     sides::{self, Face},
+};
+pub use persistence::{
+    GridSnapshot, NetworkSnapshot, NodeSnapshot, PhaseScratch, Reservoir, SlotSnapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
 

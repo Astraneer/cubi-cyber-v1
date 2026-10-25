@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cubi_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$cubi_root/tools/env.sh"
+cd "$cubi_root"
+exec python3 "$cubi_root/tools/package_release.py" "$@"

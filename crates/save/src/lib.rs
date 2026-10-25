@@ -18,6 +18,19 @@ pub const MAX_SNAPSHOT_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_WAL_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_IDENTITIES: usize = 10_000;
 pub const MAX_RECENT_ACTIONS: usize = 256;
+pub const MAX_RUNTIME_RECORDS: usize = 4;
+pub const MAX_RUNTIME_BYTES: usize = 8 * 1024 * 1024;
+pub const RUNTIME_SURVIVAL: u16 = 1;
+pub const RUNTIME_MOBS: u16 = 2;
+pub const RUNTIME_ITEMS: u16 = 3;
+pub const RUNTIME_MACHINES: u16 = 4;
+/// Snapshot payloads are complete owner state; WAL payloads are detached deltas.
+/// Save validates envelope bounds/kinds; each owner validates its private schema.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeRecord {
+    pub kind: u16,
+    pub payload: Vec<u8>,
+}
 
 #[derive(Clone, PartialEq)]
 pub struct Identity {
@@ -53,6 +66,8 @@ pub struct SavedPlayer {
     pub break_ready_at: Tick,
     /// Bounded optional extension. An absent M6 payload means an empty inventory.
     pub inventory: Vec<u8>,
+    /// Private window/cursor/crafting continuation; absent legacy data is empty.
+    pub window: Vec<u8>,
     /// Versioned server-only simulation continuation, never put into net frames.
     pub simulation: Vec<u8>,
 }
@@ -64,6 +79,7 @@ pub struct Batch {
     pub identities: Vec<Identity>,
     pub players: Vec<SavedPlayer>,
     pub actions: Vec<(PlayerId, ActionReply)>,
+    pub runtimes: Vec<RuntimeRecord>,
 }
 impl Batch {
     pub fn empty(tick: Tick) -> Self {
@@ -73,6 +89,7 @@ impl Batch {
             identities: Vec::new(),
             players: Vec::new(),
             actions: Vec::new(),
+            runtimes: Vec::new(),
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -80,6 +97,7 @@ impl Batch {
             && self.identities.is_empty()
             && self.players.is_empty()
             && self.actions.is_empty()
+            && self.runtimes.is_empty()
     }
 }
 
@@ -94,6 +112,7 @@ pub struct Snapshot {
     pub identities: Vec<Identity>,
     pub players: Vec<SavedPlayer>,
     pub dedup: Vec<(PlayerId, DedupState)>,
+    pub runtimes: Vec<RuntimeRecord>,
 }
 
 #[derive(Debug)]

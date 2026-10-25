@@ -283,3 +283,135 @@ fn thousand_sleeping_entities_add_no_idle_work_or_main_thread_allocations() {
     }
     assert_eq!(scope.finish(), AllocationCounts::ZERO);
 }
+
+#[test]
+fn chicken_egg_event_is_once_adult_only_seeded_and_replayable() {
+    let world = scene();
+    let mut runtime = MobRuntime::new(config(2)).unwrap();
+    let mut adult = Mob::new(EntityId(1), MobKind::Chicken, [0.5, 1.0, 0.5]).unwrap();
+    adult.egg_remaining = 1;
+    let mut baby = Mob::spawned(
+        EntityId(2),
+        MobKind::Chicken,
+        SpaceId(0),
+        [4.5, 1.0, 0.5],
+        33,
+    )
+    .unwrap();
+    assert!((6000..12000).contains(&baby.egg_remaining));
+    baby.baby = true;
+    baby.egg_remaining = 1;
+    runtime.insert_initial(adult, true).unwrap();
+    runtime.insert_initial(baby, true).unwrap();
+    let before = runtime.snapshot();
+    let plan = runtime
+        .plan_tick(&world, Tick(1), &[], Budget::default())
+        .unwrap();
+    assert_eq!(plan.drops.len(), 1);
+    assert_eq!(plan.drops[0].stacks[0].item(), rules::items::I_EGG);
+    assert_eq!(plan.drops[0].stacks[0].count(), 1);
+    let after = plan.delta.encode().unwrap();
+    runtime.acknowledge(plan.delta).unwrap();
+    let egg_remaining = runtime.entities().get(adult.id).unwrap().egg_remaining;
+    assert!((6000..12000).contains(&egg_remaining));
+    assert_eq!(runtime.entities().get(baby.id).unwrap().egg_remaining, 1);
+    let mut restored = MobRuntime::restore(config(2), &before).unwrap();
+    restored
+        .acknowledge(MobDelta::decode(&after, 2).unwrap())
+        .unwrap();
+    assert_eq!(restored.snapshot(), runtime.snapshot());
+    let plan = runtime
+        .plan_tick(&world, Tick(2), &[], Budget::default())
+        .unwrap();
+    assert!(plan.drops.is_empty());
+}
+
+#[test]
+fn overlapping_mobs_and_players_push_with_bounded_spatial_queries() {
+    let world = scene();
+    let mut runtime = MobRuntime::new(config(2)).unwrap();
+    for (id, x) in [(1, 0.5), (2, 0.75)] {
+        runtime
+            .insert_initial(
+                Mob::new(EntityId(id), MobKind::Pig, [x, 1.0, 0.5]).unwrap(),
+                true,
+            )
+            .unwrap();
+    }
+    let plan = runtime
+        .plan_tick(&world, Tick(1), &[], Budget::default())
+        .unwrap();
+    assert_eq!(plan.work.push_pairs, 1);
+    assert!(plan.work.push_candidates <= 16_384);
+    runtime.acknowledge(plan.delta).unwrap();
+    assert!((runtime.entities().get(EntityId(1)).unwrap().body.velocity[0] + 0.05).abs() < 1e-12);
+    assert!((runtime.entities().get(EntityId(2)).unwrap().body.velocity[0] - 0.05).abs() < 1e-12);
+    let mut single = MobRuntime::new(config(1)).unwrap();
+    single
+        .insert_initial(
+            Mob::new(EntityId(1), MobKind::Pig, [0.75, 1.0, 0.5]).unwrap(),
+            true,
+        )
+        .unwrap();
+    let mut p = player();
+    p.position = [0.5, 1.0, 0.5];
+    p.eye = [0.5, 2.62, 0.5];
+    let plan = single
+        .plan_tick(&world, Tick(1), &[p], Budget::default())
+        .unwrap();
+    single.acknowledge(plan.delta).unwrap();
+    assert!((single.entities().get(EntityId(1)).unwrap().body.velocity[0] - 0.05).abs() < 1e-12);
+    let plan = runtime
+        .plan_tick(
+            &world,
+            Tick(2),
+            &[],
+            Budget {
+                push_candidates: 1,
+                ..Budget::default()
+            },
+        )
+        .unwrap();
+    assert!(plan.work.push_candidates <= 1);
+    assert!(plan.work.push_deferred > 0);
+    assert!(plan.work.push_probes <= Budget::default().push_probes);
+    assert!(plan.work.push_buckets <= Budget::default().push_buckets);
+}
+
+#[test]
+fn pushing_known_neighbor_never_changes_an_actor_whose_body_crosses_unknown_page() {
+    let mut world = World::new(rules::properties, 100);
+    let mut tx = Transaction::new(Tick(0), SpaceId(0));
+    tx.create_page(
+        PageId {
+            space: SpaceId(0),
+            x: 0,
+            y: 0,
+            z: 0,
+        },
+        (0..PAGE_VOLUME)
+            .map(|i| Cell::from_parts(if i / 256 == 0 { STONE } else { AIR }, 0))
+            .collect::<Vec<_>>(),
+    );
+    world.commit(tx).unwrap();
+    let mut runtime = MobRuntime::new(config(2)).unwrap();
+    for (id, x) in [(1, 15.0), (2, 15.8)] {
+        let mut mob = Mob::new(EntityId(id), MobKind::Cow, [x, 1.0, 0.5]).unwrap();
+        mob.ai.goal_until = Tick(100);
+        runtime.insert_initial(mob, true).unwrap();
+    }
+    let unknown = *runtime.entities().get(EntityId(2)).unwrap();
+    let plan = runtime
+        .plan_tick(&world, Tick(1), &[], Budget::default())
+        .unwrap();
+    assert_eq!(plan.work.actors, 1);
+    assert_eq!(plan.work.waiting_world, 1);
+    assert_eq!(plan.work.push_pairs, 0);
+    runtime.validate(&world, &plan).unwrap();
+    runtime.acknowledge(plan.delta).unwrap();
+    assert_eq!(*runtime.entities().get(EntityId(2)).unwrap(), unknown);
+    assert_eq!(
+        runtime.entities().get(EntityId(1)).unwrap().body.velocity[0],
+        0.0
+    );
+}

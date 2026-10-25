@@ -66,6 +66,7 @@ fn snapshot(world: &World, sequence: u64) -> Snapshot {
         identities: Vec::new(),
         players: Vec::new(),
         dedup: Vec::new(),
+        runtimes: Vec::new(),
     }
 }
 fn edit(world: &mut World, tick: u64) -> world::WorldChange {
@@ -301,6 +302,7 @@ fn bounded_inventory_extension_preserves_m6_empty_accounts_and_roundtrips_owned_
         place_ready_at: Tick(5),
         break_ready_at: Tick(7),
         inventory: Vec::new(),
+        window: Vec::new(),
     });
     let legacy = encode_batch(&batch).unwrap();
     assert!(
@@ -345,6 +347,7 @@ fn batch_empty_inventory() -> Batch {
         place_ready_at: Tick(0),
         break_ready_at: Tick(0),
         inventory: Vec::new(),
+        window: Vec::new(),
     });
     batch
 }

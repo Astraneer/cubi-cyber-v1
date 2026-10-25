@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { withBrowser, pngPixels, pause, root } from './browser.mjs';
 const run=promisify(execFile), headed=process.argv.includes('--headed');
 const dir=join(root,'.local/artifacts',`m3-${Date.now()}`);await mkdir(dir,{recursive:true});
-await withBrowser({headed,width:780,height:437,path:'/?meshDelayMs=200&workerMeshDelayMs=200'},async({call,evaluate,waitFor})=>{
+await withBrowser({headed,width:780,height:437,path:'/?scene=forest&meshDelayMs=200&workerMeshDelayMs=200'},async({call,evaluate,waitFor})=>{
   await waitFor('document.documentElement.dataset.m2',s=>{if(s==='error')throw new Error('Client loading failed');return s==='ready';});
   const stats=async()=>JSON.parse(await evaluate('JSON.stringify(window.__M2Stats())'));
   async function until(test,timeout=20000){const end=Date.now()+timeout;let last;while(Date.now()<end){last=await stats();if(test(last))return last;await pause(30);}throw new Error(`Player condition timed out: ${JSON.stringify(last)}`);}
@@ -40,6 +40,13 @@ await withBrowser({headed,width:780,height:437,path:'/?meshDelayMs=200&workerMes
   await evaluate("import('./pkg/client_web.js').then(m=>m.pause_demo_mesh_publication(true))");
   await call('Input.dispatchMouseEvent',{type:'mousePressed',x:390,y:220,button:'right',clickCount:1});await until(s=>s.blocksPlaced>0);await call('Input.dispatchMouseEvent',{type:'mouseReleased',x:390,y:220,button:'right',clickCount:1});const placeFast=await fence(s=>s.editShellPages>0);const placeFastImage=await capture('place-fast');
   await evaluate("import('./pkg/client_web.js').then(m=>m.pause_demo_mesh_publication(false))");const placeFinal=await fence(s=>s.fullMeshReady);assert.equal(placeFast.currentCamera,placeFinal.currentCamera);assert.equal(placeFast.worldVersion,placeFinal.worldVersion);const placing=await compare(await capture('place-final'),placeFastImage,restored);checkTransient(placing);
-  const result={initial,avatar,flight,denied,fast,final,breaking,rollback,placing,presentationLatencyMeasured:false,workerDelayMs:200,visualPublicationBarrier:true};await writeFile(join(dir,'player-smoke.json'),JSON.stringify(result,null,2)+'\n');
-  console.log(`PLAYER_BROWSER_OK ${JSON.stringify({breaking,rollback,placing,artifacts:dir,presentationLatencyMeasured:false})}`);
+  // A separate edit runs without the publication barrier. Count actual completed
+  // GPU/presentation callbacks carrying its revision, not CPU encode attempts.
+  await evaluate("import('./pkg/client_web.js').then(m=>m.reset_edit_presentation_probe())");
+  assert(await evaluate("import('./pkg/client_web.js').then(m=>m.rollback_demo_edit())"));
+  const presented=await fence(s=>s.presentationLatencyMeasured&&s.presentedEditCount>=1&&s.pendingEditPresentations===0);
+  assert(presented.editPresentedFramesMax>=1&&presented.editPresentedFramesMax<=2,`Presented edit exceeded two completed frames: ${JSON.stringify(presented)}`);
+  assert.equal(presented.presentationProbeOverflow,false);
+  const result={initial,avatar,flight,denied,fast,final,breaking,rollback,placing,presented,presentationLatencyMeasured:true,workerDelayMs:200,visualPublicationBarrier:true};await writeFile(join(dir,'player-smoke.json'),JSON.stringify(result,null,2)+'\n');
+  console.log(`PLAYER_BROWSER_OK ${JSON.stringify({breaking,rollback,placing,artifacts:dir,presentationLatencyMeasured:true,presentedEditFrames:presented.editPresentedFramesMax})}`);
 });

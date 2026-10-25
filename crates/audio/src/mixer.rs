@@ -174,6 +174,50 @@ pub struct Mixer {
     clip_bytes: usize,
     echo: Option<crate::echo::SparseEcho>,
 }
+pub(crate) fn normalized_listener(listener: Listener) -> Result<Listener, AudioError> {
+    if listener.position.iter().any(|v| !v.is_finite())
+        || listener.right.iter().any(|v| !v.is_finite())
+    {
+        return Err(AudioError::Invalid);
+    }
+    let length = libm::sqrt(
+        listener
+            .right
+            .iter()
+            .map(|v| f64::from(*v) * f64::from(*v))
+            .sum(),
+    );
+    if length < 0.001 {
+        return Err(AudioError::Invalid);
+    }
+    Ok(Listener {
+        position: listener.position,
+        right: listener.right.map(|v| (f64::from(v) / length) as f32),
+    })
+}
+pub(crate) fn spatial_parameters(listener: Listener, position: [f64; 3], range: f32) -> (f32, f32) {
+    let delta = std::array::from_fn::<_, 3, _>(|i| position[i] - listener.position[i]);
+    let distance = libm::sqrt(delta.iter().map(|v| v * v).sum());
+    // Extremely distant finite coordinates may overflow the subtraction/square;
+    // they are inaudible and must never submit a NaN gain to either backend.
+    if !distance.is_finite() || distance >= f64::from(range) {
+        return (0.0, 0.0);
+    }
+    let pan = if distance < 0.0001 {
+        0.0
+    } else {
+        delta
+            .iter()
+            .zip(listener.right)
+            .map(|(v, r)| v * f64::from(r))
+            .sum::<f64>()
+            / distance
+    };
+    (
+        pan.clamp(-1.0, 1.0) as f32,
+        (1.0 - distance / f64::from(range)) as f32,
+    )
+}
 impl Mixer {
     pub fn new(rate: u32, voice_limit: usize, memory_limit: usize) -> Result<Self, AudioError> {
         if !(8_000..=192_000).contains(&rate) || voice_limit == 0 || voice_limit > MAX_VOICES {
@@ -201,6 +245,16 @@ impl Mixer {
         self.echo = crate::echo::SparseEcho::prepare(cavity, self.rate)?;
         Ok(())
     }
+    /// Endpoint selection happens before playback. Clip PCM keeps its source
+    /// rate; the existing resampler uses the actual endpoint rate afterward.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn endpoint_rate(&mut self, rate: u32) -> Result<(), AudioError> {
+        if !(8000..=192000).contains(&rate) || self.active_voices() != 0 || self.echo.is_some() {
+            return Err(AudioError::Invalid);
+        }
+        self.rate = rate;
+        Ok(())
+    }
     pub fn add_clip(&mut self, pcm: Pcm) -> Result<ClipId, AudioError> {
         if self.clips.len() == MAX_CLIPS
             || pcm.bytes() > self.memory_limit.saturating_sub(self.clip_bytes)
@@ -222,19 +276,7 @@ impl Mixer {
             .count()
     }
     pub fn listener(&mut self, listener: Listener) -> Result<(), AudioError> {
-        if listener.position.iter().any(|v| !v.is_finite())
-            || listener.right.iter().any(|v| !v.is_finite())
-        {
-            return Err(AudioError::Invalid);
-        }
-        let norm = libm::sqrtf(listener.right.iter().map(|v| v * v).sum());
-        if norm < 0.001 {
-            return Err(AudioError::Invalid);
-        }
-        self.listener = Listener {
-            position: listener.position,
-            right: listener.right.map(|v| v / norm),
-        };
+        self.listener = normalized_listener(listener)?;
         self.refresh_gains();
         Ok(())
     }
@@ -253,24 +295,7 @@ impl Mixer {
     fn gains(&self, request: VoiceRequest) -> [f32; 2] {
         let base = request.gain * self.master * self.volumes[request.category as usize];
         let (pan, attenuation) = if let Some(position) = request.position {
-            let delta = std::array::from_fn::<_, 3, _>(|i| {
-                (position[i] - self.listener.position[i]) as f32
-            });
-            let distance = libm::sqrtf(delta.iter().map(|v| v * v).sum());
-            let pan = if distance < 0.0001 {
-                0.0
-            } else {
-                delta
-                    .iter()
-                    .zip(self.listener.right)
-                    .map(|(a, b)| a * b)
-                    .sum::<f32>()
-                    / distance
-            };
-            (
-                pan.clamp(-1.0, 1.0),
-                (1.0 - distance / request.range).clamp(0.0, 1.0),
-            )
+            spatial_parameters(self.listener, position, request.range)
         } else {
             (0.0, 1.0)
         };
@@ -370,6 +395,16 @@ impl Mixer {
             slot: slot as u8,
             generation,
         })
+    }
+    pub fn stop_emitter(&mut self, emitter: EmitterId) -> usize {
+        let mut count = 0;
+        for voice in self.voices[..self.voice_limit].iter_mut().flatten() {
+            if voice.request.emitter == emitter {
+                voice.stopping = 128;
+                count += 1;
+            }
+        }
+        count
     }
     pub fn stop(&mut self, handle: VoiceHandle) -> bool {
         if let Some(voice) = self

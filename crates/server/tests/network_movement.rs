@@ -11,7 +11,7 @@ use net::{
 };
 use server::transport::Runtime;
 use server::{Server, ServerConfig};
-use sim::{GameMode, Keys, Player};
+use sim::{Keys, Player, prediction::PredictionState};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -104,17 +104,6 @@ fn keys(bits: u8) -> Keys {
         sprint: bits & InputFrame::SPRINT != 0,
     }
 }
-fn predictor(state: PlayerState, flying: bool) -> Player {
-    let mut player = Player::new(state.position);
-    player.vel = state.velocity;
-    player.yaw = state.yaw;
-    player.pitch = state.pitch;
-    player.health = state.health;
-    player.on_ground = state.on_ground;
-    player.set_mode(GameMode::Survival);
-    player.set_flight(flying).unwrap();
-    player
-}
 
 struct Bot {
     socket: UdpSocket,
@@ -127,6 +116,9 @@ struct Bot {
     flight_sent: bool,
     flight_accepted: bool,
     state: Option<(Tick, PlayerState)>,
+    exact_state: Option<(Tick, PredictionState)>,
+    terminal: Option<(Tick, Player)>,
+    terminal_checks: usize,
     history: Vec<InputFrame>,
     predicted: Option<Player>,
     predictions: BTreeMap<u64, [f64; 3]>,
@@ -171,6 +163,9 @@ impl Bot {
             flight_sent: false,
             flight_accepted: !flying,
             state: None,
+            exact_state: None,
+            terminal: None,
+            terminal_checks: 0,
             history: Vec::new(),
             predicted: None,
             predictions: BTreeMap::new(),
@@ -214,6 +209,42 @@ impl Bot {
                     Limits::default(),
                 ));
                 self.state = Some((welcome.tick, welcome.player));
+            }
+            ServerMessage::Prediction {
+                tick,
+                player,
+                continuation,
+            } => {
+                let state = PredictionState::decode(&continuation).unwrap();
+                let decoded = state.to_player().unwrap();
+                assert_eq!(decoded.pos, player.position);
+                assert_eq!(decoded.vel, player.velocity);
+                if self.exact_state.is_none_or(|(previous, _)| tick > previous) {
+                    self.exact_state = Some((tick, state));
+                }
+                // Sequence-only inputs have no promised application tick. Once
+                // every input is consumed, validate subsequent authority ticks
+                // against an independent neutral continuation instead of
+                // comparing a repeated ACK with an earlier input's pose.
+                if player.input_sequence == INPUTS {
+                    if let Some((previous, mut predicted)) = self.terminal.take() {
+                        if tick > previous {
+                            for _ in previous.0..tick.0 {
+                                predicted.tick(&flat_query, Keys::default());
+                            }
+                            assert_eq!(
+                                PredictionState::capture(&predicted).unwrap(),
+                                state,
+                                "neutral convergence after the final consumed input at {tick:?}"
+                            );
+                            self.terminal_checks += 1;
+                        } else {
+                            self.terminal = Some((previous, predicted));
+                            return;
+                        }
+                    }
+                    self.terminal = Some((tick, decoded));
+                }
             }
             ServerMessage::State { tick, player } => {
                 self.state_frames += 1;
@@ -301,9 +332,9 @@ impl Bot {
             pitch: 0.0,
         };
         if self.predicted.is_none() {
-            let (tick, state) = self.state.expect("joined state");
+            let (tick, state) = self.exact_state.expect("exact joined continuation");
             self.prediction_tick = tick.0;
-            self.predicted = Some(predictor(state, self.flying));
+            self.predicted = Some(state.to_player().unwrap());
         }
         let predicted = self.predicted.as_mut().unwrap();
         if target > 0 {
@@ -394,13 +425,16 @@ fn packet_reordered(packet: &[u8], previous: &mut u64) -> bool {
 
 #[test]
 fn walk_and_flight_authority_consume_each_input_once_through_real_delayed_udp() {
-    run_movement(false);
+    run_movement(false, false);
 }
 #[test]
 fn scheduled_inputs_match_shared_simulation_at_authoritative_ticks() {
-    run_movement(true);
+    // Repeat the exact tick oracle under different host scheduling. Network
+    // jitter/loss and authority tick durations remain unchanged in both runs.
+    run_movement(true, false);
+    run_movement(true, true);
 }
-fn run_movement(scheduled: bool) {
+fn run_movement(scheduled: bool, host_delays: bool) {
     let directory = Directory::new();
     let server = Server::open_with_world(directory.config(), flat()).unwrap();
     let mut runtime = Runtime::bind(server, local(), local()).unwrap();
@@ -424,9 +458,13 @@ fn run_movement(scheduled: bool) {
             bot.step(now);
         }
         if next_input.is_none()
-            && bots
-                .iter()
-                .all(|bot| bot.channel.is_some() && bot.flight_accepted)
+            && bots.iter().all(|bot| {
+                bot.channel.is_some()
+                    && bot.flight_accepted
+                    && bot
+                        .exact_state
+                        .is_some_and(|(_, state)| state.to_player().unwrap().flying == bot.flying)
+            })
         {
             next_input = Some(now + 50);
             if scheduled {
@@ -446,7 +484,10 @@ fn run_movement(scheduled: bool) {
                     now,
                 );
             }
-            next_input = Some(now + 50);
+            // A client scheduling hiccup creates neutral authority ticks in
+            // legacy mode. It makes the old sequence/pose oracle's ambiguity
+            // deterministic while retaining the exact network profile.
+            next_input = Some(now + if !scheduled && sent == 24 { 250 } else { 50 });
         }
         // Continue the redundant tail until both ACKs arrive; the final input
         // packet itself may have been one of the2% discarded packets.
@@ -475,7 +516,11 @@ fn run_movement(scheduled: bool) {
         }
         // The worker performs real fsync. Yield bounded real time so virtual
         // network time does not starve it or turn scheduling speed into a test.
-        thread::sleep(Duration::from_micros(500));
+        thread::sleep(if host_delays && now % 85 == 0 {
+            Duration::from_millis(3)
+        } else {
+            Duration::from_micros(500)
+        });
     }
     let now = finished_at.expect("both bots acknowledged80input sequences within30s virtual time");
     let counters = runtime.server().counters();
@@ -507,12 +552,22 @@ fn run_movement(scheduled: bool) {
         assert_eq!(bot.maximum_ack, INPUTS);
         assert_eq!(bot.predictions.len(), INPUTS as usize);
         assert!(bot.checked_predictions.len() > 60);
-        assert_eq!(
-            bot.corrections, 0,
-            "fixed profile trace requires no sequenced position correction"
+        assert!(
+            bot.terminal_checks >= 5,
+            "independent idle convergence checks"
         );
-        assert_eq!(bot.maximum_prediction_error, 0.0);
+        if !scheduled {
+            assert!(
+                bot.corrections > 0,
+                "legacy client hiccup exercises correction reporting"
+            );
+        }
         if scheduled {
+            assert_eq!(
+                bot.corrections, 0,
+                "scheduled input pose is compared only at its exact authority tick"
+            );
+            assert_eq!(bot.maximum_prediction_error, 0.0);
             assert!(bot.scheduled_checked > 60);
             assert_eq!(
                 bot.scheduled_corrections, 0,
@@ -525,7 +580,7 @@ fn run_movement(scheduled: bool) {
     let reordered: u64 = bots.iter().map(|bot| bot.reordered_packets).sum();
     assert!(reordered > 0, "jitter actually reordered datagrams");
     eprintln!(
-        "movement UDP scheduled={scheduled} bots=2 inputs_per_bot={INPUTS} virtual_ms={now} profile=75+/-20ms/2%loss lost={lost} reordered={reordered} input_steps={} owner_ticks={} traffic_in={} traffic_out={} queue_overflows={} seq_prediction_corrections=[{},{}] max_prediction_error=[{:.6},{:.6}] scheduled_tick_checks=[{},{}] scheduled_tick_corrections=[{},{}]",
+        "movement UDP scheduled={scheduled} host_delays={host_delays} bots=2 inputs_per_bot={INPUTS} virtual_ms={now} profile=75+/-20ms/2%loss lost={lost} reordered={reordered} input_steps={} owner_ticks={} traffic_in={} traffic_out={} queue_overflows={} seq_prediction_corrections=[{},{}] max_prediction_error=[{:.6},{:.6}] scheduled_tick_checks=[{},{}] scheduled_tick_corrections=[{},{}]",
         counters.input_steps,
         counters.ticks,
         transport.received_bytes,

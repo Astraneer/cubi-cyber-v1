@@ -80,6 +80,7 @@ fn frame(
         .encode_frame(&gpu.queue, &mut encoder, &view, camera, mode)
         .unwrap();
     assert_eq!(work.passes, renderer.frame_graph().count);
+    renderer.encode_final_depth_coverage(&mut encoder);
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &output,
@@ -203,6 +204,57 @@ fn conservative_depth(
             line[..width as usize * 4]
                 .chunks_exact(4)
                 .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        })
+        .collect();
+    drop(mapped);
+    buffer.unmap();
+    result
+}
+
+fn colour_coverage(gpu: &render::Gpu, renderer: &TerrainGpu, width: u32, height: u32) -> Vec<u16> {
+    let row = (width * 8).div_ceil(256) * 256;
+    let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("independent final color geometry coverage"),
+        size: u64::from(row) * u64::from(height),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: renderer.resolved_hdr_texture(),
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    gpu.queue.submit([encoder.finish()]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
+    gpu.device.poll(wgpu::PollType::Wait).unwrap();
+    rx.recv().unwrap().unwrap();
+    let mapped = buffer.slice(..).get_mapped_range();
+    let result = mapped
+        .chunks_exact(row as usize)
+        .flat_map(|line| {
+            line[..width as usize * 8]
+                .chunks_exact(8)
+                .map(|pixel| u16::from_le_bytes([pixel[6], pixel[7]]))
         })
         .collect();
     drop(mapped);
@@ -757,6 +809,7 @@ fn edit_mask_overlay_has_no_coverage_holes_and_final_mesh_is_bitwise_exact() {
             145,
         );
         let canonical_depth = conservative_depth(&gpu, &reference, 193, 145);
+        let canonical_colour = colour_coverage(&gpu, &reference, 193, 145);
         let old_max = canonical
             .iter()
             .zip(&before)
@@ -961,6 +1014,16 @@ fn edit_mask_overlay_has_no_coverage_holes_and_final_mesh_is_bitwise_exact() {
             "inactive fixed slots reached the indirect draw"
         );
         let fixed_depth = conservative_depth(&gpu, &fixed, 193, 145);
+        let fixed_colour = colour_coverage(&gpu, &fixed, 193, 145);
+        assert_eq!(
+            canonical_colour
+                .iter()
+                .zip(&fixed_colour)
+                .filter(|(expected, actual)| **expected == 0x3c00 && **actual < 0x3c00)
+                .count(),
+            0,
+            "final color pass exposed sky despite covered prepass depth"
+        );
         assert_eq!(
             canonical_depth
                 .iter()
@@ -1001,6 +1064,17 @@ fn edit_mask_overlay_has_no_coverage_holes_and_final_mesh_is_bitwise_exact() {
                 145,
             );
             let expected_depth = conservative_depth(&gpu, &reference, 193, 145);
+            let actual_colour = colour_coverage(&gpu, &fixed, 193, 145);
+            let expected_colour = colour_coverage(&gpu, &reference, 193, 145);
+            assert_eq!(
+                expected_colour
+                    .iter()
+                    .zip(&actual_colour)
+                    .filter(|(expected, actual)| **expected == 0x3c00 && **actual < 0x3c00)
+                    .count(),
+                0,
+                "distant color pass exposed sky at {eye:?}"
+            );
             assert_eq!(
                 expected_depth
                     .iter()
@@ -1282,6 +1356,16 @@ fn edit_mask_overlay_has_no_coverage_holes_and_final_mesh_is_bitwise_exact() {
                 .unwrap();
             let mean = flip_mean(193, 145, &canonical, &actual);
             let actual_depth = conservative_depth(&gpu, &renderer, 193, 145);
+            let actual_colour = colour_coverage(&gpu, &renderer, 193, 145);
+            assert_eq!(
+                canonical_colour
+                    .iter()
+                    .zip(&actual_colour)
+                    .filter(|(expected, actual)| **expected == 0x3c00 && **actual < 0x3c00)
+                    .count(),
+                0,
+                "legacy color pass exposed sky at frame{frame_index}"
+            );
             let holes = canonical_depth
                 .iter()
                 .zip(&actual_depth)
@@ -2011,6 +2095,268 @@ fn sixty_four_pages_complete_one_thousand_incremental_edits_with_bounded_uploads
             "H1_GPU_LOAD_OK resident_pages=64 edits={edits} logical_seconds={} capture_workers=2 submitted_edit_frames={frames} completed_edit_frames={completed_frames} owner_response_completed_frames=1 delayed_full_frames=12 rebases={rebases} peak_patch_pages={peak_overlays} reserved_patch_bytes={} arena_bytes=67108864 visibility_bytes=100663296 upload_total_bytes={upload_total} max_frame_upload_bytes={maximum_upload} frame_upload_limit_bytes=2097152 final_bitwise=true final_coverage_bitwise=true",
             f32::from(frames) / 60.0,
             64 * 24576 * 16
+        );
+    });
+}
+
+#[test]
+fn textured_floor_edit_at_runtime_camera_has_no_color_coverage_cracks() {
+    pollster::block_on(async {
+        use render::terrain_mesh::{MeshClass, OwnerPatch};
+        let instance = render::instance();
+        let gpu = render::Gpu::request(&instance, None, true)
+            .await
+            .expect("software Vulkan required");
+        let atlas = AtlasImage::donor().unwrap();
+        let make = || {
+            TerrainGpu::new(
+                &gpu.device,
+                &gpu.queue,
+                wgpu::TextureFormat::Rgba8Unorm,
+                780,
+                437,
+                OutputTransfer::ShaderSrgb,
+                GpuConfig {
+                    max_pages: 32,
+                    max_quads: 262_144,
+                    occlusion: true,
+                },
+                &atlas,
+            )
+            .unwrap()
+        };
+        let mut actual = make();
+        let mut reference = make();
+        let mut budget = UploadBudget::new(4_000_000);
+        let classify = |raw| match raw {
+            0 => CellMaterial::EMPTY,
+            1 => CellMaterial {
+                face_materials: [2, 0, 1, 1, 1, 1],
+                tint: 0xff70_c080,
+                tint_faces: 1 << 1,
+                ..CellMaterial::opaque(0)
+            },
+            _ => CellMaterial::opaque(2),
+        };
+        let mut halo = PageHalo::filled(0);
+        for y in -1..=16 {
+            for z in -1..=16 {
+                for x in -1..=16 {
+                    halo.set(
+                        x,
+                        y,
+                        z,
+                        if y < 8 {
+                            2
+                        } else if y == 8 {
+                            1
+                        } else {
+                            0
+                        },
+                    );
+                }
+            }
+        }
+        let mut scratch = MeshScratch::new();
+        let mut old = PageMesh::default();
+        mesh_page(&halo, classify, &mut scratch, &mut old);
+        assert_eq!(old.quad_count(), 1);
+        let mut base = None;
+        let mut resident = Vec::new();
+        for z in 5..=7 {
+            for x in 5..=7 {
+                let model = translation([x as f32 * 16.0, 64.0, z as f32 * 16.0]);
+                let handle = actual
+                    .upload_page(&gpu.queue, None, 1, model, &old, &mut budget)
+                    .unwrap();
+                resident.push((x, z, handle));
+                if x == 5 && z == 5 {
+                    base = Some(handle);
+                } else {
+                    reference
+                        .upload_page(&gpu.queue, None, 1, model, &old, &mut budget)
+                        .unwrap();
+                }
+            }
+        }
+        let base_handle = base.unwrap();
+        let east = resident
+            .iter()
+            .find(|(x, z, _)| *x == 6 && *z == 5)
+            .unwrap()
+            .2;
+        let south = resident
+            .iter()
+            .find(|(x, z, _)| *x == 5 && *z == 6)
+            .unwrap()
+            .2;
+        let neighbors = [None, None, None, Some(south), None, Some(east)];
+        assert_eq!(
+            actual
+                .set_page_neighbors(&gpu.queue, base_handle, neighbors, &mut budget)
+                .unwrap(),
+            56
+        );
+        assert_eq!(
+            actual
+                .set_page_neighbors(
+                    &gpu.queue,
+                    base_handle,
+                    neighbors,
+                    &mut UploadBudget::new(0)
+                )
+                .unwrap(),
+            0
+        );
+        let mut denied = neighbors;
+        denied[3] = None;
+        assert_eq!(
+            actual.set_page_neighbors(&gpu.queue, base_handle, denied, &mut UploadBudget::new(0)),
+            Err(render::terrain_gpu::TerrainError::UploadBudget)
+        );
+        let mut stale = neighbors;
+        stale[5] = Some(render::terrain_gpu::PageHandle {
+            slot: east.slot,
+            generation: east.generation + 1,
+        });
+        assert_eq!(
+            actual.set_page_neighbors(&gpu.queue, base_handle, stale, &mut budget),
+            Err(render::terrain_gpu::TerrainError::StaleHandle)
+        );
+        let yaw = f64::from(-135.0f32 * (std::f32::consts::PI / 180.0));
+        let pitch = f64::from(33.0f32 * (std::f32::consts::PI / 180.0));
+        let eye64 = [96.5, 73.0 + f64::from(1.62f32), 96.5];
+        let look = [
+            yaw.sin() * pitch.cos(),
+            -pitch.sin(),
+            yaw.cos() * pitch.cos(),
+        ];
+        let camera = Camera::perspective(
+            eye64.map(|v| v as f32),
+            std::array::from_fn(|axis| (eye64[axis] + look[axis]) as f32),
+            [0.0, 1.0, 0.0],
+            70f32.to_radians(),
+            780.0 / 437.0,
+            0.05,
+            2048.0,
+        );
+        let (before, _) = frame(
+            &gpu,
+            &mut actual,
+            &camera,
+            CullingMode::FrustumAndHiZ,
+            780,
+            437,
+        );
+        halo.set(14, 8, 14, 0);
+        let mut full = PageMesh::default();
+        mesh_page(&halo, classify, &mut scratch, &mut full);
+        reference
+            .upload_page(
+                &gpu.queue,
+                None,
+                2,
+                translation([80.0, 64.0, 80.0]),
+                &full,
+                &mut budget,
+            )
+            .unwrap();
+        let (canonical, _) = frame(
+            &gpu,
+            &mut reference,
+            &camera,
+            CullingMode::FrustumAndHiZ,
+            780,
+            437,
+        );
+        let expected_coverage = colour_coverage(&gpu, &reference, 780, 437);
+        let mut mask = [0u32; 128];
+        let mut updates = Vec::with_capacity(27);
+        let mut owner_mesh = PageMesh::with_capacity([6; 3]);
+        for y in 7..=9u8 {
+            for z in 13..=15u8 {
+                for x in 13..=15u8 {
+                    let owner = u16::from(x) + 16 * u16::from(z) + 256 * u16::from(y);
+                    mask[usize::from(owner) / 32] |= 1u32 << (owner % 32);
+                    render::terrain_mesh::mesh_cell_patch(
+                        &[[x, y, z]],
+                        |p| classify(halo.get(p[0], p[1], p[2])),
+                        &mut owner_mesh,
+                    )
+                    .unwrap();
+                    updates.push(OwnerPatch::from_mesh(owner, &owner_mesh).unwrap());
+                }
+            }
+        }
+        assert!(
+            updates
+                .iter()
+                .any(|patch| patch.classes.iter().any(|class| *class != MeshClass::Empty))
+        );
+        actual
+            .publish_owner_patches(
+                &gpu.queue,
+                base.unwrap(),
+                None,
+                2,
+                translation([80.0, 64.0, 80.0]),
+                &mask,
+                &updates,
+                &mut budget,
+            )
+            .unwrap();
+        let (fast, _) = frame(
+            &gpu,
+            &mut actual,
+            &camera,
+            CullingMode::FrustumAndHiZ,
+            780,
+            437,
+        );
+        let fast_coverage = colour_coverage(&gpu, &actual, 780, 437);
+        let holes = expected_coverage
+            .iter()
+            .zip(&fast_coverage)
+            .filter(|(expected, actual)| **expected == 0x3c00 && **actual < 0x3c00)
+            .count();
+        let mean = flip_mean(780, 437, &canonical, &fast);
+        let negative = flip_mean(780, 437, &canonical, &before);
+        let differing = fast
+            .chunks_exact(4)
+            .zip(canonical.chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        let maximum = fast
+            .iter()
+            .zip(&canonical)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        let artifacts =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        save_rgba(&artifacts.join("h1-textured-fast.png"), 780, 437, &fast);
+        save_rgba(
+            &artifacts.join("h1-textured-canonical.png"),
+            780,
+            437,
+            &canonical,
+        );
+        save_rgba(&artifacts.join("h1-textured-before.png"), 780, 437, &before);
+        println!(
+            "H1_TEXTURED_RUNTIME_GPU holes={holes} differing_pixels={differing} max_delta={maximum} FLIP_mean={mean:.9} old_negative_FLIP={negative:.9}"
+        );
+        assert_eq!(
+            holes, 0,
+            "runtime-perspective textured floor lost covered color samples"
+        );
+        assert!(
+            mean <= 0.001,
+            "runtime-perspective FLIP {mean} exceeds .001"
+        );
+        assert!(
+            negative > mean + 0.001,
+            "old-floor negative control escaped perceptual rejection"
         );
     });
 }
