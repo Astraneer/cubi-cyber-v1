@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Every check here is required for the local M0 acceptance run.
+# Required local acceptance checks for the implemented stages.
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$root/tools/env.sh"
@@ -13,15 +13,28 @@ if [[ -z "${VK_ICD_FILENAMES:-}" ]]; then
   done
 fi
 export WGPU_BACKEND=vulkan
-cargo fmt --all -- --check
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace
-python3 -m unittest discover -s tools -p 'test_*.py'
-bash tools/native_smoke.sh
-bash tools/build_web.sh
-bash tools/check_determinism.sh
-node crates/jobs/tests/browser_smoke.mjs
-node tools/web_smoke.mjs
+run_check() {
+  local cubi_label="$1"
+  shift
+  if "$@"; then
+    printf 'ACCEPTANCE_OK %s\n' "$cubi_label"
+  else
+    local cubi_status=$?
+    # These labels are fixed strings, never command arguments or secret values.
+    # The public Actions annotation is readable even when API logs are blocked.
+    printf '::error title=Acceptance gate::%s failed (exit %s)\n' "$cubi_label" "$cubi_status" >&2
+    return "$cubi_status"
+  fi
+}
+run_check 'Rust format' cargo fmt --all -- --check
+run_check 'Rust Clippy' cargo clippy --locked --workspace --all-targets -- -D warnings
+run_check 'Workspace tests' cargo test --locked --workspace
+run_check 'Python helpers' python3 -m unittest discover -s tools -p 'test_*.py'
+run_check 'Native window' bash tools/native_smoke.sh
+run_check 'Web build' bash tools/build_web.sh
+run_check 'Native/WASM determinism' bash tools/check_determinism.sh
+run_check 'Web Worker SAB/transfer' node crates/jobs/tests/browser_smoke.mjs
+run_check 'WebGPU sky pixels' node tools/web_smoke.mjs
 if ! command -v cargo-deny >/dev/null 2>&1 || [[ "$(cargo deny --version)" != 'cargo-deny 0.18.4' ]]; then
   CARGO_TARGET_DIR="$root/.local/tool-targets/cargo-deny" \
     cargo install cargo-deny --version '=0.18.4' --locked
@@ -29,4 +42,4 @@ fi
 # Run this gate after functional checks so an independent license failure does
 # not hide whether the native and browser shells actually render.
 # No arbitrary Git repositories are fetched; the policy concerns locked crates.
-cargo deny --locked check licenses bans sources
+run_check 'Dependency policy' cargo deny --locked check licenses bans sources
