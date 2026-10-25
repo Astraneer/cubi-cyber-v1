@@ -1,0 +1,17 @@
+{
+ "about": "G18 «рецепты как NEI»: инвентарь, справа — все предметы игры с поиском «слиток» (внизу панели), слева — закладки. Наведи на предмет: R — рецепт, U — применение, A — закладка; колесо над панелью — страницы.",
+ "x": 8.5,
+ "z": 8.5,
+ "yaw": 0.6,
+ "pitch": -0.2,
+ "time": 0.42,
+ "settings": {"nei_q": "слиток", "nei_bm": "steel_ingot,enrichment_chamber,crafting_table,furnace,dust_iron"},
+ "setup": [
+  "give:oak_log:12",
+  "give:oak_planks:20",
+  "give:stick:8",
+  "give:raw_iron:9",
+  "give:coal:5",
+  "inv"
+ ]
+}

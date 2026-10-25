@@ -1,0 +1,13 @@
+{
+ "about": "Tab с двумя игроками: ваш ник и бот (Bot). Сервер voxel-server --dev на 127.0.0.1:8326 и бот: cargo run -p voxel-server --bin bot -- ws://127.0.0.1:8326/ws --spawn 11,9 (рядом с камерой). Список открыт без клавиши (?tab=1).",
+ "x": 8.5,
+ "z": 8.5,
+ "yaw": 0.6,
+ "pitch": -0.1,
+ "time": 0.42,
+ "settings": {
+  "server": "ws://127.0.0.1:8326/ws",
+  "nick": "Tester",
+  "tab": 1
+ }
+}

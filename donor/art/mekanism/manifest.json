@@ -1,0 +1,2533 @@
+{
+ "version": 1,
+ "generator": "python -I tools/mek_art.py",
+ "date": "2026-10-22",
+ "style": "16×16, 1 тексель = 1 px модели; свет сверху-слева, тёмная рамка 1 px, крупные панели, мало шума — как блоки пака FamiliarCraft в web/atlas.png; значки — через tools/item_art.py (тот же Sprite и рампы)",
+ "license": "свои рисунки этого проекта; copper_ore и gold_ore — FamiliarCraft by Scout339 (CC BY-SA 4.0), как уголь и железо атласа. Ассеты Mekanism не использовались (decisions.md).",
+ "atlas_budget": {
+  "layer_limit": 256,
+  "used_now": 89,
+  "mekanism_M": 84,
+  "mekanism_second_queue": 12,
+  "of_which_extra_frames": 25,
+  "after_M": 173,
+  "after_all": 185,
+  "free_after_all": 71,
+  "aspect_estimate": "≈85–95 (MEK-13/14 §24.1) — совпадает"
+ },
+ "economy": [
+  {
+   "what": "cable_energy: 8 кадров → 1 слой со сдвигом UV по v во времени (шейдер вставок)",
+   "saves": 7
+  },
+  {
+   "what": "crusher_side_active: бок дробилки в работе = обычный бок (как у остальных камер)",
+   "saves": 4
+  },
+  {
+   "what": "лица в работе 6 → 4 кадра (камера, дробилка, плавильня): чуть дёрганее",
+   "saves": 6
+  },
+  {
+   "what": "transporter_glass_side + _center → один слой (центр и бок — области одного рисунка)",
+   "saves": 1
+  },
+  {
+   "what": "cube_led → область mek_port_led (то же мятное свечение)",
+   "saves": 1
+  },
+  {
+   "what": "блоки металлов и сырья — второй очередью (decisions)",
+   "saves": 12
+  },
+  {
+   "what": "smelter_bottom_active и purification_side_active — свечение маской emissive вместо отдельного слоя (нужен канал свечения в material.png или emissive-текстура)",
+   "saves": 2
+  }
+ ],
+ "embedding": [
+  "Слои дописываются в конец web/atlas.png в порядке layers (atlas_strip.png — готовая полоса); номера L_* — с ATLAS_USED (89) по порядку; кадры анимации — подряд, первый кадр = номер слоя анимации.",
+  "material_strip.png — в формате web/material.png для этих слоёв: первые len — карты A, следующие len — карты B. tools/material.py пересчитывает материалы по имени слоя; для Mekanism лучше брать готовые material/*.png (металл и шероховатость здесь по пикселям рисунка).",
+  "Анимации лиц — таблица в шейдере: (первый слой, кадров, тиков на кадр, режим loop/pingpong).",
+  "emissive/*.png — маски пикселей полной яркости (лампы, огонь, порты). В текущем формате вершины/материала канала свечения нет: либо свечение грани целиком (glow в models.json), либо добавить канал.",
+  "Модели — models.json (формат cubi-model-1): кубоиды в 1/16, UV по вершинам, glow — блочный свет 15 в вершине.",
+  "Передатчики: на каждую сторону — одна часть по режиму (none/normal/push/pull), правило прямого участка; вставки энергии/газа — буфер вставок (MEK-02 §14.7), альфа × свечение сети.",
+  "Значки: items_strip.png и items/*.png дописываются в web/items.png; имена — в manifest.items (порядок)."
+ ],
+ "layers": [
+  {
+   "name": "osmium_ore",
+   "files": [
+    "blocks/osmium_ore.png"
+   ],
+   "material": [
+    "material/osmium_ore.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "руда осмия",
+   "group": "руды",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.67,
+    "metal": 0.06,
+    "subsurface": 0.0,
+    "normal_strength": 1.3
+   }
+  },
+  {
+   "name": "tin_ore",
+   "files": [
+    "blocks/tin_ore.png"
+   ],
+   "material": [
+    "material/tin_ore.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "руда олова",
+   "group": "руды",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.67,
+    "metal": 0.05,
+    "subsurface": 0.0,
+    "normal_strength": 1.3
+   }
+  },
+  {
+   "name": "copper_ore",
+   "files": [
+    "blocks/copper_ore.png"
+   ],
+   "material": [
+    "material/copper_ore.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "руда меди (ваниль)",
+   "group": "руды",
+   "priority": "M",
+   "source": "FamiliarCraft by Scout339 (CC BY-SA 4.0), как coal_ore/iron_ore в tools/art_blocks.py",
+   "pbr": {
+    "roughness": 0.72,
+    "metal": 0.0,
+    "subsurface": 0.0,
+    "normal_strength": 1.3
+   }
+  },
+  {
+   "name": "gold_ore",
+   "files": [
+    "blocks/gold_ore.png"
+   ],
+   "material": [
+    "material/gold_ore.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "руда золота (ваниль)",
+   "group": "руды",
+   "priority": "M",
+   "source": "FamiliarCraft by Scout339 (CC BY-SA 4.0), как coal_ore/iron_ore в tools/art_blocks.py",
+   "pbr": {
+    "roughness": 0.72,
+    "metal": 0.0,
+    "subsurface": 0.0,
+    "normal_strength": 1.3
+   }
+  },
+  {
+   "name": "redstone_ore",
+   "files": [
+    "blocks/redstone_ore.png"
+   ],
+   "material": [
+    "material/redstone_ore.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "руда редстоуна (ваниль; «горит» — тот же слой + свет 9)",
+   "group": "руды",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.66,
+    "metal": 0.05,
+    "subsurface": 0.0,
+    "normal_strength": 1.3
+   },
+   "emissive": [
+    "emissive/redstone_ore.png"
+   ]
+  },
+  {
+   "name": "steel_casing",
+   "files": [
+    "blocks/steel_casing.png"
+   ],
+   "material": [
+    "material/steel_casing.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "стальной корпус",
+   "group": "строительные",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.46,
+    "metal": 0.33,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   }
+  },
+  {
+   "name": "mek_casing_side",
+   "files": [
+    "blocks/mek_casing_side.png"
+   ],
+   "material": [
+    "material/mek_casing_side.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "бока камер, дробилки, плавильни, очистителя; бока моделей",
+   "group": "кожа машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.47,
+    "metal": 0.36,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   }
+  },
+  {
+   "name": "mek_casing_top",
+   "files": [
+    "blocks/mek_casing_top.png"
+   ],
+   "material": [
+    "material/mek_casing_top.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "верх машин",
+   "group": "кожа машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.5,
+    "metal": 0.4,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   }
+  },
+  {
+   "name": "mek_casing_bottom",
+   "files": [
+    "blocks/mek_casing_bottom.png"
+   ],
+   "material": [
+    "material/mek_casing_bottom.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "низ машин",
+   "group": "кожа машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.6,
+    "metal": 0.2,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   }
+  },
+  {
+   "name": "mek_casing_back",
+   "files": [
+    "blocks/mek_casing_back.png"
+   ],
+   "material": [
+    "material/mek_casing_back.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "зад машин — порт энергии",
+   "group": "кожа машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.49,
+    "metal": 0.4,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "emissive": [
+    "emissive/mek_casing_back.png"
+   ]
+  },
+  {
+   "name": "enrichment_front",
+   "files": [
+    "blocks/enrichment_front.png"
+   ],
+   "material": [
+    "material/enrichment_front.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "обогатительная камера: лицо",
+   "group": "камеры",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.46,
+    "metal": 0.43,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   }
+  },
+  {
+   "name": "enrichment_front_active",
+   "files": [
+    "blocks/enrichment_front_active_f00.png",
+    "blocks/enrichment_front_active_f01.png",
+    "blocks/enrichment_front_active_f02.png",
+    "blocks/enrichment_front_active_f03.png",
+    "blocks/enrichment_front_active_f04.png",
+    "blocks/enrichment_front_active_f05.png"
+   ],
+   "material": [
+    "material/enrichment_front_active_f00.png",
+    "material/enrichment_front_active_f01.png",
+    "material/enrichment_front_active_f02.png",
+    "material/enrichment_front_active_f03.png",
+    "material/enrichment_front_active_f04.png",
+    "material/enrichment_front_active_f05.png"
+   ],
+   "frames": 6,
+   "layers": 6,
+   "for": "обогатительная камера: лицо, работает",
+   "group": "камеры",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.46,
+    "metal": 0.43,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "animation": {
+    "ticks_per_frame": 3,
+    "mode": "loop",
+    "sequence": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ],
+    "cycle_ticks": 18
+   },
+   "emissive": [
+    "emissive/enrichment_front_active_f00.png",
+    "emissive/enrichment_front_active_f01.png",
+    "emissive/enrichment_front_active_f02.png",
+    "emissive/enrichment_front_active_f03.png",
+    "emissive/enrichment_front_active_f04.png",
+    "emissive/enrichment_front_active_f05.png"
+   ]
+  },
+  {
+   "name": "crusher_front",
+   "files": [
+    "blocks/crusher_front.png"
+   ],
+   "material": [
+    "material/crusher_front.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "дробилка: лицо",
+   "group": "камеры",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.45,
+    "metal": 0.34,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   }
+  },
+  {
+   "name": "crusher_front_active",
+   "files": [
+    "blocks/crusher_front_active_f00.png",
+    "blocks/crusher_front_active_f01.png",
+    "blocks/crusher_front_active_f02.png",
+    "blocks/crusher_front_active_f03.png",
+    "blocks/crusher_front_active_f04.png",
+    "blocks/crusher_front_active_f05.png"
+   ],
+   "material": [
+    "material/crusher_front_active_f00.png",
+    "material/crusher_front_active_f01.png",
+    "material/crusher_front_active_f02.png",
+    "material/crusher_front_active_f03.png",
+    "material/crusher_front_active_f04.png",
+    "material/crusher_front_active_f05.png"
+   ],
+   "frames": 6,
+   "layers": 6,
+   "for": "дробилка: лицо, работает (пресс ходит)",
+   "group": "камеры",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.45,
+    "metal": 0.34,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "animation": {
+    "ticks_per_frame": 2,
+    "mode": "pingpong",
+    "sequence": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5,
+     4,
+     3,
+     2,
+     1
+    ],
+    "cycle_ticks": 20
+   },
+   "emissive": [
+    "emissive/crusher_front_active_f00.png",
+    "emissive/crusher_front_active_f01.png",
+    "emissive/crusher_front_active_f02.png",
+    "emissive/crusher_front_active_f03.png",
+    "emissive/crusher_front_active_f04.png",
+    "emissive/crusher_front_active_f05.png"
+   ]
+  },
+  {
+   "name": "crusher_side_active",
+   "files": [
+    "blocks/crusher_side_active_f00.png",
+    "blocks/crusher_side_active_f01.png",
+    "blocks/crusher_side_active_f02.png",
+    "blocks/crusher_side_active_f03.png"
+   ],
+   "material": [
+    "material/crusher_side_active_f00.png",
+    "material/crusher_side_active_f01.png",
+    "material/crusher_side_active_f02.png",
+    "material/crusher_side_active_f03.png"
+   ],
+   "frames": 4,
+   "layers": 4,
+   "for": "дробилка: бока, работает (маховик в щелях)",
+   "group": "камеры",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.47,
+    "metal": 0.36,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "animation": {
+    "ticks_per_frame": 2,
+    "mode": "loop",
+    "sequence": [
+     0,
+     1,
+     2,
+     3
+    ],
+    "cycle_ticks": 8
+   },
+   "emissive": [
+    "emissive/crusher_side_active_f00.png",
+    "emissive/crusher_side_active_f01.png",
+    "emissive/crusher_side_active_f02.png",
+    "emissive/crusher_side_active_f03.png"
+   ]
+  },
+  {
+   "name": "smelter_front",
+   "files": [
+    "blocks/smelter_front.png"
+   ],
+   "material": [
+    "material/smelter_front.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "плавильня: лицо",
+   "group": "камеры",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.46,
+    "metal": 0.38,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   }
+  },
+  {
+   "name": "smelter_front_active",
+   "files": [
+    "blocks/smelter_front_active_f00.png",
+    "blocks/smelter_front_active_f01.png",
+    "blocks/smelter_front_active_f02.png",
+    "blocks/smelter_front_active_f03.png",
+    "blocks/smelter_front_active_f04.png",
+    "blocks/smelter_front_active_f05.png"
+   ],
+   "material": [
+    "material/smelter_front_active_f00.png",
+    "material/smelter_front_active_f01.png",
+    "material/smelter_front_active_f02.png",
+    "material/smelter_front_active_f03.png",
+    "material/smelter_front_active_f04.png",
+    "material/smelter_front_active_f05.png"
+   ],
+   "frames": 6,
+   "layers": 6,
+   "for": "плавильня: лицо, работает (огонь)",
+   "group": "камеры",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.46,
+    "metal": 0.38,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "animation": {
+    "ticks_per_frame": 2,
+    "mode": "loop",
+    "sequence": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ],
+    "cycle_ticks": 12
+   },
+   "emissive": [
+    "emissive/smelter_front_active_f00.png",
+    "emissive/smelter_front_active_f01.png",
+    "emissive/smelter_front_active_f02.png",
+    "emissive/smelter_front_active_f03.png",
+    "emissive/smelter_front_active_f04.png",
+    "emissive/smelter_front_active_f05.png"
+   ]
+  },
+  {
+   "name": "smelter_bottom_active",
+   "files": [
+    "blocks/smelter_bottom_active.png"
+   ],
+   "material": [
+    "material/smelter_bottom_active.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "плавильня: низ, работает (спираль)",
+   "group": "камеры",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.55,
+    "metal": 0.16,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "emissive": [
+    "emissive/smelter_bottom_active.png"
+   ]
+  },
+  {
+   "name": "purification_front",
+   "files": [
+    "blocks/purification_front.png"
+   ],
+   "material": [
+    "material/purification_front.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "очистительная камера: лицо",
+   "group": "камеры",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.46,
+    "metal": 0.33,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   }
+  },
+  {
+   "name": "purification_front_active",
+   "files": [
+    "blocks/purification_front_active.png"
+   ],
+   "material": [
+    "material/purification_front_active.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "очистительная камера: лицо, работает (статично)",
+   "group": "камеры",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.46,
+    "metal": 0.33,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "emissive": [
+    "emissive/purification_front_active.png"
+   ]
+  },
+  {
+   "name": "purification_side_active",
+   "files": [
+    "blocks/purification_side_active.png"
+   ],
+   "material": [
+    "material/purification_side_active.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "очистительная камера: бока и зад, работает (статично)",
+   "group": "камеры",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.47,
+    "metal": 0.36,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "emissive": [
+    "emissive/purification_side_active.png"
+   ]
+  },
+  {
+   "name": "infuser_body",
+   "files": [
+    "blocks/infuser_body.png"
+   ],
+   "material": [
+    "material/infuser_body.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "металлургический инфузор: корпус",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.49,
+    "metal": 0.41,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "regions": "Инфузор, корпус. Области: panel (0,0,16,12) — лицо задней башни к лоткам (шкала инфузии, сопла); floor (0,12,16,16) — тёмный пол основания под лотками."
+  },
+  {
+   "name": "infuser_plates",
+   "files": [
+    "blocks/infuser_plates.png"
+   ],
+   "material": [
+    "material/infuser_plates.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "металлургический инфузор: лотки",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.44,
+    "metal": 0.36,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "regions": "Инфузор, лотки. Области: top (1,0,15,9) — верх лотка с ванной инфузии; front (1,9,15,11) — передняя кромка; side (0,11,9,13) — боковая кромка; under (0,13,16,16) — низ лотка."
+  },
+  {
+   "name": "separator_body",
+   "files": [
+    "blocks/separator_body.png"
+   ],
+   "material": [
+    "material/separator_body.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "электролитический сепаратор: корпус, бак воды",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.39,
+    "metal": 0.32,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "regions": "Сепаратор, корпус и бак воды. Области: tank (1,0,15,11) — стенка бака воды со стеклом (вода, пузыри); tank_top (1,11,15,16) — крышка бака; floor (0,11,1,16) — тёмный пол основания."
+  },
+  {
+   "name": "separator_h2",
+   "files": [
+    "blocks/separator_h2.png"
+   ],
+   "material": [
+    "material/separator_h2.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "сепаратор: бак водорода",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.35,
+    "metal": 0.13,
+    "subsurface": 0.0,
+    "normal_strength": 0.8
+   },
+   "emissive": [
+    "emissive/separator_h2.png"
+   ],
+   "regions": "Баки газа сепаратора. Области: front (0,0,6,10) — лицо бака со шкалой; side (6,0,12,10) — бок; top (0,10,6,16) — крышка; cap (12,0,16,4) — запас."
+  },
+  {
+   "name": "separator_o2",
+   "files": [
+    "blocks/separator_o2.png"
+   ],
+   "material": [
+    "material/separator_o2.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "сепаратор: бак кислорода",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.35,
+    "metal": 0.13,
+    "subsurface": 0.0,
+    "normal_strength": 0.8
+   },
+   "emissive": [
+    "emissive/separator_o2.png"
+   ],
+   "regions": "Баки газа сепаратора. Области: front (0,0,6,10) — лицо бака со шкалой; side (6,0,12,10) — бок; top (0,10,6,16) — крышка; cap (12,0,16,4) — запас."
+  },
+  {
+   "name": "heatgen_body",
+   "files": [
+    "blocks/heatgen_body.png"
+   ],
+   "material": [
+    "material/heatgen_body.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "тепловой генератор: кожух",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.5,
+    "metal": 0.45,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "regions": "Тепловой генератор, кожух. Области: front (0,0,16,10) — лицо кожуха (решётки по бокам; порт — коробкой поверх); top (0,10,16,16) — верх кожуха, рёбра радиатора."
+  },
+  {
+   "name": "heatgen_drum",
+   "files": [
+    "blocks/heatgen_drum.png"
+   ],
+   "material": [
+    "material/heatgen_drum.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "тепловой генератор: барабан",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.6,
+    "metal": 0.33,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "regions": "Барабан топки (железный котёл). Области: shell (0,0,16,7) — верх/спина: обечайка с заклёпками, щель решётки; end (0,7,7,14) — торец с круглой решёткой. Активный — решётки и обод светятся (грань glow, свет 13)."
+  },
+  {
+   "name": "heatgen_drum_active",
+   "files": [
+    "blocks/heatgen_drum_active.png"
+   ],
+   "material": [
+    "material/heatgen_drum_active.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "тепловой генератор: барабан, горит (грань glow)",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.6,
+    "metal": 0.31,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "emissive": [
+    "emissive/heatgen_drum_active.png"
+   ],
+   "regions": "Барабан топки (железный котёл). Области: shell (0,0,16,7) — верх/спина: обечайка с заклёпками, щель решётки; end (0,7,7,14) — торец с круглой решёткой. Активный — решётки и обод светятся (грань glow, свет 13)."
+  },
+  {
+   "name": "wind_mast",
+   "files": [
+    "blocks/wind_mast.png"
+   ],
+   "material": [
+    "material/wind_mast.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "ветряк: мачта",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.4,
+    "metal": 0.1,
+    "subsurface": 0.0,
+    "normal_strength": 0.6
+   },
+   "regions": "Ветряк: мачта. Области: mast (3,0,13,16) — сегмент мачты (белая краска, шов сверху, тень к краям)."
+  },
+  {
+   "name": "wind_head",
+   "files": [
+    "blocks/wind_head.png"
+   ],
+   "material": [
+    "material/wind_head.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "ветряк: гондола",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.4,
+    "metal": 0.1,
+    "subsurface": 0.0,
+    "normal_strength": 0.6
+   },
+   "emissive": [
+    "emissive/wind_head.png"
+   ],
+   "regions": "Гондола. Области: side (0,0,10,7); front (0,7,7,14) — морда за ступицей; top (9,6,16,16)."
+  },
+  {
+   "name": "wind_blade",
+   "files": [
+    "blocks/wind_blade.png"
+   ],
+   "material": [
+    "material/wind_blade.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "ветряк: лопасти и ступица (инстанс)",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.35,
+    "metal": 0.0,
+    "subsurface": 0.0,
+    "normal_strength": 0.4
+   },
+   "regions": "Лопасть и ступица (инстанс). Области: inner (0,0,2,16) — корень; outer (2,0,4,16) — конец (v 0 — кончик, красная полоса); edge (4,0,5,16) — ребро; hub (6,0,10,4) — ступица; cap (6,4,8,6) — колпак."
+  },
+  {
+   "name": "cube_frame",
+   "files": [
+    "blocks/cube_frame.png"
+   ],
+   "material": [
+    "material/cube_frame.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "куб энергии: рама",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.5,
+    "metal": 0.42,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "regions": "Куб энергии, рама. Области: edge (3,0,13,3) — длинная грань ребра (u вдоль ребра); corner (0,0,3,3) — угол цвета яруса (базовый); corner_white (0,3,3,6) — белый угол для тонировки другими ярусами."
+  },
+  {
+   "name": "cube_port",
+   "files": [
+    "blocks/cube_port.png"
+   ],
+   "material": [
+    "material/cube_port.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "куб энергии: порт и перемычка",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.49,
+    "metal": 0.42,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "emissive": [
+    "emissive/cube_port.png"
+   ],
+   "regions": "Куб: порт 8×8 (u, v 4…12) и перемычка bar (3,5,13,11) за ним. Режим «выход» — грань порта светится (glow)."
+  },
+  {
+   "name": "cube_led",
+   "files": [
+    "blocks/cube_led.png"
+   ],
+   "material": [
+    "material/cube_led.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "куб энергии: светодиоды",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.3,
+    "metal": 0.0,
+    "subsurface": 0.0,
+    "normal_strength": 0.3
+   },
+   "emissive": [
+    "emissive/cube_led.png"
+   ]
+  },
+  {
+   "name": "cube_core",
+   "files": [
+    "blocks/cube_core.png"
+   ],
+   "material": [
+    "material/cube_core.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "куб энергии: ядро (инстанс, тонируется ярусом)",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.2,
+    "metal": 0.0,
+    "subsurface": 0.0,
+    "normal_strength": 0.2
+   },
+   "emissive": [
+    "emissive/cube_core.png"
+   ],
+   "alpha": "translucent",
+   "regions": "Ядро куба (инстанс, масштаб 0.4): светлый узор с альфой (× заряд), тонируется цветом яруса."
+  },
+  {
+   "name": "chemtank_body",
+   "files": [
+    "blocks/chemtank_body.png"
+   ],
+   "material": [
+    "material/chemtank_body.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "химический бак: корпус",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.5,
+    "metal": 0.28,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "emissive": [
+    "emissive/chemtank_body.png"
+   ],
+   "regions": "Химический бак, корпус. Области: wall (0,0,10,11) — стенка (полосы яруса); base (0,11,12,13) — бок основания; rim (0,13,12,14) — бок обода; gauge (10,0,14,7) — окно уровня (glow); neck (14,0,16,2)."
+  },
+  {
+   "name": "chemtank_top",
+   "files": [
+    "blocks/chemtank_top.png"
+   ],
+   "material": [
+    "material/chemtank_top.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "химический бак: верх, вентиль",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.49,
+    "metal": 0.42,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "regions": "Химический бак, верх. Области: rim_top (0,0,12,12) — обод с горловиной; valve_top (12,0,16,4) — маховик; valve_side (12,4,16,5); base_top (0,12,12,16)."
+  },
+  {
+   "name": "pump_side",
+   "files": [
+    "blocks/pump_side.png"
+   ],
+   "material": [
+    "material/pump_side.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "электрический насос: бок",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.48,
+    "metal": 0.37,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "emissive": [
+    "emissive/pump_side.png"
+   ],
+   "regions": "Насос, бок. Области: wall (1,0,15,12) — стенка корпуса (окно уровня, лампа); outlet (5,12,11,15) — бок патрубка; flange (4,15,12,16) — бок фланца."
+  },
+  {
+   "name": "pump_top",
+   "files": [
+    "blocks/pump_top.png"
+   ],
+   "material": [
+    "material/pump_top.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "электрический насос: верх с выходом",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.49,
+    "metal": 0.42,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "regions": "Насос, верх (u, v 1…15) с выходным патрубком в центре (u, v 4…12 — торец фланца)."
+  },
+  {
+   "name": "pump_bottom",
+   "files": [
+    "blocks/pump_bottom.png"
+   ],
+   "material": [
+    "material/pump_bottom.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "электрический насос: заборник",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.6,
+    "metal": 0.2,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "regions": "Насос, низ: заборная решётка."
+  },
+  {
+   "name": "mek_port",
+   "files": [
+    "blocks/mek_port.png"
+   ],
+   "material": [
+    "material/mek_port.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "порт 8×8 (сепаратор, тепловой, ветряк)",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.49,
+    "metal": 0.42,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "regions": "Порт моделей (сепаратор, тепловой генератор, ветряк): стальная плита 8×8 (u, v 4…12) с фаской, гнездо 4×4 — мятное кольцо и тёмная середина (не светится; светится светодиод коробкой mek_port_led). Торцы плиты — v 4…5."
+  },
+  {
+   "name": "mek_port_led",
+   "files": [
+    "blocks/mek_port_led.png"
+   ],
+   "material": [
+    "material/mek_port_led.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "светодиод порта (glow)",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.3,
+    "metal": 0.0,
+    "subsurface": 0.0,
+    "normal_strength": 0.3
+   },
+   "emissive": [
+    "emissive/mek_port_led.png"
+   ],
+   "regions": "Светодиод порта: мятный, полная яркость (грань glow)."
+  },
+  {
+   "name": "mek_detail",
+   "files": [
+    "blocks/mek_detail.png"
+   ],
+   "material": [
+    "material/mek_detail.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "мелкие детали моделей (трубки, маховики, стойки, шкалы)",
+   "group": "модели машин",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.48,
+    "metal": 0.45,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "emissive": [
+    "emissive/mek_detail.png"
+   ],
+   "regions": "Мелкие детали моделей. Области (u0, v0, u1, v1): pipe (0,0,16,2) — трубка вдоль u; pipe_v (0,2,2,16) — вдоль v; valve (2,2,8,8) — маховик (красный); post (8,2,10,16) — стойка; brass (10,2,16,8) — латунь; dark (2,8,8,16) — тёмная сталь; gauge (10,8,16,16) — шкала."
+  },
+  {
+   "name": "cable_side",
+   "files": [
+    "blocks/cable_side.png"
+   ],
+   "material": [
+    "material/cable_side.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "универсальный кабель: бок рукава (прорезь — вырез)",
+   "group": "передатчики",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.57,
+    "metal": 0.26,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "alpha": "cutout",
+   "regions": "Бок рукава: cols — тона стенки по столбцам окна (от края к краю), slot — прозрачные столбцы окна."
+  },
+  {
+   "name": "cable_center",
+   "files": [
+    "blocks/cable_center.png"
+   ],
+   "material": [
+    "material/cable_center.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "универсальный кабель: центр",
+   "group": "передатчики",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.59,
+    "metal": 0.33,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   }
+  },
+  {
+   "name": "cable_energy",
+   "files": [
+    "blocks/cable_energy_f00.png",
+    "blocks/cable_energy_f01.png",
+    "blocks/cable_energy_f02.png",
+    "blocks/cable_energy_f03.png",
+    "blocks/cable_energy_f04.png",
+    "blocks/cable_energy_f05.png",
+    "blocks/cable_energy_f06.png",
+    "blocks/cable_energy_f07.png"
+   ],
+   "material": [
+    "material/cable_energy_f00.png",
+    "material/cable_energy_f01.png",
+    "material/cable_energy_f02.png",
+    "material/cable_energy_f03.png",
+    "material/cable_energy_f04.png",
+    "material/cable_energy_f05.png",
+    "material/cable_energy_f06.png",
+    "material/cable_energy_f07.png"
+   ],
+   "frames": 8,
+   "layers": 8,
+   "for": "кабель: вставка энергии (полупрозрачная, полная яркость, альфа × свечение)",
+   "group": "передатчики",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.3,
+    "metal": 0.0,
+    "subsurface": 0.0,
+    "normal_strength": 0.2
+   },
+   "animation": {
+    "ticks_per_frame": 3,
+    "mode": "loop",
+    "sequence": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5,
+     6,
+     7
+    ],
+    "cycle_ticks": 24
+   },
+   "emissive": [
+    "emissive/cable_energy_f00.png",
+    "emissive/cable_energy_f01.png",
+    "emissive/cable_energy_f02.png",
+    "emissive/cable_energy_f03.png",
+    "emissive/cable_energy_f04.png",
+    "emissive/cable_energy_f05.png",
+    "emissive/cable_energy_f06.png",
+    "emissive/cable_energy_f07.png"
+   ],
+   "alpha": "translucent"
+  },
+  {
+   "name": "tube_side",
+   "files": [
+    "blocks/tube_side.png"
+   ],
+   "material": [
+    "material/tube_side.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "газовая трубка: бок (щель)",
+   "group": "передатчики",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.57,
+    "metal": 0.26,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "alpha": "cutout"
+  },
+  {
+   "name": "tube_center",
+   "files": [
+    "blocks/tube_center.png"
+   ],
+   "material": [
+    "material/tube_center.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "газовая трубка: центр (глухой, кольцо яруса)",
+   "group": "передатчики",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.59,
+    "metal": 0.33,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   }
+  },
+  {
+   "name": "gas_insert",
+   "files": [
+    "blocks/gas_insert.png"
+   ],
+   "material": [
+    "material/gas_insert.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "трубка: вставка газа (белая, тонируется цветом газа)",
+   "group": "передатчики",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.2,
+    "metal": 0.0,
+    "subsurface": 0.0,
+    "normal_strength": 0.2
+   },
+   "emissive": [
+    "emissive/gas_insert.png"
+   ],
+   "alpha": "translucent"
+  },
+  {
+   "name": "pipe_side",
+   "files": [
+    "blocks/pipe_side.png"
+   ],
+   "material": [
+    "material/pipe_side.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "механическая труба: бок (окно — вырез)",
+   "group": "передатчики",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.57,
+    "metal": 0.25,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "alpha": "cutout"
+  },
+  {
+   "name": "pipe_center",
+   "files": [
+    "blocks/pipe_center.png"
+   ],
+   "material": [
+    "material/pipe_center.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "механическая труба: центр (окно)",
+   "group": "передатчики",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.6,
+    "metal": 0.34,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "alpha": "cutout"
+  },
+  {
+   "name": "transporter_side",
+   "files": [
+    "blocks/transporter_side.png"
+   ],
+   "material": [
+    "material/transporter_side.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "логистический транспортёр: бок (щель — вырез)",
+   "group": "передатчики",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.57,
+    "metal": 0.24,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "alpha": "cutout"
+  },
+  {
+   "name": "transporter_center",
+   "files": [
+    "blocks/transporter_center.png"
+   ],
+   "material": [
+    "material/transporter_center.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "транспортёр: центр (окно 4×4 — вырез)",
+   "group": "передатчики",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.6,
+    "metal": 0.34,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "alpha": "cutout"
+  },
+  {
+   "name": "transporter_glass_side",
+   "files": [
+    "blocks/transporter_glass_side.png"
+   ],
+   "material": [
+    "material/transporter_glass_side.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "транспортёр: стекло цветной линии, бок (тонируется)",
+   "group": "передатчики",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.12,
+    "metal": 0.0,
+    "subsurface": 0.0,
+    "normal_strength": 0.4
+   },
+   "alpha": "translucent"
+  },
+  {
+   "name": "transporter_glass_center",
+   "files": [
+    "blocks/transporter_glass_center.png"
+   ],
+   "material": [
+    "material/transporter_glass_center.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "транспортёр: стекло цветной линии, центр (тонируется)",
+   "group": "передатчики",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.12,
+    "metal": 0.0,
+    "subsurface": 0.0,
+    "normal_strength": 0.4
+   },
+   "alpha": "translucent"
+  },
+  {
+   "name": "transporter_color_cube",
+   "files": [
+    "blocks/transporter_color_cube.png"
+   ],
+   "material": [
+    "material/transporter_color_cube.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "кубик цвета едущего стека 7/16 (рамка, тонируется, glow)",
+   "group": "передатчики",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.4,
+    "metal": 0.0,
+    "subsurface": 0.0,
+    "normal_strength": 0.5
+   },
+   "emissive": [
+    "emissive/transporter_color_cube.png"
+   ],
+   "alpha": "cutout"
+  },
+  {
+   "name": "transmitter_parts",
+   "files": [
+    "blocks/transmitter_parts.png"
+   ],
+   "material": [
+    "material/transmitter_parts.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "фланец PULL и сопло PUSH всех передатчиков",
+   "group": "передатчики",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.5,
+    "metal": 0.41,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "regions": "Фланец PULL и сопло PUSH (общие для 4 передатчиков). Области: flange_wall (3,0,13,2) — стенка фланца; step_wall (3,2,13,5) — стенки ступеней и сопла; ring (3,5,13,15) — торцы (по центру 10×10: внешнее кольцо стали, мятное кольцо, тёмная середина)."
+  },
+  {
+   "name": "side_overlay",
+   "files": [
+    "blocks/side_overlay.png"
+   ],
+   "material": [
+    "material/side_overlay.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "наложение режима стороны (конфигуратор), тонируется цветом режима",
+   "group": "интерфейс",
+   "priority": "M",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.5,
+    "metal": 0.0,
+    "subsurface": 0.0,
+    "normal_strength": 0.0
+   },
+   "emissive": [
+    "emissive/side_overlay.png"
+   ],
+   "alpha": "translucent"
+  },
+  {
+   "name": "osmium_block",
+   "files": [
+    "blocks/osmium_block.png"
+   ],
+   "material": [
+    "material/osmium_block.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "osmium block",
+   "group": "блоки металлов",
+   "priority": "вторая очередь (decisions: блоки металлов — во вторую очередь)",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.35,
+    "metal": 0.7,
+    "subsurface": 0.0,
+    "normal_strength": 0.9
+   }
+  },
+  {
+   "name": "tin_block",
+   "files": [
+    "blocks/tin_block.png"
+   ],
+   "material": [
+    "material/tin_block.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "tin block",
+   "group": "блоки металлов",
+   "priority": "вторая очередь (decisions: блоки металлов — во вторую очередь)",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.35,
+    "metal": 0.7,
+    "subsurface": 0.0,
+    "normal_strength": 0.9
+   }
+  },
+  {
+   "name": "steel_block",
+   "files": [
+    "blocks/steel_block.png"
+   ],
+   "material": [
+    "material/steel_block.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "steel block",
+   "group": "блоки металлов",
+   "priority": "вторая очередь (decisions: блоки металлов — во вторую очередь)",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.35,
+    "metal": 0.7,
+    "subsurface": 0.0,
+    "normal_strength": 0.9
+   }
+  },
+  {
+   "name": "copper_block",
+   "files": [
+    "blocks/copper_block.png"
+   ],
+   "material": [
+    "material/copper_block.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "copper block",
+   "group": "блоки металлов",
+   "priority": "вторая очередь (decisions: блоки металлов — во вторую очередь)",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.35,
+    "metal": 0.7,
+    "subsurface": 0.0,
+    "normal_strength": 0.9
+   }
+  },
+  {
+   "name": "gold_block",
+   "files": [
+    "blocks/gold_block.png"
+   ],
+   "material": [
+    "material/gold_block.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "gold block",
+   "group": "блоки металлов",
+   "priority": "вторая очередь (decisions: блоки металлов — во вторую очередь)",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.35,
+    "metal": 0.7,
+    "subsurface": 0.0,
+    "normal_strength": 0.9
+   }
+  },
+  {
+   "name": "iron_block",
+   "files": [
+    "blocks/iron_block.png"
+   ],
+   "material": [
+    "material/iron_block.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "iron block",
+   "group": "блоки металлов",
+   "priority": "вторая очередь (decisions: блоки металлов — во вторую очередь)",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.35,
+    "metal": 0.7,
+    "subsurface": 0.0,
+    "normal_strength": 0.9
+   }
+  },
+  {
+   "name": "redstone_block",
+   "files": [
+    "blocks/redstone_block.png"
+   ],
+   "material": [
+    "material/redstone_block.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "redstone block",
+   "group": "блоки металлов",
+   "priority": "вторая очередь (decisions: блоки металлов — во вторую очередь)",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.45,
+    "metal": 0.0,
+    "subsurface": 0.0,
+    "normal_strength": 1.0
+   },
+   "emissive": [
+    "emissive/redstone_block.png"
+   ]
+  },
+  {
+   "name": "raw_osmium_block",
+   "files": [
+    "blocks/raw_osmium_block.png"
+   ],
+   "material": [
+    "material/raw_osmium_block.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "raw osmium block",
+   "group": "блоки металлов",
+   "priority": "вторая очередь (decisions: блоки металлов — во вторую очередь)",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.75,
+    "metal": 0.25,
+    "subsurface": 0.0,
+    "normal_strength": 1.4
+   }
+  },
+  {
+   "name": "raw_tin_block",
+   "files": [
+    "blocks/raw_tin_block.png"
+   ],
+   "material": [
+    "material/raw_tin_block.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "raw tin block",
+   "group": "блоки металлов",
+   "priority": "вторая очередь (decisions: блоки металлов — во вторую очередь)",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.75,
+    "metal": 0.26,
+    "subsurface": 0.0,
+    "normal_strength": 1.4
+   }
+  },
+  {
+   "name": "raw_copper_block",
+   "files": [
+    "blocks/raw_copper_block.png"
+   ],
+   "material": [
+    "material/raw_copper_block.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "raw copper block",
+   "group": "блоки металлов",
+   "priority": "вторая очередь (decisions: блоки металлов — во вторую очередь)",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.75,
+    "metal": 0.25,
+    "subsurface": 0.0,
+    "normal_strength": 1.4
+   }
+  },
+  {
+   "name": "raw_gold_block",
+   "files": [
+    "blocks/raw_gold_block.png"
+   ],
+   "material": [
+    "material/raw_gold_block.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "raw gold block",
+   "group": "блоки металлов",
+   "priority": "вторая очередь (decisions: блоки металлов — во вторую очередь)",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.75,
+    "metal": 0.25,
+    "subsurface": 0.0,
+    "normal_strength": 1.4
+   }
+  },
+  {
+   "name": "raw_iron_block",
+   "files": [
+    "blocks/raw_iron_block.png"
+   ],
+   "material": [
+    "material/raw_iron_block.png"
+   ],
+   "frames": 1,
+   "layers": 1,
+   "for": "raw iron block",
+   "group": "блоки металлов",
+   "priority": "вторая очередь (decisions: блоки металлов — во вторую очередь)",
+   "source": "свой рисунок (этот проект)",
+   "pbr": {
+    "roughness": 0.75,
+    "metal": 0.25,
+    "subsurface": 0.0,
+    "normal_strength": 1.4
+   }
+  }
+ ],
+ "blocks": {
+  "enrichment_chamber": {
+   "shape": "cube",
+   "facing": "горизонтально к игроку (front = FACING)",
+   "faces": {
+    "front": "enrichment_front",
+    "back": "mek_casing_back",
+    "side": "mek_casing_side",
+    "top": "mek_casing_top",
+    "bottom": "mek_casing_bottom"
+   },
+   "active": {
+    "front": "enrichment_front_active",
+    "back": "mek_casing_back",
+    "side": "mek_casing_side",
+    "top": "mek_casing_top",
+    "bottom": "mek_casing_bottom"
+   },
+   "light_active": 8,
+   "particles": "лицо: дым + красная пыль (MEK-13 §16)"
+  },
+  "crusher": {
+   "shape": "cube",
+   "facing": "горизонтально к игроку (front = FACING)",
+   "faces": {
+    "front": "crusher_front",
+    "back": "mek_casing_back",
+    "side": "mek_casing_side",
+    "top": "mek_casing_top",
+    "bottom": "mek_casing_bottom"
+   },
+   "active": {
+    "front": "crusher_front_active",
+    "back": "mek_casing_back",
+    "side": "crusher_side_active",
+    "top": "mek_casing_top",
+    "bottom": "mek_casing_bottom"
+   },
+   "light_active": 8,
+   "particles": "лицо: дым + красная пыль (MEK-13 §16)"
+  },
+  "smelter": {
+   "shape": "cube",
+   "facing": "горизонтально к игроку (front = FACING)",
+   "faces": {
+    "front": "smelter_front",
+    "back": "mek_casing_back",
+    "side": "mek_casing_side",
+    "top": "mek_casing_top",
+    "bottom": "mek_casing_bottom"
+   },
+   "active": {
+    "front": "smelter_front_active",
+    "back": "mek_casing_back",
+    "side": "mek_casing_side",
+    "top": "mek_casing_top",
+    "bottom": "smelter_bottom_active"
+   },
+   "light_active": 8,
+   "particles": "лицо: дым + красная пыль (MEK-13 §16)"
+  },
+  "purification_chamber": {
+   "shape": "cube",
+   "facing": "горизонтально к игроку (front = FACING)",
+   "faces": {
+    "front": "purification_front",
+    "back": "mek_casing_back",
+    "side": "mek_casing_side",
+    "top": "mek_casing_top",
+    "bottom": "mek_casing_bottom"
+   },
+   "active": {
+    "front": "purification_front_active",
+    "back": "mek_casing_back",
+    "side": "purification_side_active",
+    "top": "mek_casing_top",
+    "bottom": "mek_casing_bottom"
+   },
+   "light_active": 8,
+   "particles": "лицо: дым + красная пыль (MEK-13 §16)"
+  },
+  "steel_casing": {
+   "shape": "cube",
+   "faces": {
+    "all": "steel_casing"
+   }
+  },
+  "osmium_ore": {
+   "shape": "cube",
+   "faces": {
+    "all": "osmium_ore"
+   }
+  },
+  "tin_ore": {
+   "shape": "cube",
+   "faces": {
+    "all": "tin_ore"
+   }
+  },
+  "copper_ore": {
+   "shape": "cube",
+   "faces": {
+    "all": "copper_ore"
+   }
+  },
+  "gold_ore": {
+   "shape": "cube",
+   "faces": {
+    "all": "gold_ore"
+   }
+  },
+  "redstone_ore": {
+   "shape": "cube",
+   "faces": {
+    "all": "redstone_ore"
+   },
+   "lit": "тот же слой + свет 9; emissive — тлеющие пиксели"
+  },
+  "metallurgic_infuser": {
+   "shape": "model",
+   "model": "models.json#/models/metallurgic_infuser",
+   "light_active": 8,
+   "particles": "front"
+  },
+  "electrolytic_separator": {
+   "shape": "model",
+   "model": "models.json#/models/electrolytic_separator",
+   "light_active": 8,
+   "particles": "front",
+   "ports": {
+    "west": "водород (выход, по умолчанию)",
+    "east": "кислород (выход)",
+    "north": "вода и энергия (вход)"
+   }
+  },
+  "heat_generator": {
+   "shape": "model",
+   "model": "models.json#/models/heat_generator",
+   "light_active": 13,
+   "variants": {
+    "active": {
+     "retexture": {
+      "heatgen_drum": "heatgen_drum_active"
+     },
+     "glow_tex": [
+      "heatgen_drum_active"
+     ]
+    }
+   },
+   "particles": "back (−0.52): дым + пламя"
+  },
+  "wind_generator": {
+   "shape": "model",
+   "model": "models.json#/models/wind_generator",
+   "light_active": 8,
+   "note": "основание + 4 ограничивающих блока (E19); мачта сужается 8 → 5 px; гондола на y 66…73 px",
+   "height_blocks": 5
+  },
+  "wind_generator_rotor": {
+   "shape": "model",
+   "model": "models.json#/models/wind_generator_rotor"
+  },
+  "energy_cube": {
+   "shape": "model",
+   "model": "models.json#/models/energy_cube",
+   "note": "состояние грани — по режиму энергии стороны (none / input / output; вход-выход = output)"
+  },
+  "chemical_tank": {
+   "shape": "model",
+   "model": "models.json#/models/chemical_tank",
+   "note": "окно уровня светится; заполнение — сдвиг/обрезка UV v (не обязательно в M)"
+  },
+  "electric_pump": {
+   "shape": "model",
+   "model": "models.json#/models/electric_pump",
+   "light_active": 8,
+   "note": "наше «лучше мода»: при работе свет 8 и тихий гул; выход — только вверх"
+  },
+  "universal_cable": {
+   "shape": "transmitter",
+   "size": "small",
+   "parts": "models.json#/transmitter_parts/small",
+   "textures": {
+    "$side": "cable_side",
+    "$center": "cable_center"
+   }
+  },
+  "pressurized_tube": {
+   "shape": "transmitter",
+   "size": "small",
+   "parts": "models.json#/transmitter_parts/small",
+   "textures": {
+    "$side": "tube_side",
+    "$center": "tube_center"
+   }
+  },
+  "mechanical_pipe": {
+   "shape": "transmitter",
+   "size": "large",
+   "parts": "models.json#/transmitter_parts/large",
+   "textures": {
+    "$side": "pipe_side",
+    "$center": "pipe_center"
+   }
+  },
+  "logistical_transporter": {
+   "shape": "transmitter",
+   "size": "large",
+   "parts": "models.json#/transmitter_parts/large",
+   "textures": {
+    "$side": "transporter_side",
+    "$center": "transporter_center"
+   }
+  },
+  "osmium_block": {
+   "shape": "cube",
+   "faces": {
+    "all": "osmium_block"
+   },
+   "priority": "вторая очередь"
+  },
+  "tin_block": {
+   "shape": "cube",
+   "faces": {
+    "all": "tin_block"
+   },
+   "priority": "вторая очередь"
+  },
+  "steel_block": {
+   "shape": "cube",
+   "faces": {
+    "all": "steel_block"
+   },
+   "priority": "вторая очередь"
+  },
+  "copper_block": {
+   "shape": "cube",
+   "faces": {
+    "all": "copper_block"
+   },
+   "priority": "вторая очередь"
+  },
+  "gold_block": {
+   "shape": "cube",
+   "faces": {
+    "all": "gold_block"
+   },
+   "priority": "вторая очередь"
+  },
+  "iron_block": {
+   "shape": "cube",
+   "faces": {
+    "all": "iron_block"
+   },
+   "priority": "вторая очередь"
+  },
+  "redstone_block": {
+   "shape": "cube",
+   "faces": {
+    "all": "redstone_block"
+   },
+   "priority": "вторая очередь"
+  },
+  "raw_osmium_block": {
+   "shape": "cube",
+   "faces": {
+    "all": "raw_osmium_block"
+   },
+   "priority": "вторая очередь"
+  },
+  "raw_tin_block": {
+   "shape": "cube",
+   "faces": {
+    "all": "raw_tin_block"
+   },
+   "priority": "вторая очередь"
+  },
+  "raw_copper_block": {
+   "shape": "cube",
+   "faces": {
+    "all": "raw_copper_block"
+   },
+   "priority": "вторая очередь"
+  },
+  "raw_gold_block": {
+   "shape": "cube",
+   "faces": {
+    "all": "raw_gold_block"
+   },
+   "priority": "вторая очередь"
+  },
+  "raw_iron_block": {
+   "shape": "cube",
+   "faces": {
+    "all": "raw_iron_block"
+   },
+   "priority": "вторая очередь"
+  }
+ },
+ "glow_faces": [
+  "electrolytic_separator/port_led: down, east, north, south, up, west",
+  "heat_generator/port_led: down, east, north, south, up, west",
+  "heat_generator: вариант active — все грани слоёв ['heatgen_drum_active']",
+  "wind_generator/port_led: down, east, north, south, up, west",
+  "chemical_tank/gauge: south",
+  "energy_cube: side_parts output_* — порт и светодиоды; ядро — полная яркость",
+  "transmitter_parts.contents_small — вставки энергии и газа (полная яркость, прозрачные)"
+ ],
+ "items": [
+  {
+   "name": "raw_osmium",
+   "file": "items/raw_osmium.png"
+  },
+  {
+   "name": "raw_tin",
+   "file": "items/raw_tin.png"
+  },
+  {
+   "name": "raw_copper",
+   "file": "items/raw_copper.png"
+  },
+  {
+   "name": "raw_gold",
+   "file": "items/raw_gold.png"
+  },
+  {
+   "name": "osmium_ingot",
+   "file": "items/osmium_ingot.png"
+  },
+  {
+   "name": "tin_ingot",
+   "file": "items/tin_ingot.png"
+  },
+  {
+   "name": "copper_ingot",
+   "file": "items/copper_ingot.png"
+  },
+  {
+   "name": "gold_ingot",
+   "file": "items/gold_ingot.png"
+  },
+  {
+   "name": "steel_ingot",
+   "file": "items/steel_ingot.png"
+  },
+  {
+   "name": "steel_nugget",
+   "file": "items/steel_nugget.png"
+  },
+  {
+   "name": "osmium_nugget",
+   "file": "items/osmium_nugget.png"
+  },
+  {
+   "name": "tin_nugget",
+   "file": "items/tin_nugget.png"
+  },
+  {
+   "name": "gold_nugget",
+   "file": "items/gold_nugget.png"
+  },
+  {
+   "name": "redstone",
+   "file": "items/redstone.png"
+  },
+  {
+   "name": "dust_iron",
+   "file": "items/dust_iron.png"
+  },
+  {
+   "name": "dust_gold",
+   "file": "items/dust_gold.png"
+  },
+  {
+   "name": "dust_osmium",
+   "file": "items/dust_osmium.png"
+  },
+  {
+   "name": "dust_copper",
+   "file": "items/dust_copper.png"
+  },
+  {
+   "name": "dust_tin",
+   "file": "items/dust_tin.png"
+  },
+  {
+   "name": "dust_steel",
+   "file": "items/dust_steel.png"
+  },
+  {
+   "name": "dirty_dust_iron",
+   "file": "items/dirty_dust_iron.png"
+  },
+  {
+   "name": "dirty_dust_osmium",
+   "file": "items/dirty_dust_osmium.png"
+  },
+  {
+   "name": "dirty_dust_copper",
+   "file": "items/dirty_dust_copper.png"
+  },
+  {
+   "name": "dirty_dust_gold",
+   "file": "items/dirty_dust_gold.png"
+  },
+  {
+   "name": "dirty_dust_tin",
+   "file": "items/dirty_dust_tin.png"
+  },
+  {
+   "name": "clump_iron",
+   "file": "items/clump_iron.png"
+  },
+  {
+   "name": "clump_osmium",
+   "file": "items/clump_osmium.png"
+  },
+  {
+   "name": "clump_copper",
+   "file": "items/clump_copper.png"
+  },
+  {
+   "name": "clump_gold",
+   "file": "items/clump_gold.png"
+  },
+  {
+   "name": "clump_tin",
+   "file": "items/clump_tin.png"
+  },
+  {
+   "name": "enriched_carbon",
+   "file": "items/enriched_carbon.png"
+  },
+  {
+   "name": "enriched_redstone",
+   "file": "items/enriched_redstone.png"
+  },
+  {
+   "name": "enriched_iron",
+   "file": "items/enriched_iron.png"
+  },
+  {
+   "name": "alloy_infused",
+   "file": "items/alloy_infused.png"
+  },
+  {
+   "name": "basic_control_circuit",
+   "file": "items/basic_control_circuit.png"
+  },
+  {
+   "name": "advanced_control_circuit",
+   "file": "items/advanced_control_circuit.png"
+  },
+  {
+   "name": "electrolytic_core",
+   "file": "items/electrolytic_core.png"
+  },
+  {
+   "name": "energy_tablet",
+   "file": "items/energy_tablet.png"
+  },
+  {
+   "name": "upgrade_speed",
+   "file": "items/upgrade_speed.png"
+  },
+  {
+   "name": "upgrade_energy",
+   "file": "items/upgrade_energy.png"
+  },
+  {
+   "name": "upgrade_gas",
+   "file": "items/upgrade_gas.png"
+  },
+  {
+   "name": "configurator",
+   "file": "items/configurator.png"
+  },
+  {
+   "name": "chemical_tank_empty",
+   "file": "items/chemical_tank_empty.png"
+  },
+  {
+   "name": "chemical_tank_full",
+   "file": "items/chemical_tank_full.png"
+  },
+  {
+   "name": "jetpack",
+   "file": "items/jetpack.png"
+  },
+  {
+   "name": "steel_pickaxe",
+   "file": "items/steel_pickaxe.png"
+  },
+  {
+   "name": "steel_axe",
+   "file": "items/steel_axe.png"
+  },
+  {
+   "name": "steel_shovel",
+   "file": "items/steel_shovel.png"
+  },
+  {
+   "name": "steel_hoe",
+   "file": "items/steel_hoe.png"
+  },
+  {
+   "name": "steel_sword",
+   "file": "items/steel_sword.png"
+  },
+  {
+   "name": "steel_helmet",
+   "file": "items/steel_helmet.png"
+  },
+  {
+   "name": "steel_chestplate",
+   "file": "items/steel_chestplate.png"
+  },
+  {
+   "name": "steel_leggings",
+   "file": "items/steel_leggings.png"
+  },
+  {
+   "name": "steel_boots",
+   "file": "items/steel_boots.png"
+  }
+ ],
+ "colors": {
+  "tiers": {
+   "basic": [
+    95,
+    255,
+    184
+   ],
+   "advanced": [
+    255,
+    128,
+    106
+   ],
+   "elite": [
+    75,
+    248,
+    255
+   ],
+   "ultimate": [
+    247,
+    135,
+    255
+   ]
+  },
+  "side_modes": {
+   "none": [
+    207,
+    207,
+    207
+   ],
+   "input": [
+    201,
+    7,
+    31
+   ],
+   "input_2": [
+    255,
+    161,
+    96
+   ],
+   "output": [
+    54,
+    107,
+    208
+   ],
+   "output_2": [
+    0,
+    243,
+    208
+   ],
+   "input_output": [
+    164,
+    96,
+    217
+   ],
+   "energy": [
+    89,
+    193,
+    95
+   ],
+   "extra": [
+    255,
+    221,
+    79
+   ]
+  },
+  "transporter_colors": {
+   "black": [
+    64,
+    64,
+    64
+   ],
+   "dark_blue": [
+    54,
+    107,
+    208
+   ],
+   "dark_green": [
+    89,
+    193,
+    95
+   ],
+   "dark_aqua": [
+    0,
+    243,
+    208
+   ],
+   "dark_red": [
+    201,
+    7,
+    31
+   ],
+   "purple": [
+    164,
+    96,
+    217
+   ],
+   "orange": [
+    255,
+    161,
+    96
+   ],
+   "gray": [
+    207,
+    207,
+    207
+   ],
+   "dark_gray": [
+    122,
+    122,
+    122
+   ],
+   "indigo": [
+    85,
+    158,
+    255
+   ],
+   "bright_green": [
+    117,
+    255,
+    137
+   ],
+   "aqua": [
+    48,
+    255,
+    249
+   ],
+   "red": [
+    255,
+    56,
+    60
+   ],
+   "pink": [
+    213,
+    94,
+    203
+   ],
+   "yellow": [
+    255,
+    221,
+    79
+   ],
+   "white": [
+    255,
+    255,
+    255
+   ],
+   "brown": [
+    161,
+    118,
+    73
+   ],
+   "bright_pink": [
+    255,
+    188,
+    196
+   ]
+  },
+  "gases": {
+   "hydrogen": [
+    232,
+    240,
+    248
+   ],
+   "oxygen": [
+    108,
+    226,
+    255
+   ]
+  },
+  "infusion": {
+   "carbon": [
+    44,
+    44,
+    44
+   ],
+   "redstone": [
+    179,
+    5,
+    5
+   ]
+  },
+  "energy": [
+   95,
+   255,
+   184
+  ]
+ },
+ "particles": {
+  "machines": "SMOKE + DUST (красная) у лица: поперёк ±0.3, вверх 0.5…0.875, вперёд +0.52",
+  "heat_generator": "SMOKE + FLAME у задней грани (−0.52), только при сжигании топлива",
+  "sprites": "новых не нужно: DUST берёт серию дыма (MEK-13 §24.5)"
+ },
+ "previews": [
+  "previews/layers.png",
+  "previews/blocks.png",
+  "previews/models.png",
+  "previews/items.png",
+  "previews/world.png",
+  "previews/anim_machines.gif",
+  "previews/anim_wind.gif"
+ ]
+}

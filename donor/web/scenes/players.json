@@ -1,0 +1,12 @@
+{
+ "about": "Модели других игроков: четыре бота перед камерой — стоит, присел, машет рукой, голова повёрнута на 70°. Сервер voxel-server --dev на 127.0.0.1:8326; боты: cargo run -p voxel-server --bin bot -- ws://127.0.0.1:8326/ws --nick Анна --script still --spawn 6.5,13 --look 180,0 (и так далее: Борис sneak --spawn 8,13, Вика swing --spawn 9.5,13, Глеб still --spawn 11,13 --look 110,0).",
+ "x": 8.25,
+ "z": 9,
+ "yaw": 0,
+ "pitch": 0.05,
+ "time": 0.42,
+ "settings": {
+  "server": "ws://127.0.0.1:8326/ws",
+  "nick": "Tester"
+ }
+}

@@ -1,0 +1,16 @@
+{
+ "about": "Инвентарь с сеткой крафта 2×2 и ресурсами пути «дерево → доски → палки → верстак».",
+ "x": 8.5,
+ "z": 8.5,
+ "yaw": 0.6,
+ "pitch": -0.2,
+ "time": 0.42,
+ "setup": [
+  "give:oak_log:12",
+  "give:oak_planks:20",
+  "give:stick:8",
+  "give:crafting_table:1",
+  "give:cobblestone:24",
+  "inv"
+ ]
+}
