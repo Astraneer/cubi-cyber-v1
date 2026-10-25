@@ -141,10 +141,29 @@ fn unchanged_page_neighbor(input:VertexOut,point:vec3<u32>,axis:u32,positive:boo
     // Links cannot justify a fringe after one object moves away independently.
     let expected=base.model[3].xyz+base.model[axis].xyz*select(-16.0,16.0,positive);
     if any(abs(neighbor.model[3].xyz-expected)>vec3(0.02)){return false;}
-    for(var column=0u;column<3u;column++){if any(abs(neighbor.model[column].xyz-base.model[column].xyz)>vec3(0.00001)){return false;}}
+    if any(abs(neighbor.model[0].xyz-base.model[0].xyz)>vec3(0.00001)) ||
+       any(abs(neighbor.model[1].xyz-base.model[1].xyz)>vec3(0.00001)) ||
+       any(abs(neighbor.model[2].xyz-base.model[2].xyz)>vec3(0.00001)){return false;}
     if (neighbor.enabled&4u)==0u{return true;}
     var owner=point;owner[axis]=select(15u,0u,positive);
     return !owner_masked(link.x,owner);
+}
+
+// Explicit axes keep FXC from trying to unroll Naga's guarded while loops.
+fn unchanged_axis_neighbor(input:VertexOut,point:vec3<u32>,local:vec3<f32>,uncertainty:vec3<f32>,axis:u32)->bool {
+    if abs(input.local_normal[axis])>0.5{return false;}
+    // The owner index is clamped at page borders. Preserve the side of
+    // that owner even when raster guards put the sample just outside it.
+    let fraction=clamp(local[axis]-f32(point[axis]),0.0,1.0);
+    if fraction<uncertainty[axis] {
+        if point[axis]>0u {var neighbour=point;neighbour[axis]-=1u;if !owner_masked(input.object_slot,neighbour){return true;}}
+        else if unchanged_page_neighbor(input,point,axis,false){return true;}
+    }
+    if 1.0-fraction<uncertainty[axis] {
+        if point[axis]<15u {var neighbour=point;neighbour[axis]+=1u;if !owner_masked(input.object_slot,neighbour){return true;}}
+        else if unchanged_page_neighbor(input,point,axis,true){return true;}
+    }
+    return false;
 }
 
 fn edited_owner(input:VertexOut)->bool {
@@ -154,22 +173,10 @@ fn edited_owner(input:VertexOut)->bool {
     let local=input.local_position-input.local_normal*0.0001;
     let point=vec3<u32>(clamp(floor(local),vec3(0.0),vec3(15.0)));
     if !owner_masked(input.object_slot,point) {return false;}
-    // Keep a conservative fringe of unchanged old geometry. The CPU mask
-    // includes the full AO radius, so an unmasked neighbour is unchanged.
-    // This covers fixed-point rasterization disagreement at unit-grid edges.
-    for (var axis=0u;axis<3u;axis++) {
-        if abs(input.local_normal[axis])>0.5 {continue;}
-        let fraction=fract(local[axis]);
-        if fraction<uncertainty[axis] {
-            if point[axis]>0u {var neighbour=point;neighbour[axis]-=1u;if !owner_masked(input.object_slot,neighbour){return false;}}
-            else if unchanged_page_neighbor(input,point,axis,false){return false;}
-        }
-        if 1.0-fraction<uncertainty[axis] {
-            if point[axis]<15u {var neighbour=point;neighbour[axis]+=1u;if !owner_masked(input.object_slot,neighbour){return false;}}
-            else if unchanged_page_neighbor(input,point,axis,true){return false;}
-        }
-    }
-    return true;
+    // The CPU mask includes the full AO radius; unmasked neighbours are unchanged.
+    return !(unchanged_axis_neighbor(input,point,local,uncertainty,0u) ||
+             unchanged_axis_neighbor(input,point,local,uncertainty,1u) ||
+             unchanged_axis_neighbor(input,point,local,uncertainty,2u));
 }
 
 @fragment
