@@ -11,33 +11,39 @@ fn software_vulkan_renders_shared_msaa_sky() {
         let info = gpu.adapter.get_info();
         assert_eq!(info.device_type, wgpu::DeviceType::Cpu, "{info:?}");
         assert_eq!(render::MSAA_SAMPLES, 4);
-        let probe = render::render_probe(&gpu.device, &gpu.queue);
-        assert_eq!(probe.setup_work.pipeline_compilations, 1);
-        assert_eq!(probe.frame_work, telemetry::WorkCounts::ZERO);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        probe
-            .buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                sender.send(result).expect("readback receiver alive");
-            });
-        gpu.device.poll(wgpu::PollType::Wait).expect("GPU poll");
-        receiver
-            .recv()
-            .expect("map callback")
-            .expect("map readback");
-        let bytes = probe.buffer.slice(..).get_mapped_range();
-        let colors = probe.validate(&bytes).expect("shader matches reference");
-        println!(
-            "SOFTWARE_SKY_OK adapter={} backend={:?} pixels={} top={:?} bottom={:?} msaa={}",
-            info.name,
-            info.backend,
-            probe.width * probe.height,
-            colors.top,
-            colors.bottom,
-            render::MSAA_SAMPLES,
-        );
-        drop(bytes);
-        probe.buffer.unmap();
+        for transfer in [
+            render::OutputTransfer::Attachment,
+            render::OutputTransfer::ShaderSrgb,
+        ] {
+            let probe = render::render_probe_with_transfer(&gpu.device, &gpu.queue, transfer);
+            assert_eq!(probe.setup_work.pipeline_compilations, 1);
+            assert_eq!(probe.frame_work, telemetry::WorkCounts::ZERO);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            probe
+                .buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    sender.send(result).expect("readback receiver alive");
+                });
+            gpu.device.poll(wgpu::PollType::Wait).expect("GPU poll");
+            receiver
+                .recv()
+                .expect("map callback")
+                .expect("map readback");
+            let bytes = probe.buffer.slice(..).get_mapped_range();
+            let colors = probe.validate(&bytes).expect("shader matches reference");
+            println!(
+                "SOFTWARE_SKY_OK adapter={} backend={:?} pixels={} top={:?} bottom={:?} msaa={} transfer={:?}",
+                info.name,
+                info.backend,
+                probe.width * probe.height,
+                colors.top,
+                colors.bottom,
+                render::MSAA_SAMPLES,
+                transfer,
+            );
+            drop(bytes);
+            probe.buffer.unmap();
+        }
     });
 }

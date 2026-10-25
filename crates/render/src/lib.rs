@@ -62,6 +62,15 @@ impl Gpu {
     }
 }
 
+/// Where linear shader radiance is converted for the output attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputTransfer {
+    /// Native sRGB attachments encode in hardware; unorm probes retain linear bytes.
+    Attachment,
+    /// The browser unorm canvas receives explicitly encoded sRGB bytes.
+    ShaderSrgb,
+}
+
 pub struct SkyRenderer {
     pipeline: wgpu::RenderPipeline,
     multisampled: wgpu::Texture,
@@ -80,6 +89,21 @@ impl SkyRenderer {
         width: u32,
         height: u32,
     ) -> Self {
+        Self::new_with_transfer(device, format, width, height, OutputTransfer::Attachment)
+    }
+
+    /// Choose the final output transfer before pipeline creation, never per frame.
+    pub fn new_with_transfer(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+        transfer: OutputTransfer,
+    ) -> Self {
+        assert!(
+            transfer != OutputTransfer::ShaderSrgb || !format.is_srgb(),
+            "explicit sRGB transfer requires an unorm attachment to avoid double encoding",
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shared procedural sky"),
             source: wgpu::ShaderSource::Wgsl(include_str!("sky.wgsl").into()),
@@ -106,7 +130,10 @@ impl SkyRenderer {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fragment"),
+                entry_point: Some(match transfer {
+                    OutputTransfer::Attachment => "fragment",
+                    OutputTransfer::ShaderSrgb => "fragment_srgb_output",
+                }),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
@@ -211,9 +238,19 @@ pub struct Readback {
     pub height: u32,
     pub setup_work: telemetry::WorkCounts,
     pub frame_work: telemetry::WorkCounts,
+    pub output_transfer: OutputTransfer,
 }
 
 pub fn render_probe(device: &wgpu::Device, queue: &wgpu::Queue) -> Readback {
+    render_probe_with_transfer(device, queue, OutputTransfer::Attachment)
+}
+
+/// Exercise the same output variant used by the actual clients on a software GPU.
+pub fn render_probe_with_transfer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    transfer: OutputTransfer,
+) -> Readback {
     let width = PROBE_WIDTH;
     let height = PROBE_HEIGHT;
     let format = wgpu::TextureFormat::Rgba8Unorm;
@@ -231,7 +268,7 @@ pub fn render_probe(device: &wgpu::Device, queue: &wgpu::Queue) -> Readback {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    let mut renderer = SkyRenderer::new(device, format, width, height);
+    let mut renderer = SkyRenderer::new_with_transfer(device, format, width, height, transfer);
     let setup_work = renderer.take_work();
     let output = texture.create_view(&Default::default());
     let padded_bytes_per_row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
@@ -273,6 +310,7 @@ pub fn render_probe(device: &wgpu::Device, queue: &wgpu::Queue) -> Readback {
         height,
         setup_work,
         frame_work: renderer.take_work(),
+        output_transfer: transfer,
     }
 }
 
@@ -304,10 +342,18 @@ impl Readback {
             for x in 0..self.width {
                 let actual = pixel(x, y);
                 for channel in 0..3 {
-                    let reference = ((zenith[channel]
-                        + (horizon[channel] - zenith[channel]) * blend)
-                        * 255.0_f32)
-                        .round() as u8;
+                    let linear: f32 =
+                        zenith[channel] + (horizon[channel] - zenith[channel]) * blend;
+                    let encoded = if self.output_transfer == OutputTransfer::ShaderSrgb {
+                        if linear <= 0.0031308 {
+                            12.92 * linear
+                        } else {
+                            1.055 * linear.powf(1.0 / 2.4) - 0.055
+                        }
+                    } else {
+                        linear
+                    };
+                    let reference = (encoded * 255.0).round() as u8;
                     if actual[channel].abs_diff(reference) > 2 {
                         return Err(format!(
                             "sky mismatch at ({x},{y}) channel {channel}: {} vs {reference}",

@@ -54,7 +54,7 @@ impl WebState {
             Err(error) => return Err(JsValue::from_str(&format!("WebGPU frame failed: {error}"))),
         };
         let output = frame.texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("sRGB canvas output"),
+            label: Some("unorm canvas with shader sRGB output"),
             format: Some(self.output_format),
             ..Default::default()
         });
@@ -136,22 +136,29 @@ pub async fn start() -> Result<JsValue, JsValue> {
     config.desired_maximum_frame_latency = render::MAX_FRAMES_IN_FLIGHT;
     config.present_mode = wgpu::PresentMode::Fifo;
     let capabilities = surface.get_capabilities(&gpu.adapter);
-    if let Some(format) = capabilities.formats.iter().find(|format| format.is_srgb()) {
-        config.format = *format;
-    }
-    // Canvas configurations expose unorm base formats. An explicitly allowed
-    // sRGB view applies the same linear-to-sRGB transfer as the native surface.
-    let output_format = config.format.add_srgb_suffix();
-    if !output_format.is_srgb() {
-        return Err(JsValue::from_str(
-            "WebGPU canvas requires an sRGB-compatible format",
-        ));
-    }
-    if output_format != config.format {
-        config.view_formats.push(output_format);
-    }
+    config.format = capabilities
+        .formats
+        .iter()
+        .copied()
+        .find(|format| {
+            matches!(
+                format,
+                wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Bgra8Unorm
+            )
+        })
+        .ok_or("WebGPU canvas requires an unorm output format for explicit sRGB transfer")?;
+    // Native sRGB targets encode in hardware. The browser canvas uses an unorm
+    // target with the shared shader's explicit final sRGB transfer. This avoids
+    // software WebGPU MSAA/sRGB-view resolve paths that exported linear bytes.
+    let output_format = config.format;
     surface.configure(&gpu.device, &config);
-    let mut sky = render::SkyRenderer::new(&gpu.device, output_format, width, height);
+    let mut sky = render::SkyRenderer::new_with_transfer(
+        &gpu.device,
+        output_format,
+        width,
+        height,
+        render::OutputTransfer::ShaderSrgb,
+    );
     let startup = sky.take_work();
     let mut state = WebState {
         canvas,
@@ -207,6 +214,7 @@ pub async fn start() -> Result<JsValue, JsValue> {
     let result = js_sys::Object::new();
     js_sys::Reflect::set(&result, &"ok".into(), &JsValue::TRUE)?;
     js_sys::Reflect::set(&result, &"colorEncoding".into(), &"srgb".into())?;
+    js_sys::Reflect::set(&result, &"outputTransfer".into(), &"shader-srgb".into())?;
     js_sys::Reflect::set(
         &result,
         &"outputFormat".into(),
