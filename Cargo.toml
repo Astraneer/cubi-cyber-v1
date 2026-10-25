@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core-types", "crates/world", "crates/gen", "crates/sim",
+    "crates/rules", "crates/net", "crates/save", "crates/jobs",
+    "crates/render", "crates/ui", "crates/audio", "crates/telemetry",
+    "crates/client-native", "crates/client-web", "crates/server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+core-types = { path = "crates/core-types" }
+telemetry = { path = "crates/telemetry" }
+render = { path = "crates/render" }
+wgpu = { version = "=26.0.1", default-features = false, features = ["std", "wgsl", "dx12", "vulkan", "webgpu"] }
+winit = { version = "=0.30.12", default-features = false, features = ["x11", "rwh_06"] }
+pollster = "=0.4.0"
+wasm-bindgen = "=0.2.104"
+wasm-bindgen-futures = "=0.4.54"
+web-sys = "=0.3.81"
+js-sys = "=0.3.81"
+console_error_panic_hook = "=0.1.7"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
