@@ -19,6 +19,9 @@ use std::{
     sync::Arc,
 };
 pub const MAX_PLAN_PAIRS: u64 = 4_000_000;
+#[path = "horizon_selection.rs"]
+mod selection;
+pub use selection::{Certificate, Projection, SelectionQuality};
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub max_tiles: usize,
@@ -26,6 +29,8 @@ pub struct Config {
     pub max_proxy_pages: usize,
     pub atlas_layers: u32,
     pub horizon_level: u8,
+    pub screen_error_pixels: f64,
+    pub hysteresis_pixels: f64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -35,6 +40,8 @@ impl Default for Config {
             max_proxy_pages: 512,
             atlas_layers: 186,
             horizon_level: 9,
+            screen_error_pixels: 32.,
+            hysteresis_pixels: 8.,
         }
     }
 }
@@ -82,6 +89,23 @@ pub struct Work {
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
+    pub desired_height_tiles: usize,
+    pub cached_height_tiles: usize,
+    pub received_desired_heights: usize,
+    pub wanted_refine_tiles: usize,
+    pub unavailable_columns: usize,
+    pub known_geometry_sources: usize,
+    pub near_guard_ready: bool,
+    pub plan_id: u64,
+    pub accepted_plan_id: u64,
+    pub plan_generation: u64,
+    pub missing_error_certificates: u64,
+    pub selection_capacity_limited: bool,
+    pub selection_leaf_limited: u64,
+    pub maximum_error_pixels: f64,
+    pub sse_refinements: u64,
+    pub pending_height_confirmations: usize,
+    pub pending_exact_columns: usize,
     pub height_front: usize,
     pub height_staged: usize,
     pub proxy_front: usize,
@@ -115,6 +139,9 @@ pub struct PlanTask {
     camera: [i64; 2],
     refine: Vec<HeightKey>,
     near_radius: i64,
+    projection: Option<Projection>,
+    certificates: Vec<Certificate>,
+    previous: Vec<HeightTileKey>,
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PlanWork {
@@ -129,9 +156,14 @@ pub struct Planned {
     generation: u64,
     pub plan: HeightPlan,
     pub work: PlanWork,
+    pub quality: SelectionQuality,
+    pub exact_leaves: Vec<HeightKey>,
 }
 impl PlanTask {
     pub fn execute(self) -> Result<Planned, Error> {
+        if let Some(projection) = self.projection {
+            return selection::execute_sse(&self, projection);
+        }
         let mut plan = HeightPlan::new(
             self.space,
             self.camera,
@@ -251,6 +283,8 @@ impl PlanTask {
             generation: self.generation,
             plan,
             work,
+            quality: SelectionQuality::default(),
+            exact_leaves: Vec::new(),
         })
     }
 }
@@ -319,6 +353,7 @@ pub struct ViewHorizon {
     proxy_running: BTreeMap<PageId, u64>,
     next_proxy_revision: u64,
     wire: BTreeMap<HeightKey, Arc<net::height::HeightTile>>,
+    certificates: BTreeMap<HeightKey, Certificate>,
     geometry: BTreeMap<PageId, GeometryMeta>,
     wanted: BTreeMap<PageId, GeometryStamp>,
     front: BTreeMap<PageId, Resident>,
@@ -330,8 +365,13 @@ pub struct ViewHorizon {
     models: Vec<(ProxyHandle, [[f32; 4]; 4])>,
     origin: [i64; 3],
     plan_id: u64,
+    accepted_plan_id: u64,
     plan_generation: u64,
     last_request: Option<(u32, [i64; 2], u64)>,
+    projection: Option<Projection>,
+    quality: SelectionQuality,
+    fresh_heights: BTreeSet<HeightKey>,
+    exact_leaves: BTreeSet<HeightKey>,
     near_radius: Option<i64>,
     near_bounds: Option<(u32, [i64; 4])>,
     guard_ready: bool,
@@ -364,6 +404,11 @@ impl ViewHorizon {
             || config.max_proxy_pages == 0
             || config.max_proxy_pages > 512
             || config.horizon_level > 10
+            || !config.screen_error_pixels.is_finite()
+            || config.screen_error_pixels <= 0.
+            || !config.hysteresis_pixels.is_finite()
+            || config.hysteresis_pixels < 0.
+            || config.hysteresis_pixels >= config.screen_error_pixels
         {
             return Err(Error::InvalidConfig);
         }
@@ -414,6 +459,7 @@ impl ViewHorizon {
             proxy_running: BTreeMap::new(),
             next_proxy_revision: 1,
             wire: BTreeMap::new(),
+            certificates: BTreeMap::new(),
             geometry: BTreeMap::new(),
             wanted: BTreeMap::new(),
             front: BTreeMap::new(),
@@ -425,8 +471,13 @@ impl ViewHorizon {
             models: Vec::with_capacity(config.max_proxy_pages * 2),
             origin: [0; 3],
             plan_id: 0,
+            accepted_plan_id: 0,
             plan_generation: 0,
             last_request: None,
+            projection: None,
+            quality: SelectionQuality::default(),
+            fresh_heights: BTreeSet::new(),
+            exact_leaves: BTreeSet::new(),
             near_radius: None,
             near_bounds: None,
             guard_ready: false,
@@ -540,13 +591,29 @@ impl ViewHorizon {
             camera: camera_page,
             refine,
             near_radius: radius,
+            projection: self.projection,
+            certificates: self.certificates.values().copied().collect(),
+            previous: self.cache.wanted().collect(),
         }))
     }
     pub fn complete_plan(&mut self, result: Planned) -> Result<bool, Error> {
         if result.id != self.plan_id || result.generation != self.plan_generation {
             return Ok(false);
         }
+        let previous = self.cache.wanted().map(wire_key).collect::<BTreeSet<_>>();
         self.cache.set_plan(&result.plan)?;
+        // Cached ancestor metadata can guide selection but cannot certify a new
+        // interest period: edits may have occurred while it was unsubscribed.
+        self.fresh_heights.retain(|key| {
+            previous.contains(key)
+                && result
+                    .plan
+                    .tiles
+                    .iter()
+                    .any(|tile| wire_key(tile.key) == *key)
+        });
+        self.quality = result.quality;
+        self.exact_leaves = result.exact_leaves.into_iter().collect();
         let keys = self.cache.wanted().map(wire_key).collect::<Vec<_>>();
         for key in keys {
             if let Some(tile) = self.wire.get(&key) {
@@ -554,37 +621,108 @@ impl ViewHorizon {
             }
         }
         self.rebuild_wanted()?;
+        // Keep only current leaves and ancestors useful for future coarsening.
+        // A long route cannot fill the fixed cache with obsolete fine tiles.
+        let mut keep = BTreeSet::new();
+        for tile in &result.plan.tiles {
+            let mut key = wire_key(tile.key);
+            loop {
+                keep.insert(key);
+                if key.level == self.config.horizon_level {
+                    break;
+                }
+                key = HeightKey {
+                    level: key.level + 1,
+                    x: key.x.div_euclid(2),
+                    z: key.z.div_euclid(2),
+                    ..key
+                };
+            }
+        }
+        self.wire.retain(|key, _| keep.contains(key));
+        self.certificates.retain(|key, _| keep.contains(key));
+        self.accepted_plan_id = result.id;
         self.dirty = true;
         Ok(true)
     }
     pub fn wanted_height(&self) -> impl Iterator<Item = HeightKey> + '_ {
         self.cache.wanted().map(wire_key)
     }
+    pub fn wanted_exact_height(&self) -> impl Iterator<Item = HeightKey> + '_ {
+        self.exact_leaves.iter().copied()
+    }
     pub fn ingest_height(&mut self, tile: Box<net::height::HeightTile>) -> Result<bool, Error> {
         tile.validate().map_err(|_| Error::InvalidWire)?;
+        let selected = self.cache.wanted().any(|key| wire_key(key) == tile.key);
+        let mut exact_promotion = false;
         if let Some(old) = self.wire.get(&tile.key) {
             if tile.source < old.source {
                 return Ok(false);
             }
             if tile.source == old.source && **old == *tile {
+                if selected && self.fresh_heights.insert(tile.key) {
+                    self.dirty = true;
+                }
                 return Ok(false);
             }
-            if tile.source == old.source && render_tile(old) != render_tile(&tile) {
-                return Err(Error::InvalidWire);
+            if tile.source == old.source
+                && (render_tile(old) != render_tile(&tile) || old.error != tile.error)
+            {
+                exact_promotion = old.protected == [0; 32]
+                    && matches!(old.replacement, Replacement::None)
+                    && tile.key.level == 0
+                    && tile.protected == [255; 32]
+                    && matches!(&tile.replacement,Replacement::Column{geometry,..}if !geometry.is_empty())
+                    && old.heights == tile.heights
+                    && old.known == tile.known
+                    && old.atlas == tile.atlas
+                    && old.tint == tile.tint
+                    && old.error == tile.error;
+                if !exact_promotion {
+                    return Err(Error::InvalidWire);
+                }
             }
         } else if self.wire.len() >= self.config.max_sources {
             return Err(Error::Capacity);
         }
         let refine = matches!(tile.replacement, Replacement::Refine);
-        let tile: Arc<_> = Arc::from(tile);
-        self.cache.ingest(Arc::new(render_tile(&tile)))?;
+        let certified = tile.error.is_some();
+        let tile: Arc<net::height::HeightTile> = Arc::from(tile);
+        let rendered = Arc::new(render_tile(&tile));
+        if exact_promotion {
+            self.cache.ingest_exact_promotion(rendered)?;
+        } else {
+            self.cache.ingest(rendered)?;
+        }
+        if selected {
+            self.fresh_heights.insert(tile.key);
+        }
+        if let Some(bound) = tile.error {
+            self.certificates.insert(tile.key,Certificate{key:tile.key,bound,
+                seam_error_q1024:selection::seam_error_q1024(&tile.heights),
+                exact_replacement:matches!(&tile.replacement,Replacement::Column{geometry,..}if !geometry.is_empty())});
+        } else {
+            self.certificates.remove(&tile.key);
+        }
         self.wire.insert(tile.key, tile);
-        if refine {
+        if refine || certified {
             self.plan_generation = self.plan_generation.checked_add(1).ok_or(Error::Capacity)?;
         }
         self.rebuild_wanted()?;
         self.dirty = true;
         Ok(true)
+    }
+    /// The eye box is quantized by the View, so head bob and camera interpolation
+    /// never replan at display frequency. Resizing or FOV changes do replan.
+    pub fn set_projection(&mut self, mut projection: Projection) -> Result<(), Error> {
+        projection.target_pixels = self.config.screen_error_pixels;
+        projection.hysteresis_pixels = self.config.hysteresis_pixels;
+        projection.validate()?;
+        if self.projection != Some(projection) {
+            self.plan_generation = self.plan_generation.checked_add(1).ok_or(Error::Capacity)?;
+            self.projection = Some(projection);
+        }
+        Ok(())
     }
     fn rebuild_wanted(&mut self) -> Result<(), Error> {
         self.wanted.clear();
@@ -780,6 +918,17 @@ impl ViewHorizon {
             self.proxies.release(queue, handle, budget)?;
             self.retired.pop();
             work.retired += 1;
+        }
+        if self
+            .cache
+            .wanted()
+            .any(|key| !self.fresh_heights.contains(&wire_key(key)))
+            || self.exact_leaves.iter().any(|key|self.wire.get(key).is_none_or(|tile|
+                !matches!(&tile.replacement,Replacement::Column{geometry,..}if !geometry.is_empty())))
+        {
+            work.held_previous = true;
+            work.upload_bytes = before - budget.remaining_bytes;
+            return Ok(work);
         }
         self.keys.clear();
         for (&page, resident) in &self.staged {
@@ -982,6 +1131,24 @@ impl ViewHorizon {
     }
     pub fn stats(&self) -> Stats {
         Stats {
+            desired_height_tiles:self.cache.wanted().count(),
+            cached_height_tiles:self.wire.len(),
+            received_desired_heights:self.cache.wanted().filter(|key|self.wire.contains_key(&wire_key(*key))).count(),
+            wanted_refine_tiles:self.cache.wanted().filter_map(|key|self.wire.get(&wire_key(key))).filter(|tile|matches!(tile.replacement,Replacement::Refine)).count(),
+            unavailable_columns:self.cache.wanted().filter_map(|key|self.wire.get(&wire_key(key))).filter(|tile|matches!(&tile.replacement,Replacement::Column{geometry,..}if geometry.is_empty())).count(),
+            known_geometry_sources:self.geometry.len(),
+            near_guard_ready:self.guard_ready,
+            plan_id:self.plan_id,
+            accepted_plan_id:self.accepted_plan_id,
+            plan_generation:self.plan_generation,
+            missing_error_certificates:self.quality.missing_certificates,
+            selection_capacity_limited:self.quality.capacity_limited,
+            selection_leaf_limited:self.quality.leaf_limited,
+            maximum_error_pixels:self.quality.maximum_error_pixels,
+            sse_refinements:self.quality.sse_refinements,
+            pending_height_confirmations:self.cache.wanted().filter(|key|!self.fresh_heights.contains(&wire_key(*key))).count(),
+            pending_exact_columns:self.exact_leaves.iter().filter(|key|self.wire.get(key).is_none_or(|tile|
+                !matches!(&tile.replacement,Replacement::Column{geometry,..}if !geometry.is_empty()))).count(),
             height_front: self.cache.front_len(),
             height_staged: self.cache.staged_len(),
             proxy_front: self.front.len(),
@@ -1098,7 +1265,7 @@ impl TaskContext {
 /// The caller supplies bounded JobSpec/Dispatch metadata; both result kinds are
 /// immutable and carry their own source/plan guards for owner-thread completion.
 pub enum BackgroundTask {
-    Plan(PlanTask),
+    Plan(Box<PlanTask>),
     Proxy(ProxyTask),
 }
 impl BackgroundTask {
@@ -1133,6 +1300,8 @@ impl BackgroundTask {
             Self::Plan(task) => {
                 std::mem::size_of::<PlanTask>()
                     + task.refine.capacity() * std::mem::size_of::<HeightKey>()
+                    + task.certificates.capacity() * std::mem::size_of::<Certificate>()
+                    + task.previous.capacity() * std::mem::size_of::<HeightTileKey>()
             }
             Self::Proxy(task) => {
                 std::mem::size_of::<net::PublicGeometry>()
@@ -1219,6 +1388,9 @@ mod tests {
                 z: 20,
             }],
             near_radius: 4,
+            projection: None,
+            certificates: Vec::new(),
+            previous: Vec::new(),
         }
         .execute()
         .unwrap();

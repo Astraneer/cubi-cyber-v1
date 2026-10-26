@@ -14,6 +14,7 @@ pub struct Preparation {
     pub scene: client::SceneConfig,
     pub raster: NearRasterization,
     pub entities: bool,
+    pub props: bool,
     pub lighting: Option<ClientLightingConfig>,
     pub materials: bool,
     pub environment: bool,
@@ -40,7 +41,7 @@ pub fn prepare(
     let mut view =
         ClientView::new_with_rasterization(terrain, preparation.scene, preparation.raster)?;
     if let Some(mut config) = preparation.lighting {
-        config.shadows.dynamic_casters |= preparation.entities;
+        config.shadows.dynamic_casters |= preparation.entities || preparation.props;
         view.prepare_lighting(device, queue, config)?;
     }
     if preparation.environment {
@@ -56,6 +57,9 @@ pub fn prepare(
     }
     if preparation.entities {
         view.prepare_entities(device, queue)?;
+    }
+    if preparation.props {
+        view.prepare_props(device, queue, Default::default())?;
     }
     if preparation.horizon {
         view.prepare_horizon(device, queue, client::view::horizon::Config::default())?;

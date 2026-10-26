@@ -12,6 +12,8 @@ const MAX_DROP_SOURCES: usize = 16_384;
 pub(super) struct Runtimes {
     pub(super) survival: survival::SurvivalRuntime,
     pub(super) mobs: entities::MobRuntime,
+    pub(super) natural: natural::State,
+    pub(super) hostile_mobs: usize,
     pub(super) items: ItemRuntime,
     pub(super) machines: machines::MachineRuntime,
     pub(super) chat: chat::Ledger,
@@ -19,6 +21,8 @@ pub(super) struct Runtimes {
     pub(super) height: height_authority::HeightAuthority,
     pub(super) height_loaded: bool,
     pub(super) topology_bootstrap: BTreeSet<BlockPos>,
+    pub(super) props_dirty: BTreeSet<PageId>,
+    pub(super) packet_dirty: BTreeSet<PageId>,
     machine_activity: BTreeSet<PageId>,
     machine_activity_initialized: bool,
     machine_activity_revision: u64,
@@ -32,7 +36,7 @@ pub(super) struct Runtimes {
     sections_revision: u64,
 }
 impl Runtimes {
-    pub(super) fn new(entropy: &[u8; 32]) -> Result<Self, ServerError> {
+    pub(super) fn new(entropy: &[u8; 32], public_seed: u32) -> Result<Self, ServerError> {
         let key = |domain: &str| {
             let hash = blake3::derive_key(domain, entropy);
             u64::from_le_bytes(hash[..8].try_into().expect("hash prefix"))
@@ -48,6 +52,12 @@ impl Runtimes {
                 ..entities::Config::default()
             })
             .map_err(|_| ServerError::Invalid("mob runtime initialization"))?,
+            hostile_mobs: 0,
+            natural: natural::State::new(
+                u64::from(public_seed),
+                key("cubi natural spawning rng v1").max(1),
+            )
+            .map_err(|_| ServerError::Invalid("natural initial state"))?,
             items: ItemRuntime::new(MAX_ITEMS, key("cubi item runtime v1"))
                 .map_err(|_| ServerError::Invalid("item runtime initialization"))?,
             machines: machines::MachineRuntime::new(machines::Config::default())
@@ -59,6 +69,8 @@ impl Runtimes {
                 .map_err(|_| ServerError::Invalid("height authority limits"))?,
             height_loaded: false,
             topology_bootstrap: BTreeSet::new(),
+            props_dirty: BTreeSet::new(),
+            packet_dirty: BTreeSet::new(),
             machine_activity: BTreeSet::new(),
             machine_activity_initialized: false,
             machine_activity_revision: 0,
@@ -84,15 +96,29 @@ impl Runtimes {
                     .map_err(|_| ServerError::Invalid("survival snapshot state"))?
                 }
                 RUNTIME_MOBS => {
-                    self.mobs = entities::MobRuntime::restore(
+                    let (snapshot, natural) =
+                        natural_records::restore(&record.payload).map_err(ServerError::Invalid)?;
+                    let mobs = entities::MobRuntime::restore(
                         entities::Config {
                             maximum_entities: MAX_MOBS,
                             ..entities::Config::default()
                         },
-                        &entities::Snapshot::decode(&record.payload, MAX_MOBS)
-                            .map_err(|_| ServerError::Invalid("mob snapshot codec"))?,
+                        &snapshot,
                     )
-                    .map_err(|_| ServerError::Invalid("mob snapshot state"))?
+                    .map_err(|_| ServerError::Invalid("mob snapshot state"))?;
+                    if let Some(natural) = natural {
+                        if natural.map_seed() != self.natural.map_seed() {
+                            return Err(ServerError::Invalid("natural map seed mismatch"));
+                        }
+                        self.natural = natural;
+                    }
+                    self.hostile_mobs = mobs
+                        .entities()
+                        .rows()
+                        .iter()
+                        .filter(|m| m.kind.definition().hostile && m.life.alive())
+                        .count();
+                    self.mobs = mobs;
                 }
                 RUNTIME_ITEMS => {
                     self.items = ItemRuntime::restore(
@@ -155,13 +181,47 @@ impl Runtimes {
                             .map_err(|_| ServerError::Invalid("survival delta codec"))?,
                     )
                     .map_err(|_| ServerError::Invalid("survival delta state"))?,
-                RUNTIME_MOBS => self
-                    .mobs
-                    .acknowledge(
-                        entities::MobDelta::decode(&record.payload, MAX_MOBS)
-                            .map_err(|_| ServerError::Invalid("mob delta codec"))?,
-                    )
-                    .map_err(|_| ServerError::Invalid("mob delta state"))?,
+                RUNTIME_MOBS => {
+                    let (mobs, natural) = natural_records::decode_delta(&record.payload)
+                        .map_err(ServerError::Invalid)?;
+                    if let Some(ref mobs) = mobs {
+                        self.mobs
+                            .validate_owner_delta(mobs)
+                            .map_err(|_| ServerError::Invalid("mob delta guard"))?;
+                    }
+                    if let Some(natural) = natural {
+                        self.natural
+                            .validate(natural)
+                            .map_err(|_| ServerError::Invalid("natural delta guard"))?;
+                    }
+                    if let Some(mobs) = mobs {
+                        let before = mobs
+                            .patches
+                            .iter()
+                            .filter_map(|p| p.before)
+                            .filter(|m| m.kind.definition().hostile && m.life.alive())
+                            .count();
+                        let after = mobs
+                            .patches
+                            .iter()
+                            .filter_map(|p| p.after)
+                            .filter(|m| m.kind.definition().hostile && m.life.alive())
+                            .count();
+                        self.hostile_mobs = self
+                            .hostile_mobs
+                            .checked_sub(before)
+                            .and_then(|n| n.checked_add(after))
+                            .ok_or(ServerError::Invalid("hostile count guard"))?;
+                        self.mobs
+                            .acknowledge(mobs)
+                            .map_err(|_| ServerError::Invalid("mob delta state"))?;
+                    }
+                    if let Some(natural) = natural {
+                        self.natural
+                            .apply(natural)
+                            .map_err(|_| ServerError::Invalid("natural delta state"))?;
+                    }
+                }
                 RUNTIME_ITEMS => self
                     .items
                     .acknowledge(
@@ -169,16 +229,37 @@ impl Runtimes {
                             .map_err(|_| ServerError::Invalid("item delta codec"))?,
                     )
                     .map_err(|_| ServerError::Invalid("item delta state"))?,
-                save::RUNTIME_MACHINES => self
-                    .machines
-                    .acknowledge(
-                        machines::RuntimeDelta::decode(
-                            &record.payload,
-                            machines::Config::default(),
-                        )
-                        .map_err(|_| ServerError::Invalid("machine delta codec"))?,
+                save::RUNTIME_MACHINES => {
+                    let delta = machines::RuntimeDelta::decode(
+                        &record.payload,
+                        machines::Config::default(),
                     )
-                    .map_err(|_| ServerError::Invalid("machine delta state"))?,
+                    .map_err(|_| ServerError::Invalid("machine delta codec"))?;
+                    if let Some(transport) = &delta.transport {
+                        for patch in &transport.packets {
+                            for packet in patch.before.iter().chain(patch.after.iter()) {
+                                if let Some(at) = packet.at() {
+                                    self.packet_dirty.insert(at.page());
+                                }
+                            }
+                        }
+                        self.packet_dirty
+                            .extend(transport.clocks.iter().map(|patch| patch.page));
+                    }
+                    for patch in &delta.machines {
+                        for meta in patch.before.iter().chain(patch.after.iter()) {
+                            self.props_dirty.insert(meta.anchor.page());
+                        }
+                    }
+                    for patch in &delta.configs {
+                        for config in patch.before.iter().chain(patch.after.iter()) {
+                            self.props_dirty.insert(config.position.page());
+                        }
+                    }
+                    self.machines
+                        .acknowledge(delta)
+                        .map_err(|_| ServerError::Invalid("machine delta state"))?;
+                }
                 save::RUNTIME_HEIGHT => {
                     self.height
                         .apply_encoded_delta(&record.payload)
@@ -212,11 +293,8 @@ impl Runtimes {
             },
             RuntimeRecord {
                 kind: RUNTIME_MOBS,
-                payload: self
-                    .mobs
-                    .snapshot()
-                    .encode()
-                    .map_err(|_| ServerError::Invalid("mob snapshot bounds"))?,
+                payload: natural_records::snapshot(&self.mobs, &self.natural)
+                    .map_err(ServerError::Invalid)?,
             },
             RuntimeRecord {
                 kind: RUNTIME_ITEMS,

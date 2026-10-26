@@ -349,28 +349,32 @@ fn homogeneous_f64_energy_preserves_each_msaa_sample_and_resize_reuses_pipelines
     // ray segment, while an empty depth map is an independent lit control.
     let shadow_uniform = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("analytic fully-occluded aerial shadow atlas mapping"),
-        size: 224,
+        size: std::mem::size_of::<render::shadows::ShadowSampling>() as u64,
         usage: wgpu::BufferUsages::UNIFORM,
         mapped_at_creation: true,
     });
-    let mut shadow_words = [0u32; 56];
-    for cascade in 0..3 {
-        shadow_words[cascade * 16 + 14] = 0.5f32.to_bits();
-        shadow_words[cascade * 16 + 15] = 1f32.to_bits();
-    }
-    shadow_words[49] = 1f32.to_bits();
-    shadow_words[52] = 1;
-    shadow_words[53] = 1;
+    let matrix = [
+        [0.000001, 0., 0., 0.],
+        [0., 0., 0.000001, 0.],
+        [0., 0.000001, 0., 0.],
+        [0., 0., 0.5, 1.],
+    ];
+    let sampling = render::shadows::ShadowSampling {
+        matrices: [matrix; 3],
+        desired_matrices: [matrix; 3],
+        sun: [0., 1., 0., 0.],
+        params: [1, 8, 0, 0],
+    };
     shadow_uniform
         .slice(..)
         .get_mapped_range_mut()
-        .copy_from_slice(bytemuck::cast_slice(&shadow_words));
+        .copy_from_slice(bytemuck::bytes_of(&sampling));
     shadow_uniform.unmap();
     let shadow_depth = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("controlled actual reverse-Z comparison depth"),
         size: wgpu::Extent3d {
-            width: 1,
-            height: 1,
+            width: 8,
+            height: 8,
             depth_or_array_layers: 3,
         },
         mip_level_count: 1,
@@ -446,7 +450,7 @@ fn homogeneous_f64_energy_preserves_each_msaa_sample_and_resize_reuses_pipelines
             &mut 2048,
         )
         .unwrap();
-    assert_eq!(work.shadow_samples, 262144);
+    assert_eq!(work.shadow_samples, 524288);
     gpu.queue.submit([encoder.finish()]);
     let blocked = pixels(&gpu, shadowed.resolved_texture(), W, H);
     let darkened = image
@@ -488,7 +492,7 @@ fn homogeneous_f64_energy_preserves_each_msaa_sample_and_resize_reuses_pipelines
         "empty shadow atlas must match no-shadow source: {max_restore}"
     );
     println!(
-        "M10_AERIAL_SHADOW_GPU_OK blocked_receivers={darkened} max_restore_error={max_restore} shadow_reads_upper_bound=262144 stale_shadow_cache_rebuilt=true"
+        "M10_AERIAL_SHADOW_GPU_OK blocked_receivers={darkened} max_restore_error={max_restore} shadow_reads_upper_bound=524288 stale_shadow_cache_rebuilt=true"
     );
     let original = image;
     let source_only = AerialState {

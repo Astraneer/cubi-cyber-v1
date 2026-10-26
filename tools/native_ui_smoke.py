@@ -94,7 +94,7 @@ EndSection
         dpy = wait(lambda: X.XOpenDisplay(display.encode()), "owned Xorg unavailable", 10)
         ready = folder / "ready"
         with (folder / "server.log").open("w") as output:
-            processes.append(sp.Popen([str(ROOT / "target/debug/server"), "--data", str(folder / "world"), "--ws", "127.0.0.1:0", "--udp", "127.0.0.1:0", "--ready-file", str(ready), "--spawn", "8.5,90,8.5"], stdout=output, stderr=sp.STDOUT, cwd=ROOT, env=environment))
+            processes.append(sp.Popen([os.environ.get("CUBI_PRODUCT_SERVER",str(ROOT / "target/debug/server")), "--data", str(folder / "world"), "--ws", "127.0.0.1:0", "--udp", "127.0.0.1:0", "--ready-file", str(ready), "--spawn", "8.5,90,8.5"], stdout=output, stderr=sp.STDOUT, cwd=ROOT, env=environment))
         wait(ready.exists, "authority unavailable")
         address = re.search(r"ws=(\S+)", ready.read_text())[1]
         owner = os.environ.get("CUBI_UI_OWNER") == "1"
@@ -112,7 +112,7 @@ EndSection
             if stack_kib:
                 resource.setrlimit(resource.RLIMIT_STACK, (stack_kib*1024, resource.getrlimit(resource.RLIMIT_STACK)[1]))
         with log.open("w") as output:
-            processes.append(sp.Popen([str(ROOT / "target/debug/client-native"), "--software"], stdout=output, stderr=sp.STDOUT, cwd=ROOT, env=environment, preexec_fn=native_limits))
+            processes.append(sp.Popen([os.environ.get("CUBI_PRODUCT_NATIVE",str(ROOT / "target/debug/client-native")), "--software"], stdout=output, stderr=sp.STDOUT, cwd=ROOT, env=environment, preexec_fn=native_limits))
         native = processes[-1]
         def text():
             if native.poll() is not None:
@@ -201,6 +201,7 @@ EndSection
         before=len(text())
         crafted=False
         chest_transfer=False
+        configurator_cycle=False
         creative_grant=False
         if owner:
             assert "role=Owner" in text()
@@ -266,6 +267,24 @@ EndSection
             capture("creative")
             before=len(text());key("Escape");painted("Game",before)
             creative_grant=True
+            before=len(text());command("/give 327 1")
+            wait(lambda:window_state(before,inventory_items=69),"owned configurator missing")
+            before=len(text());key("3")
+            wait(lambda:"NATIVE_UI_ITEM selected=2 item=327 fact=Some(Configurator(0))" in text()[before:],"owned configurator fact missing")
+            def mode_press(mode,back=False):
+                before=len(text())
+                if back:key("Shift_L",True)
+                key("n")
+                if back:key("Shift_L",False)
+                wait(lambda:f"NATIVE_UI_ITEM selected=2 item=327 fact=Some(Configurator({mode}))" in text()[before:],"authoritative configurator mode did not reach UI")
+            mode_press(1)
+            mode_press(0,True)
+            for mode in [1,2,3,4,0]:mode_press(mode)
+            before=len(text());key("e");painted("Inventory",before,extra=r"window=0*[1-9a-f][0-9a-f]*")
+            T.XTestFakeMotionEvent(dpy,-1,287,411,0);X.XFlush(dpy);time.sleep(0.2)
+            capture("configurator")
+            before=len(text());key("Escape");painted("Game",before)
+            configurator_cycle=True
         before=len(text())
         key("Tab", True)
         painted("Game",before, "tab=true")
@@ -282,7 +301,7 @@ EndSection
         report = json.loads(report_path.read_text())
         assert report["movementReplayAvailable"] and report["movementReplay"]["steps"] > 0
         assert report["movementReplay"]["rendererReplay"] is False
-        replay = sp.run([str(ROOT / "target/debug/examples/replay"), str(report_path)], cwd=ROOT, env=environment, capture_output=True, text=True)
+        replay = sp.run([os.environ.get("CUBI_PRODUCT_REPLAY",str(ROOT / "target/debug/examples/replay")), str(report_path)], cwd=ROOT, env=environment, capture_output=True, text=True)
         assert replay.returncode == 0, replay.stderr
         assert "MOVEMENT_REPLAY_OK" in replay.stdout
         (ARTIFACTS / "native-product-movement-replay.txt").write_text(replay.stdout)
@@ -307,6 +326,7 @@ EndSection
         wait(lambda: native.poll() is not None, "native UI quit unavailable")
         assert native.returncode == 0, log.read_text()
         result = {"mainStackLimitKiB": stack_kib or None, "productProfile":{"authoritativeLightPages":int(profile[1]),"farHeightTiles":int(profile[2]),"knownEyeSky":int(profile[3]),"atmospherePost":True,"shadowResolution":2048}, "ownerAuthenticated":owner,"authoritativeCraft":crafted,"authoritativeChestTransfer":chest_transfer,"authorizedCreativeNeiGrant":creative_grant, "welcomePixels": welcome, "settingsPixels": settings, "inventoryPixels": inventory, "rosterPixels": roster, "profilerPixels": profiler, "authority": True, "guardedInventory": True, "chat": True, "serverMeasuredPing": True, "virtualAudioVoiceSamples": max(voices), "hardwareAudibilityProven": False, "movementReplaySteps": report["movementReplay"]["steps"], "offlineReplay": True, "persistedIdentityResumed": True, "freshViewReconnect": True}
+        result["authoritativeConfiguratorCycle"]=configurator_cycle
         (ARTIFACTS / ("native-owner-ui-smoke.json" if owner else "native-product-ui-smoke.json")).write_text(json.dumps(result, indent=2) + "\n")
         (ARTIFACTS / ("native-owner-ui-smoke.log" if owner else "native-product-ui-smoke.log")).write_text(log.read_text())
         print("NATIVE_PRODUCT_UI_OK " + json.dumps(result))

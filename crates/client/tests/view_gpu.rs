@@ -650,6 +650,7 @@ fn shared_view_dispatches_public_horizon_plan_and_draws_the_complete_gpu_cover()
         view.ingest_remote_height(Box::new(net::height::HeightTile {
             key: *key,
             source: 1,
+            error: None,
             heights: [64; 289],
             known,
             atlas: [0; 256],
@@ -903,7 +904,12 @@ fn entity_body_animation_preserves_static_shadow_cache_and_uses_no_cpu_vertices(
     assert_eq!(after.static_shadow_draws, before.static_shadow_draws);
     assert_eq!(after.shadow_updates, before.shadow_updates);
     assert!(after.dynamic_shadow_draws > before.dynamic_shadow_draws);
-    assert!(after.dynamic_shadow_copy_bytes > before.dynamic_shadow_copy_bytes);
+    assert!(after.dynamic_shadow_restore_pixels > before.dynamic_shadow_restore_pixels);
+    assert!(after.dynamic_shadow_restore_draws > before.dynamic_shadow_restore_draws);
+    assert_eq!(
+        after.dynamic_shadow_copy_bytes, 0,
+        "dynamic shadow damage never copies the whole atlas"
+    );
     assert_eq!(view.entity_stats().unwrap().cpu_vertices, 0);
     assert!(view.entity_stats().unwrap().instance_records > 0);
     let mut movement_report = String::from("{}");

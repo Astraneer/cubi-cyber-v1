@@ -188,7 +188,7 @@ impl ServerLighting {
     pub fn request_sky_page(&mut self, page: PageId, tick: Tick) -> bool {
         let accepted = self
             .engine
-            .queue_page(page, tick, LightPriority::Interactive)
+            .queue_sky_boundary_page(page, tick, LightPriority::Interactive)
             .is_ok();
         self.work.sky_pages_queued += u64::from(accepted);
         accepted

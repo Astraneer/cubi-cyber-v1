@@ -14,6 +14,7 @@ fn tile(key: HeightKey, source: u64) -> Box<HeightTile> {
     let mut t = HeightTile {
         key,
         source,
+        error: None,
         heights: [32; 289],
         known: [255; 37],
         atlas: [3; 256],
@@ -375,6 +376,169 @@ fn live_horizon_requires_gpu_manifest_and_preserves_old_cover_and_arch_air() {
 }
 
 #[test]
+fn reselected_cached_parent_waits_for_fresh_identical_source_before_gpu_publication() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut terrain = render::terrain_gpu::TerrainGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            96,
+            96,
+            render::OutputTransfer::Attachment,
+            render::terrain_gpu::GpuConfig {
+                max_pages: 8,
+                max_quads: 8192,
+                occlusion: false,
+            },
+            &render::terrain_gpu::AtlasImage::donor().unwrap(),
+        )
+        .unwrap();
+        let mut horizon = ViewHorizon::prepare(
+            &gpu.device,
+            &gpu.queue,
+            &terrain,
+            None,
+            Config {
+                max_tiles: 64,
+                max_sources: 128,
+                max_proxy_pages: 16,
+                horizon_level: 1,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        horizon.reserve_near_cutout(0).unwrap();
+        horizon
+            .guard_near(&gpu.queue, 0, [0, 0], &mut UploadBudget::new(4096))
+            .unwrap()
+            .unwrap();
+        let low = Projection {
+            eye_min: [0., 10000., 0.],
+            eye_max: [0., 10000., 0.],
+            focal_pixels: 1.,
+            diagonal_tangent: 1.,
+            target_pixels: 32.,
+            hysteresis_pixels: 8.,
+            view_direction: [0., -1., 0.],
+            view_cosine: 0.,
+        };
+        horizon.set_projection(low).unwrap();
+        let first = horizon
+            .plan_task(0, [0, 0])
+            .unwrap()
+            .unwrap()
+            .execute()
+            .unwrap();
+        horizon.complete_plan(first).unwrap();
+        let focus = HeightKey {
+            space: 0,
+            level: 1,
+            x: 1,
+            z: 1,
+        };
+        let mut parent = None;
+        for key in horizon.wanted_height().collect::<Vec<_>>() {
+            let mut input = tile(key, 1);
+            input.error = Some(net::height::HeightErrorBound {
+                max_error_q1024: if key == focus { 500 * 1024 } else { 0 },
+                min_height: 32,
+                max_height: 32,
+            });
+            if key == focus {
+                input.tint.fill(0xff0000ff);
+                parent = Some(input.clone());
+            }
+            horizon.ingest_height(input).unwrap();
+        }
+        let parent = parent.expect("a coarse public root is selected");
+        horizon
+            .pump(&gpu.queue, &mut UploadBudget::new(1_000_000), 64, 16)
+            .unwrap();
+        let eye = [48., 44., 80.];
+        let camera = Camera::perspective(eye, [48., 32., 48.], [0., 1., 0.], 1., 1., 0.1, 200.);
+        let coarse = frame_at(&gpu, &mut terrain, &mut horizon, camera, eye);
+        horizon
+            .set_projection(Projection {
+                focal_pixels: 1000.,
+                ..low
+            })
+            .unwrap();
+        let refined = horizon
+            .plan_task(0, [0, 0])
+            .unwrap()
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert!(
+            !refined
+                .plan
+                .tiles
+                .iter()
+                .any(|tile| tile.key.level == 1 && tile.key.x == 1 && tile.key.z == 1)
+        );
+        horizon.complete_plan(refined).unwrap();
+        for key in horizon.wanted_height().collect::<Vec<_>>() {
+            if key.level == 0 && key.x.div_euclid(2) == 1 && key.z.div_euclid(2) == 1 {
+                let mut input = tile(key, 1);
+                input.error = Some(net::height::HeightErrorBound {
+                    max_error_q1024: 0,
+                    min_height: 32,
+                    max_height: 32,
+                });
+                horizon.ingest_height(input).unwrap();
+            }
+        }
+        assert!(
+            horizon
+                .pump(&gpu.queue, &mut UploadBudget::new(1_000_000), 64, 16)
+                .unwrap()
+                .published
+        );
+        let fine = frame_at(&gpu, &mut terrain, &mut horizon, camera, eye);
+        assert!(
+            coarse != fine,
+            "the old cached parent has a visible material positive control"
+        );
+        horizon.set_projection(low).unwrap();
+        let coarsened = horizon
+            .plan_task(0, [0, 0])
+            .unwrap()
+            .unwrap()
+            .execute()
+            .unwrap();
+        horizon.complete_plan(coarsened).unwrap();
+        assert_eq!(horizon.stats().pending_height_confirmations, 1);
+        let held = horizon
+            .pump(&gpu.queue, &mut UploadBudget::new(1_000_000), 64, 16)
+            .unwrap();
+        assert!(held.held_previous);
+        assert_eq!(held.upload_bytes, 0);
+        assert!(
+            fine == frame_at(&gpu, &mut terrain, &mut horizon, camera, eye),
+            "unconfirmed cached parent changed actual GPU output"
+        );
+        assert!(
+            !horizon.ingest_height(parent).unwrap(),
+            "identical-source reply changes the lease, not the payload"
+        );
+        assert_eq!(horizon.stats().pending_height_confirmations, 0);
+        assert!(
+            horizon
+                .pump(&gpu.queue, &mut UploadBudget::new(1_000_000), 64, 16)
+                .unwrap()
+                .published
+        );
+        assert!(
+            fine != frame_at(&gpu, &mut terrain, &mut horizon, camera, eye),
+            "fresh confirmation must permit the visible parent publication"
+        );
+    });
+}
+
+#[test]
 fn browser_horizon_packets_keep_plan_and_public_proxy_results_exact_and_bounded() {
     pollster::block_on(async {
         assert_eq!(
@@ -403,7 +567,7 @@ fn browser_horizon_packets_keep_plan_and_public_proxy_results_exact_and_bounded(
             ViewHorizon::prepare(&gpu.device, &gpu.queue, &terrain, None, Config::default())
                 .unwrap();
         owner.reserve_near_cutout(4).unwrap();
-        let task = BackgroundTask::Plan(owner.plan_task(0, [0, 0]).unwrap().unwrap());
+        let task = BackgroundTask::Plan(Box::new(owner.plan_task(0, [0, 0]).unwrap().unwrap()));
         let context = task.context();
         let request = encode_background_task(&task).unwrap();
         for n in 0..request.len() {

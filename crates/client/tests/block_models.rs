@@ -45,21 +45,26 @@ fn defined_model_families_preserve_catalog_ids_and_do_not_duplicate_terrain() {
         assert_eq!(output.light, 0xa321);
         assert_eq!(output.position, [0.5, 1.0, 0.5], "id{id}");
     }
+    for id in [AIR, STONE, GLASS, WATER, BOUNDING] {
+        assert!(
+            instance(sample(id, 0), [0; 3]).unwrap().is_none(),
+            "terrain/hidden id{id}"
+        );
+    }
     for id in [
-        AIR,
-        STONE,
-        GLASS,
-        WATER,
         ELECTRIC_PUMP,
         ENRICHMENT_CHAMBER,
         ENERGIZED_SMELTER,
         CRUSHER,
         PURIFICATION_CHAMBER,
-        BOUNDING,
     ] {
-        assert!(
-            instance(sample(id, 0), [0; 3]).unwrap().is_none(),
-            "terrain/hidden id{id}"
+        let model = instance(sample(id, 0), [0; 3]).unwrap().unwrap();
+        assert!(is_model_candidate(sample(id, 0).cell));
+        assert_eq!(model.kind, kind::CUBE_MACHINE);
+        assert_ne!(model.flags & render::block_models::PORT_MARKER_ONLY, 0);
+        assert_eq!(
+            rules::block(id).unwrap().render,
+            rules::blocks::Render::Cube
         );
     }
     assert_eq!(std::mem::size_of::<BlockInstance>(), 64);

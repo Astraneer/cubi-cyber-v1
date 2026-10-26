@@ -94,6 +94,7 @@ impl Default for Budget {
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Work {
+    pub visited: u64,
     pub actors: u64,
     pub queries: u64,
     pub waiting_world: u64,
@@ -301,8 +302,23 @@ impl MobRuntime {
                 inputs: &inputs,
             };
             let result = self.plan_actor(before, &query, now, &mut budget, &mut work);
+            if exhausted.get() {
+                admitted -= 1;
+                work.budget_exhausted = true;
+                work.deferred_actors += count.saturating_sub(admitted) as u64;
+                break;
+            }
             match result {
                 Ok((after, control)) => {
+                    // Grass consumption performs two final guarded reads after
+                    // the body/AI plan. Retain this actor for the next owner
+                    // microbatch rather than turn quota pressure into Unknown.
+                    if control.eat_grass && reads.get().saturating_add(2) > budget.cells {
+                        admitted -= 1;
+                        work.budget_exhausted = true;
+                        work.deferred_actors += count.saturating_sub(admitted) as u64;
+                        break;
+                    }
                     work.actors += 1;
                     if control.lay_egg {
                         drops.push(DeathDrops {
@@ -392,7 +408,9 @@ impl MobRuntime {
                     work.waiting_world += 1;
                 }
                 Err(EntityError::Capacity) => {
-                    work.deferred_actors += count.saturating_sub(admitted) as u64 + 1;
+                    admitted -= 1;
+                    work.budget_exhausted = true;
+                    work.deferred_actors += count.saturating_sub(admitted) as u64;
                     break;
                 }
                 Err(error) => return Err(error),
@@ -402,6 +420,7 @@ impl MobRuntime {
                 break;
             }
         }
+        work.visited = admitted as u64;
         work.queries = reads.get();
         let cursor = if self.store.active_len() == 0 {
             0

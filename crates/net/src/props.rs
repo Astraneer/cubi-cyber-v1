@@ -23,7 +23,8 @@ pub struct Hint {
     pub index: LocalIdx,
     pub kind: Kind,
     pub flags: u8,
-    /// Machine/Wind: six3-bit modes0..5. Connector: six2-bit modes0..3.
+    /// Machine/Wind: six3-bit modes0..5. Connector low12: six2-bit
+    /// modes0..3; bits12..16: color0..18 (zero means no overlay).
     /// Face order is Down Up North South West East, without inventory fields.
     pub ports: u32,
     pub lid: u16,
@@ -43,7 +44,8 @@ impl Hint {
         if self.flags & !allowed != 0
             || (matches!(self.kind, Kind::Machine | Kind::Wind)
                 && (self.ports > 0x3ffff || (0..6).any(|face| (self.ports >> (face * 3) & 7) > 5)))
-            || (self.kind == Kind::Connector && self.ports > 4095)
+            || (self.kind == Kind::Connector
+                && (self.ports & !0x1ffff != 0 || self.ports >> 12 > 18))
             || (self.flags & PORTS == 0 && self.ports != 0)
             || (self.flags & LID == 0 && self.lid != 0)
             || (self.flags & ROTOR == 0 && (self.rotor != 0 || self.rotor_velocity != 0))

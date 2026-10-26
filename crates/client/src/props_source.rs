@@ -31,6 +31,31 @@ pub struct PropsLimits {
     pub max_ready: usize,
     pub max_age_ticks: u64,
 }
+/// Inclusive page bounds for near-model ownership. LIGHT halo pages can remain
+/// in World without being duplicated over the public horizon renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisibleRegion {
+    pub min: PageId,
+    pub max: PageId,
+}
+impl VisibleRegion {
+    pub fn contains(self, page: PageId) -> bool {
+        page.space == self.min.space
+            && page.x >= self.min.x
+            && page.x <= self.max.x
+            && page.y >= self.min.y
+            && page.y <= self.max.y
+            && page.z >= self.min.z
+            && page.z <= self.max.z
+    }
+    fn valid(self) -> bool {
+        self.min.space == self.max.space
+            && self.min.space == SpaceId(0)
+            && self.min.x <= self.max.x
+            && self.min.y <= self.max.y
+            && self.min.z <= self.max.z
+    }
+}
 impl Default for PropsLimits {
     fn default() -> Self {
         Self {
@@ -86,6 +111,8 @@ pub struct PropsWork {
     pub binding_members: u64,
     pub public_members: u64,
     pub animated_models: u64,
+    pub visibility_headers: u64,
+    pub visibility_members: u64,
     pub records_uploaded: u64,
     pub upload_bytes: u64,
     pub cpu_vertices: u64,
@@ -114,6 +141,7 @@ struct PageState {
     light_next: Option<usize>,
     public_next: Option<usize>,
     first: Option<Tick>,
+    retiring: bool,
 }
 struct Slot {
     position: Option<BlockPos>,
@@ -279,8 +307,80 @@ pub struct PropsSource {
     ready: VecDeque<Ready>,
     next_job: u64,
     work: PropsWork,
+    region: Option<VisibleRegion>,
+    retiring: VecDeque<(PageId, usize)>,
 }
 impl PropsSource {
+    fn in_region(&self, page: PageId) -> bool {
+        self.region.is_none_or(|region| region.contains(page))
+    }
+    /// A region change visits indexed page headers once. Record retirement then
+    /// consumes normal ingest credits, and hidden records consume upload credits.
+    /// The caller explicitly watches newly included visible pages afterwards.
+    pub fn set_visible_region(
+        &mut self,
+        region: Option<VisibleRegion>,
+        tick: Tick,
+    ) -> Result<bool, PropsError> {
+        if region.is_some_and(|region| !region.valid()) {
+            return Err(PropsError::Space);
+        }
+        if self.region == region {
+            return Ok(false);
+        }
+        self.region = region;
+        for (&page, state) in &mut self.pages {
+            self.work.visibility_headers += 1;
+            if region.is_some_and(|region| !region.contains(page)) {
+                state.known = false;
+                state.first = Some(state.first.map_or(tick, |old| old.min(tick)));
+                if !state.retiring {
+                    state.retiring = true;
+                    self.retiring.push_back((page, 0));
+                }
+            }
+        }
+        Ok(true)
+    }
+    fn advance_retirement(&mut self, tick: Tick) -> Result<bool, PropsError> {
+        let Some(&(page, next)) = self.retiring.front() else {
+            return Ok(false);
+        };
+        if self.in_region(page) {
+            if let Some(state) = self.pages.get_mut(&page) {
+                state.retiring = false;
+            }
+            self.retiring.pop_front();
+            return Ok(true);
+        }
+        let member = self
+            .pages
+            .get(&page)
+            .and_then(|state| state.members.get(next))
+            .copied();
+        if let Some(index) = member {
+            if index != u32::MAX
+                && let Some(position) = self.slots[index as usize].position
+            {
+                self.remove(position, tick)?;
+            }
+            self.retiring.front_mut().expect("retirement cursor").1 += 1;
+            self.work.visibility_members += 1;
+        } else {
+            self.retiring.pop_front();
+            if let Some(state) = self.pages.get_mut(&page) {
+                state.retiring = false;
+            }
+            if self
+                .pages
+                .get(&page)
+                .is_some_and(|state| state.live == 0 && !state.running && !state.queued)
+            {
+                self.pages.remove(&page);
+            }
+        }
+        Ok(true)
+    }
     /// GPU reserve_slots(max_instances) is a separate loading operation and its
     /// actual bytes must be reported as loading, before this owner publishes.
     pub fn attach(world: &mut World, limits: PropsLimits) -> Result<Self, PropsError> {
@@ -319,6 +419,8 @@ impl PropsSource {
             ready: VecDeque::with_capacity(limits.max_ready),
             next_job: 1,
             work: PropsWork::default(),
+            region: None,
+            retiring: VecDeque::with_capacity(limits.max_pages * 2),
         };
         for (page, _) in world.pages() {
             if page.space == SpaceId(0) {
@@ -330,6 +432,9 @@ impl PropsSource {
     pub fn watch_page(&mut self, page: PageId, tick: Tick) -> Result<(), PropsError> {
         if page.space != SpaceId(0) {
             return Err(PropsError::Space);
+        }
+        if !self.in_region(page) {
+            return Ok(());
         }
         if !self.pages.contains_key(&page) && self.pages.len() >= self.limits.max_pages * 2 {
             return Err(PropsError::Capacity);
@@ -344,6 +449,7 @@ impl PropsSource {
             light_next: None,
             public_next: None,
             first: Some(tick),
+            retiring: false,
         });
         state.known = true;
         state.first = Some(state.first.map_or(tick, |old| old.min(tick)));
@@ -408,6 +514,9 @@ impl PropsSource {
         Ok(())
     }
     fn set_from_world(&mut self, world: &World, p: BlockPos, tint: u32) -> Result<(), PropsError> {
+        if !self.in_region(p.page()) {
+            return Ok(());
+        }
         let Some(page) = world.page(p.page()) else {
             return self.remove(p, world.tick());
         };
@@ -702,6 +811,10 @@ impl PropsSource {
         mut tint: impl FnMut(BlockPos) -> u32,
     ) -> Result<usize, PropsError> {
         let mut used = 0;
+        while used < max_entries && self.advance_retirement(world.tick())? {
+            used += 1;
+        }
+        let retirement_credits = used;
         while used < max_entries {
             let mut pending = if let Some(p) = self.pending.take() {
                 p
@@ -793,7 +906,7 @@ impl PropsSource {
                 }
             }
         }
-        self.work.journal_entries += used as u64;
+        self.work.journal_entries += (used - retirement_credits) as u64;
         Ok(used)
     }
     pub fn take_job(
@@ -917,6 +1030,8 @@ impl PropsSource {
             let page = ready.built.page;
             if world.page(page).is_none()
                 || world.input_version(page, CHANNELS) != ready.built.source
+                || !self.in_region(page)
+                || self.pages.get(&page).is_none_or(|state| !state.known)
             {
                 self.ready.pop_front();
                 self.work.jobs_stale += 1;
@@ -1065,7 +1180,9 @@ impl PropsSource {
                     instance(sample_at(sample), origin)?.unwrap_or_else(BlockInstance::hidden);
                 if let Some((kind, ports)) = slot.ports {
                     if kind == net::props::Kind::Connector {
-                        value.connections = ports;
+                        value.connections = ports & 0xfff;
+                        let color = ports >> 12;
+                        value.reserved[3] = if color == 0 { 0 } else { (1 << 30) | color };
                     } else {
                         value.reserved[3] = ports | (1 << 31);
                     }
@@ -1143,7 +1260,8 @@ impl PropsSource {
                 && self.running.is_empty()
                 && self.ready.is_empty()
                 && self.light_jobs.is_empty()
-                && self.public_jobs.is_empty(),
+                && self.public_jobs.is_empty()
+                && self.retiring.is_empty(),
         }
     }
     pub fn take_work(&mut self) -> PropsWork {
@@ -1158,6 +1276,7 @@ impl PropsSource {
     }
     /// Before detach, queue/flush every model removal if GPU owner is retained.
     pub fn clear(&mut self, tick: Tick) -> Result<(), PropsError> {
+        self.retiring.clear();
         let revision = self
             .public_revision
             .checked_add(1)
@@ -1201,12 +1320,7 @@ impl PropsSource {
     }
 }
 fn eligible(cell: Cell) -> bool {
-    rules::block(cell.id()).is_some_and(|d| {
-        matches!(
-            d.render,
-            rules::blocks::Render::Model(_) | rules::blocks::Render::Cross
-        )
-    })
+    crate::block_models::is_model_candidate(cell)
 }
 fn hint_matches(kind: net::props::Kind, cell: Cell) -> bool {
     let Some(definition) = rules::block(cell.id()) else {
@@ -1226,10 +1340,11 @@ fn hint_matches(kind: net::props::Kind, cell: Cell) -> bool {
         Kind::Wind => cell.id() == rules::ids::WIND_GENERATOR,
         Kind::Machine => {
             cell.id() != rules::ids::WIND_GENERATOR
-                && matches!(
-                    definition.render,
-                    rules::blocks::Render::Model(rules::Model::Mek)
-                )
+                && (crate::block_models::is_classic_machine(cell)
+                    || matches!(
+                        definition.render,
+                        rules::blocks::Render::Model(rules::Model::Mek)
+                    ))
         }
     }
 }

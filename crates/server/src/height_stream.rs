@@ -128,7 +128,7 @@ impl Server {
             if published >= 2 {
                 break;
             }
-            let Some((connection, tile)) = self.height_worker.ready.pop_front() else {
+            let Some((connection, mut tile)) = self.height_worker.ready.pop_front() else {
                 break;
             };
             let key = wire_key(tile.key);
@@ -148,6 +148,15 @@ impl Server {
                     peer.height_requests.push_back((key, None));
                 }
                 self.counters.height_discarded += 1;
+                continue;
+            }
+            if peer.height_exact.contains(&key)
+                && crate::height_tile::promote_exact_leaf(&mut tile).is_err()
+            {
+                output.push(Outgoing::reliable(
+                    connection,
+                    ServerMessage::HeightUnavailable(key),
+                ));
                 continue;
             }
             let replacement = match &tile.replacement {
@@ -231,6 +240,7 @@ impl Server {
             let wire = HeightTile {
                 key,
                 source: tile.source,
+                error: tile.error,
                 heights: tile.heights,
                 known: tile.known,
                 atlas: tile.atlas,

@@ -126,3 +126,77 @@ impl<const N: usize> GpuPassTimer<N> {
         }
     }
 }
+
+/// Whole command-graph scope, including copies and subsystem-owned passes.
+/// Timestamp-only boundary passes work with WebGPU TIMESTAMP_QUERY; no optional
+/// inside-encoder timestamp feature or frame-time pipeline is required.
+pub struct GpuGraphTimer {
+    queries: Option<Queries>,
+    started: Cell<bool>,
+}
+impl GpuGraphTimer {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, label: &str) -> Self {
+        let queries = device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY)
+            .then(|| Queries {
+                set: device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some(label),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: 2,
+                }),
+                resolved: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: 256,
+                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
+                period: queue.get_timestamp_period(),
+            });
+        Self {
+            queries,
+            started: Cell::new(false),
+        }
+    }
+    pub fn begin_frame(&self) {
+        self.started.set(false);
+    }
+    pub fn start(&self, encoder: &mut wgpu::CommandEncoder) {
+        if self.started.replace(true) {
+            return;
+        }
+        if let Some(queries) = &self.queries {
+            let _pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("whole GPU graph begins"),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: &queries.set,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: None,
+                }),
+            });
+        }
+    }
+    pub fn finish(&self, encoder: &mut wgpu::CommandEncoder) {
+        if self.started.get()
+            && let Some(queries) = &self.queries
+        {
+            {
+                let _pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("whole GPU graph ends"),
+                    timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                        query_set: &queries.set,
+                        beginning_of_pass_write_index: None,
+                        end_of_pass_write_index: Some(1),
+                    }),
+                });
+            }
+            encoder.resolve_query_set(&queries.set, 0..2, &queries.resolved, 0);
+        }
+    }
+    pub fn timestamp_buffer(&self) -> Option<(&wgpu::Buffer, f32)> {
+        self.queries
+            .as_ref()
+            .filter(|_| self.started.get())
+            .map(|q| (&q.resolved, q.period))
+    }
+}

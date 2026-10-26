@@ -4,7 +4,10 @@ use crate::{
     MSAA_SAMPLES,
     entity_models::{MODEL_KINDS, ModelCatalog, ModelVertex, model_atlas},
     light_volume::PackedLight,
-    shadows::{DynamicShadowCaster, ShadowGpu},
+    shadows::{
+        DynamicShadowCaster, ShadowDamageTracker, ShadowGpu, ShadowPrepareWork, ShadowRect,
+        WorldBounds, crop_camera,
+    },
     terrain_gpu::{Camera, TerrainGeometry, UploadBudget},
 };
 use bytemuck::{Pod, Zeroable};
@@ -107,6 +110,7 @@ struct CameraGpu {
     reserved: [u32; 4],
 }
 struct EntityShadow {
+    cull_cameras: [wgpu::Buffer; 3],
     cameras: [wgpu::Buffer; 3],
     render_binds: [wgpu::BindGroup; 3],
     cull_binds: [wgpu::BindGroup; 3],
@@ -134,6 +138,7 @@ pub struct EntityGpu {
     count: u32,
     revision: u64,
     shadow_revision: u64,
+    shadow_damage: ShadowDamageTracker,
     shadow: Option<EntityShadow>,
     last_frame: Option<(Camera, u64)>,
     work: EntityWork,
@@ -630,6 +635,13 @@ impl EntityGpu {
                     texture_layout(7, f, wgpu::TextureSampleType::Float { filterable: true }),
                 ],
             });
+            let cull_cameras = std::array::from_fn(|_| {
+                buffer(
+                    "dynamic caster cropped cull camera",
+                    96,
+                    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                )
+            });
             let render_binds = std::array::from_fn(|i| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("dynamic caster tables"),
@@ -665,7 +677,7 @@ impl EntityGpu {
                     label: Some("dynamic caster frustum tables"),
                     layout: &cull_layout,
                     entries: &[
-                        buffer_binding(0, &cameras[i]),
+                        buffer_binding(0, &cull_cameras[i]),
                         buffer_binding(1, &instances),
                         buffer_binding(2, &visible),
                         buffer_binding(3, &indirect),
@@ -717,6 +729,7 @@ impl EntityGpu {
                 cache: None,
             });
             Some(EntityShadow {
+                cull_cameras,
                 cameras,
                 render_binds,
                 cull_binds,
@@ -747,6 +760,7 @@ impl EntityGpu {
             count: 0,
             revision: 0,
             shadow_revision: 0,
+            shadow_damage: ShadowDamageTracker::new(config.max_entities as usize),
             shadow,
             last_frame: None,
             work: EntityWork {
@@ -839,6 +853,19 @@ impl EntityGpu {
         };
         if budget.remaining_bytes < bytes {
             return Err(EntityError::UploadBudget);
+        }
+        if shadow_changed {
+            for index in 0..self.previous.len().max(instances.len()) {
+                let old = self.previous.get(index);
+                let new = instances.get(index);
+                if old
+                    .zip(new)
+                    .is_none_or(|(old, new)| !same_shadow_geometry(old, new))
+                {
+                    self.shadow_damage
+                        .record(index, old.map(entity_shadow_bounds));
+                }
+            }
         }
         if instance_changed && !instances.is_empty() {
             queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(instances));
@@ -934,6 +961,30 @@ impl EntityGpu {
         std::mem::take(&mut self.work)
     }
 }
+fn entity_shadow_bounds(value: &EntityInstance) -> WorldBounds {
+    let scale = value.scale;
+    let (radius, low, high) = if value.kind >= 6 {
+        if value.flags & PIPE != 0 {
+            (0.72 * scale, -0.5 * scale, 0.5 * scale)
+        } else {
+            (0.72 * scale, 0., scale + 0.2)
+        }
+    } else {
+        (2.2 * scale, -0.3 * scale, 2.3 * scale)
+    };
+    WorldBounds {
+        min: [
+            value.position[0] - radius,
+            value.position[1] + low,
+            value.position[2] - radius,
+        ],
+        max: [
+            value.position[0] + radius,
+            value.position[1] + high,
+            value.position[2] + radius,
+        ],
+    }
+}
 fn same_shadow_geometry(a: &EntityInstance, b: &EntityInstance) -> bool {
     a.position == b.position
         && a.body_yaw == b.body_yaw
@@ -957,6 +1008,20 @@ impl DynamicShadowCaster for EntityGpu {
     fn shadow_revision(&self) -> u64 {
         self.shadow_revision
     }
+    fn visit_shadow_damage(&self, previous: [u64; 4], visit: &mut dyn FnMut(WorldBounds)) -> bool {
+        if previous[1..].iter().any(|v| *v != 0) {
+            return false;
+        }
+        self.shadow_damage.visit(
+            previous[0],
+            self.shadow_revision,
+            |index| self.previous.get(index).map(entity_shadow_bounds),
+            visit,
+        )
+    }
+    fn commit_shadow_damage(&mut self) {
+        self.shadow_damage.commit(self.shadow_revision);
+    }
     fn prepare_shadow(
         &mut self,
         queue: &wgpu::Queue,
@@ -964,23 +1029,43 @@ impl DynamicShadowCaster for EntityGpu {
         cascade: usize,
         camera: Camera,
     ) -> u32 {
+        self.prepare_shadow_region(queue, encoder, cascade, camera, ShadowRect::full(1), 1)
+            .dispatches
+    }
+    fn prepare_shadow_region(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        cascade: usize,
+        camera: Camera,
+        rect: ShadowRect,
+        resolution: u32,
+    ) -> ShadowPrepareWork {
         if self.count == 0 {
-            return 0;
+            return ShadowPrepareWork::default();
         }
         let Some(shadow) = &self.shadow else {
-            return 0;
+            return ShadowPrepareWork::default();
         };
-        queue.write_buffer(
-            &shadow.cameras[cascade],
-            0,
-            bytemuck::bytes_of(&CameraGpu {
-                view_projection: camera.view_projection,
-                params: [self.count, self.config.max_entities, 1, 0],
-                reserved: [0; 4],
-            }),
-        );
+        for (buffer, camera) in [
+            (&shadow.cameras[cascade], camera),
+            (
+                &shadow.cull_cameras[cascade],
+                crop_camera(camera, rect, resolution),
+            ),
+        ] {
+            queue.write_buffer(
+                buffer,
+                0,
+                bytemuck::bytes_of(&CameraGpu {
+                    view_projection: camera.view_projection,
+                    params: [self.count, self.config.max_entities, 1, 0],
+                    reserved: [0; 4],
+                }),
+            );
+        }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("dynamic model independent shadow cull"),
+            label: Some("localized model independent shadow cull"),
             timestamp_writes: None,
         });
         pass.set_bind_group(0, &shadow.cull_binds[cascade], &[]);
@@ -988,7 +1073,10 @@ impl DynamicShadowCaster for EntityGpu {
         pass.dispatch_workgroups(1, 1, 1);
         pass.set_pipeline(&self.cull);
         pass.dispatch_workgroups(self.count.div_ceil(64), 1, 1);
-        2
+        ShadowPrepareWork {
+            dispatches: 2,
+            upload_bytes: 192,
+        }
     }
     fn draw_shadow(&self, pass: &mut wgpu::RenderPass<'_>, cascade: usize) -> u32 {
         if self.count == 0 {

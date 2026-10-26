@@ -9,7 +9,7 @@ use rules::{
 };
 #[path = "mob_spawn/snapshot.rs"]
 mod snapshot;
-pub use snapshot::{Snapshot, Task, Workers};
+pub use snapshot::{CHANNELS, Snapshot, Task, Workers};
 #[path = "mob_spawn/plan.rs"]
 mod plan;
 pub const HERD_COLUMNS_PER_TICK: usize = 6;
@@ -198,8 +198,10 @@ pub fn plan(
         || request
             .column
             .iter()
-            .any(|&v| v.checked_mul(16).and_then(|x| x.checked_add(32)).is_none())
+            .any(|&v| (i64::from(v) * 16).abs() > 30_000_000 - 64)
         || budget.min_y >= budget.max_y_exclusive
+        || budget.min_y <= i32::MIN + 2
+        || budget.max_y_exclusive >= i32::MAX - 2
         || budget.columns > 4096
         || budget.cells > 131072
         || budget.lights > 1024

@@ -18,6 +18,7 @@ pub struct MachineSoundWork {
     pub revalidated: u32,
     pub started: u32,
     pub stopped: u32,
+    pub refreshed: u32,
     pub capacity: bool,
 }
 #[derive(Clone, Copy)]
@@ -25,6 +26,7 @@ struct Loop {
     position: BlockPos,
     emitter: audio::EmitterId,
     event: &'static str,
+    refresh_at: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Key {
@@ -40,6 +42,7 @@ pub struct MachineSounds {
     scanning: bool,
     cursor: Option<(PageId, usize)>,
     active: Vec<Loop>,
+    clock: core_types::Tick,
 }
 impl Default for MachineSounds {
     fn default() -> Self {
@@ -50,12 +53,16 @@ impl Default for MachineSounds {
             scanning: false,
             cursor: None,
             active: Vec::with_capacity(MAX_LOOPS),
+            clock: core_types::Tick(0),
         }
     }
 }
 impl MachineSounds {
     pub fn active(&self) -> usize {
         self.active.len()
+    }
+    pub fn set_time(&mut self, tick: core_types::Tick) {
+        self.clock = tick;
     }
     pub fn clear(&mut self, mut emit: impl FnMut(MachineCommand)) {
         for row in self.active.drain(..) {
@@ -112,6 +119,15 @@ impl MachineSounds {
                     })
                     .is_some_and(|(_, event)| event == row.event);
                 if valid {
+                    if self.clock.0 >= row.refresh_at {
+                        emit(MachineCommand::Start(loop_cue(
+                            row.position,
+                            row.emitter,
+                            row.event,
+                        )));
+                        self.active[index].refresh_at = self.clock.0.saturating_add(20);
+                        work.refreshed += 1;
+                    }
                     index += 1;
                 } else {
                     self.active.swap_remove(index);
@@ -178,21 +194,12 @@ impl MachineSounds {
                     continue;
                 }
                 let emitter = emitter(position);
-                emit(MachineCommand::Start(BlockCue {
-                    event,
-                    gain: 0.6,
-                    position: [
-                        f64::from(position.x) + 0.5,
-                        f64::from(position.y) + 0.5,
-                        f64::from(position.z) + 0.5,
-                    ],
-                    emitter,
-                    seed: emitter.0,
-                }));
+                emit(MachineCommand::Start(loop_cue(position, emitter, event)));
                 self.active.push(Loop {
                     position,
                     emitter,
                     event,
+                    refresh_at: self.clock.0.saturating_add(20),
                 });
                 work.started += 1;
             }
@@ -207,6 +214,19 @@ impl MachineSounds {
         } else {
             self.pass = Some(key);
         }
+    }
+}
+fn loop_cue(position: BlockPos, emitter: audio::EmitterId, event: &'static str) -> BlockCue {
+    BlockCue {
+        event,
+        gain: 0.6,
+        position: [
+            f64::from(position.x) + 0.5,
+            f64::from(position.y) + 0.5,
+            f64::from(position.z) + 0.5,
+        ],
+        emitter,
+        seed: emitter.0,
     }
 }
 fn eligible(
@@ -254,12 +274,8 @@ fn eligible(
     }
 }
 fn machine(cell: Cell) -> bool {
-    rules::block(cell.id()).is_some_and(|block| {
-        matches!(
-            block.render,
-            rules::blocks::Render::Model(rules::Model::Mek)
-        )
-    })
+    rules::block(cell.id())
+        .is_some_and(|block| matches!(block.be, Some(rules::blocks::BeKind::Mek(_))))
 }
 fn position(page: PageId, index: LocalIdx) -> Option<BlockPos> {
     let (x, y, z) = index.xyz();

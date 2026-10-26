@@ -10,6 +10,7 @@ pub mod entity_gpu;
 pub mod entity_models;
 pub mod environment_gpu;
 pub mod gi;
+pub mod gi_directional;
 pub mod gpu_time;
 pub mod height_gpu;
 pub mod height_tile;

@@ -187,3 +187,81 @@ fn simultaneous_work_is_bounded_and_unchanged_revisions_allocate_nothing() {
         0
     );
 }
+#[test]
+fn living_public_pose_drives_ambient_without_new_pose_revisions_and_never_replays_missed_intervals()
+{
+    let mut network = connection();
+    let mut sounds = EntitySounds::default();
+    let mut pig = pose(1, 0);
+    frame(&mut network, 1, vec![pig]);
+    sounds.visit(&network, [0.; 3], |_| panic!("initial ambient"));
+    let sim = sim::Player::new([0.; 3]);
+    let player = net::PlayerState {
+        identity: net::PlayerId([1; 16]),
+        position: sim.pos,
+        velocity: sim.vel,
+        yaw: sim.yaw,
+        pitch: sim.pitch,
+        health: sim.health,
+        mode: sim.mode as u8,
+        on_ground: sim.on_ground,
+        flying: sim.flying,
+        noclip: sim.noclip,
+        ..Default::default()
+    };
+    let continuation = sim::prediction::PredictionState::capture(&sim)
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    network
+        .receive(
+            ServerMessage::Prediction {
+                tick: Tick(1000),
+                player,
+                continuation: continuation.clone(),
+            },
+            50_000,
+        )
+        .unwrap();
+    let mut events = Vec::new();
+    assert_eq!(
+        sounds.visit(&network, [0.; 3], |cue| events.push(cue.event)),
+        1
+    );
+    assert_eq!(events, vec!["entity.pig.ambient"]);
+    assert_eq!(sounds.visit(&network, [0.; 3], |_| panic!("same tick")), 0);
+    network
+        .receive(
+            ServerMessage::Prediction {
+                tick: Tick(1001),
+                player,
+                continuation: continuation.clone(),
+            },
+            50_050,
+        )
+        .unwrap();
+    assert_eq!(
+        sounds.visit(&network, [0.; 3], |_| panic!(
+            "missed intervals must not burst"
+        )),
+        0
+    );
+    pig.flags |= 4;
+    pig.death_roll = 20.;
+    frame(&mut network, 2, vec![pig]);
+    sounds.visit(&network, [0.; 3], |_| {});
+    network
+        .receive(
+            ServerMessage::Prediction {
+                tick: Tick(4000),
+                player,
+                continuation,
+            },
+            200_000,
+        )
+        .unwrap();
+    assert_eq!(
+        sounds.visit(&network, [0.; 3], |_| panic!("dead mob ambient")),
+        0
+    );
+}

@@ -1,7 +1,7 @@
 //! Preallocated bridge from an explicit immutable visible-model snapshot to the
 //! shared static GPU catalog. No World scan, vertices, I/O or generation occurs.
 use core_types::{BlockPos, Cell};
-use render::block_models::{ACTIVE, BlockInstance, kind};
+use render::block_models::{ACTIVE, BlockInstance, PORT_MARKER_ONLY, kind};
 use rules::{
     Model, arms,
     blocks::{self, Render, ST_LIT},
@@ -18,7 +18,7 @@ pub struct Animation {
 pub struct BlockSample {
     pub position: BlockPos,
     pub cell: Cell,
-    /// Already sampled RGB/sky light, using the shared M4 nibble layout.
+    /// Already sampled RGB/sky light, using the shared M4 RGB8 layout.
     pub light: u32,
     /// RGBA8, low byte red; normally u32::MAX except biome-tinted plants.
     pub tint: u32,
@@ -95,6 +95,18 @@ pub fn cube_machine_instance(
 ) -> Result<Option<BlockInstance>, ModelError> {
     build(sample, origin, true)
 }
+/// Cube bodies stay in terrain; only six public side annotations are modeled.
+pub fn is_classic_machine(cell: Cell) -> bool {
+    matches!(
+        cell.id(),
+        ENRICHMENT_CHAMBER | ENERGIZED_SMELTER | CRUSHER | PURIFICATION_CHAMBER | ELECTRIC_PUMP
+    )
+}
+pub fn is_model_candidate(cell: Cell) -> bool {
+    is_classic_machine(cell)
+        || rules::block(cell.id())
+            .is_some_and(|d| matches!(d.render, Render::Model(_) | Render::Cross))
+}
 fn build(
     sample: BlockSample,
     origin: [i64; 3],
@@ -114,6 +126,7 @@ fn build(
     {
         return Err(ModelError::InvalidAnimation);
     }
+    let marker_only = !cube_override && is_classic_machine(cell);
     let model = if cube_override {
         match cell.id() {
             ENRICHMENT_CHAMBER | ENERGIZED_SMELTER | CRUSHER | PURIFICATION_CHAMBER => {
@@ -124,6 +137,7 @@ fn build(
         }
     } else {
         match definition.render {
+            Render::Cube if marker_only => kind::CUBE_MACHINE,
             Render::Cross => kind::CROSS,
             Render::Model(Model::Chest) => kind::CHEST,
             Render::Model(Model::Ladder) => kind::LADDER,
@@ -158,6 +172,7 @@ fn build(
         return Err(ModelError::InvalidPosition);
     }
     let directional = cube_override
+        || marker_only
         || matches!(
             definition.render,
             Render::Model(Model::Chest | Model::Ladder | Model::WallTorch | Model::Mek)
@@ -193,7 +208,8 @@ fn build(
         position,
         yaw,
         kind: model,
-        flags: u32::from(sample.animation.active || cell.state() & ST_LIT != 0) * ACTIVE,
+        flags: (u32::from(sample.animation.active || cell.state() & ST_LIT != 0) * ACTIVE)
+            | if marker_only { PORT_MARKER_ONLY } else { 0 },
         connections: if matches!(definition.render, Render::Model(Model::Cable)) {
             u32::from(arms::arms_of(cell.state()))
         } else {

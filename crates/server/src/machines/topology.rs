@@ -30,6 +30,16 @@ impl MachineRuntime {
     pub fn transmitter_config(&self, p: BlockPos) -> Option<TransmitterConfig> {
         self.configs.get(&p).copied()
     }
+    pub fn transmitter_configs_in_page(
+        &self,
+        page: PageId,
+    ) -> impl Iterator<Item = &TransmitterConfig> {
+        self.config_pages
+            .get(&page)
+            .into_iter()
+            .flat_map(|positions| positions.iter())
+            .filter_map(|p| self.configs.get(p))
+    }
     pub fn network_at(&self, p: BlockPos) -> Option<NetworkKey> {
         self.grids
             .get(&p.space)?
@@ -328,9 +338,23 @@ impl MachineRuntime {
         for patch in &delta.configs {
             if let Some(before) = patch.before {
                 self.configs.remove(&before.position);
+                if patch.after.is_none()
+                    && let Some(positions) = self.config_pages.get_mut(&before.position.page())
+                {
+                    positions.remove(&before.position);
+                    if positions.is_empty() {
+                        self.config_pages.remove(&before.position.page());
+                    }
+                }
             }
             if let Some(after) = patch.after {
                 self.configs.insert(after.position, after);
+                if patch.before.is_none() {
+                    self.config_pages
+                        .entry(after.position.page())
+                        .or_default()
+                        .insert(after.position);
+                }
             }
         }
         Ok(())

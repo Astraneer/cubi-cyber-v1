@@ -10,7 +10,7 @@ use rules::ids::*;
 
 pub(crate) const R_ZONE: i32 = 32;
 const R_FLAT: f32 = 34.0;
-const R_BLEND: f32 = 58.0;
+pub(crate) const R_BLEND: f32 = 58.0;
 const R_NO_TREES: i32 = 46;
 const R_BUILT: f32 = 31.5;
 pub(crate) const DECK: i32 = 26;

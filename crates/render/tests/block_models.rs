@@ -481,12 +481,21 @@ fn block_and_entity_shadow_pair_preserves_both_exact_version_counters() {
         props
             .update(&gpu.queue, 0, chest, &mut UploadBudget::new(64))
             .unwrap();
-        assert_eq!(
-            encode(&mut shadows, &mut props, &mut mobs).dynamic_copy_bytes,
-            196608
+        let localized = encode(&mut shadows, &mut props, &mut mobs);
+        assert_eq!(localized.dynamic_copy_bytes, 0);
+        assert!(
+            localized.dynamic_restore_pixels > 0
+                && localized.dynamic_restore_pixels < 3 * 128 * 128 / 4
         );
         let opened = shadow_depths(&gpu, shadows.sampled_texture(), 128);
         assert_ne!(opened, initial);
+        shadows.invalidate_all();
+        encode(&mut shadows, &mut props, &mut mobs);
+        assert_eq!(
+            shadow_depths(&gpu, shadows.sampled_texture(), 128),
+            opened,
+            "fully open chest damage differed from full shadow oracle"
+        );
         assert_eq!(
             encode(&mut shadows, &mut props, &mut mobs).dynamic_copy_bytes,
             0
@@ -494,9 +503,11 @@ fn block_and_entity_shadow_pair_preserves_both_exact_version_counters() {
         props
             .upload(&gpu.queue, &[], &mut UploadBudget::new(0))
             .unwrap();
-        assert_eq!(
-            encode(&mut shadows, &mut props, &mut mobs).dynamic_copy_bytes,
-            196608
+        let localized = encode(&mut shadows, &mut props, &mut mobs);
+        assert_eq!(localized.dynamic_copy_bytes, 0);
+        assert!(
+            localized.dynamic_restore_pixels > 0
+                && localized.dynamic_restore_pixels < 3 * 128 * 128 / 4
         );
         let mob_only = shadow_depths(&gpu, shadows.sampled_texture(), 128);
         assert_ne!(mob_only, opened);
@@ -507,7 +518,7 @@ fn block_and_entity_shadow_pair_preserves_both_exact_version_counters() {
                 .all(|v| *v == 0.)
         );
         println!(
-            "M7 pair mob+chest draws27/copy196608B; static cache untouched; prop changes and removal visible; unchanged frame copies0"
+            "M7 pair mob+chest draws27/localrestore/copy0; static cache untouched; openchest equalsfullBITWISE; removal visible; unchangedframe0work"
         );
     });
 }
@@ -684,3 +695,12 @@ fn optional_atmosphere_lighting_tracks_day_and_dark_night_without_recompilation(
         "M10_block_models_ATMOSPHERE_GPU_OK consumer=block_models night_black={dark_pixels} day_lit={lit_pixels} runtime_pipeline_compilations=0"
     );
 }
+
+#[path = "common/ports_live.rs"]
+mod ports_live;
+
+#[path = "common/ports_markers.rs"]
+mod ports_markers;
+
+#[path = "common/connector_color.rs"]
+mod connector_color;

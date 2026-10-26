@@ -446,7 +446,10 @@ fn moving_model_shadows_preserve_static_cache_and_retire_old_silhouettes() {
             moved.cascade_updates, 0,
             "moving model re-rendered static terrain"
         );
-        assert_eq!(moved.dynamic_copy_bytes, 3 * 128 * 128 * 4);
+        assert_eq!(moved.dynamic_copy_bytes, 0);
+        assert!(
+            moved.dynamic_restore_pixels > 0 && moved.dynamic_restore_pixels < 3 * 128 * 128 / 4
+        );
         let after = shadow_depths(&gpu, shadows.sampled_texture(), 128);
         assert_ne!(before, after);
         assert!(
@@ -457,10 +460,19 @@ fn moving_model_shadows_preserve_static_cache_and_retire_old_silhouettes() {
             "old caster silhouette was not cleared"
         );
         assert_eq!(shadow_depths(&gpu, shadows.texture(), 128), static_before);
+        shadows.invalidate_all();
+        encode(&mut shadows, &mut entities);
+        assert_eq!(
+            shadow_depths(&gpu, shadows.sampled_texture(), 128),
+            after,
+            "localized old+new restore differs from forced full redraw"
+        );
         let idle = encode(&mut shadows, &mut entities);
         assert_eq!(idle.dynamic_copy_bytes, 0);
         assert_eq!(idle.dynamic_draw_calls, 0);
         assert_eq!(idle.dynamic_cull_dispatches, 0);
+        assert_eq!(idle.dynamic_restore_pixels, 0);
+        assert!(shadows.timing_source().is_none());
         mob.flags |= 16;
         entities
             .upload(&gpu.queue, &[mob], &[], &mut UploadBudget::new(1000000))
@@ -488,15 +500,19 @@ fn moving_model_shadows_preserve_static_cache_and_retire_old_silhouettes() {
             .unwrap();
         let removed = encode(&mut shadows, &mut entities);
         assert_eq!(removed.dynamic_draw_calls, 0);
-        assert!(removed.dynamic_copy_bytes > 0);
+        assert_eq!(removed.dynamic_copy_bytes, 0);
+        assert!(
+            removed.dynamic_restore_pixels > 0
+                && removed.dynamic_restore_pixels < 3 * 128 * 128 / 4
+        );
         assert_eq!(
             shadow_depths(&gpu, shadows.sampled_texture(), 128),
             static_before,
             "removed model left its shadow behind"
         );
         println!(
-            "M7dynamicshadow moves: staticDraws=0,copyBytes={},draws={},idleCopies=0,idleDraws=0; default4096worstGPUcopy=192MiB",
-            moved.dynamic_copy_bytes, moved.dynamic_draw_calls
+            "M7dynamicshadow moves: staticDraws=0,copyBytes={},restorePixels={},draws={},idleCopies=0,idleDraws=0; localDepthEqualsFullBITWISE",
+            moved.dynamic_copy_bytes, moved.dynamic_restore_pixels, moved.dynamic_draw_calls
         );
     });
 }
@@ -579,7 +595,9 @@ fn first_person_human_hides_color_but_keeps_shadow_without_static_redraw() {
         models
             .upload(&gpu.queue, &[human], &[], &mut UploadBudget::new(64))
             .unwrap();
-        assert!(encode(&mut shadows, &mut models).dynamic_copy_bytes > 0);
+        let crouch_work = encode(&mut shadows, &mut models);
+        assert_eq!(crouch_work.dynamic_copy_bytes, 0);
+        assert!(crouch_work.dynamic_restore_pixels > 0);
         let crouch = frame(&gpu, &mut terrain, Some(&mut models), camera()).0;
         assert_ne!(crouch, visible);
         assert_ne!(crouch, sky);

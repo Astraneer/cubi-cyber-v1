@@ -222,6 +222,7 @@ pub struct WaterGpu {
     arena: Option<WaterArena>,
     staging: Vec<WaterQuad>,
     revision: u64,
+    surface_enabled: bool,
     last: Option<(WaterState, u64)>,
     last_cull: Option<(Camera, u64)>,
     last_snapshot: Option<(Camera, u64)>,
@@ -636,6 +637,7 @@ impl WaterGpu {
             arena: None,
             staging: Vec::with_capacity(config.max_quads as usize),
             revision: 0,
+            surface_enabled: true,
             last: None,
             last_cull: None,
             last_snapshot: None,
@@ -1060,11 +1062,24 @@ impl WaterGpu {
     pub fn revision(&self) -> u64 {
         self.revision
     }
+    /// Keep the sample-preserving background copy while bootstrapping a cover.
+    pub fn set_surface_enabled(&mut self, enabled: bool) {
+        if self.surface_enabled != enabled {
+            self.surface_enabled = enabled;
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+    pub fn capacity(&self) -> (u32, u32) {
+        (self.config.max_objects, self.config.max_quads)
+    }
     pub fn needs_redraw(&self, state: WaterState) -> bool {
         self.last != Some((state, self.revision))
     }
     /// Conservative global bound includes both triangles and arbitrary surface overdraw.
     pub fn worst_reflection_steps(&self) -> u64 {
+        if !self.surface_enabled {
+            return 0;
+        }
         u64::from(self.width)
             * u64::from(self.height)
             * 8
@@ -1174,9 +1189,13 @@ impl WaterGpu {
             image: [
                 self.width,
                 self.height,
-                self.arena
-                    .as_ref()
-                    .map_or(self.previous.len() as u32, |a| a.high),
+                if self.surface_enabled {
+                    self.arena
+                        .as_ref()
+                        .map_or(self.previous.len() as u32, |a| a.high)
+                } else {
+                    0
+                },
                 self.config.max_objects,
             ],
             quality: [

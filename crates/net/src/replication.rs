@@ -133,6 +133,13 @@ impl ViewHistory {
             next_version: 1,
         }
     }
+    pub fn confirmed_page(&self, page: PageId) -> Option<&PageSnapshot> {
+        let version = self.confirmed_version(page)?;
+        self.pages
+            .get(&page)?
+            .iter()
+            .find(|image| image.version == version)
+    }
     pub fn confirmed_version(&self, page: PageId) -> Option<u64> {
         self.confirmed.get(&page).copied()
     }

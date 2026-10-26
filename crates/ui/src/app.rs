@@ -55,6 +55,60 @@ pub struct PlayerRow {
     pub role: Role,
     pub ping_ms: Option<u16>,
 }
+/// Owner-only, revision-checked facts. Nested machine contents and opaque IDs
+/// have no display representation here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemFact {
+    Configurator(u8),
+    Charge(u32),
+    SavedMachine(u16),
+}
+impl ItemFact {
+    pub fn valid_for(self, stack: ItemStack) -> bool {
+        match self {
+            Self::Configurator(mode) => {
+                stack.item() == rules::items::I_CONFIGURATOR
+                    && mode <= 4
+                    && (stack.payload().is_some() || mode == 0)
+            }
+            Self::Charge(joules) => {
+                stack.item() == rules::items::I_ENERGY_TABLET
+                    && joules <= rules::machines::TABLET_CAPACITY
+                    && joules.is_multiple_of(20)
+                    && (stack.payload().is_none() == (joules == 0))
+            }
+            Self::SavedMachine(block) => {
+                stack.item() == block && stack.payload().is_some() && rules::block(block).is_some()
+            }
+        }
+    }
+    pub fn write_text(self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        match self {
+            Self::Configurator(mode) => write!(
+                out,
+                "Режим: {}",
+                match mode {
+                    0 => "предметы",
+                    1 => "опустошение",
+                    2 => "поворот",
+                    3 => "ключ",
+                    4 => "газ",
+                    _ => "неизвестен",
+                }
+            ),
+            Self::Charge(joules) => write!(
+                out,
+                "Заряд: {joules} / {} Дж",
+                rules::machines::TABLET_CAPACITY
+            ),
+            Self::SavedMachine(block) => write!(
+                out,
+                "Сохранено: {}",
+                rules::item(block).map_or("машина", |item| item.name)
+            ),
+        }
+    }
+}
 #[derive(Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub connected: bool,
@@ -66,6 +120,7 @@ pub struct Snapshot {
     pub armor: u8,
     pub inventory: [ItemStack; 41],
     pub inventory_revision: u64,
+    pub inventory_facts: [Option<ItemFact>; 41],
     pub selected: u8,
     pub cursor: ItemStack,
     pub craft: [ItemStack; 9],
@@ -93,6 +148,7 @@ impl Default for Snapshot {
             armor: 0,
             inventory: [ItemStack::EMPTY; 41],
             inventory_revision: 0,
+            inventory_facts: [None; 41],
             selected: 0,
             cursor: ItemStack::EMPTY,
             craft: [ItemStack::EMPTY; 9],
@@ -497,6 +553,11 @@ impl UiApp {
             || snapshot.players.len() > 64
             || snapshot.container_name.len() > 128
             || snapshot.players.iter().any(|p| p.name.len() > 64)
+            || snapshot
+                .inventory_facts
+                .iter()
+                .zip(snapshot.inventory)
+                .any(|(fact, stack)| fact.is_some_and(|fact| !fact.valid_for(stack)))
         {
             return Err("UI snapshot bound");
         }
@@ -846,6 +907,13 @@ impl UiApp {
         } else {
             "Сохранённое состояние"
         })
+    }
+    pub fn hovered_fact(&self) -> Option<ItemFact> {
+        let Some(Widget::Slot(slot @ 0..=40)) = self.hover else {
+            return None;
+        };
+        self.snapshot.inventory_facts[slot as usize]
+            .filter(|fact| fact.valid_for(self.snapshot.inventory[slot as usize]))
     }
     fn recipes(&mut self, item: ItemId, uses: bool) {
         self.recipes.clear();
@@ -1225,7 +1293,13 @@ impl UiApp {
         if let Some(item) = self.hovered_item()
             && let Some(item) = rules::item(item)
         {
-            let detail = self.hovered_state_label();
+            let mut detail_text = TextBuffer::default();
+            let detail = if let Some(fact) = self.hovered_fact() {
+                let _ = fact.write_text(&mut detail_text);
+                Some(detail_text.as_str())
+            } else {
+                self.hovered_state_label()
+            };
             let width = (p
                 .text_width(item.name)
                 .max(detail.map_or(0.0, |text| p.text_width(text)))
@@ -1419,6 +1493,11 @@ impl UiApp {
         );
     }
     fn hud(&mut self, p: &mut Painter<'_>, w: f32, h: f32) {
+        if let Some(fact) = self.snapshot.inventory_facts[self.snapshot.selected as usize] {
+            let mut text = TextBuffer::default();
+            let _ = fact.write_text(&mut text);
+            p.centered(Rect::new(4., h - 111., w - 8., 20.), text.as_str(), TEXT);
+        }
         let start = w * 0.5 - 9.0 * 18.0;
         for slot in 0..9 {
             let rect = Rect::new(start + slot as f32 * 36.0, h - 43.0, 34.0, 34.0);

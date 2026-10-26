@@ -285,3 +285,46 @@ fn structures_between_sparse_samples_require_refinement_and_canonical_materials_
         }
     }
 }
+
+#[test]
+fn exact_leaf_promotion_keeps_world_source_and_surface_inputs_and_requires_full_column() {
+    let index = HeightEditIndex::new(IndexLimits::default()).unwrap();
+    let generator = r#gen::Generator::new(r#gen::TerrainSeed(1337));
+    let (mut tile, work) = build_canonical_tile(
+        &generator,
+        &index.capture(key(0, 3, 1), 4096, 65536).unwrap(),
+        HeightBuildLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(work.error_columns, 289);
+    assert_eq!(work.error_intervals, 0);
+    assert_eq!(work.error_unit_cells, 256);
+    assert!(tile.error.unwrap().max_error_q1024 > 0);
+    let before = tile.clone();
+    assert!(promote_exact_leaf(&mut tile).unwrap());
+    assert_eq!(tile.source, before.source);
+    assert_eq!(tile.key, before.key);
+    assert_eq!(tile.heights, before.heights);
+    assert_eq!(tile.known, before.known);
+    assert_eq!(tile.atlas, before.atlas);
+    assert_eq!(tile.tint, before.tint);
+    assert_eq!(tile.error, before.error);
+    assert_eq!(tile.protected, [255; 32]);
+    assert_eq!(
+        tile.replacement,
+        ReplacementRequirement::Column {
+            source: tile.source,
+            min_page_y: 0,
+            max_page_y: 7
+        }
+    );
+    assert!(!promote_exact_leaf(&mut tile).unwrap());
+    let mut coarse = before;
+    coarse.key.level = 1;
+    let unchanged = coarse.clone();
+    assert_eq!(
+        promote_exact_leaf(&mut coarse),
+        Err(HeightBuildError::InvalidInput)
+    );
+    assert_eq!(coarse, unchanged);
+}

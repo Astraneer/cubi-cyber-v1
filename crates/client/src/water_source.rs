@@ -80,6 +80,7 @@ pub struct WaterSourceWork {
     pub jobs_failed: u64,
     pub worker_cells: u64,
     pub worker_halo_samples: u64,
+    pub worker_quads: u64,
     pub gpu_upload_bytes: u64,
     pub pages_published: u64,
     pub pages_retired: u64,
@@ -208,6 +209,8 @@ pub struct WaterSource {
     model_staging: Vec<(PageId, WaterHandle, [[f32; 4]; 4])>,
     tint_staging: Vec<PageId>,
     work: WaterSourceWork,
+    interest: Vec<PageId>,
+    interest_enabled: bool,
 }
 impl WaterSource {
     pub fn attach(world: &mut World, limits: WaterSourceLimits) -> Result<Self, WaterSourceError> {
@@ -245,6 +248,8 @@ impl WaterSource {
             model_staging: Vec::with_capacity(limits.max_pages * 2),
             tint_staging: Vec::with_capacity(limits.max_pages * 2),
             work: WaterSourceWork::default(),
+            interest: Vec::with_capacity(limits.max_pages),
+            interest_enabled: false,
         };
         for (page, _) in world.pages() {
             source.mark(world, page, world.tick())?;
@@ -252,6 +257,10 @@ impl WaterSource {
         Ok(source)
     }
     fn mark(&mut self, world: &World, page: PageId, tick: Tick) -> Result<(), WaterSourceError> {
+        if self.interest_enabled && self.interest.binary_search(&page).is_err() {
+            self.forget_page(page);
+            return Ok(());
+        }
         let Some(data) = world.page(page) else {
             self.forget_page(page);
             return Ok(());
@@ -300,6 +309,38 @@ impl WaterSource {
         p.first_dirty = Some(p.first_dirty.map_or(tick, |old| old.min(tick)));
         p.failed = false;
         Ok(())
+    }
+    /// Only these sorted near pages own physical surfaces. Halo pages remain
+    /// readable inputs; their independent far representation is never duplicated.
+    pub fn set_interest(
+        &mut self,
+        world: &World,
+        pages: &[PageId],
+        tick: Tick,
+    ) -> Result<bool, WaterSourceError> {
+        if pages.len() > self.limits.max_pages || pages.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(WaterSourceError::InvalidLimits);
+        }
+        if self.interest_enabled && self.interest == pages {
+            return Ok(false);
+        }
+        self.interest.clear();
+        self.interest.extend_from_slice(pages);
+        self.interest_enabled = true;
+        self.tint_staging.clear();
+        self.tint_staging.extend(
+            self.pages
+                .keys()
+                .filter(|page| self.interest.binary_search(page).is_err())
+                .copied(),
+        );
+        while let Some(page) = self.tint_staging.pop() {
+            self.forget_page(page);
+        }
+        for &page in pages {
+            self.mark(world, page, tick)?;
+        }
+        Ok(true)
     }
     pub fn watch_page(&mut self, world: &World, page: PageId) -> Result<(), WaterSourceError> {
         self.mark(world, page, world.tick())
@@ -402,6 +443,36 @@ impl WaterSource {
         Ok(entries)
     }
     /// Callback supplies an existing immutable biome tint table, without generation.
+    pub fn next_job_page(&mut self, world: &World) -> Option<PageId> {
+        if self.running.len() >= self.limits.max_running
+            || self.ready.len() >= self.limits.max_ready
+        {
+            return None;
+        }
+        for _ in 0..self.limits.max_task_probes {
+            let page = *self.dirty.front()?;
+            if self
+                .pages
+                .get(&page)
+                .is_some_and(|p| p.queued && p.known && !p.running && !p.ready)
+                && world.page(page).is_some()
+            {
+                return Some(page);
+            }
+            self.dirty.pop_front();
+            self.work.task_probes += 1;
+            if let Some(p) = self.pages.get_mut(&page) {
+                p.enqueued = false;
+                if p.known && p.queued && (p.running || p.ready) {
+                    p.enqueued = true;
+                    self.dirty.push_back(page);
+                }
+            }
+            self.prune(page);
+        }
+        None
+    }
+    /// Callback supplies an existing immutable biome tint table, without generation.
     pub fn take_job(
         &mut self,
         world: &World,
@@ -499,6 +570,7 @@ impl WaterSource {
             Ok(result) => {
                 self.work.worker_cells += result.mesh.work.cells_scanned;
                 self.work.worker_halo_samples += result.mesh.work.halo_samples;
+                self.work.worker_quads += result.mesh.work.quads;
                 if !current {
                     self.work.jobs_stale += 1;
                     let _ = self.mark(world, meta.page, meta.first);

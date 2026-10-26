@@ -55,6 +55,7 @@ struct Resident {
     seams: u32,
     handle: HeightHandle,
     enabled: bool,
+    drawable: bool,
 }
 pub struct HeightCache {
     config: Config,
@@ -181,6 +182,15 @@ impl HeightCache {
         Ok(true)
     }
     pub fn ingest(&mut self, tile: Arc<HeightTile>) -> Result<bool, Error> {
+        self.ingest_inner(tile, false)
+    }
+    /// Caller has validated an authenticated, nonempty exact-column manifest.
+    /// Only an unchanged leaf's unprotected→fully protected representation can
+    /// change at the same world source. It remains hidden until protected_ready.
+    pub fn ingest_exact_promotion(&mut self, tile: Arc<HeightTile>) -> Result<bool, Error> {
+        self.ingest_inner(tile, true)
+    }
+    fn ingest_inner(&mut self, tile: Arc<HeightTile>, exact: bool) -> Result<bool, Error> {
         tile.validate(self.config.atlas_layers)
             .map_err(|_| Error::InvalidTile)?;
         if !self.desired.contains_key(&tile.key) {
@@ -191,10 +201,12 @@ impl HeightCache {
                 return Ok(false);
             }
             if tile.source == old.source {
-                if *old.as_ref() != *tile {
+                if *old.as_ref() == *tile {
+                    return Ok(false);
+                }
+                if !exact || !exact_promotion(old, &tile) {
                     return Err(Error::ConflictingSource);
                 }
-                return Ok(false);
             }
         } else if self.sources.len() >= self.config.max_sources {
             return Err(Error::Capacity);
@@ -212,7 +224,7 @@ impl HeightCache {
             && self
                 .sources
                 .get(key)
-                .is_some_and(|tile| tile.source == resident.tile.source)
+                .is_some_and(|tile| Arc::ptr_eq(tile, &resident.tile))
     }
     /// Work is bounded by actual changed tiles and the explicit upload count.
     /// If data or budget is missing, all prior active handles stay enabled.
@@ -241,10 +253,20 @@ impl HeightCache {
             }
         }
         for key in &self.remove {
+            let resident = self.staged.get(key).expect("collected staged");
+            // Exact promotion borrows its unchanged front handle. Discarding
+            // an obsolete staged representation must never release that front.
+            if self
+                .front
+                .values()
+                .any(|front| front.handle == resident.handle)
+            {
+                self.staged.remove(key);
+                continue;
+            }
             if budget.remaining_bytes < 4 {
                 break;
             }
-            let resident = self.staged.get(key).expect("collected staged");
             gpu.release(queue, resident.handle, budget)?;
             self.staged.remove(key);
             work.released += 1;
@@ -268,6 +290,27 @@ impl HeightCache {
             let Some(tile) = self.sources.get(key) else {
                 continue;
             };
+            if let Some(front) = self.front.get(key)
+                && tile.protected == [255; 32]
+                && same_surface(&front.tile, tile)
+            {
+                // No height triangles survive a whole-column replacement. Keep
+                // the existing GPU payload/handle untouched; atomic publication
+                // disables it only after every exact proxy is ready. This also
+                // preserves the GPU's strict source/hash conflict contract.
+                self.staged.insert(
+                    *key,
+                    Resident {
+                        tile: tile.clone(),
+                        seams: *seams,
+                        handle: front.handle,
+                        enabled: false,
+                        drawable: false,
+                    },
+                );
+                work.staged += 1;
+                continue;
+            }
             // Exact bounded per-tile cost. Insufficient budget makes no write.
             if budget.remaining_bytes < render::height_gpu::TILE_BYTES + 64 {
                 break;
@@ -280,6 +323,7 @@ impl HeightCache {
                     seams: *seams,
                     handle,
                     enabled: false,
+                    drawable: tile.drawable_cells(*seams) > 0,
                 },
             );
             work.staged += 1;
@@ -326,16 +370,24 @@ impl HeightCache {
             }
             for (key, resident) in &self.staged {
                 if self.current(key, resident) {
-                    self.changes.push((resident.handle, !self.suppresses(*key)));
+                    self.changes
+                        .push((resident.handle, resident.drawable && !self.suppresses(*key)));
                 }
             }
             self.changes.sort_unstable_by_key(|(handle, _)| handle.slot);
+            self.changes.dedup();
             let bytes = self.changes.len() as u64 * 4;
             if budget.remaining_bytes >= bytes {
                 gpu.set_enabled_batch(queue, &self.changes, budget)?;
                 for key in &self.remove {
                     let old = self.front.remove(key).expect("collected front");
-                    self.retired.push(old.handle);
+                    if !self
+                        .staged
+                        .get(key)
+                        .is_some_and(|new| new.handle == old.handle)
+                    {
+                        self.retired.push(old.handle);
+                    }
                 }
                 self.remove.clear();
                 for (key, resident) in &self.staged {
@@ -345,7 +397,7 @@ impl HeightCache {
                 }
                 for key in &self.remove {
                     let mut resident = self.staged.remove(key).expect("collected staging");
-                    resident.enabled = !self.suppresses(*key);
+                    resident.enabled = resident.drawable && !self.suppresses(*key);
                     self.front.insert(*key, resident);
                 }
                 self.published_epoch = self.desired_epoch;
@@ -395,7 +447,7 @@ impl HeightCache {
         }
         self.changes.clear();
         for (key, resident) in &self.front {
-            let enabled = !intersects(*key, space, bounds);
+            let enabled = resident.drawable && !intersects(*key, space, bounds);
             if resident.enabled != enabled {
                 self.changes.push((resident.handle, enabled));
             }
@@ -404,10 +456,24 @@ impl HeightCache {
         let bytes = gpu.set_enabled_batch(queue, &self.changes, budget)?;
         self.suppressed = Some((space, bounds));
         for (key, resident) in &mut self.front {
-            resident.enabled = !intersects(*key, space, bounds);
+            resident.enabled = resident.drawable && !intersects(*key, space, bounds);
         }
         Ok(bytes)
     }
+}
+fn exact_promotion(old: &HeightTile, new: &HeightTile) -> bool {
+    old.key.level == 0
+        && same_surface(old, new)
+        && old.protected == [0; 32]
+        && new.protected == [255; 32]
+}
+fn same_surface(old: &HeightTile, new: &HeightTile) -> bool {
+    old.key == new.key
+        && old.source == new.source
+        && old.heights == new.heights
+        && old.known == new.known
+        && old.atlas == new.atlas
+        && old.tint == new.tint
 }
 fn intersects(key: HeightTileKey, space: u32, bounds: [i64; 4]) -> bool {
     if key.space != space {

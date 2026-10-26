@@ -152,3 +152,63 @@ fn overflow_and_future_ack_do_not_publish_partial_public_page() {
     assert_eq!(full.revision, 1);
     assert_eq!(full.upserts.len(), 1);
 }
+
+#[test]
+fn unchanged_linear_public_motion_has_zero_allocations_for_five_hundred_twelve_rows() {
+    let mut snapshot = runtime(1).snapshot();
+    snapshot.transport.next_packet = 513;
+    snapshot.transport.packets = (1..=512).map(|id| packet(id, 2)).collect();
+    let mut runtime = MachineRuntime::restore(Config::default(), &snapshot).unwrap();
+    let page = p(2).page();
+    let mut history = PacketHistory::new(page, Version(7), 512, 2).unwrap();
+    history.plan(&runtime, Tick(1)).unwrap();
+    history.request(Request::Ack {
+        page,
+        view_version: Version(7),
+        revision: 1,
+    });
+    let mut td = runtime.transport_delta();
+    for id in 1..=512 {
+        let before = runtime.packet(id).unwrap().clone();
+        let mut after = before.clone();
+        after.progress = 10;
+        after.last_tick = Tick(2);
+        after.due = Tick(3);
+        td.packets.push(PacketPatch {
+            before: Some(before),
+            after: Some(after),
+        });
+    }
+    let mut delta = runtime.noop_delta().unwrap();
+    delta.transport = Some(td);
+    runtime.acknowledge(delta).unwrap();
+    let scope = AllocationScope::begin().unwrap();
+    let (frame, work) = history
+        .plan_filtered(&runtime, Tick(2), &|_| true, 512, 8192)
+        .unwrap();
+    let counts = scope.finish();
+    assert!(frame.is_none());
+    assert_eq!(work.indexed_rows, 512);
+    assert_eq!(counts, telemetry::AllocationCounts::ZERO);
+}
+#[test]
+fn filtered_public_rows_and_probe_budget_fail_closed_without_consuming_revision() {
+    let mut snapshot = runtime(1).snapshot();
+    snapshot.transport.next_packet = 3;
+    snapshot.transport.packets.push(packet(2, 4));
+    let runtime = MachineRuntime::restore(Config::default(), &snapshot).unwrap();
+    let mut history = PacketHistory::new(p(2).page(), Version(7), 512, 2).unwrap();
+    assert!(
+        history
+            .plan_filtered(&runtime, Tick(1), &|_| true, 512, 1)
+            .is_err()
+    );
+    let frame = history
+        .plan_filtered(&runtime, Tick(1), &|at| at == p(2), 512, 8)
+        .unwrap()
+        .0
+        .unwrap();
+    assert_eq!(frame.revision, 1);
+    assert_eq!(frame.upserts.len(), 1);
+    assert_eq!(frame.upserts[0].id, 1);
+}

@@ -1,4 +1,5 @@
 //! Reflected-light probe cache with edited-visible scheduling and bounded GPU DDA.
+use crate::gi_directional::{Directional, GiSurface, Sources, SurfaceUpdate};
 use crate::terrain_gpu::UploadBudget;
 use bytemuck::{Pod, Zeroable};
 
@@ -9,6 +10,13 @@ pub const MAX_REFLECTED_RADIANCE: f32 = 32.0;
 impl GiVoxel {
     pub const UNKNOWN: Self = Self(0);
     pub const EMPTY: Self = Self(0x8000_0000);
+    pub fn packed(self) -> u32 {
+        self.0
+    }
+    pub fn from_packed(value: u32) -> Option<Self> {
+        (value == 0 || value == 0x8000_0000 || value & 0xc000_0000 == 0xc000_0000)
+            .then_some(Self(value))
+    }
     /// Reflected radiance only, after albedo/PI. Do not pass direct lamp emission
     /// or escaped skylight: those have separate terms in the M4 energy model.
     pub fn opaque_reflected(radiance: [f32; 3]) -> Option<Self> {
@@ -68,6 +76,7 @@ pub enum GiError {
     StaleVersion,
     UploadBudget,
     Capacity,
+    DirectionalRequired,
 }
 impl std::fmt::Display for GiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -89,6 +98,7 @@ pub struct GiWork {
     pub candidates_scanned: u32,
     pub pending_probes: u32,
     pub passes: u32,
+    pub max_shadow_samples: u64,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GiScrollWork {
@@ -162,6 +172,7 @@ pub struct GiGpu {
     probes: wgpu::Buffer,
     job_buffer: wgpu::Buffer,
     statistics: wgpu::Buffer,
+    rays: wgpu::Buffer,
     bind: wgpu::BindGroup,
     reset: wgpu::ComputePipeline,
     trace: wgpu::ComputePipeline,
@@ -172,6 +183,8 @@ pub struct GiGpu {
     jobs: Vec<Job>,
     dirty: u32,
     timer: crate::gpu_time::GpuPassTimer<2>,
+    directional: Option<Directional>,
+    has_traced: bool,
 }
 fn grid_coordinate(index: usize, counts: [u32; 3]) -> [u32; 3] {
     let index = index as u32;
@@ -206,7 +219,11 @@ fn overlaps(coordinate: [u32; 3], delta: [i64; 3], counts: [u32; 3]) -> bool {
     })
 }
 
-fn buffer_entry(binding: u32, uniform: bool, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+pub(crate) fn buffer_entry(
+    binding: u32,
+    uniform: bool,
+    read_only: bool,
+) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -222,7 +239,7 @@ fn buffer_entry(binding: u32, uniform: bool, read_only: bool) -> wgpu::BindGroup
         count: None,
     }
 }
-fn binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+pub(crate) fn binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),
@@ -396,7 +413,14 @@ impl GiGpu {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("GI reflected voxel DDA"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("gi.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}",
+                    include_str!("gi_flat.wgsl"),
+                    include_str!("gi.wgsl")
+                )
+                .into(),
+            ),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("GI tracing pipeline layout"),
@@ -421,6 +445,7 @@ impl GiGpu {
             probes,
             job_buffer,
             statistics,
+            rays,
             bind,
             reset: pipeline("reset_statistics"),
             trace: pipeline("trace_probes"),
@@ -431,7 +456,77 @@ impl GiGpu {
             jobs: Vec::with_capacity(config.max_jobs as usize),
             dirty: probe_count,
             timer: crate::gpu_time::GpuPassTimer::new(device, queue, "GI pass timings"),
+            directional: None,
+            has_traced: false,
         })
+    }
+    /// Loading-only optional first-bounce mode. No extra source memory exists
+    /// for the original compact RGB-only mode.
+    pub fn prepare_directional(
+        &mut self,
+        device: &wgpu::Device,
+        atmosphere: &crate::atmosphere::AtmosphereGpu,
+        shadows: &crate::shadows::ShadowGpu,
+    ) -> Result<(), GiError> {
+        if self.directional.is_some()
+            || self.has_traced
+            || self.page_versions.iter().any(Option::is_some)
+        {
+            return Err(GiError::InvalidConfig);
+        }
+        self.directional = Some(Directional::new(
+            device,
+            self.page_versions.len(),
+            Sources {
+                uniform: &self.uniform,
+                world: &self.world,
+                probes: &self.probes,
+                jobs: &self.job_buffer,
+                rays: &self.rays,
+                statistics: &self.statistics,
+            },
+            atmosphere,
+            shadows,
+        )?);
+        Ok(())
+    }
+    pub fn directional_enabled(&self) -> bool {
+        self.directional.is_some()
+    }
+    pub fn directional_source_bytes(&self) -> u64 {
+        if self.directional.is_some() {
+            self.page_versions.len() as u64 * 4096 * 48
+        } else {
+            0
+        }
+    }
+    pub fn lighting_change_upload_bytes(&self) -> Result<u64, GiError> {
+        if self.directional.is_none() {
+            return Err(GiError::InvalidConfig);
+        }
+        self.parameters.stamps[0]
+            .checked_add(1)
+            .ok_or(GiError::Capacity)?;
+        Ok(96)
+    }
+    /// Advance the GPU source certificate without re-uploading World pages.
+    /// Previously encoded jobs cannot publish under a different sky/shadow state.
+    pub fn invalidate_lighting(
+        &mut self,
+        queue: &wgpu::Queue,
+        tick: u64,
+        budget: &mut UploadBudget,
+    ) -> Result<u64, GiError> {
+        let bytes = self.lighting_change_upload_bytes()?;
+        if budget.remaining_bytes < bytes {
+            return Err(GiError::UploadBudget);
+        }
+        self.invalidate_queued_jobs(tick);
+        self.invalidate(tick);
+        self.parameters.stamps[0] += 1;
+        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&self.parameters));
+        budget.remaining_bytes -= bytes;
+        Ok(bytes)
     }
     pub fn probe_count(&self) -> usize {
         self.metadata.len()
@@ -710,6 +805,61 @@ impl GiGpu {
         tick: u64,
         budget: &mut UploadBudget,
     ) -> Result<u64, GiError> {
+        if self.directional.is_some() {
+            return Err(GiError::DirectionalRequired);
+        }
+        self.upload_page_core(queue, page, version, voxels, tick, budget)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_page_directional(
+        &mut self,
+        queue: &wgpu::Queue,
+        page: [i32; 3],
+        version: u64,
+        voxels: &[GiVoxel; 4096],
+        surfaces: &[GiSurface; 4096],
+        tick: u64,
+        budget: &mut UploadBudget,
+    ) -> Result<u64, GiError> {
+        let index = self.page_index(page)?;
+        if self.directional.is_none() {
+            return Err(GiError::InvalidConfig);
+        }
+        if let Some(prior) = self.page_versions[index] {
+            if version < prior {
+                return Err(GiError::StaleVersion);
+            }
+            if version == prior {
+                return Ok(0);
+            }
+        }
+        let additional = 4096 * 48;
+        if budget.remaining_bytes < 4096 * 4 + 96 + additional {
+            return Err(GiError::UploadBudget);
+        }
+        let bytes = self.upload_page_core(queue, page, version, voxels, tick, budget)?;
+        queue.write_buffer(
+            &self
+                .directional
+                .as_ref()
+                .expect("checked directional mode")
+                .surfaces,
+            index as u64 * 4096 * 48,
+            bytemuck::cast_slice(surfaces),
+        );
+        budget.remaining_bytes -= additional;
+        Ok(bytes + additional)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn upload_page_core(
+        &mut self,
+        queue: &wgpu::Queue,
+        page: [i32; 3],
+        version: u64,
+        voxels: &[GiVoxel; 4096],
+        tick: u64,
+        budget: &mut UploadBudget,
+    ) -> Result<u64, GiError> {
         let index = self.page_index(page)?;
         if let Some(prior) = self.page_versions[index] {
             if version < prior {
@@ -740,6 +890,76 @@ impl GiGpu {
     }
     #[allow(clippy::too_many_arguments)]
     pub fn upload_cells(
+        &mut self,
+        queue: &wgpu::Queue,
+        page: [i32; 3],
+        version: u64,
+        updates: &[CellUpdate],
+        tick: u64,
+        budget: &mut UploadBudget,
+    ) -> Result<u64, GiError> {
+        if self.directional.is_some() {
+            return Err(GiError::DirectionalRequired);
+        }
+        self.upload_cells_core(queue, page, version, updates, tick, budget)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_cells_directional(
+        &mut self,
+        queue: &wgpu::Queue,
+        page: [i32; 3],
+        version: u64,
+        updates: &[CellUpdate],
+        surfaces: &[SurfaceUpdate],
+        tick: u64,
+        budget: &mut UploadBudget,
+    ) -> Result<u64, GiError> {
+        let index = self.page_index(page)?;
+        if self.directional.is_none() {
+            return Err(GiError::InvalidConfig);
+        }
+        let prior = self.page_versions[index].ok_or(GiError::InvalidPage)?;
+        if version < prior {
+            return Err(GiError::StaleVersion);
+        }
+        if version == prior || updates.is_empty() {
+            return Ok(0);
+        }
+        if surfaces.len() != updates.len()
+            || surfaces
+                .iter()
+                .zip(updates)
+                .any(|(a, b)| a.local != b.local)
+        {
+            return Err(GiError::InvalidUpdates);
+        }
+        let additional = surfaces.len() as u64 * 48;
+        if budget.remaining_bytes < updates.len() as u64 * 4 + 96 + additional {
+            return Err(GiError::UploadBudget);
+        }
+        let bytes = self.upload_cells_core(queue, page, version, updates, tick, budget)?;
+        let directional = self.directional.as_mut().expect("checked directional mode");
+        for (entry, update) in directional.staging.iter_mut().zip(surfaces) {
+            *entry = update.value;
+        }
+        let mut first = 0;
+        while first < surfaces.len() {
+            let mut end = first + 1;
+            while end < surfaces.len() && surfaces[end].local == surfaces[end - 1].local + 1 {
+                end += 1;
+            }
+            queue.write_buffer(
+                &directional.surfaces,
+                index as u64 * 4096 * 48 + u64::from(surfaces[first].local) * 48,
+                bytemuck::cast_slice(&directional.staging[first..end]),
+            );
+            first = end;
+        }
+        budget.remaining_bytes -= additional;
+        Ok(bytes + additional)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn upload_cells_core(
         &mut self,
         queue: &wgpu::Queue,
         page: [i32; 3],
@@ -864,8 +1084,18 @@ impl GiGpu {
                 label: Some("reset GI DDA counters"),
                 timestamp_writes: self.timer.compute(1),
             });
-            pass.set_pipeline(&self.reset);
-            pass.set_bind_group(0, &self.bind, &[]);
+            pass.set_pipeline(
+                self.directional
+                    .as_ref()
+                    .map_or(&self.reset, |mode| &mode.reset),
+            );
+            pass.set_bind_group(
+                0,
+                self.directional
+                    .as_ref()
+                    .map_or(&self.bind, |mode| &mode.bind),
+                &[],
+            );
             pass.dispatch_workgroups(1, 1, 1);
         }
         {
@@ -873,14 +1103,30 @@ impl GiGpu {
                 label: Some("edited-visible GI DDA probes"),
                 timestamp_writes: self.timer.compute(2),
             });
-            pass.set_pipeline(&self.trace);
-            pass.set_bind_group(0, &self.bind, &[]);
+            pass.set_pipeline(
+                self.directional
+                    .as_ref()
+                    .map_or(&self.trace, |mode| &mode.trace),
+            );
+            pass.set_bind_group(
+                0,
+                self.directional
+                    .as_ref()
+                    .map_or(&self.bind, |mode| &mode.bind),
+                &[],
+            );
             pass.dispatch_workgroups(self.jobs.len() as u32, 1, 1);
         }
         self.timer.finish(encoder);
+        self.has_traced = true;
         work.updated_probes = self.jobs.len() as u32;
         work.rays = work.updated_probes * rays;
         work.max_dda_steps = u64::from(work.rays) * u64::from(self.config.max_steps);
+        work.max_shadow_samples = if self.directional.is_some() {
+            u64::from(work.updated_probes) * u64::from(self.config.rays_per_probe) * 8
+        } else {
+            0
+        };
         work.upload_bytes = bytes;
         work.pending_probes = self.dirty;
         work.passes = 2;

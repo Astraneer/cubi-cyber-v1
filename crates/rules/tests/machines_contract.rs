@@ -4,7 +4,6 @@ use rules::{
     items::*,
     machine_recipes as chem,
     machines::{
-        events::{self, EventWork},
         logistics::{self, Arrival, Route, Transit},
         sides, *,
     },
@@ -604,207 +603,19 @@ fn transit_is_exactly_one_step_per_tick_and_waits_for_commit_ack() {
 }
 
 #[test]
-fn h2_two_machine_chain_matches_detailed_ticks_for_120000_boundaries() {
-    let mut a = Machine::new(MekKind::Crusher);
-    a.slots[0] = stack(I_IRON_INGOT, 64);
-    a.energy = a.capacity();
-    let mut b = Machine::new(MekKind::Smelter);
-    b.energy = b.capacity();
-    let mut slow = [a, b];
-    let mut fast = slow.clone();
-    let mut world = World::default();
-    let mut work = EventWork::default();
-    let mut detailed_ticks = 0u64;
-    for boundary in 0u64..120_000 {
-        // External dependency events occur at the same global boundary in both
-        // simulations: supply, loss/restoration of energy, output congestion and
-        // transfer reservation ACK. No hidden per-tick work in the event path.
-        for pair in [&mut slow, &mut fast] {
-            if boundary % 31 == 0 {
-                pair[0].slots[0] = stack(I_IRON_INGOT, 64);
-            }
-            if boundary % 17 != 0 {
-                for m in pair.iter_mut() {
-                    m.insert_energy(15_000);
-                }
-            } else {
-                for m in pair.iter_mut() {
-                    m.energy = 0;
-                }
-            }
-            if boundary % 43 == 0 {
-                pair[1].slots[1] = stack(I_IRON_INGOT, 64);
-            } else if boundary % 43 == 3 {
-                pair[1].slots[1] = Slot::default();
-            }
-            let out = pair[0].slots[1].stack;
-            if !out.is_empty()
-                && (pair[1].slots[0].stack.is_empty()
-                    || pair[1].slots[0].stack.item() == out.item())
-            {
-                let n = out.count().min(64 - pair[1].slots[0].stack.count());
-                if n > 0 {
-                    pair[0].slots[1].stack = out.with_count(out.count() - n).unwrap();
-                    pair[1].slots[0] = stack(out.item(), pair[1].slots[0].stack.count() + n);
-                }
-            }
-        }
-        let span = 1 + (boundary * 13 % 37);
-        for _ in 0..span {
-            for m in &mut slow {
-                m.tick([0; 3], Face::South, &mut world);
-                detailed_ticks += 1;
-            }
-        }
-        for m in &mut fast {
-            events::advance(m, span, &mut work).unwrap();
-        }
-        assert_eq!(slow, fast, "boundary {boundary}");
-    }
-    assert!(work.transitions >= 100_000);
-    assert!(work.completed_operations > 10_000);
-    assert!(
-        detailed_ticks >= work.transitions * 4,
-        "detailed {detailed_ticks}, events {}",
-        work.transitions
-    );
-    eprintln!(
-        "H2_EVENT_KERNEL boundaries=120000 detailed_ticks={detailed_ticks} event_transitions={} completed={} reduction={:.3}",
-        work.transitions,
-        work.completed_operations,
-        detailed_ticks as f64 / work.transitions as f64
-    );
-}
-
-#[test]
-fn repeated_machine_and_idle_event_phases_allocate_nothing() {
+fn repeated_detailed_machine_idle_phases_allocate_nothing() {
     let mut m = Machine::new(MekKind::Enrich);
     let mut w = World::default();
-    let mut work = EventWork::default();
     let positive = AllocationScope::begin().unwrap();
     black_box(Vec::<u64>::with_capacity(64));
     assert!(positive.finish().allocating_calls() > 0);
     let scope = AllocationScope::begin().unwrap();
     for _ in 0..10_000 {
         m.tick([0; 3], Face::South, &mut w);
-        events::advance(&mut m, 1000, &mut work).unwrap();
     }
     let counts = scope.finish();
     assert_eq!(counts.allocating_calls(), 0);
     assert_eq!(counts.dealloc_calls, 0);
-}
-
-#[test]
-fn h2_2048_copies_match_detailed_chain_under_shared_outages() {
-    let mut crusher = Machine::new(MekKind::Crusher);
-    crusher.slots[0] = stack(I_IRON_INGOT, 64);
-    let smelter = Machine::new(MekKind::Smelter);
-    let mut detailed = vec![[crusher, smelter]; 2048];
-    let mut projected = detailed.clone();
-    let mut world = World::default();
-    let mut work = EventWork::default();
-    for boundary in 0..20 {
-        for (index, (slow, fast)) in detailed.iter_mut().zip(projected.iter_mut()).enumerate() {
-            for pair in [&mut *slow, &mut *fast] {
-                let powered = (boundary + index) % 7 != 0;
-                for m in pair.iter_mut() {
-                    if powered {
-                        m.insert_energy(20_000);
-                    } else {
-                        m.energy = 0;
-                    }
-                }
-                if boundary % 5 == 0 {
-                    pair[1].slots[1] = if index % 3 == 0 {
-                        stack(I_IRON_INGOT, 64)
-                    } else {
-                        Slot::default()
-                    };
-                }
-                let output = pair[0].slots[1].stack;
-                if !output.is_empty() && pair[1].slots[0].stack.count() + output.count() <= 64 {
-                    pair[1].slots[0] = stack(
-                        output.item(),
-                        pair[1].slots[0].stack.count() + output.count(),
-                    );
-                    pair[0].slots[1] = Slot::default();
-                }
-            }
-            for _ in 0..50 {
-                for m in slow.iter_mut() {
-                    m.tick([0; 3], Face::South, &mut world);
-                }
-            }
-            for m in fast.iter_mut() {
-                events::advance(m, 50, &mut work).unwrap();
-            }
-            assert_eq!(slow, fast, "copy {index},boundary {boundary}");
-        }
-    }
-    let detailed_ticks = 2048u64 * 2 * 1000;
-    assert!(detailed_ticks > work.transitions * 4);
-    eprintln!(
-        "H2_COPIES copies=2048 detailed_ticks={detailed_ticks} event_transitions={} reduction={:.3}",
-        work.transitions,
-        detailed_ticks as f64 / work.transitions as f64
-    );
-}
-
-#[test]
-fn indexed_wake_heap_coalesces_without_scanning_sleeping_machines() {
-    use events::{Wake, WakeQueue};
-    use std::collections::BTreeMap;
-    let mut queue = WakeQueue::new(128);
-    let mut expected = BTreeMap::<u32, Wake>::new();
-    let mut random = 42u64;
-    for tick in 0..50_000u64 {
-        random ^= random << 13;
-        random ^= random >> 7;
-        random ^= random << 17;
-        let wake = Wake {
-            at: tick + ((random >> 16) % 20),
-            machine: (random % 128) as u32,
-            generation: ((random >> 32) % 20) as u32,
-        };
-        queue.schedule(wake).unwrap();
-        if let Some(old) = expected.get_mut(&wake.machine) {
-            if wake.generation > old.generation
-                || (wake.generation == old.generation && wake.at < old.at)
-            {
-                *old = wake;
-            }
-        } else {
-            expected.insert(wake.machine, wake);
-        }
-        let wanted = expected
-            .values()
-            .filter(|w| w.at <= tick)
-            .min_by_key(|w| (w.at, w.machine))
-            .copied();
-        assert_eq!(queue.pop_due(tick), wanted);
-        if let Some(w) = wanted {
-            expected.remove(&w.machine);
-        }
-        assert_eq!(queue.len(), expected.len());
-    }
-    let mut queue = WakeQueue::new(4096);
-    for machine in 0..4096 {
-        queue
-            .schedule(Wake {
-                at: 1_000_000,
-                machine,
-                generation: 1,
-            })
-            .unwrap();
-    }
-    let scope = AllocationScope::begin().unwrap();
-    for tick in 0..10_000 {
-        assert_eq!(black_box(queue.pop_due(tick)), None);
-    }
-    let counts = scope.finish();
-    assert_eq!(counts.allocating_calls(), 0);
-    assert_eq!(counts.dealloc_calls, 0);
-    assert_eq!(queue.len(), 4096);
 }
 
 #[test]

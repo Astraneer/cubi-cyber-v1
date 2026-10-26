@@ -1,5 +1,4 @@
-#[path = "../src/network/machine_packets.rs"]
-mod packets;
+use client::network::machine_packets as packets;
 use core_types::{LocalIdx, PageId, SpaceId, Tick, Version};
 use net::machine_packets::{ACTIVE, Frame, Pose, Request};
 use packets::{Apply, PIPE_INSTANCE_FLAG, PacketPage};
@@ -98,6 +97,15 @@ fn certified_packet_lifecycle_missing_base_and_late_invalid_row_are_atomic() {
     assert_eq!(replica.view_version(), Some(Version(8)));
     assert_eq!(replica.tick(), Tick(3));
     assert!(replica.get(1).is_some());
+    let mut fresh = full();
+    fresh.view_version = Version(9);
+    fresh.tick = Tick(4);
+    fresh.revision = 1;
+    assert!(matches!(
+        replica.apply(fresh, Version(9)).unwrap(),
+        Apply::Applied(_)
+    ));
+    assert_eq!(replica.revision(), Some(1));
 }
 #[test]
 fn pipe_gpu_bridge_preserves_fraction_after_integer_origin_and_has_no_drop_bob_flag() {
@@ -248,4 +256,214 @@ fn multipage_row_capacity_rejects_atomically_and_render_output_allocates_nothing
     assert!(scene.remove_page(second.page));
     assert_eq!(scene.len(), 1);
     assert_eq!(scene.retained_ids(), 1);
+}
+
+use client::entities;
+use client::packet_source::{PacketGpuSource, View};
+struct Icons;
+impl entities::ItemVisuals for Icons {
+    fn visual(&self, item: u16) -> Option<entities::ItemVisual> {
+        Some(entities::ItemVisual {
+            kind: if item == rules::ids::STONE { 6 } else { 7 },
+            atlas_layer: 1,
+        })
+    }
+}
+fn scene(count: u64) -> packets::PacketScene {
+    let mut scene = packets::PacketScene::new(4, 2048).unwrap();
+    scene
+        .apply(
+            Frame {
+                page: page(),
+                view_version: Version(7),
+                revision: 1,
+                base: None,
+                tick: Tick(1),
+                upserts: (1..=count)
+                    .map(|id| Pose {
+                        id,
+                        index: LocalIdx::new(546).unwrap(),
+                        item: rules::ids::STONE,
+                        count: 1,
+                        color: 0,
+                        entry: 5,
+                        exit: 3,
+                        progress: 5,
+                        flags: ACTIVE,
+                        epoch: Tick(1),
+                    })
+                    .collect(),
+                removes: vec![],
+            },
+            Version(7),
+        )
+        .unwrap();
+    scene
+}
+fn view() -> View {
+    View {
+        space: SpaceId(0),
+        tick: Tick(1),
+        alpha: 0.,
+        origin: [16_000_000, 0, 0],
+    }
+}
+#[test]
+fn packet_source_checks_current_raw_certificate_and_unknown_light_before_gpu_copy() {
+    let scene = scene(1);
+    let mut source = PacketGpuSource::new(8).unwrap();
+    let work = source
+        .prepare(
+            &scene,
+            view(),
+            &|p, v, i| p == page() && v == Version(7) && i.get() == 546,
+            &Icons,
+            |_| None,
+        )
+        .unwrap();
+    assert_eq!(work.instances, 1);
+    assert_eq!(work.unknown_light_reads, 1);
+    assert_eq!(work.cpu_vertices, 0);
+    assert!((source.instances()[0].position[0] - 2.05).abs() < 1e-6);
+    assert_eq!(source.instances()[0].flags, 32 | 4096);
+    assert_eq!(source.lights().len(), 1);
+    let work = source
+        .prepare(&scene, view(), &|_, _, _| false, &Icons, |_| {
+            panic!("withheld rows cannot read light")
+        })
+        .unwrap();
+    assert_eq!(work.withheld, 1);
+    assert_eq!(work.instances, 0);
+    assert!(source.instances().is_empty());
+}
+#[test]
+fn five_hundred_twelve_packets_copy_no_vertices_and_allocate_no_frame_memory() {
+    let scene = scene(512);
+    let mut source = PacketGpuSource::new(512).unwrap();
+    let light = |_| {
+        Some(world::LightSample {
+            sky: 15,
+            block: 0,
+            rgb: [0; 3],
+        })
+    };
+    source
+        .prepare(&scene, view(), &|_, _, _| true, &Icons, light)
+        .unwrap();
+    let scope = AllocationScope::begin().unwrap();
+    for tick in 1..=1000 {
+        let work = source
+            .prepare(
+                &scene,
+                View {
+                    tick: Tick(tick),
+                    ..view()
+                },
+                &|_, _, _| true,
+                &Icons,
+                light,
+            )
+            .unwrap();
+        assert_eq!(work.instances, 512);
+        assert_eq!(work.cpu_vertices, 0);
+    }
+    assert_eq!(scope.finish(), AllocationCounts::ZERO);
+}
+
+fn connected_raw_page() -> client::network::Connection {
+    let mut connection = client::network::Connection::new(client::network::NetworkConfig {
+        maximum_pages: 256,
+        ..client::network::NetworkConfig::default()
+    })
+    .unwrap();
+    connection.request_page(page(), 0).unwrap();
+    connection
+        .receive(
+            net::ServerMessage::Page(net::PageUpdate::Snapshot(net::PageSnapshot {
+                page: page(),
+                version: 7,
+                source_version: Version(11),
+                cells: Box::new(
+                    [core_types::Cell::from_parts(rules::ids::LOGISTICAL_TRANSPORTER, 0); 4096],
+                ),
+            })),
+            0,
+        )
+        .unwrap();
+    connection.take_outgoing(256);
+    connection
+}
+#[test]
+fn real_connection_coalesces_a_thousand_packet_acknowledgements_and_requests_missing_base() {
+    let mut connection = connected_raw_page();
+    for revision in 1..=1000 {
+        let mut frame = full();
+        frame.revision = revision;
+        frame.tick = Tick(revision);
+        let bytes =
+            net::encode_server(&net::ServerMessage::MachinePackets(Box::new(frame))).unwrap();
+        connection
+            .receive(net::decode_server(&bytes).unwrap(), revision)
+            .unwrap();
+    }
+    assert_eq!(connection.packet_scene().len(), 1);
+    assert_eq!(connection.queue_depths().outgoing, 1);
+    assert!(matches!(
+        connection.take_outgoing(256).as_slice(),
+        [net::ClientMessage::MachinePackets(Request::Ack {
+            revision: 1000,
+            ..
+        })]
+    ));
+    let mut missing = full();
+    missing.revision = 1002;
+    missing.base = Some(1001);
+    missing.tick = Tick(1002);
+    connection
+        .receive(net::ServerMessage::MachinePackets(Box::new(missing)), 1002)
+        .unwrap();
+    assert_eq!(
+        connection.packet_scene().page(page()).unwrap().revision(),
+        Some(1000)
+    );
+    assert!(matches!(
+        connection.take_outgoing(256).as_slice(),
+        [net::ClientMessage::MachinePackets(Request::Full {
+            have: Some(1000),
+            ..
+        })]
+    ));
+}
+#[test]
+fn real_connection_rejects_packet_before_mutation_when_ack_capacity_is_exhausted() {
+    let mut connection = connected_raw_page();
+    connection
+        .receive(net::ServerMessage::MachinePackets(Box::new(full())), 1)
+        .unwrap();
+    connection.take_outgoing(256);
+    for x in 0..255 {
+        connection.request_page(PageId { x, ..page() }, 2).unwrap();
+    }
+    connection.request_geometry(page(), 2).unwrap();
+    let mut frame = full();
+    frame.revision = 2;
+    frame.tick = Tick(2);
+    frame.upserts[0].count = 2;
+    assert_eq!(
+        connection.receive(
+            net::ServerMessage::MachinePackets(Box::new(frame.clone())),
+            2
+        ),
+        Err(client::network::NetworkError::Capacity)
+    );
+    assert_eq!(
+        connection.packet_scene().page(page()).unwrap().revision(),
+        Some(1)
+    );
+    assert_eq!(connection.packet_scene().get(1).unwrap().1.count, 1);
+    connection.take_outgoing(256);
+    connection
+        .receive(net::ServerMessage::MachinePackets(Box::new(frame)), 2)
+        .unwrap();
+    assert_eq!(connection.packet_scene().get(1).unwrap().1.count, 2);
 }

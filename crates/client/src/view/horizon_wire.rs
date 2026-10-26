@@ -2,7 +2,7 @@
 //! Decoder loops are bounded validation, never generator/mesher execution.
 use super::*;
 use render::lod_gpu::ProxyPayload;
-const MAX_BYTES: usize = 50_000;
+const MAX_BYTES: usize = 180_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireError {
     Length,
@@ -18,10 +18,13 @@ impl std::fmt::Display for WireError {
 impl std::error::Error for WireError {}
 pub fn encode_background_task(task: &BackgroundTask) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::with_capacity(30_000);
-    out.extend_from_slice(b"CHJ1");
+    out.extend_from_slice(b"CHJ2");
     match task {
         BackgroundTask::Plan(task) => {
-            if task.refine.len() > 512 {
+            if task.refine.len() > 512
+                || task.certificates.len() > 4096
+                || task.previous.len() > 512
+            {
                 return Err(WireError::Length);
             }
             out.push(1);
@@ -36,6 +39,8 @@ pub fn encode_background_task(task: &BackgroundTask) -> Result<Vec<u8>, WireErro
             }
             w32(&mut out, task.config.atlas_layers);
             out.push(task.config.horizon_level);
+            w64(&mut out, task.config.screen_error_pixels.to_bits());
+            w64(&mut out, task.config.hysteresis_pixels.to_bits());
             w32(&mut out, task.space);
             for n in task.camera {
                 w64(&mut out, n as u64);
@@ -44,6 +49,37 @@ pub fn encode_background_task(task: &BackgroundTask) -> Result<Vec<u8>, WireErro
             w16(&mut out, task.refine.len() as u16);
             for key in &task.refine {
                 key_write(&mut out, *key);
+            }
+            out.push(u8::from(task.projection.is_some()));
+            if let Some(p) = task.projection {
+                for n in p
+                    .eye_min
+                    .into_iter()
+                    .chain(p.eye_max)
+                    .chain([
+                        p.focal_pixels,
+                        p.diagonal_tangent,
+                        p.target_pixels,
+                        p.hysteresis_pixels,
+                    ])
+                    .chain(p.view_direction)
+                    .chain([p.view_cosine])
+                {
+                    w64(&mut out, n.to_bits());
+                }
+            }
+            w16(&mut out, task.certificates.len() as u16);
+            for c in &task.certificates {
+                key_write(&mut out, c.key);
+                w64(&mut out, c.bound.max_error_q1024);
+                w32(&mut out, c.bound.min_height as u32);
+                w32(&mut out, c.bound.max_height as u32);
+                w64(&mut out, c.seam_error_q1024);
+                out.push(u8::from(c.exact_replacement));
+            }
+            w16(&mut out, task.previous.len() as u16);
+            for key in &task.previous {
+                key_write(&mut out, wire_key(*key));
             }
         }
         BackgroundTask::Proxy(task) => {
@@ -71,6 +107,9 @@ pub fn encode_background_task(task: &BackgroundTask) -> Result<Vec<u8>, WireErro
             out.extend_from_slice(&task.input.indices);
         }
     }
+    if out.len() > MAX_BYTES {
+        return Err(WireError::Length);
+    }
     Ok(out)
 }
 fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
@@ -78,7 +117,7 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
         return Err(WireError::Length);
     }
     let mut r = Reader { bytes, at: 0 };
-    if r.take::<4>()? != *b"CHJ1" {
+    if r.take::<4>()? != *b"CHJ2" {
         return Err(WireError::Magic);
     }
     let task = match r.u8()? {
@@ -90,6 +129,8 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
             let max_proxy_pages = r.u32()? as usize;
             let atlas_layers = r.u32()?;
             let horizon_level = r.u8()?;
+            let screen_error_pixels = f64::from_bits(r.u64()?);
+            let hysteresis_pixels = f64::from_bits(r.u64()?);
             let space = r.u32()?;
             let camera = [r.u64()? as i64, r.u64()? as i64];
             let near_radius = i64::from(r.u32()?);
@@ -103,6 +144,11 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
                 || atlas_layers == 0
                 || atlas_layers > 256
                 || horizon_level > 10
+                || !screen_error_pixels.is_finite()
+                || screen_error_pixels <= 0.
+                || !hysteresis_pixels.is_finite()
+                || hysteresis_pixels < 0.
+                || hysteresis_pixels >= screen_error_pixels
                 || near_radius > 128
                 || n > 512
                 || camera
@@ -111,14 +157,79 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
             {
                 return Err(WireError::Invalid);
             }
-            if r.bytes.len().saturating_sub(r.at) != n * 13 {
+            if r.bytes.len().saturating_sub(r.at) < n * 13 + 5 {
                 return Err(WireError::Length);
             }
             let mut refine = Vec::with_capacity(n);
             for _ in 0..n {
                 refine.push(key_read(&mut r)?);
             }
-            BackgroundTask::Plan(PlanTask {
+            let projection = match r.u8()? {
+                0 => None,
+                1 => {
+                    let mut values = [0.; 14];
+                    for value in &mut values {
+                        *value = f64::from_bits(r.u64()?);
+                    }
+                    let p = Projection {
+                        eye_min: values[..3].try_into().unwrap(),
+                        eye_max: values[3..6].try_into().unwrap(),
+                        focal_pixels: values[6],
+                        diagonal_tangent: values[7],
+                        target_pixels: values[8],
+                        hysteresis_pixels: values[9],
+                        view_direction: values[10..13].try_into().unwrap(),
+                        view_cosine: values[13],
+                    };
+                    p.validate().map_err(|_| WireError::Invalid)?;
+                    Some(p)
+                }
+                _ => return Err(WireError::Invalid),
+            };
+            let count = r.u16()? as usize;
+            if count > 4096 || r.bytes.len().saturating_sub(r.at) < count * 38 + 2 {
+                return Err(WireError::Length);
+            }
+            let mut certificates = Vec::with_capacity(count);
+            for _ in 0..count {
+                let key = key_read(&mut r)?;
+                let bound = net::height::HeightErrorBound {
+                    max_error_q1024: r.u64()?,
+                    min_height: r.u32()? as i32,
+                    max_height: r.u32()? as i32,
+                };
+                bound.validate().map_err(|_| WireError::Invalid)?;
+                let seam_error_q1024 = r.u64()?;
+                let exact_replacement = match r.u8()? {
+                    0 => false,
+                    1 if key.level == 0 => true,
+                    _ => return Err(WireError::Invalid),
+                };
+                if seam_error_q1024 > (u64::from(u32::MAX) + 1) * 1024 {
+                    return Err(WireError::Invalid);
+                }
+                certificates.push(Certificate {
+                    key,
+                    bound,
+                    seam_error_q1024,
+                    exact_replacement,
+                });
+            }
+            if certificates
+                .windows(2)
+                .any(|pair| pair[0].key >= pair[1].key)
+            {
+                return Err(WireError::Invalid);
+            }
+            let count = r.u16()? as usize;
+            if count > 512 || r.bytes.len().saturating_sub(r.at) != count * 13 {
+                return Err(WireError::Length);
+            }
+            let mut previous = Vec::with_capacity(count);
+            for _ in 0..count {
+                previous.push(render_key(key_read(&mut r)?));
+            }
+            BackgroundTask::Plan(Box::new(PlanTask {
                 id,
                 generation,
                 config: Config {
@@ -127,12 +238,17 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
                     max_proxy_pages,
                     atlas_layers,
                     horizon_level,
+                    screen_error_pixels,
+                    hysteresis_pixels,
                 },
                 space,
                 camera,
                 refine,
                 near_radius,
-            })
+                projection,
+                certificates,
+                previous,
+            }))
         }
         2 => {
             let stamp = stamp_read(&mut r)?;
@@ -216,7 +332,7 @@ pub fn execute_background_request(
 }
 fn encode_result(result: &BackgroundResult) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::with_capacity(10_000);
-    out.extend_from_slice(b"CHR1");
+    out.extend_from_slice(b"CHR2");
     match result {
         BackgroundResult::Plan(Err(_)) => out.extend_from_slice(&[1, 1]),
         BackgroundResult::Proxy(Err(_)) => out.extend_from_slice(&[2, 1]),
@@ -235,6 +351,15 @@ fn encode_result(result: &BackgroundResult) -> Result<Vec<u8>, WireError> {
                 result.work.seam_tests,
             ] {
                 w64(&mut out, n);
+            }
+            w64(&mut out, result.quality.missing_certificates);
+            out.push(u8::from(result.quality.capacity_limited));
+            w64(&mut out, result.quality.leaf_limited);
+            w64(&mut out, result.quality.maximum_error_pixels.to_bits());
+            w64(&mut out, result.quality.sse_refinements);
+            w16(&mut out, result.exact_leaves.len() as u16);
+            for key in &result.exact_leaves {
+                key_write(&mut out, *key);
             }
             w32(&mut out, result.plan.visited_nodes);
             for n in result.plan.outer_bounds_pages {
@@ -265,7 +390,7 @@ pub fn decode_background_result(bytes: &[u8]) -> Result<BackgroundResult, WireEr
         return Err(WireError::Length);
     }
     let mut r = Reader { bytes, at: 0 };
-    if r.take::<4>()? != *b"CHR1" {
+    if r.take::<4>()? != *b"CHR2" {
         return Err(WireError::Magic);
     }
     let kind = r.u8()?;
@@ -288,6 +413,45 @@ pub fn decode_background_result(bytes: &[u8]) -> Result<BackgroundResult, WireEr
                 || work.near_tiles_removed > 32768
                 || work.adjacency_tests.saturating_add(work.seam_tests) > MAX_PLAN_PAIRS
             {
+                return Err(WireError::Invalid);
+            }
+            let missing_certificates = r.u64()?;
+            let capacity_limited = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(WireError::Invalid),
+            };
+            let leaf_limited = r.u64()?;
+            let maximum_error_pixels = f64::from_bits(r.u64()?);
+            let sse_refinements = r.u64()?;
+            if missing_certificates > 512
+                || leaf_limited > 512
+                || maximum_error_pixels.is_nan()
+                || maximum_error_pixels < 0.
+                || sse_refinements > 8192
+            {
+                return Err(WireError::Invalid);
+            }
+            let quality = SelectionQuality {
+                missing_certificates,
+                capacity_limited,
+                leaf_limited,
+                maximum_error_pixels,
+                sse_refinements,
+            };
+            let exact_count = r.u16()? as usize;
+            if exact_count > 512 || r.bytes.len().saturating_sub(r.at) < exact_count * 13 {
+                return Err(WireError::Length);
+            }
+            let mut exact_leaves = Vec::with_capacity(exact_count);
+            for _ in 0..exact_count {
+                let key = key_read(&mut r)?;
+                if key.level != 0 {
+                    return Err(WireError::Invalid);
+                }
+                exact_leaves.push(key);
+            }
+            if exact_leaves.windows(2).any(|p| p[0] >= p[1]) {
                 return Err(WireError::Invalid);
             }
             let visited_nodes = r.u32()?;
@@ -321,6 +485,12 @@ pub fn decode_background_result(bytes: &[u8]) -> Result<BackgroundResult, WireEr
             if tiles.windows(2).any(|p| p[0].key >= p[1].key) {
                 return Err(WireError::Invalid);
             }
+            if exact_leaves
+                .iter()
+                .any(|key| !tiles.iter().any(|tile| wire_key(tile.key) == *key))
+            {
+                return Err(WireError::Invalid);
+            }
             BackgroundResult::Plan(Ok(Planned {
                 id,
                 generation,
@@ -330,6 +500,8 @@ pub fn decode_background_result(bytes: &[u8]) -> Result<BackgroundResult, WireEr
                     outer_bounds_pages: bounds,
                 },
                 work,
+                quality,
+                exact_leaves,
             }))
         }
         (2, 0) => {

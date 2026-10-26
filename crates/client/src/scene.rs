@@ -496,7 +496,15 @@ impl ClientScene {
     pub(crate) fn derived_world_mut(&mut self) -> &mut World {
         &mut self.world
     }
+    pub(crate) fn derived_world_and_biome_tints(
+        &mut self,
+    ) -> (&mut World, &BTreeMap<PageId, Box<[u16; 256]>>) {
+        (&mut self.world, &self.tints)
+    }
     /// Immutable generated biome tint for terrain and the immediate edit shell.
+    pub fn cached_biome_tints(&self, page: PageId) -> Option<&[u16; 256]> {
+        self.tints.get(&page).map(Box::as_ref)
+    }
     pub fn biome_tint(&self, page: PageId, x: u8, z: u8) -> Option<u16> {
         if x >= 16 || z >= 16 {
             return None;

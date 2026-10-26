@@ -411,6 +411,19 @@ pub fn encode_client(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
                         out.u64(inventory.payload);
                     }
                 }
+                Action::CycleToolMode { back, inventory } => {
+                    if inventory.selected >= 9 || (inventory.payload != 0 && inventory.count != 1) {
+                        return Err(CodecError::InvalidBounds);
+                    }
+                    out.byte(19);
+                    out.bool(*back);
+                    out.u64(inventory.revision);
+                    out.byte(inventory.selected);
+                    out.u16(inventory.item);
+                    out.u16(inventory.count);
+                    out.u16(inventory.damage);
+                    out.u64(inventory.payload);
+                }
                 Action::Chat(text) => {
                     if !presence::valid_chat(text) {
                         return Err(CodecError::InvalidBounds);
@@ -470,8 +483,13 @@ pub fn encode_client(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
                 &entities::encode_request(*request).map_err(|_| CodecError::InvalidBounds)?,
             );
         }
-        ClientMessage::RequestHeight { key, known } => {
-            out.byte(12);
+        ClientMessage::RequestHeight { key, known }
+        | ClientMessage::RequestExactHeight { key, known } => {
+            let exact = matches!(message, ClientMessage::RequestExactHeight { .. });
+            if exact && key.level != 0 {
+                return Err(CodecError::InvalidBounds);
+            }
+            out.byte(if exact { 18 } else { 12 });
             write_height_key(&mut out, *key)?;
             out.bool(known.is_some());
             if let Some(source) = known {
@@ -480,6 +498,29 @@ pub fn encode_client(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
                 }
                 out.u64(*source);
             }
+        }
+        ClientMessage::RequestProps {
+            page,
+            cell_view,
+            known,
+        } => {
+            if *cell_view == 0 || *known == Some(0) {
+                return Err(CodecError::InvalidBounds);
+            }
+            out.byte(16);
+            out.page(*page);
+            out.u64(*cell_view);
+            out.bool(known.is_some());
+            if let Some(view) = known {
+                out.u64(*view);
+            }
+        }
+        ClientMessage::MachinePackets(request) => {
+            out.byte(17);
+            write_blob(
+                &mut out,
+                &request.encode().map_err(|_| CodecError::InvalidBounds)?,
+            );
         }
         ClientMessage::RequestLight(request) => {
             out.byte(14);
@@ -619,6 +660,21 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
                         inventory,
                     }
                 }
+                19 => {
+                    let back = input.bool()?;
+                    let inventory = InventoryGuard {
+                        revision: input.u64()?,
+                        selected: input.byte()?,
+                        item: input.u16()?,
+                        count: input.u16()?,
+                        damage: input.u16()?,
+                        payload: input.u64()?,
+                    };
+                    if inventory.selected >= 9 || (inventory.payload != 0 && inventory.count != 1) {
+                        return Err(CodecError::InvalidBounds);
+                    }
+                    Action::CycleToolMode { back, inventory }
+                }
                 8 => {
                     let text = input.string(presence::MAX_CHAT_BYTES)?;
                     if !presence::valid_chat(&text) {
@@ -670,8 +726,11 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
             ClientMessage::RequestGeometry { page, known }
         }
         8 => ClientMessage::ForgetGeometry(input.page()?),
-        12 => {
+        tag @ (12 | 18) => {
             let key = read_height_key(&mut input)?;
+            if tag == 18 && key.level != 0 {
+                return Err(CodecError::InvalidBounds);
+            }
             let known = if input.bool()? {
                 let n = input.u64()?;
                 if n == 0 {
@@ -681,7 +740,11 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
             } else {
                 None
             };
-            ClientMessage::RequestHeight { key, known }
+            if tag == 18 {
+                ClientMessage::RequestExactHeight { key, known }
+            } else {
+                ClientMessage::RequestHeight { key, known }
+            }
         }
         13 => ClientMessage::ForgetHeight(read_height_key(&mut input)?),
         14 => ClientMessage::RequestLight(
@@ -689,6 +752,27 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
                 .map_err(|_| CodecError::InvalidBounds)?,
         ),
         15 => ClientMessage::ForgetLight(input.page()?),
+        17 => ClientMessage::MachinePackets(
+            machine_packets::Request::decode(read_blob(&mut input, 37)?)
+                .map_err(|_| CodecError::InvalidBounds)?,
+        ),
+        16 => {
+            let page = input.page()?;
+            let cell_view = input.u64()?;
+            let known = if input.bool()? {
+                Some(input.u64()?)
+            } else {
+                None
+            };
+            if cell_view == 0 || known == Some(0) {
+                return Err(CodecError::InvalidBounds);
+            }
+            ClientMessage::RequestProps {
+                page,
+                cell_view,
+                known,
+            }
+        }
         10 => ClientMessage::Presence(
             presence::decode_client(read_blob(&mut input, 64)?)
                 .map_err(|_| CodecError::InvalidBounds)?,
@@ -824,6 +908,13 @@ pub fn encode_server(message: &ServerMessage) -> Result<Vec<u8>, CodecError> {
                 &presence::encode_server(event).map_err(|_| CodecError::InvalidBounds)?,
             );
         }
+        ServerMessage::ItemAttributes(attributes) => {
+            out.byte(24);
+            write_blob(
+                &mut out,
+                &attributes.encode().map_err(|_| CodecError::InvalidBounds)?,
+            );
+        }
         ServerMessage::Entities(frame) => {
             out.byte(16);
             write_blob(
@@ -843,6 +934,20 @@ pub fn encode_server(message: &ServerMessage) -> Result<Vec<u8>, CodecError> {
             write_blob(
                 &mut out,
                 &height::encode(tile).map_err(|_| CodecError::InvalidBounds)?,
+            );
+        }
+        ServerMessage::MachinePackets(frame) => {
+            out.byte(23);
+            write_blob(
+                &mut out,
+                &frame.encode().map_err(|_| CodecError::InvalidBounds)?,
+            );
+        }
+        ServerMessage::Props(frame) => {
+            out.byte(22);
+            write_blob(
+                &mut out,
+                &frame.encode().map_err(|_| CodecError::InvalidBounds)?,
             );
         }
         ServerMessage::Light(update) => {
@@ -1180,6 +1285,21 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, CodecError> {
                 .map_err(|_| CodecError::InvalidBounds)?,
         )),
         21 => ServerMessage::LightUnavailable(input.page()?),
+        23 => ServerMessage::MachinePackets(Box::new(
+            machine_packets::Frame::decode(read_blob(&mut input, machine_packets::MAX_BYTES)?)
+                .map_err(|_| CodecError::InvalidBounds)?,
+        )),
+        22 => ServerMessage::Props(Box::new(
+            props::Frame::decode(read_blob(&mut input, props::MAX_BYTES)?)
+                .map_err(|_| CodecError::InvalidBounds)?,
+        )),
+        24 => ServerMessage::ItemAttributes(Box::new(
+            item_attributes::InventoryAttributes::decode(read_blob(
+                &mut input,
+                item_attributes::MAX_BYTES,
+            )?)
+            .map_err(|_| CodecError::InvalidBounds)?,
+        )),
         _ => return Err(CodecError::InvalidEnum),
     };
     finish(input)?;

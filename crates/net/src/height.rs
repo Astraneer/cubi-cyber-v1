@@ -58,10 +58,34 @@ pub enum Replacement {
         geometry: Vec<GeometryStamp>,
     },
 }
+/// Authority-certified vertical displacement from the canonical voxel surface
+/// to this tile's two triangles. Quantization rounds UP, in 1/1024 blocks.
+/// It is bound to the same `source` as heights and replacement manifests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeightErrorBound {
+    pub max_error_q1024: u64,
+    pub min_height: i32,
+    pub max_height: i32,
+}
+impl HeightErrorBound {
+    pub fn blocks(self) -> f64 {
+        self.max_error_q1024 as f64 / 1024.
+    }
+    pub fn validate(self) -> Result<(), HeightError> {
+        if self.min_height > self.max_height
+            || self.max_error_q1024 > (u64::from(u32::MAX) + 1) * 1024
+        {
+            return Err(HeightError::Bounds);
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeightTile {
     pub key: HeightKey,
     pub source: u64,
+    /// None is Unknown error, never zero error inferred from sparse samples.
+    pub error: Option<HeightErrorBound>,
     pub heights: [i32; 289],
     pub known: [u8; 37],
     pub atlas: [u16; 256],
@@ -79,6 +103,15 @@ pub enum HeightError {
 impl HeightTile {
     pub fn validate(&self) -> Result<(), HeightError> {
         self.key.validate()?;
+        if let Some(error) = self.error {
+            error.validate()?;
+            if self.heights.iter().enumerate().any(|(i, &height)| {
+                self.known[i / 8] & (1 << (i % 8)) != 0
+                    && !(error.min_height..=error.max_height).contains(&height)
+            }) {
+                return Err(HeightError::Bounds);
+            }
+        }
         if self.source == 0
             || self.known[36] & !1 != 0
             || self.atlas.iter().any(|&a| a >= ATLAS_LAYERS)
@@ -133,12 +166,21 @@ impl HeightTile {
 pub fn encode(tile: &HeightTile) -> Result<Vec<u8>, HeightError> {
     tile.validate()?;
     let mut out = Vec::with_capacity(MAX_HEIGHT_BYTES);
-    out.extend_from_slice(b"HTI1");
+    out.extend_from_slice(b"HTI2");
     out.extend_from_slice(&tile.key.space.to_le_bytes());
     out.push(tile.key.level);
     out.extend_from_slice(&tile.key.x.to_le_bytes());
     out.extend_from_slice(&tile.key.z.to_le_bytes());
     out.extend_from_slice(&tile.source.to_le_bytes());
+    match tile.error {
+        None => out.push(0),
+        Some(error) => {
+            out.push(1);
+            out.extend_from_slice(&error.max_error_q1024.to_le_bytes());
+            out.extend_from_slice(&error.min_height.to_le_bytes());
+            out.extend_from_slice(&error.max_height.to_le_bytes());
+        }
+    }
     for v in tile.heights {
         out.extend_from_slice(&v.to_le_bytes());
     }
@@ -206,7 +248,7 @@ pub fn decode(bytes: &[u8]) -> Result<HeightTile, HeightError> {
         return Err(HeightError::Bounds);
     }
     let mut r = Reader { bytes, at: 0 };
-    if r.take::<4>()? != *b"HTI1" {
+    if r.take::<4>()? != *b"HTI2" {
         return Err(HeightError::Malformed);
     }
     let key = HeightKey {
@@ -217,6 +259,15 @@ pub fn decode(bytes: &[u8]) -> Result<HeightTile, HeightError> {
     };
     key.validate()?;
     let source = r.u64()?;
+    let error = match r.u8()? {
+        0 => None,
+        1 => Some(HeightErrorBound {
+            max_error_q1024: r.u64()?,
+            min_height: r.i32()?,
+            max_height: r.i32()?,
+        }),
+        _ => return Err(HeightError::Malformed),
+    };
     let mut heights = [0; 289];
     for v in &mut heights {
         *v = r.i32()?;
@@ -268,6 +319,7 @@ pub fn decode(bytes: &[u8]) -> Result<HeightTile, HeightError> {
     let tile = HeightTile {
         key,
         source,
+        error,
         heights,
         known,
         atlas,

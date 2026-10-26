@@ -151,7 +151,7 @@ impl ProfilerSnapshot {
                 p,
                 x + column * (1 + index / 8) as f32,
                 y + 45.0 + (index % 8) as f32 * 18.0,
-                if index == 6 { "sky+terrain" } else { label },
+                if index == 6 { "scene color" } else { label },
                 self.gpu_passes_ns[index],
                 0xff8bcbd9,
             );

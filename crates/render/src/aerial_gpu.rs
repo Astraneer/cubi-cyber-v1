@@ -568,7 +568,7 @@ impl AerialGpu {
                 * u64::from(self.config.grid[1])
                 * u64::from(self.config.grid[2])
                 * u64::from(self.config.steps)
-                * 4,
+                * 8,
             passes: 1 + u32::from(volume),
             draws: 1,
             ..Default::default()

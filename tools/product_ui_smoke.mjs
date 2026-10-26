@@ -23,7 +23,7 @@ root=pathlib.Path(sys.argv[3]);sound=pathlib.Path('donor/web/sounds/ui/click_1.o
 (root/'assets/indexes/test.json').write_text(json.dumps({'private':sys.argv[2],'objects':{'minecraft/sounds/random/click.ogg':{'hash':h,'size':len(sound)}}}))
 (root/'launcher_accounts.json').write_text(sys.argv[2]+'PRIVATE_ACCOUNT_NEVER_READ')
 `,pack,canary,minecraft],{cwd:root,encoding:'utf8'});assert.equal(fixture.status,0,fixture.stderr);await mkdir(downloads);
-let log='';const server=spawn(join(root,'target/debug/server'),['--data',folder,'--ws','127.0.0.1:0','--udp','127.0.0.1:0','--ready-file',ready,'--spawn','8.5,90,8.5'],{cwd:root,stdio:['ignore','pipe','pipe']});
+let log='';const server=spawn(process.env.CUBI_PRODUCT_SERVER??join(root,'target/debug/server'),['--data',folder,'--ws','127.0.0.1:0','--udp','127.0.0.1:0','--ready-file',ready,'--spawn','8.5,90,8.5'],{cwd:root,stdio:['ignore','pipe','pipe']});
 server.stdout.on('data',d=>log+=d);server.stderr.on('data',d=>log+=d);
 try{
   let address;for(let i=0;i<200;i++){try{address=(await readFile(ready,'utf8')).match(/ws=(\S+)/)?.[1];}catch{}if(address)break;if(server.exitCode!==null)throw Error(log);await pause(100);}assert(address,log);

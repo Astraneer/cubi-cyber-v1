@@ -41,6 +41,7 @@ run_check 'Web build' bash tools/build_web.sh
 run_check 'Native/WASM determinism' bash tools/check_determinism.sh
 run_check 'Web Worker SAB/transfer' node crates/jobs/tests/browser_smoke.mjs
 run_check 'WebGPU sky pixels' node tools/web_smoke.mjs
+run_check 'WebGPU GI, water and worker bounds' node tools/m10_graphics_smoke.mjs
 run_check 'WebGPU forest and movement' node tools/terrain_smoke.mjs
 run_check 'Player edits, completed frames and image equality' node tools/player_smoke.mjs
 run_check 'Authority binary for product scenario' cargo build --locked -p server

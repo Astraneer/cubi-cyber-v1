@@ -80,6 +80,27 @@ fn frozen_render_owner_accepts_125_pages_and_1000_light_changes_without_temporal
         depth.outgoing, 250,
         "ACKs coalesce by page while the render owner is blocked"
     );
+    for x in 0..6 {
+        client.request_geometry(page(1000 + x), 0).unwrap();
+    }
+    assert_eq!(client.queue_depths().outgoing, 256);
+    client
+        .receive(
+            ServerMessage::Page(PageUpdate::Delta(net::PageDelta {
+                page: page(0),
+                base: 1,
+                version: 2001,
+                source_version: Version(9),
+                changes: vec![(0, Cell::from_parts(rules::ids::STONE, 0))],
+            })),
+            2001,
+        )
+        .unwrap();
+    assert_eq!(
+        client.queue_depths().outgoing,
+        256,
+        "updating retained ACKs needs zero additional outbox slots"
+    );
     for _ in 0..125 {
         let update = client.take_light_update().unwrap();
         let image = client.light_replica().page(update.header().page).unwrap();
@@ -134,6 +155,7 @@ fn geometry_and_height_bursts_are_bounded_by_active_subscription_sets() {
                     ServerMessage::Height(Box::new(HeightTile {
                         key,
                         source,
+                        error: None,
                         heights: [0; 289],
                         known: [0; 37],
                         atlas: [0; 256],
@@ -151,4 +173,75 @@ fn geometry_and_height_bursts_are_bounded_by_active_subscription_sets() {
         assert_eq!(client.take_height_update().unwrap().source, 3);
     }
     assert!(client.take_height_update().is_none());
+}
+
+#[test]
+fn model_hint_bursts_coalesce_per_page_and_never_add_ack_pressure() {
+    let mut client = Connection::new(NetworkConfig::remote_scene()).unwrap();
+    for x in 0..125 {
+        client.request_page(page(x), 0).unwrap();
+    }
+    client.take_outgoing(256);
+    for x in 0..125 {
+        client
+            .receive(
+                ServerMessage::Page(PageUpdate::Snapshot(PageSnapshot {
+                    page: page(x),
+                    version: x as u64 + 1,
+                    source_version: Version(1),
+                    cells: Box::new([Cell::AIR; 4096]),
+                })),
+                0,
+            )
+            .unwrap();
+    }
+    for view in 1..=1000 {
+        let x = (view % 125) as i32;
+        client
+            .receive(
+                ServerMessage::Props(Box::new(net::props::Frame {
+                    page: page(x),
+                    cell_view: x as u64 + 1,
+                    view,
+                    source: Version(view),
+                    tick: core_types::Tick(view),
+                    hints: Vec::new(),
+                })),
+                view,
+            )
+            .unwrap();
+    }
+    assert_eq!(client.queue_depths().props, 125);
+    assert_eq!(client.queue_depths().outgoing, 250);
+    let mut count = 0;
+    while let Some(frame) = client.take_props_update() {
+        assert_eq!(client.props_frame(frame.page), Some(frame.as_ref()));
+        count += 1;
+    }
+    assert_eq!(count, 125);
+    let old = client.props_frame(page(0)).unwrap().clone();
+    let mut conflict = old.clone();
+    conflict.tick.0 += 1;
+    assert!(
+        client
+            .receive(ServerMessage::Props(Box::new(conflict)), 2001)
+            .is_err()
+    );
+    assert_eq!(client.props_frame(page(0)), Some(&old));
+    client
+        .receive(
+            ServerMessage::Page(PageUpdate::Delta(net::PageDelta {
+                page: page(0),
+                base: 1,
+                version: 2002,
+                source_version: Version(2),
+                changes: vec![],
+            })),
+            2002,
+        )
+        .unwrap();
+    assert!(
+        client.props_frame(page(0)).is_none(),
+        "prior cell-view hints cannot certify a new page view"
+    );
 }

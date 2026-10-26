@@ -18,10 +18,18 @@ pub mod lighting;
 pub mod lod;
 pub mod machines;
 mod migration_owner;
+mod mob_owner;
 pub mod mob_spawn;
+pub mod natural;
+mod natural_owner;
+mod natural_records;
+mod packet_stream;
 pub mod presence;
+pub mod props;
+mod props_stream;
 mod runtime;
 pub mod survival;
+mod tool_owner;
 mod topology_owner;
 pub mod topology_queue;
 pub mod transport;
@@ -62,6 +70,7 @@ pub struct ServerConfig {
     pub spawn_protection_radius: i32,
     pub generation_enabled: bool,
     pub geometry_result_delay_ticks: u8,
+    pub light_budget: world::lighting::LightBudget,
 }
 impl ServerConfig {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
@@ -74,6 +83,12 @@ impl ServerConfig {
             spawn_protection_radius: 32,
             generation_enabled: true,
             geometry_result_delay_ticks: 0,
+            light_budget: world::lighting::LightBudget {
+                max_cells: 4096,
+                max_neighbor_reads: 24576,
+                max_seed_cells: 4096,
+                max_updates: 4096,
+            },
         }
     }
 }
@@ -123,6 +138,8 @@ pub struct ServerCounters {
     pub durable_batches: u64,
     pub storage_stalls: u64,
     pub rejected_messages: u64,
+    pub protocol_rejections: u64,
+    pub inbox_backpressure: u64,
     pub page_images: u64,
     pub generation_submitted: u64,
     pub generation_published: u64,
@@ -165,16 +182,33 @@ pub struct ServerCounters {
     pub mob_deferred: u64,
     pub mob_drops: u64,
     pub mob_activity_buckets: u64,
+    pub natural_submitted: u64,
+    pub natural_completed: u64,
+    pub natural_stale: u64,
+    pub natural_deferred: u64,
+    pub natural_births: u64,
+    pub natural_index_probes: u64,
+    pub natural_worker_cells: u64,
+    pub natural_worker_columns: u64,
+    pub natural_max_wait_age: u64,
     pub height_migration_cells: u64,
     pub height_migration_pages: u64,
     pub light_cells: u64,
     pub light_neighbor_reads: u64,
     pub light_updates: u64,
     pub light_profile_columns: u64,
+    pub light_pending_cells: usize,
+    pub light_pending_seed_pages: usize,
+    pub light_pending_sky_pages: usize,
+    pub light_sky_pages_queued: u64,
     pub light_snapshots: u64,
     pub light_deltas: u64,
     pub light_snapshot_cells: u64,
     pub light_delta_cells: u64,
+    pub props_frames: u64,
+    pub props_hints: u64,
+    pub props_cell_reads: u64,
+    pub props_anchors: u64,
 }
 struct MiningAction {
     id: ActionId,
@@ -216,6 +250,7 @@ struct Peer {
     geometry_views: BTreeMap<PageId, u64>,
     height_requests: VecDeque<(net::height::HeightKey, Option<u64>)>,
     height_subscriptions: BTreeMap<net::height::HeightKey, u64>,
+    height_exact: BTreeSet<net::height::HeightKey>,
     last_view_position: [f64; 3],
     roster_revision: Option<u64>,
     entities: Option<entities::replication::EntityHistory>,
@@ -262,8 +297,12 @@ pub struct Server {
     drop_seed: u64,
     authoritative_transactions: VecDeque<Transaction>,
     runtimes: runtime::Runtimes,
+    mob_owner: mob_owner::Owner,
+    natural_owner: natural_owner::Owner,
     lighting: light_owner::LightOwner,
     light_stream: light_stream::LightStream,
+    props_stream: props_stream::PropsStream,
+    packet_stream: packet_stream::Owner,
     presence: presence::Presence,
     staged_chats: Vec<presence::ChatReservation>,
     now_ms: u64,
@@ -275,7 +314,7 @@ impl Server {
         Self::open_with_world(config, World::new(rules::properties, 1024))
     }
     pub fn open_with_world(
-        config: ServerConfig,
+        mut config: ServerConfig,
         initial_world: World,
     ) -> Result<Self, ServerError> {
         if config.maximum_players == 0
@@ -302,7 +341,11 @@ impl Server {
                 .try_into()
                 .expect("hash prefix"),
         );
-        let mut runtimes = runtime::Runtimes::new(&entropy)?;
+        let saved_seed = recovery
+            .snapshot
+            .as_ref()
+            .map_or(config.public_seed, |snapshot| snapshot.public_seed);
+        let mut runtimes = runtime::Runtimes::new(&entropy, saved_seed)?;
         let mut identities = BTreeMap::new();
         let mut players = BTreeMap::new();
         let mut dedup = BTreeMap::new();
@@ -371,6 +414,7 @@ impl Server {
                     .is_some_and(|i| i.role.can_admin());
             actor::restore(saved, allow_debug).map_err(ServerError::Invalid)?;
         }
+        config.public_seed = public_seed;
         tick = Tick(tick.0.max(world.tick().0));
         runtimes.bootstrap_drops(&world)?;
         runtimes.validate_owned_payloads(&world, &players)?;
@@ -451,8 +495,18 @@ impl Server {
         presence.set_chat_frontier(runtimes.chat.frontier());
         let height_migration =
             migration_owner::LegacyMigration::new(&world, &runtimes.height, generator.clone())?;
-        let lighting = light_owner::LightOwner::attach(&mut world)?;
+        let lighting = light_owner::LightOwner::attach(&mut world, config.light_budget)?;
         let light_stream = light_stream::LightStream::new(&world);
+        let motion_key = blake3::derive_key("cubi living item motion v1", &entropy);
+        let mob_owner = mob_owner::Owner::new(
+            u64::from_le_bytes(motion_key[..8].try_into().expect("hash prefix")),
+            runtimes.mobs.entities(),
+        );
+        let natural_key = blake3::derive_key("cubi natural actor bodies v1", &entropy);
+        let natural_owner = natural_owner::Owner::new(
+            &world,
+            u64::from_le_bytes(natural_key[..8].try_into().expect("key prefix")),
+        )?;
         let height_worker = height_stream::HeightWorker::new(r#gen::Generator::new(
             r#gen::TerrainSeed(public_seed),
         ))?;
@@ -481,8 +535,12 @@ impl Server {
             drop_seed,
             authoritative_transactions: VecDeque::new(),
             runtimes,
+            mob_owner,
+            natural_owner,
             lighting,
             light_stream,
+            props_stream: props_stream::PropsStream::default(),
+            packet_stream: packet_stream::Owner::new(),
             presence,
             staged_chats: Vec::new(),
             now_ms: 0,
@@ -496,8 +554,14 @@ impl Server {
     pub fn height_authority(&self) -> &height_authority::HeightAuthority {
         &self.runtimes.height
     }
+    pub fn public_seed(&self) -> u32 {
+        self.config.public_seed
+    }
     pub fn item_payloads(&self) -> &rules::item_payload::Ledger {
         &self.runtimes.payloads
+    }
+    pub fn mob_entities(&self) -> &rules::entities::mob::EntityStore {
+        self.runtimes.mobs.entities()
     }
     pub fn machine_runtime(&self) -> &machines::MachineRuntime {
         &self.runtimes.machines
@@ -507,6 +571,9 @@ impl Server {
     }
     pub fn height_ready_for_publication(&self) -> bool {
         self.height_ready()
+    }
+    pub fn inbox_capacity(&self) -> usize {
+        MAX_INBOX - self.inbox.len()
     }
     pub fn awaiting_durability(&self) -> bool {
         self.pending.is_some()
@@ -539,6 +606,7 @@ impl Server {
     pub fn disconnect(&mut self, connection: u64) {
         self.peers.remove(&connection);
         self.light_stream.forget_peer(connection);
+        self.packet_stream.forget_peer(connection);
         self.inbox.retain(|(c, _, _)| *c != connection);
     }
     pub fn handle(
@@ -549,11 +617,32 @@ impl Server {
     ) -> Vec<Outgoing> {
         // Decode validation is also applied to in-process callers. This boundary
         // must not admit finite/length checks bypassed by a different transport.
-        if net::encode_client(&message).is_err() || self.inbox.len() >= MAX_INBOX {
+        if let Err(error) = net::encode_client(&message) {
+            self.counters.protocol_rejections += 1;
             self.counters.rejected_messages += 1;
+            let kind = match &message {
+                ClientMessage::Hello(_) => "hello",
+                ClientMessage::Inputs(_) => "inputs",
+                ClientMessage::Action { .. } | ClientMessage::AimedAction { .. } => "action",
+                _ => "subscription/control",
+            };
+            eprintln!("authority invalid message: kind={kind} codec={error:?}");
             return vec![Outgoing::reliable(
                 connection,
                 ServerMessage::Error(RejectReason::Protocol),
+            )];
+        }
+        if self.inbox.len() >= MAX_INBOX {
+            self.counters.inbox_backpressure += 1;
+            if self.counters.inbox_backpressure == 1 {
+                eprintln!(
+                    "authority inbox backpressure: queued={} capacity={MAX_INBOX}",
+                    self.inbox.len()
+                );
+            }
+            return vec![Outgoing::reliable(
+                connection,
+                ServerMessage::Error(RejectReason::RateLimited),
             )];
         }
         self.inbox.push_back((connection, message, now_ms));
@@ -587,6 +676,22 @@ impl Server {
                 return output;
             }
         }
+        match self.finish_mob_phase() {
+            Ok(true) => return output,
+            Ok(false) => {}
+            Err(_) => {
+                self.failed = true;
+                return output;
+            }
+        }
+        match self.finish_natural() {
+            Ok(true) => return output,
+            Ok(false) => {}
+            Err(_) => {
+                self.failed = true;
+                return output;
+            }
+        }
         match self.import_items() {
             Ok(true) => return output,
             Ok(false) => {}
@@ -605,6 +710,8 @@ impl Server {
         self.next_tick_at = now_ms.saturating_add(TICK_MILLIS);
         self.tick.0 = self.tick.0.saturating_add(1);
         self.counters.ticks += 1;
+        self.mob_owner
+            .start(self.runtimes.mobs.entities().active_len());
         let mut batch = Batch::empty(self.tick);
         let mut deferred = Vec::new();
         for _ in 0..2 {
@@ -741,7 +848,15 @@ impl Server {
             self.failed = true;
             return output;
         }
+        if self.tick_mobs(&mut batch).is_err() {
+            self.failed = true;
+            return output;
+        }
         if self.tick_lighting(&mut batch).is_err() {
+            self.failed = true;
+            return output;
+        }
+        if self.schedule_natural().is_err() {
             self.failed = true;
             return output;
         }
@@ -787,6 +902,12 @@ impl Server {
                 self.failed = true;
                 break;
             }
+            if self.observe_packets(&pending.changes).is_err() {
+                self.failed = true;
+                break;
+            }
+            self.observe_natural(&pending.changes);
+            self.observe_props(&pending.changes);
             self.counters.durable_batches += 1;
             if pending.changes.iter().any(|c| !c.cells.is_empty()) {
                 self.refresh_heights();
@@ -905,6 +1026,17 @@ impl Server {
             for (connection, peer) in &mut self.peers {
                 if peer.ready {
                     if peer.inventory_sent != Some(peer.inventory.revision()) {
+                        let Ok(attributes) = tool_owner::inventory_attributes(
+                            &peer.inventory,
+                            &self.runtimes.payloads,
+                        ) else {
+                            self.failed = true;
+                            return Vec::new();
+                        };
+                        output.push(Outgoing::reliable(
+                            *connection,
+                            ServerMessage::ItemAttributes(Box::new(attributes)),
+                        ));
                         output.push(Outgoing::reliable(
                             *connection,
                             ServerMessage::Inventory {
@@ -1118,12 +1250,18 @@ impl Server {
             ClientMessage::RequestPage { page, acknowledged } => {
                 let confirmed =
                     acknowledged.is_some_and(|version| peer.history.acknowledge(page, version));
+                if confirmed {
+                    self.packet_stream.queue(connection, page, false, self.tick);
+                    self.props_stream.queue(connection, page, false);
+                }
                 if peer.page_requests.len() < MAX_AOI_PAGES {
                     peer.page_requests.push_back((page, !confirmed));
                 }
             }
             ClientMessage::AckPage { page, version } => {
                 if peer.history.acknowledge(page, version) {
+                    self.packet_stream.queue(connection, page, false, self.tick);
+                    self.props_stream.queue(connection, page, false);
                     self.light_stream.queue_auto(connection, page, version);
                 }
             }
@@ -1151,11 +1289,28 @@ impl Server {
                     }
                 }
             }
-            ClientMessage::RequestHeight { key, known } => {
+            message @ (ClientMessage::RequestHeight { .. }
+            | ClientMessage::RequestExactHeight { .. }) => {
+                let (key, mut known, exact) = match message {
+                    ClientMessage::RequestHeight { key, known } => (key, known, false),
+                    ClientMessage::RequestExactHeight { key, known } => (key, known, true),
+                    _ => unreachable!(),
+                };
                 if peer.height_subscriptions.len() < height_stream::MAX_TILES
                     || peer.height_subscriptions.contains_key(&key)
                 {
                     peer.height_subscriptions.entry(key).or_insert(0);
+                    if exact {
+                        peer.height_exact.insert(key);
+                    }
+                    if peer.height_exact.contains(&key) {
+                        known = None;
+                        if let Some((_, old)) =
+                            peer.height_requests.iter_mut().find(|(k, _)| *k == key)
+                        {
+                            *old = None;
+                        }
+                    }
                     if peer.height_requests.len() < height_stream::MAX_TILES
                         && !peer.height_requests.iter().any(|(k, _)| *k == key)
                     {
@@ -1166,6 +1321,26 @@ impl Server {
                         connection,
                         ServerMessage::HeightUnavailable(key),
                     ));
+                }
+            }
+            ClientMessage::RequestProps {
+                page,
+                cell_view,
+                known,
+            } => {
+                if peer.pages.contains(&page)
+                    && peer.history.confirmed_version(page) == Some(cell_view)
+                {
+                    self.props_stream.queue(connection, page, known.is_none());
+                }
+            }
+            ClientMessage::MachinePackets(request) => {
+                if peer.ready
+                    && peer.pages.contains(&request.page())
+                    && peer.history.confirmed_version(request.page())
+                        == Some(request.view_version().0)
+                {
+                    self.packet_stream.request(connection, request, self.tick);
                 }
             }
             ClientMessage::RequestLight(request) => {
@@ -1184,6 +1359,7 @@ impl Server {
             ClientMessage::ForgetLight(page) => self.light_stream.forget(connection, page),
             ClientMessage::ForgetHeight(key) => {
                 peer.height_subscriptions.remove(&key);
+                peer.height_exact.remove(&key);
                 peer.height_requests.retain(|(k, _)| *k != key);
             }
             ClientMessage::ForgetGeometry(page) => {
@@ -1452,6 +1628,7 @@ impl Server {
                 geometry_views: BTreeMap::new(),
                 height_requests: VecDeque::new(),
                 height_subscriptions: BTreeMap::new(),
+                height_exact: BTreeSet::new(),
                 last_view_position: position,
                 roster_revision: None,
                 entities: None,
@@ -1562,6 +1739,11 @@ impl Server {
         let mut cell = None;
         match action {
             Action::SelectSlot(_) | Action::PlaceOwned { .. } => unreachable!("handled above"),
+            Action::CycleToolMode { back, inventory } => {
+                if let Err(reason) = self.cycle_tool_mode(peer, back, inventory, batch) {
+                    status = ActionStatus::Rejected(reason);
+                }
+            }
             Action::Flight(enabled) => {
                 let _ = peer.player.set_flight(enabled);
             }
@@ -2444,6 +2626,8 @@ impl Server {
         output.extend(self.publish_geometry());
         output.extend(self.publish_heights());
         output.extend(self.publish_lights());
+        output.extend(self.publish_props());
+        output.extend(self.publish_packets());
         output
     }
     fn observer_page(&self, peer: &Peer, space: SpaceId) -> Option<PageId> {

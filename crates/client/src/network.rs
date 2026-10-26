@@ -3,6 +3,7 @@
 //! Rendering integration consumes `take_page_updates` at the scene owner boundary.
 pub mod audio;
 pub mod entities;
+pub mod machine_packets;
 pub mod presence;
 pub mod window;
 use core_types::{BlockPos, Cell, PageId, SpaceId, SpaceTransform, Tick, Version};
@@ -86,6 +87,7 @@ pub struct QueueDepths {
     pub geometry: usize,
     pub height: usize,
     pub outgoing: usize,
+    pub props: usize,
 }
 #[derive(Clone, Copy)]
 struct PredictedTick {
@@ -139,6 +141,7 @@ pub struct Connection {
     remote_players: BTreeMap<PlayerId, PlayerState>,
     remote_tick: Tick,
     inventory: Option<rules::survival::Inventory>,
+    item_attributes: Option<net::item_attributes::InventoryAttributes>,
     presence: presence::PresenceCache,
     window: window::WindowCache,
     entities: entities::EntityReplica,
@@ -150,9 +153,13 @@ pub struct Connection {
     geometry_updates: VecDeque<net::PublicGeometry>,
     geometry_removals: VecDeque<PageId>,
     height_interest: BTreeMap<net::height::HeightKey, (Option<u64>, u64, bool)>,
+    height_exact: BTreeSet<net::height::HeightKey>,
     height_updates: VecDeque<Box<net::height::HeightTile>>,
     lights: net::light::Replica,
     light_updates: VecDeque<net::light::Update>,
+    props: BTreeMap<PageId, std::sync::Arc<net::props::Frame>>,
+    machine_packets: machine_packets::PacketScene,
+    props_updates: VecDeque<std::sync::Arc<net::props::Frame>>,
     counters: NetworkCounters,
 }
 
@@ -209,6 +216,7 @@ impl Connection {
             remote_players: BTreeMap::new(),
             remote_tick: Tick(0),
             inventory: None,
+            item_attributes: None,
             presence: presence::PresenceCache::new(),
             window: window::WindowCache::default(),
             entities: entities::EntityReplica::new(net::entities::MAX_ENTITIES)
@@ -221,10 +229,15 @@ impl Connection {
             geometry_updates: VecDeque::new(),
             geometry_removals: VecDeque::new(),
             height_interest: BTreeMap::new(),
+            height_exact: BTreeSet::new(),
             height_updates: VecDeque::new(),
             lights: net::light::Replica::new(config.maximum_pages)
                 .map_err(|_| NetworkError::Capacity)?,
             light_updates: VecDeque::new(),
+            props: BTreeMap::new(),
+            machine_packets: machine_packets::PacketScene::new(config.maximum_pages, 2048)
+                .map_err(|_| NetworkError::Capacity)?,
+            props_updates: VecDeque::new(),
             counters: NetworkCounters::default(),
         })
     }
@@ -258,6 +271,7 @@ impl Connection {
             geometry: self.geometry_updates.len(),
             height: self.height_updates.len(),
             outgoing: self.outbox.len(),
+            props: self.props_updates.len(),
         }
     }
     pub fn movement_replay(&self) -> &sim::replay::Recorder {
@@ -324,6 +338,13 @@ impl Connection {
     }
     pub fn inventory(&self) -> Option<&rules::survival::Inventory> {
         self.inventory.as_ref()
+    }
+    pub fn item_attributes(&self) -> Option<&net::item_attributes::InventoryAttributes> {
+        self.item_attributes.as_ref().filter(|a| {
+            self.inventory
+                .as_ref()
+                .is_some_and(|i| i.revision() == a.inventory_revision)
+        })
     }
     pub fn predicted_inventory(&self) -> Option<rules::survival::Inventory> {
         let mut inventory = self.inventory?;
@@ -399,12 +420,38 @@ impl Connection {
         key: net::height::HeightKey,
         now_ms: u64,
     ) -> Result<(), NetworkError> {
+        if self.height_exact.contains(&key) {
+            return self.request_height_exact(key, now_ms);
+        }
         key.validate().map_err(|_| NetworkError::Protocol)?;
         if !self.height_interest.contains_key(&key) && self.height_interest.len() >= 512 {
             return Err(NetworkError::Capacity);
         }
         let known = self.height_interest.get(&key).and_then(|i| i.0);
         self.queue(ClientMessage::RequestHeight { key, known })?;
+        self.height_interest.insert(key, (known, now_ms, false));
+        Ok(())
+    }
+    pub fn height_is_exact(&self, key: net::height::HeightKey) -> bool {
+        self.height_exact.contains(&key)
+    }
+    pub fn request_height_exact(
+        &mut self,
+        key: net::height::HeightKey,
+        now_ms: u64,
+    ) -> Result<(), NetworkError> {
+        key.validate().map_err(|_| NetworkError::Protocol)?;
+        if key.level != 0 {
+            return Err(NetworkError::Protocol);
+        }
+        if !self.height_interest.contains_key(&key) && self.height_interest.len() >= 512 {
+            return Err(NetworkError::Capacity);
+        }
+        // Representation promotion keeps the source stamp, so a source-only
+        // conditional request cannot distinguish it from the prior height mesh.
+        self.queue(ClientMessage::RequestExactHeight { key, known: None })?;
+        self.height_exact.insert(key);
+        let known = self.height_interest.get(&key).and_then(|i| i.0);
         self.height_interest.insert(key, (known, now_ms, false));
         Ok(())
     }
@@ -425,6 +472,7 @@ impl Connection {
             self.release_geometry(page)?;
         }
         self.height_interest.remove(&key);
+        self.height_exact.remove(&key);
         self.height_updates.retain(|t| t.key != key);
         Ok(())
     }
@@ -520,6 +568,36 @@ impl Connection {
     pub fn light_replica(&self) -> &net::light::Replica {
         &self.lights
     }
+    pub fn packet_scene(&self) -> &machine_packets::PacketScene {
+        &self.machine_packets
+    }
+    pub fn props_frame(&self, page: PageId) -> Option<&net::props::Frame> {
+        self.props
+            .get(&page)
+            .filter(|f| {
+                self.replica
+                    .page(page)
+                    .is_some_and(|p| p.version == f.cell_view)
+            })
+            .map(|f| f.as_ref())
+    }
+    pub fn props_frames(&self) -> impl Iterator<Item = &std::sync::Arc<net::props::Frame>> {
+        self.props.values().filter(|f| {
+            self.replica
+                .page(f.page)
+                .is_some_and(|p| p.version == f.cell_view)
+        })
+    }
+    pub fn take_props_update(&mut self) -> Option<std::sync::Arc<net::props::Frame>> {
+        self.props_updates.pop_front()
+    }
+    fn queue_props_update(&mut self, frame: std::sync::Arc<net::props::Frame>) {
+        if let Some(old) = self.props_updates.iter_mut().find(|f| f.page == frame.page) {
+            *old = frame;
+        } else if self.props_updates.len() < self.config.maximum_pages {
+            self.props_updates.push_back(frame);
+        }
+    }
     pub fn take_light_update(&mut self) -> Option<net::light::Update> {
         self.light_updates.pop_front()
     }
@@ -555,19 +633,44 @@ impl Connection {
                 a == b
             }
             (ClientMessage::RequestLight(a), ClientMessage::RequestLight(b)) => a.page == b.page,
+            (ClientMessage::MachinePackets(a), ClientMessage::MachinePackets(b)) => {
+                a.page() == b.page()
+            }
             (
                 ClientMessage::RequestPage { page: a, .. },
                 ClientMessage::RequestPage { page: b, .. },
             ) => a == b,
             (ClientMessage::Entities(_), ClientMessage::Entities(_)) => true,
+            (
+                ClientMessage::RequestHeight { key: a, .. }
+                | ClientMessage::RequestExactHeight { key: a, .. },
+                ClientMessage::RequestHeight { key: b, .. }
+                | ClientMessage::RequestExactHeight { key: b, .. },
+            ) => a == b,
             _ => false,
         };
         if let Some(old) = self.outbox.iter_mut().find(|old| same(old)) {
             let replace = match (&*old, &message) {
+                (ClientMessage::RequestExactHeight { .. }, ClientMessage::RequestHeight { .. }) => {
+                    false
+                }
                 (
                     ClientMessage::AckPage { version: a, .. },
                     ClientMessage::AckPage { version: b, .. },
                 ) => b >= a,
+                (ClientMessage::MachinePackets(a), ClientMessage::MachinePackets(b)) => {
+                    use net::machine_packets::Request;
+                    b.view_version() > a.view_version()
+                        || (b.view_version() == a.view_version()
+                            && match (a, b) {
+                                (Request::Full { .. }, Request::Ack { .. }) => false,
+                                (
+                                    Request::Ack { revision: a, .. },
+                                    Request::Ack { revision: b, .. },
+                                ) => b >= a,
+                                _ => true,
+                            })
+                }
                 (ClientMessage::RequestLight(a), ClientMessage::RequestLight(b)) => {
                     b.cell_view >= a.cell_view
                 }
@@ -607,6 +710,9 @@ impl Connection {
         if !self.interest.contains_key(&page) || self.outbox.len() >= MAX_OUTBOX {
             return Err(NetworkError::Capacity);
         }
+        self.machine_packets.remove_page(page);
+        self.props.remove(&page);
+        self.props_updates.retain(|f| f.page != page);
         if self.replica.remove(page) {
             self.world_changed = true;
         }
@@ -626,6 +732,23 @@ impl Connection {
     pub fn receive(&mut self, message: ServerMessage, now_ms: u64) -> Result<(), NetworkError> {
         self.note_replay_time(now_ms);
         match message {
+            ServerMessage::ItemAttributes(attributes) => {
+                attributes.validate().map_err(|_| NetworkError::Protocol)?;
+                if self
+                    .item_attributes
+                    .as_ref()
+                    .is_some_and(|old| old.inventory_revision > attributes.inventory_revision)
+                {
+                    return Ok(());
+                }
+                if self.item_attributes.as_ref().is_some_and(|old| {
+                    old.inventory_revision == attributes.inventory_revision
+                        && old != attributes.as_ref()
+                }) {
+                    return Err(NetworkError::Protocol);
+                }
+                self.item_attributes = Some(*attributes);
+            }
             ServerMessage::Inventory { data } => {
                 let inventory = rules::survival::Inventory::decode(&data)
                     .map_err(|_| NetworkError::Protocol)?;
@@ -705,8 +828,7 @@ impl Connection {
                 self.counters.authoritative_states += 1;
             }
             ServerMessage::Page(update) => {
-                if self.page_updates.len() >= MAX_PAGE_UPDATES || self.outbox.len() + 2 > MAX_OUTBOX
-                {
+                if self.page_updates.len() >= MAX_PAGE_UPDATES {
                     return Err(NetworkError::Capacity);
                 }
                 let (page, cells) = match &update {
@@ -751,6 +873,14 @@ impl Connection {
                             PageUpdate::Delta(_) => self.counters.deltas += 1,
                         }
                         self.queue_page_update(update)?;
+                        if let Some(frame) = self
+                            .props
+                            .get(&page)
+                            .filter(|f| f.cell_view == version)
+                            .cloned()
+                        {
+                            self.queue_props_update(frame);
+                        }
                         self.overlay.retire_applied(&self.replica);
                         self.world_changed = true;
                     }
@@ -782,6 +912,9 @@ impl Connection {
                 {
                     return Err(NetworkError::Capacity);
                 }
+                self.machine_packets.remove_page(page);
+                self.props.remove(&page);
+                self.props_updates.retain(|f| f.page != page);
                 if self.replica.remove(page) {
                     self.page_removals.push_back(page);
                     self.world_changed = true;
@@ -1001,6 +1134,13 @@ impl Connection {
             }
             ServerMessage::Height(tile) => {
                 tile.validate().map_err(|_| NetworkError::Protocol)?;
+                if self.height_exact.contains(&tile.key)
+                    && !matches!(&tile.replacement, net::height::Replacement::Column { .. })
+                {
+                    // A normal worker result may have crossed the promotion
+                    // request. It cannot downgrade a sticky exact representation.
+                    return Ok(());
+                }
                 if let Some(interest) = self.height_interest.get_mut(&tile.key)
                     && interest.0.is_none_or(|old| tile.source >= old)
                 {
@@ -1009,7 +1149,9 @@ impl Connection {
                     {
                         return Err(NetworkError::Capacity);
                     }
-                    *interest = (Some(tile.source), now_ms, true);
+                    let exact_ready = !self.height_exact.contains(&tile.key)
+                        || matches!(&tile.replacement, net::height::Replacement::Column { .. });
+                    *interest = (Some(tile.source), now_ms, exact_ready);
                     if let Some(old) = self.height_updates.iter_mut().find(|t| t.key == tile.key) {
                         *old = tile;
                     } else {
@@ -1021,6 +1163,77 @@ impl Connection {
                 if let Some(interest) = self.height_interest.get_mut(&key) {
                     interest.1 = now_ms;
                     interest.2 = false;
+                }
+            }
+            ServerMessage::MachinePackets(frame) => {
+                let page = frame.page;
+                if !self.interest.contains_key(&page) {
+                    return Ok(());
+                }
+                let Some(raw) = self.replica.page(page) else {
+                    return Ok(());
+                };
+                let certified = Version(raw.version);
+                if self.outbox.len() == MAX_OUTBOX
+                    && !self
+                        .outbox
+                        .iter()
+                        .any(|m| matches!(m,ClientMessage::MachinePackets(r)if r.page()==page))
+                {
+                    return Err(NetworkError::Capacity);
+                }
+                let request = match self
+                    .machine_packets
+                    .apply(*frame, certified)
+                    .map_err(|_| NetworkError::Protocol)?
+                {
+                    machine_packets::Apply::Applied(r)
+                    | machine_packets::Apply::Stale(r)
+                    | machine_packets::Apply::MissingBase(r)
+                    | machine_packets::Apply::WrongView(r) => r,
+                };
+                self.queue(ClientMessage::MachinePackets(request))?;
+            }
+            ServerMessage::Props(frame) => {
+                frame.validate().map_err(|_| NetworkError::Protocol)?;
+                let page = frame.page;
+                if !self.interest.contains_key(&page) {
+                    return Ok(());
+                }
+                if self
+                    .replica
+                    .page(page)
+                    .is_some_and(|p| frame.cell_view < p.version)
+                {
+                    return Ok(());
+                }
+                if let Some(old) = self.props.get(&page) {
+                    if old.view > frame.view {
+                        return Ok(());
+                    }
+                    if old.view < frame.view
+                        && (frame.source < old.source || frame.cell_view < old.cell_view)
+                    {
+                        return Err(NetworkError::Protocol);
+                    }
+                    if old.view == frame.view {
+                        return if old.as_ref() == frame.as_ref() {
+                            Ok(())
+                        } else {
+                            Err(NetworkError::Protocol)
+                        };
+                    }
+                } else if self.props.len() >= self.config.maximum_pages {
+                    return Err(NetworkError::Capacity);
+                }
+                let frame: std::sync::Arc<net::props::Frame> = std::sync::Arc::from(frame);
+                self.props.insert(page, frame.clone());
+                if self
+                    .replica
+                    .page(page)
+                    .is_some_and(|p| p.version == frame.cell_view)
+                {
+                    self.queue_props_update(frame);
                 }
             }
             ServerMessage::Window(state) => {
@@ -1225,6 +1438,27 @@ impl Connection {
     ) -> Result<ActionId, NetworkError> {
         self.queue_action(action, predict_edit, now_ms, Some([yaw, pitch]))
     }
+    pub fn cycle_tool_mode(&mut self, back: bool, now_ms: u64) -> Result<ActionId, NetworkError> {
+        let inventory = self
+            .predicted_inventory()
+            .ok_or(NetworkError::NotConnected)?;
+        let held = inventory.hand();
+        self.action(
+            Action::CycleToolMode {
+                back,
+                inventory: net::InventoryGuard {
+                    revision: inventory.revision(),
+                    selected: inventory.selected() as u8,
+                    item: held.item(),
+                    count: held.count(),
+                    damage: held.damage(),
+                    payload: held.payload().map_or(0, |id| id.0),
+                },
+            },
+            false,
+            now_ms,
+        )
+    }
     pub fn action_pending(&self, id: ActionId) -> bool {
         self.actions.contains_key(&id)
     }
@@ -1414,6 +1648,9 @@ impl Connection {
         }
         for page in evict {
             self.interest.remove(&page);
+            self.machine_packets.remove_page(page);
+            self.props.remove(&page);
+            self.props_updates.retain(|f| f.page != page);
             if self.replica.remove(page) {
                 self.page_removals.push_back(page);
             }
@@ -1471,6 +1708,9 @@ impl Connection {
             }
             for page in selected {
                 self.interest.remove(&page);
+                self.machine_packets.remove_page(page);
+                self.props.remove(&page);
+                self.props_updates.retain(|f| f.page != page);
                 if self.replica.remove(page) {
                     self.page_removals.push_back(page);
                 }

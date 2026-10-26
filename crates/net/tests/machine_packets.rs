@@ -61,6 +61,9 @@ fn bounded_counts_padding_invalid_pose_lifecycle_and_every_truncated_prefix_reje
     bad[HEADER_BYTES + 19] = 1;
     assert!(Frame::decode(&bad).is_err());
     let mut f = frame();
+    f.view_version = Version(0);
+    assert!(f.encode().is_err());
+    let mut f = frame();
     f.upserts[0].progress = 100;
     assert!(f.encode().is_err());
     let mut f = frame();
@@ -89,6 +92,15 @@ fn bounded_counts_padding_invalid_pose_lifecycle_and_every_truncated_prefix_reje
 }
 #[test]
 fn request_ack_and_missing_base_are_strict_and_preserve_view_certificate() {
+    assert!(
+        Request::Full {
+            page: page(),
+            view_version: Version(0),
+            have: None
+        }
+        .encode()
+        .is_err()
+    );
     for request in [
         Request::Ack {
             page: page(),

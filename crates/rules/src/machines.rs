@@ -6,7 +6,6 @@
 //! atomically after its durable journal commit.
 
 mod codec;
-pub mod events;
 pub mod grid;
 pub mod logistics;
 pub mod sides;

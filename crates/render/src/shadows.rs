@@ -1,6 +1,9 @@
 //! Stable world-space directional cascades and a bounded static depth cache.
 use crate::terrain_gpu::{Camera, TerrainGeometry};
 use bytemuck::{Pod, Zeroable};
+#[path = "shadow_damage.rs"]
+mod damage;
+pub(crate) use damage::ShadowDamageTracker;
 
 pub const CASCADES: usize = 3;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -90,6 +93,9 @@ pub struct ShadowWork {
     pub dynamic_copy_bytes: u64,
     pub dynamic_draw_calls: u32,
     pub dynamic_cull_dispatches: u32,
+    pub dynamic_restore_pixels: u64,
+    pub dynamic_restore_draws: u32,
+    pub dynamic_damage_bounds: u64,
     pub clear_pixels: u64,
     pub caster_dispatches: u32,
     pub draw_calls: u32,
@@ -101,6 +107,8 @@ pub struct ShadowWork {
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct ShadowSampling {
     pub matrices: [[[f32; 4]; 4]; CASCADES],
+    /// Current selection footprints, independent of deferred committed depth.
+    pub desired_matrices: [[[f32; 4]; 4]; CASCADES],
     /// Direction to the sun, followed by reverse-depth receiver bias.
     pub sun: [f32; 4],
     /// Valid cascade bitmask, texture resolution, reserved, reserved.
@@ -147,6 +155,7 @@ impl ShadowCache {
                     .unwrap_or(self.cascades[i].desired)
                     .view_projection
             }),
+            desired_matrices: std::array::from_fn(|i| self.cascades[i].desired.view_projection),
             sun: [self.sun[0], self.sun[1], self.sun[2], 0.00005],
             params: [
                 self.cascades.iter().enumerate().fold(0, |bits, (i, c)| {
@@ -352,12 +361,41 @@ fn project_bounds(camera: Camera, bounds: WorldBounds, resolution: u32) -> Optio
 
 /// A prepared dynamic model pass uses independent visibility so it cannot
 /// overwrite the camera's color list or the cached terrain visibility.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShadowPrepareWork {
+    pub dispatches: u32,
+    pub upload_bytes: u64,
+}
 pub trait DynamicShadowCaster {
     fn available(&self) -> bool;
     fn shadow_revision(&self) -> u64;
     /// Exact component versions; composites must preserve each counter separately.
     fn shadow_key(&self) -> [u64; 4] {
         [self.shadow_revision(), 0, 0, 0]
+    }
+    /// False requests a conservative full-layer restore when damage history is
+    /// unavailable. Acknowledgement is valid only after every valid cascade.
+    fn visit_shadow_damage(
+        &self,
+        _previous: [u64; 4],
+        _visit: &mut dyn FnMut(WorldBounds),
+    ) -> bool {
+        false
+    }
+    fn commit_shadow_damage(&mut self) {}
+    fn prepare_shadow_region(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        cascade: usize,
+        camera: Camera,
+        _rect: ShadowRect,
+        _resolution: u32,
+    ) -> ShadowPrepareWork {
+        ShadowPrepareWork {
+            dispatches: self.prepare_shadow(queue, encoder, cascade, camera),
+            upload_bytes: 0,
+        }
     }
     fn prepare_shadow(
         &mut self,
@@ -389,6 +427,40 @@ impl DynamicShadowCaster for ShadowCasterPair<'_> {
             0,
         ]
     }
+    fn visit_shadow_damage(&self, previous: [u64; 4], visit: &mut dyn FnMut(WorldBounds)) -> bool {
+        if previous[2] != 2 {
+            return false;
+        }
+        self.first
+            .visit_shadow_damage([previous[0], 0, 0, 0], visit)
+            && self
+                .second
+                .visit_shadow_damage([previous[1], 0, 0, 0], visit)
+    }
+    fn commit_shadow_damage(&mut self) {
+        self.first.commit_shadow_damage();
+        self.second.commit_shadow_damage();
+    }
+    fn prepare_shadow_region(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        cascade: usize,
+        camera: Camera,
+        rect: ShadowRect,
+        resolution: u32,
+    ) -> ShadowPrepareWork {
+        let a = self
+            .first
+            .prepare_shadow_region(queue, encoder, cascade, camera, rect, resolution);
+        let b = self
+            .second
+            .prepare_shadow_region(queue, encoder, cascade, camera, rect, resolution);
+        ShadowPrepareWork {
+            dispatches: a.dispatches + b.dispatches,
+            upload_bytes: a.upload_bytes + b.upload_bytes,
+        }
+    }
     fn prepare_shadow(
         &mut self,
         queue: &wgpu::Queue,
@@ -404,6 +476,8 @@ impl DynamicShadowCaster for ShadowCasterPair<'_> {
     }
 }
 struct CombinedDepth {
+    restore: wgpu::RenderPipeline,
+    restore_binds: [wgpu::BindGroup; CASCADES],
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     layers: [wgpu::TextureView; CASCADES],
@@ -436,6 +510,8 @@ pub struct ShadowGpu {
     combined: Option<CombinedDepth>,
     last_dynamic: Option<DynamicStamp>,
     timer: crate::gpu_time::GpuPassTimer<9>,
+    total_timer: crate::gpu_time::GpuGraphTimer,
+    last_static_rects: [Option<ShadowRect>; CASCADES],
 }
 impl ShadowGpu {
     pub fn new(
@@ -479,8 +555,10 @@ impl ShadowGpu {
             })
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("stable shadow nearest PCF taps"),
+            label: Some("stable shadow bilinear PCF taps"),
             compare: Some(wgpu::CompareFunction::GreaterEqual),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let make_buffer = |label, size, usage| {
@@ -718,6 +796,67 @@ impl ShadowGpu {
             cache: None,
         });
         let combined = config.dynamic_casters.then(|| {
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("localized combined-depth restore source"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                }],
+            });
+            let restore_binds = std::array::from_fn(|i| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("static layer for combined restore"),
+                    layout: &layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&layers[i]),
+                    }],
+                })
+            });
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("scissored static depth restore"),
+                source: wgpu::ShaderSource::Wgsl(
+                    format!("{CLEAR_SHADER}\n{RESTORE_SHADER}").into(),
+                ),
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("combined restore layout"),
+                bind_group_layouts: &[&layout],
+                push_constant_ranges: &[],
+            });
+            let restore = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("bounded fragment depth restore"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vertex"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Always,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("restore"),
+                    compilation_options: Default::default(),
+                    targets: &[],
+                }),
+                multiview: None,
+                cache: None,
+            });
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("static cache plus moving model shadow depth"),
                 size: wgpu::Extent3d {
@@ -748,6 +887,8 @@ impl ShadowGpu {
                 })
             });
             CombinedDepth {
+                restore,
+                restore_binds,
                 texture,
                 view,
                 layers,
@@ -775,6 +916,12 @@ impl ShadowGpu {
             sampling_dirty: false,
             combined,
             last_dynamic: None,
+            last_static_rects: [None; CASCADES],
+            total_timer: crate::gpu_time::GpuGraphTimer::new(
+                device,
+                queue,
+                "total directional shadow graph",
+            ),
             timer: crate::gpu_time::GpuPassTimer::new(
                 device,
                 queue,
@@ -782,9 +929,10 @@ impl ShadowGpu {
             ),
         })
     }
-    /// Two render pipelines (depth/rect clear) and two compute pipelines (reset/cull), all loading-only.
+    /// Depth, clear, reset and cull plus an optional combined restore pipeline,
+    /// all created during loading.
     pub const fn startup_pipeline_compilations(&self) -> u32 {
-        4
+        4 + self.combined.is_some() as u32
     }
     pub fn cache(&self) -> &ShadowCache {
         &self.cache
@@ -800,8 +948,8 @@ impl ShadowGpu {
     pub fn sampler(&self) -> &wgpu::Sampler {
         &self.sampler
     }
-    /// Pass kinds1=static frustum,2=static depth/clear,3=dynamic model depth.
-    /// Copy commands and caster-owned compute remain separate unmeasured work.
+    /// Detailed pass kinds1=static frustum,2=static depth/clear,3=dynamic restore/depth.
+    /// timing_source() reports a separate whole-graph scope including copies and caster compute.
     pub fn graph(&self) -> crate::gpu_time::PassGraph<9> {
         self.timer.graph()
     }
@@ -818,26 +966,31 @@ impl ShadowGpu {
     }
     pub fn clear_timing(&self) {
         self.timer.begin();
+        self.total_timer.begin_frame();
     }
     pub fn timing_source(&self) -> Option<crate::gpu_time::TimingSource<'_>> {
-        let graph = self.timer.graph();
-        self.timer
+        self.total_timer
             .timestamp_buffer()
-            .filter(|_| graph.count > 0)
             .map(|(buffer, period)| crate::gpu_time::TimingSource {
                 buffer,
                 period,
                 kinds: [4; 32],
-                count: graph.count,
+                count: 1,
             })
     }
+
     pub fn texture(&self) -> &wgpu::Texture {
         &self.texture
     }
     pub fn update_view(&mut self, center: [f32; 3], sun: [f32; 3]) -> Result<(), ShadowError> {
         let old = self.cache.sun;
+        let desired = self.cache.cascades.map(|c| c.desired);
         self.cache.update_view(center, sun)?;
-        self.sampling_dirty |= old != self.cache.sun;
+        self.sampling_dirty |= old != self.cache.sun
+            || desired
+                .into_iter()
+                .zip(self.cache.cascades)
+                .any(|(old, new)| old != new.desired);
         Ok(())
     }
     pub fn invalidate_bounds(&mut self, bounds: WorldBounds) {
@@ -851,9 +1004,9 @@ impl ShadowGpu {
             .as_ref()
             .map_or(&self.texture, |combined| &combined.texture)
     }
-    /// Copy only changed cascade layers from static cache, then add the moving
-    /// caster depth. No static terrain is re-meshed or re-rendered for animation.
-    /// At4096² the worst moving frame copies192MiB on GPU; work is reported.
+    /// Restore only old/new model damage from static depth, then draw current
+    /// intersecting casters. Incompatible matrices/history fall back to a full
+    /// restore. No static terrain is re-rendered solely for model animation.
     pub fn encode_dynamic(
         &mut self,
         queue: &wgpu::Queue,
@@ -861,64 +1014,73 @@ impl ShadowGpu {
         caster: &mut impl DynamicShadowCaster,
     ) -> Result<ShadowWork, ShadowError> {
         self.timer.begin();
+        self.total_timer.begin_frame();
         if self.combined.is_none() {
             return Err(ShadowError::DynamicDisabled);
         }
         if !caster.available() {
             return Err(ShadowError::CasterUnavailable);
         }
+        if self.cache.pending() != 0 {
+            self.total_timer.start(encoder);
+        }
         let mut work = self.encode_static(queue, encoder);
         let sampling = self.cache.sampling();
         let revision = caster.shadow_key();
+        let config = self.cache.config;
+        let mut rectangles = [None; CASCADES];
+        let previous = self.last_dynamic.as_ref().map(|old| old.revision);
+        let mut damage_bounds = 0;
+        let damage_known = previous.is_some_and(|previous| {
+            caster.visit_shadow_damage(previous, &mut |bounds| {
+                damage_bounds += 1;
+                for (cascade, rect) in rectangles.iter_mut().enumerate() {
+                    if let Some(next) = project_bounds(
+                        Camera {
+                            view_projection: sampling.matrices[cascade],
+                        },
+                        bounds,
+                        config.resolution,
+                    ) {
+                        *rect = Some(rect.map_or(next, |old: ShadowRect| old.union(next)));
+                    }
+                }
+            })
+        });
+        work.dynamic_damage_bounds = damage_bounds;
         let combined = self.combined.as_ref().expect("enabled combined target");
-        for cascade in 0..CASCADES {
+        for (cascade, mut rect) in rectangles.into_iter().enumerate() {
             let bit = 1u32 << cascade;
             if sampling.params[0] & bit == 0 {
                 continue;
             }
-            let dirty = self.last_dynamic.as_ref().is_none_or(|old| {
-                old.revision != revision
-                    || old.valid & bit == 0
-                    || old.matrices[cascade] != sampling.matrices[cascade]
-            }) || work.static_updated_mask & bit != 0;
-            if !dirty {
-                continue;
+            let incompatible = self.last_dynamic.as_ref().is_none_or(|old| {
+                old.valid & bit == 0 || old.matrices[cascade] != sampling.matrices[cascade]
+            });
+            if incompatible || (!damage_known && previous != Some(revision)) {
+                rect = Some(ShadowRect::full(config.resolution));
             }
-            let origin = wgpu::Origin3d {
-                x: 0,
-                y: 0,
-                z: cascade as u32,
+            if let Some(static_rect) = self.last_static_rects[cascade] {
+                rect = Some(rect.map_or(static_rect, |old| old.union(static_rect)));
+            }
+            let Some(rect) = rect else {
+                continue;
             };
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.texture,
-                    mip_level: 0,
-                    origin,
-                    aspect: wgpu::TextureAspect::DepthOnly,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &combined.texture,
-                    mip_level: 0,
-                    origin,
-                    aspect: wgpu::TextureAspect::DepthOnly,
-                },
-                wgpu::Extent3d {
-                    width: self.cache.config.resolution,
-                    height: self.cache.config.resolution,
-                    depth_or_array_layers: 1,
-                },
-            );
-            work.dynamic_copy_bytes += u64::from(self.cache.config.resolution).pow(2) * 4;
-            work.dynamic_cull_dispatches += caster.prepare_shadow(
+            self.total_timer.start(encoder);
+            let prepared = caster.prepare_shadow_region(
                 queue,
                 encoder,
                 cascade,
                 Camera {
                     view_projection: sampling.matrices[cascade],
                 },
+                rect,
+                config.resolution,
             );
+            work.dynamic_cull_dispatches += prepared.dispatches;
+            work.uniform_upload_bytes += prepared.upload_bytes;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("moving model depth over static shadow cache"),
+                label: Some("localized combined restore and current model depth"),
                 color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &combined.layers[cascade],
@@ -931,13 +1093,21 @@ impl ShadowGpu {
                 timestamp_writes: self.timer.render(3),
                 occlusion_query_set: None,
             });
+            pass.set_scissor_rect(rect.x, rect.y, rect.width, rect.height);
+            pass.set_pipeline(&combined.restore);
+            pass.set_bind_group(0, &combined.restore_binds[cascade], &[]);
+            pass.draw(0..3, 0..1);
+            work.dynamic_restore_pixels += rect.pixels();
+            work.dynamic_restore_draws += 1;
             work.dynamic_draw_calls += caster.draw_shadow(&mut pass, cascade);
         }
+        caster.commit_shadow_damage();
         self.last_dynamic = Some(DynamicStamp {
             revision,
             matrices: sampling.matrices,
             valid: sampling.params[0],
         });
+        self.total_timer.finish(encoder);
         self.timer.finish(encoder);
         Ok(work)
     }
@@ -947,6 +1117,10 @@ impl ShadowGpu {
         encoder: &mut wgpu::CommandEncoder,
     ) -> ShadowWork {
         self.timer.begin();
+        self.total_timer.begin_frame();
+        if self.cache.pending() != 0 || self.last_dynamic.is_some() {
+            self.total_timer.start(encoder);
+        }
         let mut work = self.encode_static(queue, encoder);
         if let Some(combined) = &self.combined {
             let sampling = self.cache.sampling();
@@ -986,6 +1160,7 @@ impl ShadowGpu {
                 work.dynamic_copy_bytes += u64::from(self.cache.config.resolution).pow(2) * 4;
             }
         }
+        self.total_timer.finish(encoder);
         self.timer.finish(encoder);
         work
     }
@@ -995,6 +1170,7 @@ impl ShadowGpu {
         encoder: &mut wgpu::CommandEncoder,
     ) -> ShadowWork {
         let mut work = ShadowWork::default();
+        self.last_static_rects.fill(None);
         for _ in 0..self.cache.config.max_updates_per_frame {
             let Some(update) = self.cache.next_update() else {
                 break;
@@ -1062,12 +1238,13 @@ impl ShadowGpu {
                     pass.draw_indirect(&self.indirect, bucket * 16);
                 }
             }
+            self.last_static_rects[update.cascade] = Some(update.rect);
             self.cache.commit(update);
             self.sampling_dirty = true;
             work.cascade_updates += 1;
             work.static_updated_mask |= 1 << update.cascade;
             work.clear_pixels += update.rect.pixels();
-            work.caster_dispatches += 1;
+            work.caster_dispatches += 2;
             work.draw_calls += 5;
             work.uniform_upload_bytes += 192;
         }
@@ -1092,6 +1269,12 @@ const SHADOW_FRAGMENT: &str = r#"
     if input.bucket==1u {let alpha=textureSampleGrad(colors,texels,input.uv,i32(materials[input.material].x),du,dv).a;if alpha<0.5 {discard;}}
 }
 "#;
+const RESTORE_SHADER: &str = r#"
+@group(0)@binding(0)var static_depth:texture_depth_2d;
+@fragment fn restore(@builtin(position)p:vec4<f32>)->@builtin(frag_depth)f32 {
+    return textureLoad(static_depth,vec2<i32>(p.xy),0);
+}
+"#;
 const CLEAR_SHADER: &str = r#"
 @vertex fn vertex(@builtin(vertex_index) i:u32)->@builtin(position)vec4<f32>{let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));return vec4(p[i],0.,1.);}
 "#;
@@ -1103,7 +1286,7 @@ fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_>
     }
 }
 
-fn crop_camera(camera: Camera, rect: ShadowRect, resolution: u32) -> Camera {
+pub(crate) fn crop_camera(camera: Camera, rect: ShadowRect, resolution: u32) -> Camera {
     let low = [
         rect.x as f32 / resolution as f32 * 2. - 1.,
         1. - (rect.y + rect.height) as f32 / resolution as f32 * 2.,

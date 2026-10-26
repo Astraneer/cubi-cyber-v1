@@ -3,17 +3,38 @@
 use core_types::{BlockPos, ChannelMask, LocalIdx, PageId, Version};
 use render::{
     gi::{CellUpdate, GiError, GiGpu, GiVoxel},
+    gi_directional::{GiSurface, SurfaceUpdate},
     terrain_gpu::{AtlasImage, UploadBudget},
     terrain_mesh::Face,
 };
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 use world::{CellRead, PageInput, World, WorldChange};
+mod worker;
+#[cfg(not(target_arch = "wasm32"))]
+pub use worker::gi_native_pool;
+pub use worker::{
+    BuiltGiSource, GI_RETAINED_BYTES, GiBakeStamp, GiBakeTask, GiBakedData, GiWireError,
+    MAX_GI_REQUEST_BYTES, MAX_GI_RESULT_BYTES, execute_gi_request,
+};
 const CHANNELS: ChannelMask = ChannelMask(
     ChannelMask::SHAPE.0
         | ChannelMask::OPACITY.0
         | ChannelMask::LIGHTING.0
         | ChannelMask::EMISSION.0,
 );
+trait SourceRead {
+    fn read(&self, position: BlockPos) -> CellRead;
+    fn light(&self, position: BlockPos) -> Option<world::LightSample>;
+}
+impl SourceRead for World {
+    fn read(&self, position: BlockPos) -> CellRead {
+        World::read(self, position)
+    }
+    fn light(&self, position: BlockPos) -> Option<world::LightSample> {
+        self.page(position.page())
+            .map(|page| page.light(position.local_index()))
+    }
+}
 #[derive(Clone, Copy, Debug, Default)]
 struct Layer {
     linear: [f32; 3],
@@ -107,6 +128,7 @@ pub enum GiSourceError {
     ReadBudget,
     StaleInput,
     Revision,
+    Cancelled,
     Gi(GiError),
 }
 impl std::fmt::Display for GiSourceError {
@@ -145,13 +167,18 @@ struct Entry {
 /// One retained scratch page and bounded certificate map. Building a page reads
 /// at most 4096 centers + six adjacent cells per center, and never scans a world.
 pub struct GiSourceBuilder {
-    albedo: GiAlbedo,
+    albedo: Arc<GiAlbedo>,
     sky_ambient: [f32; 3],
     scratch: Box<[GiVoxel; 4096]>,
     updates: Vec<CellUpdate>,
     entries: BTreeMap<PageId, Entry>,
     max_pages: usize,
     revision: u64,
+    directional: Option<DirectionalScratch>,
+}
+struct DirectionalScratch {
+    page: Box<[GiSurface; 4096]>,
+    updates: Vec<SurfaceUpdate>,
 }
 impl GiSourceBuilder {
     pub fn new(albedo: GiAlbedo, max_pages: usize) -> Result<Self, GiSourceError> {
@@ -159,14 +186,25 @@ impl GiSourceBuilder {
             return Err(GiSourceError::Capacity);
         }
         Ok(Self {
-            albedo,
+            albedo: Arc::new(albedo),
             sky_ambient: [0.15; 3],
             scratch: Box::new([GiVoxel::UNKNOWN; 4096]),
             updates: Vec::with_capacity(4096),
             entries: BTreeMap::new(),
             max_pages,
             revision: 0,
+            directional: None,
         })
+    }
+    /// Allocate the optional face source only during client loading.
+    pub fn enable_directional(&mut self) {
+        if self.directional.is_none() {
+            self.directional = Some(DirectionalScratch {
+                page: Box::new([GiSurface::EMPTY; 4096]),
+                updates: Vec::with_capacity(4096),
+            });
+            self.entries.clear();
+        }
     }
     pub fn forget(&mut self, page: PageId) {
         self.entries.remove(&page);
@@ -187,7 +225,7 @@ impl GiSourceBuilder {
         Ok(())
     }
     pub fn invalidate_materials(&mut self, albedo: GiAlbedo) {
-        self.albedo = albedo;
+        self.albedo = Arc::new(albedo);
         self.entries.clear();
     }
     pub fn retained_pages(&self) -> usize {
@@ -305,6 +343,9 @@ impl GiSourceBuilder {
         if page.space != core_types::SpaceId(0) {
             return Err(GiSourceError::InvalidPage);
         }
+        if gi.directional_enabled() != self.directional.is_some() {
+            return Err(GiSourceError::InvalidMaterial);
+        }
         let pages = input_pages(page)?;
         let inputs = pages.map(|page| world.capture_input(page, CHANNELS));
         let gpu_version = gi.source_page_version([page.x, page.y, page.z])?;
@@ -350,6 +391,9 @@ impl GiSourceBuilder {
             .ok_or(GiSourceError::Revision)?;
         let mut work = if certified {
             self.updates.clear();
+            if let Some(directional) = &mut self.directional {
+                directional.updates.clear();
+            }
             let mut work = SourceWork {
                 incremental: true,
                 ..SourceWork::default()
@@ -361,7 +405,7 @@ impl GiSourceBuilder {
                     bits &= bits - 1;
                     let local = LocalIdx::new(index).expect("owner mask index");
                     let (x, _, z) = local.xyz();
-                    let value = self.sample_voxel(
+                    let (value, surface) = self.sample_voxel(
                         world,
                         position_of(page, local)?,
                         tints[usize::from(x) + 16 * usize::from(z)],
@@ -371,6 +415,12 @@ impl GiSourceBuilder {
                         local: index,
                         value,
                     });
+                    if let Some(directional) = &mut self.directional {
+                        directional.updates.push(SurfaceUpdate {
+                            local: index,
+                            value: surface,
+                        });
+                    }
                 }
             }
             work
@@ -381,7 +431,29 @@ impl GiSourceBuilder {
         if !world.matches_inputs(&inputs) {
             return Err(GiSourceError::StaleInput);
         }
-        work.upload_bytes = if certified {
+        work.upload_bytes = if let Some(directional) = &self.directional {
+            if certified {
+                gi.upload_cells_directional(
+                    queue,
+                    [page.x, page.y, page.z],
+                    revision,
+                    &self.updates,
+                    &directional.updates,
+                    tick,
+                    upload_budget,
+                )?
+            } else {
+                gi.upload_page_directional(
+                    queue,
+                    [page.x, page.y, page.z],
+                    revision,
+                    &self.scratch,
+                    &directional.page,
+                    tick,
+                    upload_budget,
+                )?
+            }
+        } else if certified {
             gi.upload_cells(
                 queue,
                 [page.x, page.y, page.z],
@@ -449,44 +521,64 @@ impl GiSourceBuilder {
         page: PageId,
         tints: &[u16; 256],
     ) -> Result<SourceWork, GiSourceError> {
+        self.bake_from(world, page, tints, || false)
+    }
+    fn bake_from(
+        &mut self,
+        world: &impl SourceRead,
+        page: PageId,
+        tints: &[u16; 256],
+        cancel: impl Fn() -> bool,
+    ) -> Result<SourceWork, GiSourceError> {
         let mut work = SourceWork::default();
         for index in 0..4096 {
+            if index % 64 == 0 && cancel() {
+                return Err(GiSourceError::Cancelled);
+            }
             let local = LocalIdx::new(index as u16).expect("page index");
             let (x, _, z) = local.xyz();
-            self.scratch[index] = self.sample_voxel(
+            let (value, surface) = self.sample_voxel(
                 world,
                 position_of(page, local)?,
                 tints[usize::from(x) + 16 * usize::from(z)],
                 &mut work,
             )?;
+            self.scratch[index] = value;
+            if let Some(directional) = &mut self.directional {
+                directional.page[index] = surface;
+            }
         }
         Ok(work)
     }
     fn sample_voxel(
         &self,
-        world: &World,
+        world: &impl SourceRead,
         position: BlockPos,
         tint: u16,
         work: &mut SourceWork,
-    ) -> Result<GiVoxel, GiSourceError> {
+    ) -> Result<(GiVoxel, GiSurface), GiSourceError> {
         work.world_reads += 1;
         let CellRead::Known(cell) = world.read(position) else {
-            return Ok(GiVoxel::UNKNOWN);
+            return Ok((GiVoxel::UNKNOWN, GiSurface::EMPTY));
         };
         if rules::block(cell.id()).is_none() {
-            return Ok(GiVoxel::UNKNOWN);
+            return Ok((GiVoxel::UNKNOWN, GiSurface::EMPTY));
         }
         let properties = rules::properties(cell);
         if !properties.opaque {
-            return Ok(GiVoxel::EMPTY);
+            return Ok((GiVoxel::EMPTY, GiSurface::EMPTY));
         }
         work.opaque_voxels += 1;
         if properties.emitter() {
-            return Ok(GiVoxel::opaque_reflected([0.; 3]).expect("zero reflection"));
+            return Ok((
+                GiVoxel::opaque_reflected([0.; 3]).expect("zero reflection"),
+                GiSurface::EMPTY,
+            ));
         }
         let material = crate::material(cell.raw(), tint);
         let mut radiance = [0.; 3];
         let mut visible = 0;
+        let mut surface = GiSurface::EMPTY;
         for face in Face::ALL {
             let n = face.normal();
             let neighbor = BlockPos {
@@ -516,11 +608,13 @@ impl GiSourceBuilder {
             if rules::properties(neighbor_cell).opaque {
                 continue;
             }
-            let light = world
-                .page(neighbor.page())
-                .expect("known cell has page")
-                .light(neighbor.local_index());
+            let light = world.light(neighbor).ok_or(GiSourceError::StaleInput)?;
             let albedo = self.albedo.face(&material, face)?;
+            if self.directional.is_some() {
+                surface = surface
+                    .with_face(face as u8, albedo, light.sky, light.rgb)
+                    .ok_or(GiSourceError::InvalidMaterial)?;
+            }
             visible += 1;
             work.reflected_faces += 1;
             for channel in 0..3 {
@@ -534,7 +628,9 @@ impl GiSourceBuilder {
             }
         }
         // Compact first-bounce cache: isotropic face average, no fake sun term.
-        GiVoxel::opaque_reflected(radiance).ok_or(GiSourceError::InvalidMaterial)
+        GiVoxel::opaque_reflected(radiance)
+            .map(|voxel| (voxel, surface))
+            .ok_or(GiSourceError::InvalidMaterial)
     }
 }
 fn position_of(page: PageId, index: LocalIdx) -> Result<BlockPos, GiSourceError> {
@@ -672,6 +768,59 @@ mod tests {
         assert!(
             reflected[0] > 23. && reflected[2] > 24.9,
             "legal HDR must not saturate at old8-unit limit"
+        );
+    }
+    #[test]
+    fn directional_records_preserve_faces_and_rgb8_and_exclude_gameplay_scalar() {
+        let mut world = source_world();
+        let light = LightSample {
+            sky: 12,
+            block: 15,
+            rgb: [231, 17, 255],
+        };
+        light_neighbors(&mut world, light, 2);
+        let mut builder = GiSourceBuilder::new(white_albedo(), 4).unwrap();
+        builder.set_sky_ambient([0.; 3]).unwrap();
+        builder.enable_directional();
+        let work = builder
+            .bake(&world, position().page(), &[u16::MAX; 256])
+            .unwrap();
+        assert_eq!(work.world_reads, 4102);
+        let mut expected = GiSurface::EMPTY;
+        for face in Face::ALL {
+            expected = expected
+                .with_face(face as u8, [1.; 3], 12, light.rgb)
+                .unwrap();
+        }
+        assert_eq!(
+            builder.directional.as_ref().unwrap().page[usize::from(position().local_index().get())],
+            expected
+        );
+        assert_eq!(std::mem::size_of::<GiSurface>(), 48);
+        let mut tx = Transaction::new(Tick(3), SpaceId(0));
+        tx.set_cell(
+            BlockPos {
+                y: position().y + 1,
+                ..position()
+            },
+            Cell::from_parts(rules::ids::STONE, 0),
+        );
+        world.commit(tx).unwrap();
+        builder
+            .bake(&world, position().page(), &[u16::MAX; 256])
+            .unwrap();
+        let mut expected = GiSurface::EMPTY;
+        for face in Face::ALL {
+            if face != Face::Up {
+                expected = expected
+                    .with_face(face as u8, [1.; 3], 12, light.rgb)
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            builder.directional.as_ref().unwrap().page[usize::from(position().local_index().get())],
+            expected,
+            "covered face cannot receive another surface's sky"
         );
     }
     #[test]

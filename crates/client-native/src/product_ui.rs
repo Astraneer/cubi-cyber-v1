@@ -42,6 +42,7 @@ pub struct ProductUi {
     sounds: client::audio_bridge::PredictionSounds,
     block_sounds: client::audio_bridge::ConfirmedBlockSounds,
     entity_sounds: client::audio_bridge::EntitySounds,
+    machine_sounds: client::audio_bridge::MachineSounds,
     commands: VecDeque<Command>,
     requests: VecDeque<net::ActionId>,
     local: Option<audio::resources::LocalResources>,
@@ -67,6 +68,7 @@ type DiagnosticStamp = (
     u64,
     ui::app::Role,
     bool,
+    Option<ui::app::ItemFact>,
 );
 pub fn data_path(name: &str) -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
@@ -105,6 +107,7 @@ impl ProductUi {
             sounds: Default::default(),
             block_sounds: Default::default(),
             entity_sounds: Default::default(),
+            machine_sounds: Default::default(),
             commands: VecDeque::with_capacity(8),
             requests: VecDeque::with_capacity(128),
             local: None,
@@ -147,12 +150,19 @@ impl ProductUi {
             snapshot.window_revision,
             snapshot.role,
             snapshot.creative,
+            snapshot.inventory_facts[usize::from(snapshot.selected)],
         );
         if self.last_diagnostic == Some(stamp) {
             return;
         }
         self.last_diagnostic = Some(stamp);
         println!("NATIVE_UI_STATUS {:?}", self.layer.app.status());
+        println!(
+            "NATIVE_UI_ITEM selected={} item={} fact={:?}",
+            snapshot.selected,
+            snapshot.inventory[usize::from(snapshot.selected)].item(),
+            stamp.9
+        );
         println!(
             "NATIVE_UI_STATE screen={:?} window={:016x} inventory_revision={} chat_messages={} players={} ping_measured={} window_revision={} role={:?}",
             stamp.0, stamp.1, stamp.2, stamp.3, stamp.4, stamp.5, stamp.6, stamp.7
@@ -286,6 +296,18 @@ impl ProductUi {
         self.report_state();
     }
     pub fn disconnected(&mut self, message: &str) {
+        if let Some(audio) = &mut self.audio {
+            self.machine_sounds.clear(|command| {
+                if let client::audio_bridge::MachineCommand::Stop(emitter) = command {
+                    let _ = audio.forget_emitter(emitter);
+                }
+            });
+            if let Some(emitter) = self.sounds.emitter() {
+                let _ = audio.forget_emitter(emitter);
+            }
+        } else {
+            self.machine_sounds.clear(|_| {});
+        }
         self.block_sounds.clear();
         self.ready_world = false;
         self.requests.clear();
@@ -355,6 +377,31 @@ impl ProductUi {
             let _ = audio.forget_emitter(old);
         }
         if let Some(audio) = &mut self.audio {
+            if let (Some(welcome), Some(player), Some(source)) =
+                (network.welcome(), network.player(), view.props_source())
+            {
+                self.machine_sounds.set_time(network.acknowledged_tick());
+                self.machine_sounds.visit(
+                    welcome.session,
+                    &view.scene,
+                    source,
+                    player.eye(1.0),
+                    |command| match command {
+                        client::audio_bridge::MachineCommand::Start(cue) => {
+                            let _ = audio.event_gain(
+                                cue.event,
+                                cue.emitter,
+                                Some(cue.position),
+                                cue.seed,
+                                cue.gain,
+                            );
+                        }
+                        client::audio_bridge::MachineCommand::Stop(emitter) => {
+                            let _ = audio.forget_emitter(emitter);
+                        }
+                    },
+                );
+            }
             if let Some(player) = network.player() {
                 self.entity_sounds.visit(network, player.eye(1.0), |cue| {
                     let _ = audio.event_gain(
@@ -622,6 +669,7 @@ impl ProductUi {
                     return;
                 }
                 self.local = Some(local);
+                self.machine_sounds.clear(|_| {});
                 self.resource_epoch = revision;
                 self.apply_sound();
                 self.layer.app.set_status(if self.audio.is_some() {

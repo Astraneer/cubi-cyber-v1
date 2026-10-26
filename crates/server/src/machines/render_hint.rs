@@ -25,6 +25,9 @@ impl MachineRuntime {
         let CellRead::Known(cell) = world.read(anchor) else {
             return Err(MachineError::Unknown);
         };
+        if !matches!(blocks::bdef(cell.id()).be,Some(BeKind::Mek(kind)) if kind==machine.kind) {
+            return Err(MachineError::Component);
+        }
         let facing = Face::ALL[blocks::facing_of(cell.raw()) as usize];
         let modes = Face::ALL.into_iter().fold(0, |bits, face| {
             bits | (machine.sides[sides::relative(facing, face) as usize] as u32)

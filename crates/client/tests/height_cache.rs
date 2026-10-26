@@ -30,6 +30,209 @@ fn tile(key: HeightTileKey, source: u64, height: i32) -> Arc<HeightTile> {
     tile.known[36] = 1;
     Arc::new(tile)
 }
+fn exact(old: &HeightTile) -> Arc<HeightTile> {
+    let mut tile = old.clone();
+    tile.protected = [255; 32];
+    Arc::new(tile)
+}
+
+#[test]
+fn exact_leaf_promotion_cannot_change_the_world_source_or_surface_payload() {
+    let mut cache = HeightCache::new(Config {
+        max_tiles: 1,
+        max_sources: 2,
+        atlas_layers: 186,
+    })
+    .unwrap();
+    cache.set_plan(&plan(&[key(0)])).unwrap();
+    let original = tile(key(0), 1, 32);
+    cache.ingest(original.clone()).unwrap();
+    let promoted = exact(&original);
+    assert_eq!(
+        cache.ingest(promoted.clone()),
+        Err(Error::ConflictingSource)
+    );
+    for kind in 0..5 {
+        let mut forged = (*promoted).clone();
+        match kind {
+            0 => forged.heights[0] += 1,
+            1 => {
+                forged.known[0] &= !1;
+                forged.heights[0] = 0;
+            }
+            2 => forged.atlas[0] = 4,
+            3 => forged.tint[0] = 0,
+            _ => forged.protected[0] = 1,
+        }
+        assert_eq!(
+            cache.ingest_exact_promotion(Arc::new(forged)),
+            Err(Error::ConflictingSource)
+        );
+    }
+    assert!(cache.ingest_exact_promotion(promoted.clone()).unwrap());
+    assert!(!cache.ingest_exact_promotion(promoted).unwrap());
+    assert_eq!(cache.ingest(original), Err(Error::ConflictingSource));
+}
+
+#[test]
+fn same_source_exact_promotion_borrows_the_front_and_switches_only_at_atomic_publication() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        for abandoned in [false, true] {
+            let mut terrain = renderer(&gpu);
+            let mut heights = heights(&gpu, &terrain, 2);
+            let mut cache = HeightCache::new(Config {
+                max_tiles: 1,
+                max_sources: 2,
+                atlas_layers: 186,
+            })
+            .unwrap();
+            cache.set_plan(&plan(&[key(0)])).unwrap();
+            let original = tile(key(0), 1, 32);
+            cache.ingest(original.clone()).unwrap();
+            assert!(
+                cache
+                    .pump(
+                        &mut heights,
+                        &gpu.queue,
+                        &mut UploadBudget::new(100000),
+                        1,
+                        |_| true
+                    )
+                    .unwrap()
+                    .published
+            );
+            let before = image(&gpu, &mut terrain, &mut heights);
+            assert_eq!(before.1, 1);
+            let epoch = cache.epoch();
+            cache.ingest_exact_promotion(exact(&original)).unwrap();
+            let staged = cache
+                .pump(
+                    &mut heights,
+                    &gpu.queue,
+                    &mut UploadBudget::new(0),
+                    1,
+                    |_| false,
+                )
+                .unwrap();
+            assert_eq!(staged.staged, 1);
+            assert_eq!(staged.upload_bytes, 0);
+            assert!(staged.held_previous && !staged.published);
+            assert_eq!(cache.epoch(), epoch);
+            assert_eq!(image(&gpu, &mut terrain, &mut heights), before);
+            if abandoned {
+                // Superseding the pending promotion must not free its borrowed
+                // front handle, even when no upload/release budget is available.
+                cache.ingest(tile(key(0), 2, 33)).unwrap();
+                let held = cache
+                    .pump(
+                        &mut heights,
+                        &gpu.queue,
+                        &mut UploadBudget::new(0),
+                        1,
+                        |_| true,
+                    )
+                    .unwrap();
+                assert_eq!(held.upload_bytes, 0);
+                assert_eq!(cache.staged_len(), 0);
+                assert_eq!(image(&gpu, &mut terrain, &mut heights), before);
+                assert!(
+                    cache
+                        .pump(
+                            &mut heights,
+                            &gpu.queue,
+                            &mut UploadBudget::new(100000),
+                            1,
+                            |_| true
+                        )
+                        .unwrap()
+                        .published
+                );
+                assert_eq!(cache.front_source(key(0)), Some(2));
+                assert_eq!(image(&gpu, &mut terrain, &mut heights).1, 1);
+                continue;
+            }
+            let short = cache
+                .pump(
+                    &mut heights,
+                    &gpu.queue,
+                    &mut UploadBudget::new(3),
+                    1,
+                    |_| true,
+                )
+                .unwrap();
+            assert_eq!(short.upload_bytes, 0);
+            assert!(!short.published);
+            assert_eq!(image(&gpu, &mut terrain, &mut heights), before);
+            let published = cache
+                .pump(
+                    &mut heights,
+                    &gpu.queue,
+                    &mut UploadBudget::new(4),
+                    1,
+                    |_| true,
+                )
+                .unwrap();
+            assert!(published.published);
+            assert_eq!(published.upload_bytes, 4);
+            assert_eq!(cache.front_source(key(0)), Some(1));
+            assert_eq!(cache.pending_retirements(), 0);
+            assert!(cache.epoch() > epoch);
+            assert_eq!(image(&gpu, &mut terrain, &mut heights).1, 0);
+            // Moving the near cutout can never re-enable the borrowed old
+            // unprotected GPU payload after the exact cover replaced it.
+            for bounds in [[0, 0, 16, 16], [32, 0, 48, 16]] {
+                assert_eq!(
+                    cache
+                        .suppress_region(
+                            &mut heights,
+                            &gpu.queue,
+                            0,
+                            bounds,
+                            &mut UploadBudget::new(0)
+                        )
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(image(&gpu, &mut terrain, &mut heights).1, 0);
+            }
+            let mut stitched = plan(&[key(0)]);
+            stitched.tiles[0].seams = 1;
+            cache.set_plan(&stitched).unwrap();
+            assert!(
+                cache
+                    .pump(
+                        &mut heights,
+                        &gpu.queue,
+                        &mut UploadBudget::new(4),
+                        1,
+                        |_| true
+                    )
+                    .unwrap()
+                    .published
+            );
+            assert_eq!(cache.pending_retirements(), 0);
+            assert_eq!(image(&gpu, &mut terrain, &mut heights).1, 0);
+            let scope = telemetry::AllocationScope::begin().unwrap();
+            for _ in 0..1000 {
+                let work = cache
+                    .pump(
+                        &mut heights,
+                        &gpu.queue,
+                        &mut UploadBudget::new(0),
+                        1,
+                        |_| true,
+                    )
+                    .unwrap();
+                assert_eq!(work.upload_bytes, 0);
+                assert!(!work.published);
+            }
+            assert_eq!(scope.finish().allocating_calls(), 0);
+        }
+    });
+}
 fn plan(keys: &[HeightTileKey]) -> HeightPlan {
     HeightPlan {
         tiles: keys

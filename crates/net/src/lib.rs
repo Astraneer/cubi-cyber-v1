@@ -7,6 +7,7 @@ pub mod emulator;
 pub mod entities;
 pub mod geometry;
 pub mod height;
+pub mod item_attributes;
 pub mod light;
 pub mod machine_packets;
 pub mod presence;
@@ -154,6 +155,10 @@ pub enum Action {
     Chat(String),
     Window(window::WindowIntent),
     SelectSlot(u8),
+    CycleToolMode {
+        back: bool,
+        inventory: InventoryGuard,
+    },
     PlaceOwned {
         position: BlockPos,
         expected: Cell,
@@ -199,7 +204,18 @@ pub enum ClientMessage {
         key: height::HeightKey,
         known: Option<u64>,
     },
+    /// Sticky exact public-geometry representation for a level-zero leaf.
+    RequestExactHeight {
+        key: height::HeightKey,
+        known: Option<u64>,
+    },
     ForgetHeight(height::HeightKey),
+    RequestProps {
+        page: PageId,
+        cell_view: u64,
+        known: Option<u64>,
+    },
+    MachinePackets(machine_packets::Request),
     RequestLight(light::Request),
     ForgetLight(PageId),
     Presence(presence::PresenceClientEvent),
@@ -298,6 +314,7 @@ pub enum ServerMessage {
     Inventory {
         data: Vec<u8>,
     },
+    ItemAttributes(Box<item_attributes::InventoryAttributes>),
     Geometry(Box<PublicGeometry>),
     GeometryUnavailable(PageId),
     Presence(presence::PresenceServerEvent),
@@ -305,6 +322,8 @@ pub enum ServerMessage {
     Window(Box<window::WindowSnapshot>),
     Height(Box<height::HeightTile>),
     HeightUnavailable(height::HeightKey),
+    Props(Box<props::Frame>),
+    MachinePackets(Box<machine_packets::Frame>),
     Light(Box<light::Update>),
     LightUnavailable(PageId),
     Players {

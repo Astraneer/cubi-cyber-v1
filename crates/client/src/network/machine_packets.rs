@@ -79,7 +79,9 @@ impl PacketPage {
                 have: self.revision,
             }));
         }
-        if self.revision.is_some_and(|old| frame.revision <= old) {
+        if self.view_version == Some(certified)
+            && self.revision.is_some_and(|old| frame.revision <= old)
+        {
             return Ok(Apply::Stale(Request::Ack {
                 page: self.page,
                 view_version: frame.view_version,

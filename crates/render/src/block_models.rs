@@ -2,7 +2,10 @@
 //! built once from allowed asset data; edits upload records, never model vertices.
 use crate::{
     MSAA_SAMPLES,
-    shadows::{DynamicShadowCaster, ShadowGpu},
+    shadows::{
+        DynamicShadowCaster, ShadowDamageTracker, ShadowGpu, ShadowPrepareWork, ShadowRect,
+        WorldBounds, crop_camera,
+    },
     terrain_gpu::{Camera, TerrainGeometry, UploadBudget},
 };
 use bytemuck::{Pod, Zeroable};
@@ -29,6 +32,9 @@ pub mod kind {
 pub const ACTIVE: u32 = 1;
 /// Reserved stable slots remain allocated but publish no primary or shadow draw.
 pub const HIDDEN: u32 = 2;
+/// Six annotations derived from the cube catalog; terrain remains the only body.
+/// This record never contributes geometry to any shadow pass.
+pub const PORT_MARKER_ONLY: u32 = 4;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct BlockInstance {
@@ -42,7 +48,9 @@ pub struct BlockInstance {
     pub amount: f32,
     pub tint: u32,
     pub layer: u32,
-    /// Generic cube faces: Down|Up<<16, North|South<<16, West|East<<16.
+    /// First three words: cube face layers Down|Up<<16, North|South<<16,
+    /// West|East<<16. Fourth: public machine presence bit31 plus World Face6
+    /// modes (three bits per face); this annotation does not alter geometry.
     pub reserved: [u32; 4],
 }
 impl BlockInstance {
@@ -133,7 +141,14 @@ impl BlockCatalog {
                         uv: face.uv[corner],
                         bone: face.bone,
                         kind: face.kind,
-                        pivot: face.pivot,
+                        // Bone0 has no animation pivot; retain canonical face
+                        // coordinates for a procedural public-port annotation.
+                        pivot: if face.bone == 0 {
+                            let uv = [[0., 0.], [1., 0.], [1., 1.], [0., 1.]][corner];
+                            [uv[0], uv[1], 0.]
+                        } else {
+                            face.pivot
+                        },
                         frames: face.frames,
                     });
                 }
@@ -153,7 +168,7 @@ impl BlockCatalog {
             range.maximum[0] = radius;
             range.maximum[2] = radius;
             if kind == kind::CHEST as usize {
-                range.maximum[1] = 1.3;
+                range.maximum[1] = 1.6;
                 range.minimum[2] = -0.8;
             }
             if kind == kind::WIND_GENERATOR as usize {
@@ -212,6 +227,7 @@ struct CameraGpu {
     reserved: [u32; 4],
 }
 struct ShadowResources {
+    cull_cameras: [wgpu::Buffer; 3],
     cameras: [wgpu::Buffer; 3],
     binds: [wgpu::BindGroup; 3],
     cull_binds: [wgpu::BindGroup; 3],
@@ -227,13 +243,18 @@ pub struct BlockModelsGpu {
     bind: wgpu::BindGroup,
     cull_bind: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
+    glass: wgpu::RenderPipeline,
+    colored_transporters: u32,
     reset: wgpu::ComputePipeline,
     cull: wgpu::ComputePipeline,
     previous: Vec<BlockInstance>,
     active: u32,
     kind_counts: [u32; MODEL_KINDS],
+    shadow_kind_counts: [u32; MODEL_KINDS],
     revision: u64,
     shadow_revision: u64,
+    shadow_damage: ShadowDamageTracker,
+    model_bounds: [ModelRange; MODEL_KINDS],
     last: Option<(Camera, u64)>,
     shadow: Option<ShadowResources>,
     work: BlockWork,
@@ -422,7 +443,8 @@ impl BlockModelsGpu {
         let bind = make_bind(&render_layout, &camera, &visible, true);
         let cull_bind = make_cull(&camera, &visible, &indirect);
         let source = crate::atmosphere::surface_shader(
-            include_str!("block_models.wgsl"),
+            &include_str!("block_models.wgsl")
+                .replace("// PORTS", include_str!("block_ports.wgsl")),
             shadows.is_some(),
             atmosphere.is_some(),
             true,
@@ -436,7 +458,8 @@ impl BlockModelsGpu {
             label: Some("GPU static block poses"),
             source: wgpu::ShaderSource::Wgsl(source.clone().into()),
         });
-        let pipeline = render_pipeline(device, &render_layout, &shader, false);
+        let pipeline = render_pipeline(device, &render_layout, &shader, false, false);
+        let glass = render_pipeline(device, &render_layout, &shader, false, true);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("GPU static block frustum buckets"),
             source: wgpu::ShaderSource::Wgsl(include_str!("block_models_cull.wgsl").into()),
@@ -466,6 +489,13 @@ impl BlockModelsGpu {
                     wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 )
             });
+            let cull_cameras = std::array::from_fn(|_| {
+                buffer(
+                    "block caster cropped cull camera",
+                    96,
+                    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                )
+            });
             let visible = buffer(
                 "independent block caster compacted indices",
                 u64::from(config.max_instances) * MODEL_KINDS as u64 * 4,
@@ -481,17 +511,19 @@ impl BlockModelsGpu {
                 entries: &base_entries,
             });
             let binds = std::array::from_fn(|i| make_bind(&layout, &cameras[i], &visible, false));
-            let cull_binds = std::array::from_fn(|i| make_cull(&cameras[i], &visible, &indirect));
+            let cull_binds =
+                std::array::from_fn(|i| make_cull(&cull_cameras[i], &visible, &indirect));
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("same block pose for shadows"),
                 source: wgpu::ShaderSource::Wgsl(source.into()),
             });
             Some(ShadowResources {
+                cull_cameras,
                 cameras,
                 binds,
                 cull_binds,
                 indirect,
-                pipeline: render_pipeline(device, &layout, &shader, true),
+                pipeline: render_pipeline(device, &layout, &shader, true, false),
             })
         } else {
             None
@@ -505,19 +537,24 @@ impl BlockModelsGpu {
             bind,
             cull_bind,
             pipeline,
+            glass,
+            colored_transporters: 0,
             reset,
             cull,
             previous: Vec::with_capacity(config.max_instances as usize),
             active: 0,
             kind_counts: [0; MODEL_KINDS],
+            shadow_kind_counts: [0; MODEL_KINDS],
             revision: 0,
             shadow_revision: 0,
+            shadow_damage: ShadowDamageTracker::new(config.max_instances as usize),
+            model_bounds: catalog.ranges,
             last: None,
             shadow,
             work: BlockWork {
                 upload_bytes: catalog.vertices.len() as u64 * 64 + MODEL_KINDS as u64 * 48,
                 startup_vertices: catalog.vertices.len() as u32,
-                pipeline_compilations: 3 + u32::from(
+                pipeline_compilations: 4 + u32::from(
                     shadows.is_some_and(|s| s.cache().config().dynamic_casters),
                 ),
                 ..BlockWork::default()
@@ -530,7 +567,8 @@ impl BlockModelsGpu {
             .chain([i.yaw, i.phase, i.amount].iter())
             .all(|x| x.is_finite())
             && i.kind < MODEL_KINDS as u32
-            && i.flags & !(ACTIVE | HIDDEN) == 0
+            && i.flags & !(ACTIVE | HIDDEN | PORT_MARKER_ONLY) == 0
+            && (i.flags & PORT_MARKER_ONLY == 0 || i.kind == kind::CUBE_MACHINE)
             && i.connections & !0xfff == 0
             && i.layer < self.config.atlas_layers
             && (0.0..=1.0).contains(&i.amount)
@@ -595,12 +633,20 @@ impl BlockModelsGpu {
             || self.previous.iter().zip(instances).any(|(a, b)| {
                 a.position != b.position || a.kind != b.kind || (a.flags ^ b.flags) & HIDDEN != 0
             });
-        let shadow_changed = self.previous.len() != instances.len()
-            || self
-                .previous
-                .iter()
-                .zip(instances)
-                .any(|(a, b)| !same_geometry(a, b));
+        let shadow_changed = (0..self.previous.len().max(instances.len()))
+            .any(|index| !same_shadow(self.previous.get(index), instances.get(index)));
+        if shadow_changed {
+            for index in 0..self.previous.len().max(instances.len()) {
+                let old = self.previous.get(index);
+                let new = instances.get(index);
+                if !same_shadow(old, new) {
+                    self.shadow_damage.record(
+                        index,
+                        old.and_then(|value| block_shadow_bounds(value, &self.model_bounds)),
+                    );
+                }
+            }
+        }
         if bytes > 0 {
             queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(instances));
         }
@@ -643,6 +689,12 @@ impl BlockModelsGpu {
         if budget.remaining_bytes < 64 {
             return Err(BlockError::UploadBudget);
         }
+        if !same_shadow(Some(&old), Some(&value)) {
+            self.shadow_damage.record(
+                index as usize,
+                block_shadow_bounds(&old, &self.model_bounds),
+            );
+        }
         queue.write_buffer(
             &self.instances,
             u64::from(index) * 64,
@@ -657,7 +709,7 @@ impl BlockModelsGpu {
         {
             self.revision = self.revision.wrapping_add(1);
         }
-        if !same_geometry(&old, &value) {
+        if !same_shadow(Some(&old), Some(&value)) {
             self.shadow_revision = self.shadow_revision.wrapping_add(1)
         }
         budget.remaining_bytes -= 64;
@@ -670,6 +722,8 @@ impl BlockModelsGpu {
     }
     fn refresh_active(&mut self) {
         self.kind_counts.fill(0);
+        self.shadow_kind_counts.fill(0);
+        self.colored_transporters = 0;
         self.active = 0;
         for index in 0..self.previous.len() {
             self.count_instance(self.previous[index], true);
@@ -678,6 +732,24 @@ impl BlockModelsGpu {
     fn count_instance(&mut self, instance: BlockInstance, add: bool) {
         if instance.flags & HIDDEN != 0 {
             return;
+        }
+        if instance.kind == kind::TRANSPORTER
+            && instance.reserved[3] & 0x40000000 != 0
+            && (1..=18).contains(&(instance.reserved[3] & 31))
+        {
+            if add {
+                self.colored_transporters += 1;
+            } else {
+                self.colored_transporters -= 1;
+            }
+        }
+        if instance.flags & PORT_MARKER_ONLY == 0 {
+            let count = &mut self.shadow_kind_counts[instance.kind as usize];
+            if add {
+                *count += 1;
+            } else {
+                *count -= 1;
+            }
         }
         let count = &mut self.kind_counts[instance.kind as usize];
         if add {
@@ -746,7 +818,13 @@ impl BlockModelsGpu {
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> u32 {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind, &[]);
-        self.draw_buckets(pass, &self.indirect)
+        let mut draws = self.draw_buckets(pass, &self.indirect);
+        if self.colored_transporters != 0 {
+            pass.set_pipeline(&self.glass);
+            pass.draw_indirect(&self.indirect, u64::from(kind::TRANSPORTER) * 16);
+            draws += 1;
+        }
+        draws
     }
     fn draw_buckets(&self, pass: &mut wgpu::RenderPass<'_>, indirect: &wgpu::Buffer) -> u32 {
         for kind in 0..MODEL_KINDS {
@@ -770,6 +848,28 @@ impl BlockModelsGpu {
         std::mem::take(&mut self.work)
     }
 }
+fn block_shadow_bounds(
+    value: &BlockInstance,
+    ranges: &[ModelRange; MODEL_KINDS],
+) -> Option<WorldBounds> {
+    if value.flags & (HIDDEN | PORT_MARKER_ONLY) != 0 {
+        return None;
+    }
+    let range = &ranges[value.kind as usize];
+    Some(WorldBounds {
+        min: std::array::from_fn(|axis| value.position[axis] + range.minimum[axis]),
+        max: std::array::from_fn(|axis| value.position[axis] + range.maximum[axis]),
+    })
+}
+fn same_shadow(a: Option<&BlockInstance>, b: Option<&BlockInstance>) -> bool {
+    let a = a.filter(|v| v.flags & PORT_MARKER_ONLY == 0);
+    let b = b.filter(|v| v.flags & PORT_MARKER_ONLY == 0);
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => same_geometry(a, b),
+        _ => false,
+    }
+}
 fn same_geometry(a: &BlockInstance, b: &BlockInstance) -> bool {
     a.position == b.position
         && a.yaw == b.yaw
@@ -778,7 +878,7 @@ fn same_geometry(a: &BlockInstance, b: &BlockInstance) -> bool {
         && a.phase == b.phase
         && a.amount == b.amount
         && a.layer == b.layer
-        && a.reserved == b.reserved
+        && a.reserved[..3] == b.reserved[..3]
         && (a.flags ^ b.flags) & HIDDEN == 0
 }
 impl DynamicShadowCaster for BlockModelsGpu {
@@ -788,6 +888,24 @@ impl DynamicShadowCaster for BlockModelsGpu {
     fn shadow_revision(&self) -> u64 {
         self.shadow_revision
     }
+    fn visit_shadow_damage(&self, previous: [u64; 4], visit: &mut dyn FnMut(WorldBounds)) -> bool {
+        if previous[1..].iter().any(|v| *v != 0) {
+            return false;
+        }
+        self.shadow_damage.visit(
+            previous[0],
+            self.shadow_revision,
+            |index| {
+                self.previous
+                    .get(index)
+                    .and_then(|value| block_shadow_bounds(value, &self.model_bounds))
+            },
+            visit,
+        )
+    }
+    fn commit_shadow_damage(&mut self) {
+        self.shadow_damage.commit(self.shadow_revision);
+    }
     fn prepare_shadow(
         &mut self,
         queue: &wgpu::Queue,
@@ -795,18 +913,52 @@ impl DynamicShadowCaster for BlockModelsGpu {
         cascade: usize,
         camera: Camera,
     ) -> u32 {
-        let Some(s) = &self.shadow else { return 0 };
-        if self.previous.is_empty() {
-            return 0;
+        self.prepare_shadow_region(queue, encoder, cascade, camera, ShadowRect::full(1), 1)
+            .dispatches
+    }
+    fn prepare_shadow_region(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        cascade: usize,
+        camera: Camera,
+        rect: ShadowRect,
+        resolution: u32,
+    ) -> ShadowPrepareWork {
+        let Some(shadow) = &self.shadow else {
+            return ShadowPrepareWork::default();
+        };
+        if self.shadow_kind_counts.iter().all(|n| *n == 0) {
+            return ShadowPrepareWork::default();
         }
-        self.prepare(
-            queue,
-            encoder,
-            &s.cameras[cascade],
-            &s.cull_binds[cascade],
-            camera,
+        let full = CameraGpu {
+            view_projection: camera.view_projection,
+            params: [self.previous.len() as u32, self.config.max_instances, 1, 0],
+            reserved: [0; 4],
+        };
+        let cropped = CameraGpu {
+            view_projection: crop_camera(camera, rect, resolution).view_projection,
+            ..full
+        };
+        queue.write_buffer(&shadow.cameras[cascade], 0, bytemuck::bytes_of(&full));
+        queue.write_buffer(
+            &shadow.cull_cameras[cascade],
+            0,
+            bytemuck::bytes_of(&cropped),
         );
-        2
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("localized block model shadow cull"),
+            timestamp_writes: None,
+        });
+        pass.set_bind_group(0, &shadow.cull_binds[cascade], &[]);
+        pass.set_pipeline(&self.reset);
+        pass.dispatch_workgroups(1, 1, 1);
+        pass.set_pipeline(&self.cull);
+        pass.dispatch_workgroups((self.previous.len() as u32).div_ceil(64), 1, 1);
+        ShadowPrepareWork {
+            dispatches: 2,
+            upload_bytes: 192,
+        }
     }
     fn draw_shadow(&self, pass: &mut wgpu::RenderPass<'_>, cascade: usize) -> u32 {
         let Some(s) = &self.shadow else { return 0 };
@@ -815,7 +967,14 @@ impl DynamicShadowCaster for BlockModelsGpu {
         }
         pass.set_pipeline(&s.pipeline);
         pass.set_bind_group(0, &s.binds[cascade], &[]);
-        self.draw_buckets(pass, &s.indirect)
+        let mut draws = 0;
+        for (kind, count) in self.shadow_kind_counts.iter().enumerate() {
+            if *count != 0 {
+                pass.draw_indirect(&s.indirect, kind as u64 * 16);
+                draws += 1;
+            }
+        }
+        draws
     }
 }
 fn render_pipeline(
@@ -823,12 +982,22 @@ fn render_pipeline(
     layout: &wgpu::BindGroupLayout,
     shader: &wgpu::ShaderModule,
     shadow: bool,
+    glass: bool,
 ) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("static block vertex pulling"),
         bind_group_layouts: &[layout],
         push_constant_ranges: &[],
     });
+    let color_targets = [Some(wgpu::ColorTargetState {
+        format: wgpu::TextureFormat::Rgba16Float,
+        blend: if glass {
+            Some(wgpu::BlendState::ALPHA_BLENDING)
+        } else {
+            None
+        },
+        write_mask: wgpu::ColorWrites::ALL,
+    })];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("static blocks immutable model pipeline"),
         layout: Some(&layout),
@@ -844,33 +1013,27 @@ fn render_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
+            depth_write_enabled: !glass,
             depth_compare: wgpu::CompareFunction::GreaterEqual,
             stencil: Default::default(),
             bias: Default::default(),
         }),
         multisample: wgpu::MultisampleState {
             count: if shadow { 1 } else { MSAA_SAMPLES },
-            alpha_to_coverage_enabled: !shadow,
+            alpha_to_coverage_enabled: !shadow && !glass,
             ..Default::default()
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some(if shadow {
+            entry_point: Some(if glass {
+                "glass_fragment"
+            } else if shadow {
                 "shadow_fragment"
             } else {
                 "fragment"
             }),
             compilation_options: Default::default(),
-            targets: if shadow {
-                &[]
-            } else {
-                &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })]
-            },
+            targets: if shadow { &[] } else { &color_targets },
         }),
         multiview: None,
         cache: None,

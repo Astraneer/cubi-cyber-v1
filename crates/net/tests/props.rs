@@ -95,3 +95,44 @@ fn rotor_epoch_interpolates_without_repeated_server_packets() {
     assert_eq!(bytes.len(), MAX_BYTES);
     assert_eq!(Frame::decode(&bytes).unwrap(), all);
 }
+
+#[test]
+fn connector_colors_use_spare_bits_and_preserve_zero_color_bytes() {
+    for color in 0..=18u32 {
+        let packed = 0xA55 | (color << 12);
+        let hint =
+            Hint::from_visual(index(0), Kind::Connector, Some(packed), false, None, None).unwrap();
+        let mut sample = frame();
+        sample.hints = vec![hint];
+        let bytes = sample.encode().unwrap();
+        assert_eq!(
+            &bytes[HEADER_BYTES + 4..HEADER_BYTES + 8],
+            &[
+                0x55,
+                0x0A | ((color as u8 & 15) << 4),
+                (color >> 4) as u8,
+                0
+            ]
+        );
+        assert_eq!(Frame::decode(&bytes).unwrap(), sample);
+    }
+    for color in 19..32u32 {
+        assert!(
+            Hint::from_visual(
+                index(0),
+                Kind::Connector,
+                Some(color << 12),
+                false,
+                None,
+                None
+            )
+            .is_err()
+        );
+    }
+    for bit in 17..32 {
+        assert!(
+            Hint::from_visual(index(0), Kind::Connector, Some(1 << bit), false, None, None)
+                .is_err()
+        );
+    }
+}

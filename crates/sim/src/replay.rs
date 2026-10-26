@@ -12,7 +12,9 @@ pub use codec::Archive;
 pub const WINDOW_NS: u64 = 10_000_000_000;
 pub const MAX_CELLS: usize = 256;
 pub const MAX_FLOWS: usize = 32;
-pub const DEFAULT_STEPS: usize = 512;
+// A 20 Hz session also records reconciliation steps. The 10 s window must
+// retain several replays per authority tick, rather than only the forward 200.
+pub const DEFAULT_STEPS: usize = 2048;
 pub const MAX_STEPS: usize = 4096;
 pub const MAX_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
 const TABLE: usize = MAX_CELLS * 2;

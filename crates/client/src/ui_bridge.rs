@@ -44,7 +44,11 @@ pub fn apply_key(
         view.clear_keys();
     }
     if let Some((key, down)) = route.world {
-        view.set_key(key, down);
+        if key == InputKey::ToolMode {
+            view.set_tool_mode_key(down, modifiers.shift);
+        } else {
+            view.set_key(key, down);
+        }
     }
     route.captured
 }
@@ -61,6 +65,7 @@ fn world_key(action: bindings::Action) -> Option<InputKey> {
         A::Flight => InputKey::Flight,
         A::DebugFlight => InputKey::Noclip,
         A::View => InputKey::Camera,
+        A::ToolMode => InputKey::ToolMode,
         _ => return None,
     })
 }
@@ -109,6 +114,7 @@ struct AuthorityStamp {
     session: Option<u64>,
     identity: Option<net::PlayerId>,
     inventory: Option<u64>,
+    item_attributes: Option<u64>,
     health_bits: u32,
     creative: bool,
     role: Role,
@@ -151,6 +157,9 @@ impl UiBridge {
             session: network.welcome().map(|welcome| welcome.session),
             identity: network.welcome().map(|welcome| welcome.identity),
             inventory: network.inventory().map(|v| v.revision()),
+            item_attributes: network
+                .item_attributes()
+                .map(|attributes| attributes.inventory_revision),
             health_bits: player.map_or_else(
                 || {
                     network
@@ -209,11 +218,14 @@ impl UiBridge {
         if let Some(inventory) = network.inventory() {
             snapshot.inventory = *inventory.slots();
             snapshot.inventory_revision = inventory.revision();
+            snapshot.inventory_facts =
+                crate::ui_item_facts::project(network.item_attributes(), inventory);
             snapshot.selected = inventory.selected() as u8;
             snapshot.armor = inventory.armor().0;
         } else {
             snapshot.inventory = [rules::stack::ItemStack::EMPTY; 41];
             snapshot.inventory_revision = 0;
+            snapshot.inventory_facts = [None; 41];
             snapshot.selected = 0;
             snapshot.armor = 0;
         }

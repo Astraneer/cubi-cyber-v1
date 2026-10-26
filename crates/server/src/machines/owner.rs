@@ -23,6 +23,7 @@ impl MachineRuntime {
             network_orders: BTreeMap::new(),
             producers: BTreeMap::new(),
             configs: BTreeMap::new(),
+            config_pages: BTreeMap::new(),
             phase_scratch: PhaseScratch::new(config.endpoints),
             transport: transport::TransportOwner::new(),
             topology_queue: topology_pending::new_queue()?,
@@ -180,6 +181,11 @@ impl MachineRuntime {
         for &config in &snapshot.configs {
             validate_config(config)?;
             runtime.configs.insert(config.position, config);
+            runtime
+                .config_pages
+                .entry(config.position.page())
+                .or_default()
+                .insert(config.position);
         }
         runtime.restore_dirty();
         Ok(runtime)

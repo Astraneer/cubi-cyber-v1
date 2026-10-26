@@ -27,6 +27,7 @@ pub struct EnvironmentProfile {
     pub celestials: Option<CelestialConfig>,
     pub aerial: Option<AerialConfig>,
     pub multiple_scattering: Option<MultipleScatteringConfig>,
+    pub directional_sky_bounce: bool,
     pub journal_rows_per_pump: usize,
     pub source_pages_per_pump: usize,
     pub source_reads_per_pump: u64,
@@ -45,6 +46,7 @@ impl Default for EnvironmentProfile {
             celestials: Some(CelestialConfig::default()),
             aerial: Some(AerialConfig::default()),
             multiple_scattering: Some(MultipleScatteringConfig::default()),
+            directional_sky_bounce: true,
             journal_rows_per_pump: 8192,
             source_pages_per_pump: 4,
             source_reads_per_pump: 131072,
@@ -113,6 +115,8 @@ pub struct ViewEnvironment {
     pub stats: EnvironmentStats,
     profile: EnvironmentProfile,
     source: Option<SourceOwner>,
+    gi_tick: Option<u64>,
+    gi_rays_left: u32,
 }
 impl ViewEnvironment {
     /// Call from the existing native loading worker or browser loading task.
@@ -167,11 +171,21 @@ impl ViewEnvironment {
         if let Some(config) = profile.aerial {
             gpu.prepare_aerial(device, queue, terrain, width, height, config, &mut budget)?;
         }
+        if profile.graphics.gi.is_some() && profile.directional_sky_bounce {
+            gpu.prepare_directional_gi(
+                device,
+                lighting
+                    .ok_or(EnvironmentError::MissingLighting)?
+                    .owner
+                    .shadows(),
+            )?;
+        }
         let source = if let Some(config) = profile.graphics.gi {
             Some(SourceOwner::new(
                 scene,
                 GiAlbedo::from_atlas(atlas)?,
                 config,
+                profile.directional_sky_bounce,
             )?)
         } else {
             None
@@ -184,6 +198,8 @@ impl ViewEnvironment {
             },
             profile,
             source,
+            gi_tick: None,
+            gi_rays_left: profile.gi_rays_per_tick,
         })
     }
     pub fn state(
@@ -251,7 +267,35 @@ impl ViewEnvironment {
         mode: CullingMode,
         state: EnvironmentState,
     ) -> bool {
-        self.gpu.needs_redraw(terrain, camera, mode, state)
+        self.gpu.needs_redraw_with_rays(
+            terrain,
+            camera,
+            mode,
+            state,
+            self.available_gi_rays(state.tick),
+        )
+    }
+    fn available_gi_rays(&self, tick: u64) -> u32 {
+        if self.gi_tick == Some(tick) {
+            self.gi_rays_left
+        } else {
+            self.profile.gi_rays_per_tick
+        }
+    }
+    pub fn scene_needed(
+        &self,
+        terrain: &TerrainGpu,
+        camera: &Camera,
+        mode: CullingMode,
+        state: EnvironmentState,
+    ) -> bool {
+        self.gpu.scene_needed_with_rays(
+            terrain,
+            camera,
+            mode,
+            state,
+            self.available_gi_rays(state.tick),
+        )
     }
     /// Use the remaining shared frame upload budget; this does not create a
     /// second independent 2-MiB allowance after terrain/source uploads.
@@ -275,7 +319,7 @@ impl ViewEnvironment {
             atmosphere_steps: self.profile.atmosphere_steps,
             water_reflection_steps: self.profile.water_reflection_steps,
             cloud_density_samples: self.profile.cloud_density_samples,
-            gi_rays: self.profile.gi_rays_per_tick,
+            gi_rays: self.available_gi_rays(state.tick),
             post_pixels: self.profile.post_pixels,
         };
         let work = self.gpu.encode(
@@ -289,6 +333,8 @@ impl ViewEnvironment {
             &mut budget,
             extra,
         )?;
+        self.gi_tick = Some(state.tick);
+        self.gi_rays_left = budget.gi_rays;
         upload.remaining_bytes = budget.upload_bytes;
         self.stats.gpu = work;
         self.stats.pending_probes = self.gpu.gi().map_or(0, GiGpu::pending);
@@ -355,6 +401,7 @@ impl SourceOwner {
         scene: &mut ClientScene,
         albedo: GiAlbedo,
         config: GiConfig,
+        directional: bool,
     ) -> Result<Self, ViewEnvironmentError> {
         let count = config
             .world_pages
@@ -363,6 +410,9 @@ impl SourceOwner {
             .ok_or(ViewEnvironmentError::InvalidConfig)?;
         let mut builder = GiSourceBuilder::new(albedo, count)?;
         builder.set_sky_ambient([0.0; 3])?;
+        if directional {
+            builder.enable_directional();
+        }
         let mut slots = Vec::with_capacity(count);
         for y in 0..config.world_pages[1] {
             for z in 0..config.world_pages[2] {
@@ -819,6 +869,12 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn live_owner_bounds_journal_rows_publishes_complete_delta_and_never_generates_unknown() {
+        for directional in [false, true] {
+            live_owner_mode(directional);
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn live_owner_mode(directional: bool) {
         use crate::{SceneConfig, lighting::ClientLightingConfig};
         use core_types::Cell;
         use render::{
@@ -936,6 +992,7 @@ mod tests {
                 ..EnvironmentConfig::default()
             },
             journal_rows_per_pump: 1,
+            directional_sky_bounce: directional,
             ..EnvironmentProfile::default()
         };
         let mut view = ViewEnvironment::prepare(
@@ -961,6 +1018,10 @@ mod tests {
         assert!(bootstrap.source_ready);
         assert_eq!(bootstrap.source_pages, 2);
         assert_eq!(bootstrap.source_reads, 8198);
+        assert_eq!(
+            bootstrap.source_upload_bytes,
+            2 * if directional { 213088 } else { 16480 }
+        );
         let page = stone.page();
         let initial = view
             .gpu
@@ -997,8 +1058,137 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first.gi.updated_probes, 2);
+        let reflected = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("live World directional/RGB source proof"),
+            size: 256,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(view.gpu.gi().unwrap().probe_buffer(), 0, &reflected, 0, 256);
         gpu.queue.submit([encoder.finish()]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        reflected
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |value| {
+                sender.send(value).unwrap()
+            });
         gpu.device.poll(wgpu::PollType::Wait).unwrap();
+        receiver.recv().unwrap().unwrap();
+        let bytes = reflected.slice(..).get_mapped_range();
+        let channel = |offset| f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        assert!(
+            channel(48) > 0. || channel(176) > 0.,
+            "actual World RGB must reach GPU probes"
+        );
+        assert_eq!((channel(16), channel(144)), (0., 0.));
+        drop(bytes);
+        reflected.unmap();
+        assert_eq!(view.gpu.gi().unwrap().pending(), 0);
+        let mut night = ViewEnvironment::state(eye, 0., 1. / 60., Tick(2), sun, false);
+        night.sun_intensity = 0.;
+        for shadow_revision in [0, 1] {
+            view.gpu.set_shadow_revision(shadow_revision);
+            if directional {
+                assert!(view.gpu.scene_needed(
+                    &terrain,
+                    &camera,
+                    CullingMode::FrustumAndHiZ,
+                    night
+                ));
+            }
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            let relit = view
+                .encode(
+                    &gpu.queue,
+                    &mut encoder,
+                    &mut terrain,
+                    &output.create_view(&Default::default()),
+                    &camera,
+                    CullingMode::FrustumAndHiZ,
+                    night,
+                    &mut budget,
+                    |_| 0,
+                )
+                .unwrap();
+            assert_eq!(relit.gi.updated_probes, if directional { 2 } else { 0 });
+            gpu.queue.submit([encoder.finish()]);
+            assert_eq!(
+                view.gpu
+                    .gi()
+                    .unwrap()
+                    .source_page_version([page.x, page.y, page.z])
+                    .unwrap(),
+                initial,
+                "solar/shadow invalidation must not republish CPU sources"
+            );
+        }
+        if directional {
+            assert_eq!(
+                view.available_gi_rays(night.tick),
+                0,
+                "two batches already consumed152 rays in this tick"
+            );
+            view.gpu.set_shadow_revision(2);
+            assert!(!view.scene_needed(&terrain, &camera, CullingMode::FrustumAndHiZ, night));
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            let deferred = view
+                .encode(
+                    &gpu.queue,
+                    &mut encoder,
+                    &mut terrain,
+                    &output.create_view(&Default::default()),
+                    &camera,
+                    CullingMode::FrustumAndHiZ,
+                    night,
+                    &mut budget,
+                    |_| 0,
+                )
+                .unwrap();
+            assert_eq!(deferred.gi.rays, 0);
+            assert_eq!(deferred.terrain.passes, 0);
+            assert_eq!(view.gpu.gi().unwrap().pending(), 2);
+            gpu.queue.submit([encoder.finish()]);
+            assert!(!view.needs_redraw(&terrain, &camera, CullingMode::FrustumAndHiZ, night));
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            let idle = view
+                .encode(
+                    &gpu.queue,
+                    &mut encoder,
+                    &mut terrain,
+                    &output.create_view(&Default::default()),
+                    &camera,
+                    CullingMode::FrustumAndHiZ,
+                    night,
+                    &mut budget,
+                    |_| 0,
+                )
+                .unwrap();
+            assert_eq!(idle.gi.updated_probes, 0);
+            assert_eq!(idle.passes, 0);
+            gpu.queue.submit([encoder.finish()]);
+            let next = EnvironmentState {
+                tick: night.tick + 1,
+                ..night
+            };
+            assert!(view.needs_redraw(&terrain, &camera, CullingMode::FrustumAndHiZ, next));
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            let resumed = view
+                .encode(
+                    &gpu.queue,
+                    &mut encoder,
+                    &mut terrain,
+                    &output.create_view(&Default::default()),
+                    &camera,
+                    CullingMode::FrustumAndHiZ,
+                    next,
+                    &mut budget,
+                    |_| 0,
+                )
+                .unwrap();
+            assert_eq!(resumed.gi.rays, 76);
+            assert_eq!(view.gpu.gi().unwrap().pending(), 0);
+            gpu.queue.submit([encoder.finish()]);
+        }
         let above = BlockPos {
             y: stone.y + 1,
             ..stone
@@ -1037,7 +1227,7 @@ mod tests {
         assert!(current.source_ready);
         assert_eq!(
             (current.source_reads, current.source_upload_bytes),
-            (13, 124)
+            (13, if directional { 460 } else { 124 })
         );
         let known_pages = scene.world().loaded_pages();
         let moved = [1000.5, 10.5, 14.5];
@@ -1068,7 +1258,8 @@ mod tests {
             CursorError::UnknownCursor
         );
         println!(
-            "M10_VIEW_OWNER_GPU_OK bootstrap_pages=2 bootstrap_reads=8198 journal_limit=1 incomplete_publications=0 partial_reads=13 partial_upload_bytes=124 initial_gpu_probes=2 recenter_unknown_generation=0 detach_cursor_released=true"
+            "M10_VIEW_OWNER_GPU_OK directional={directional} bootstrap_pages=2 bootstrap_reads=8198 journal_limit=1 incomplete_publications=0 partial_reads=13 partial_upload_bytes={} initial_gpu_probes=2 recenter_unknown_generation=0 detach_cursor_released=true",
+            if directional { 460 } else { 124 }
         );
     }
 }

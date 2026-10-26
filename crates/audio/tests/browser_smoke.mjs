@@ -32,6 +32,9 @@ try {await withBrowser({width:640,height:320,path:'/audio-test.html'},async({cal
   const minecraftSummary=JSON.parse(await waitFor('window.__AUDIO.local_resource_summary()',s=>JSON.parse(s).revision===2));assert.equal(minecraftSummary.files,2,'Accounts/non-sound objects entered local asset store');assert.equal(minecraftSummary.sounds,1);
   await pause(500);assert.equal(requests.length,0,`Import attempted network I/O: ${JSON.stringify(requests)}`);assert(!requests.some(v=>v.url.includes(canary)||v.body.includes(canary)));offChooser();offNetwork();
   const complete=new Promise(resolve=>{const off=onEvent('Tracing.tracingComplete',result=>{off();resolve(result);});});
+  // Both real picker clicks preceded AudioContext.resume; preserve the browser's
+  // gesture requirement instead of enabling autoplay through a launch flag.
+  const loops=JSON.parse(await evaluate('window.__AUDIO.audio_loop_lifecycle_oracle()'));assert(loops.sameNodeOnRefresh&&loops.recoveredAfterStop&&loops.recoveredAfterEviction&&loops.bankControlsPreserved&&loops.staleHandlesRejected);assert.equal(loops.loopUpdates,1);assert.equal(loops.started,5);assert.equal(loops.hardwareAudibility,false);
   await call('Tracing.start',{transferMode:'ReturnAsStream',categories:'audio,webaudio,disabled-by-default-audio,blink.user_timing,toplevel',options:'record-as-much-as-possible,enable-sampling'});
   const live=JSON.parse(await evaluate('window.__AUDIO.start_audio_benchmark(false,64)'));assert(live.running);assert.equal(live.voices,64);await pause(300);
   await evaluate("performance.mark('m12-plain-start')");await pause(1000);await evaluate("performance.mark('m12-plain-end')");
@@ -56,6 +59,6 @@ try {await withBrowser({width:640,height:320,path:'/audio-test.html'},async({cal
   timing.isolatedConvolverCpuMeasured=false;
   timing.h8Accepted=false;
   await writeFile(join(artifacts,'audio-cpu-trace.json'),raw);
-  const result={oracle,privacy:{files:imported.files,bytes:imported.bytes,minecraft:minecraftSummary,outgoingRequests:requests.length,actualFilePicker:true,actualDirectoryPicker:true,accountFilesExcluded:true},timing};await writeFile(join(artifacts,'m12-audio-smoke.json'),JSON.stringify(result,null,2)+'\n');
+  const result={oracle,loops,privacy:{files:imported.files,bytes:imported.bytes,minecraft:minecraftSummary,outgoingRequests:requests.length,actualFilePicker:true,actualDirectoryPicker:true,accountFilesExcluded:true},timing};await writeFile(join(artifacts,'m12-audio-smoke.json'),JSON.stringify(result,null,2)+'\n');
   console.log(`AUDIO_BROWSER_OK ${JSON.stringify(result)}`);
 });} finally {await rm(fixture,{force:true});await rm(join(minecraft,'..'),{recursive:true,force:true});}

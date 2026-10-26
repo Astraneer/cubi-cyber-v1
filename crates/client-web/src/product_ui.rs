@@ -34,6 +34,7 @@ pub struct ProductUi {
     sounds: client::audio_bridge::PredictionSounds,
     block_sounds: client::audio_bridge::ConfirmedBlockSounds,
     entity_sounds: client::audio_bridge::EntitySounds,
+    machine_sounds: client::audio_bridge::MachineSounds,
 }
 fn preferences_storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok().flatten()
@@ -80,6 +81,7 @@ impl ProductUi {
             sounds: client::audio_bridge::PredictionSounds::default(),
             block_sounds: Default::default(),
             entity_sounds: Default::default(),
+            machine_sounds: Default::default(),
         };
         result.apply_sound()?;
         Ok(result)
@@ -102,6 +104,16 @@ impl ProductUi {
             self.audio.output().volume(Some(category), gain)?;
         }
         Ok(())
+    }
+    pub fn replace_sounds(&mut self, prepared: PreparedSounds) -> Result<(), JsValue> {
+        self.audio.replace_bank(prepared)?;
+        // The replacement dropped the old loop voices. Rediscover only the
+        // still-confirmed public emitters on the next authority update.
+        self.machine_sounds.clear(|_| {});
+        Ok(())
+    }
+    pub fn machine_loops(&self) -> usize {
+        self.machine_sounds.active()
     }
     pub fn gesture(&mut self) {
         if let Ok(promise) = self.audio.output().resume_request() {
@@ -137,6 +149,31 @@ impl ProductUi {
     }
     pub fn sync(&mut self, network: &Connection, view: &ClientView) -> Result<(), JsValue> {
         self.block_sounds.observe(network);
+        if let (Some(welcome), Some(player), Some(source)) =
+            (network.welcome(), network.player(), view.props_source())
+        {
+            self.machine_sounds.set_time(network.acknowledged_tick());
+            self.machine_sounds.visit(
+                welcome.session,
+                &view.scene,
+                source,
+                player.eye(1.0),
+                |command| match command {
+                    client::audio_bridge::MachineCommand::Start(cue) => {
+                        let _ = self.audio.event_gain(
+                            cue.event,
+                            cue.emitter,
+                            Some(cue.position),
+                            cue.seed,
+                            cue.gain,
+                        );
+                    }
+                    client::audio_bridge::MachineCommand::Stop(emitter) => {
+                        let _ = self.audio.forget_emitter(emitter);
+                    }
+                },
+            );
+        }
         if let Some(player) = network.player() {
             self.entity_sounds.visit(network, player.eye(1.0), |cue| {
                 let _ = self.audio.event_gain(
@@ -203,6 +240,11 @@ impl ProductUi {
         self.layer.app.open(Screen::Loading);
     }
     pub fn disconnected(&mut self, message: &str) {
+        self.machine_sounds.clear(|command| {
+            if let client::audio_bridge::MachineCommand::Stop(emitter) = command {
+                let _ = self.audio.forget_emitter(emitter);
+            }
+        });
         self.block_sounds.clear();
         self.entity_sounds.clear();
         self.ready_world = false;

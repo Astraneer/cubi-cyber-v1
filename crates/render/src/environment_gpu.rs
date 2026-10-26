@@ -169,6 +169,7 @@ pub struct EnvironmentGpu {
     output_revision: u64,
     last_delta: f32,
     last_gi_attempt: Option<(u64, u32)>,
+    directional_light: Option<(AtmosphereState, f32, u64)>,
     last_work: EnvironmentWork,
     startup_pipeline_compilations: u32,
 }
@@ -269,6 +270,9 @@ impl EnvironmentGpu {
                 .as_ref()
                 .map_or(0, |clouds| clouds.startup_work().pipeline_compilations)
             + u32::from(gi.is_some()) * 2;
+        if let Some(water) = &mut water {
+            water.set_surface_enabled(false);
+        }
         Ok(Self {
             config,
             atmosphere,
@@ -296,6 +300,7 @@ impl EnvironmentGpu {
             output_revision: 0,
             last_delta: 1. / 60.,
             last_gi_attempt: None,
+            directional_light: None,
             last_work: EnvironmentWork::default(),
             startup_pipeline_compilations,
         })
@@ -556,6 +561,22 @@ impl EnvironmentGpu {
     pub fn atmosphere(&self) -> &AtmosphereGpu {
         &self.atmosphere
     }
+    /// Loading-only first bounce using the same atmosphere and cached cascades.
+    pub fn prepare_directional_gi(
+        &mut self,
+        device: &wgpu::Device,
+        shadows: &ShadowGpu,
+    ) -> Result<(), EnvironmentError> {
+        if self.encoded {
+            return Err(EnvironmentError::Terrain(TerrainError::LatePreparation));
+        }
+        self.gi
+            .as_mut()
+            .ok_or(EnvironmentError::InvalidState)?
+            .prepare_directional(device, &self.atmosphere, shadows)?;
+        self.startup_pipeline_compilations += 2;
+        Ok(())
+    }
     pub fn atmosphere_lighting_buffer(&self) -> &wgpu::Buffer {
         self.atmosphere.lighting_buffer()
     }
@@ -582,6 +603,9 @@ impl EnvironmentGpu {
             self.water_cover_ready = ready;
             terrain.invalidate();
         }
+        if let Some(water) = &mut self.water {
+            water.set_surface_enabled(ready);
+        }
         Ok(())
     }
     fn water_state(
@@ -600,7 +624,7 @@ impl EnvironmentGpu {
             },
             sun: state.sun,
             sun_intensity: state.sun_intensity * crate::atmosphere::SOLAR_IRRADIANCE,
-            underwater: state.underwater,
+            underwater: state.underwater && self.water_cover_ready,
             scene_revision,
         }
     }
@@ -629,8 +653,19 @@ impl EnvironmentGpu {
     }
     fn gi_pending(&self, state: EnvironmentState) -> bool {
         self.gi.as_ref().is_some_and(|gi| {
-            gi.pending() > 0 && self.last_gi_attempt != Some((state.tick, gi.source_revision()))
+            self.directional_light_changed(state)
+                || (gi.pending() > 0
+                    && self.last_gi_attempt != Some((state.tick, gi.source_revision())))
         })
+    }
+    fn directional_light_changed(&self, state: EnvironmentState) -> bool {
+        self.gi.as_ref().is_some_and(|gi| gi.directional_enabled())
+            && self.directional_light
+                != Some((
+                    state.atmosphere(),
+                    state.sun_intensity,
+                    self.shadow_revision,
+                ))
     }
     /// Predict color-scene work before preparing optional model culling.
     /// GI prediction assumes the configured frame budget can update one probe.
@@ -641,7 +676,22 @@ impl EnvironmentGpu {
         mode: CullingMode,
         state: EnvironmentState,
     ) -> bool {
-        self.scene_needed_with_gi(terrain, camera, mode, state, self.gi_pending(state))
+        self.scene_needed_with_rays(terrain, camera, mode, state, u32::MAX)
+    }
+    pub fn scene_needed_with_rays(
+        &self,
+        terrain: &TerrainGpu,
+        camera: &Camera,
+        mode: CullingMode,
+        state: EnvironmentState,
+        gi_rays: u32,
+    ) -> bool {
+        let gi_planned = self.gi_pending(state)
+            && self
+                .gi
+                .as_ref()
+                .is_some_and(|gi| gi_rays >= gi.config().rays_per_probe + 6);
+        self.scene_needed_with_gi(terrain, camera, mode, state, gi_planned)
     }
     fn scene_needed_with_gi(
         &self,
@@ -667,7 +717,17 @@ impl EnvironmentGpu {
         mode: CullingMode,
         state: EnvironmentState,
     ) -> bool {
-        self.scene_needed(terrain, camera, mode, state)
+        self.needs_redraw_with_rays(terrain, camera, mode, state, u32::MAX)
+    }
+    pub fn needs_redraw_with_rays(
+        &self,
+        terrain: &TerrainGpu,
+        camera: &Camera,
+        mode: CullingMode,
+        state: EnvironmentState,
+        gi_rays: u32,
+    ) -> bool {
+        self.scene_needed_with_rays(terrain, camera, mode, state, gi_rays)
             || self.water.as_ref().is_some_and(|water| {
                 water.needs_redraw(self.water_state(*camera, state, terrain.hdr_revision()))
             })
@@ -703,7 +763,7 @@ impl EnvironmentGpu {
         if !state.valid() || camera.inverse_view_projection().is_none() {
             return Err(EnvironmentError::InvalidState);
         }
-        if !self.needs_redraw(terrain, camera, mode, state) {
+        if !self.needs_redraw_with_rays(terrain, camera, mode, state, budget.gi_rays) {
             return Ok(self.last_work);
         }
         let atmosphere_work = self
@@ -711,17 +771,32 @@ impl EnvironmentGpu {
             .pending_work_for(state.atmosphere(), state.sun_intensity)?;
         let atmosphere_changed =
             self.atmosphere_state != state.atmosphere() || self.solar_scale != state.sun_intensity;
+        let directional_changed = self.directional_light_changed(state);
+        let relight_bytes = if directional_changed {
+            self.gi
+                .as_ref()
+                .expect("directional GI")
+                .lighting_change_upload_bytes()?
+        } else {
+            0
+        };
         let gi_plan = self
             .gi
             .as_ref()
             .filter(|gi| {
-                gi.pending() > 0 && self.last_gi_attempt != Some((state.tick, gi.source_revision()))
+                directional_changed
+                    || (gi.pending() > 0
+                        && self.last_gi_attempt != Some((state.tick, gi.source_revision())))
             })
             .map_or(0, |gi| {
                 let config = self.config.gi.expect("configured GI");
-                gi.pending()
-                    .min(config.max_jobs)
-                    .min(budget.gi_rays / (config.rays_per_probe + 6))
+                (if directional_changed {
+                    gi.probe_count() as u32
+                } else {
+                    gi.pending()
+                })
+                .min(config.max_jobs)
+                .min(budget.gi_rays / (config.rays_per_probe + 6))
             });
         let scene_needed = self.scene_needed_with_gi(terrain, camera, mode, state, gi_plan > 0);
         let water_state = self.water_state(
@@ -789,6 +864,7 @@ impl EnvironmentGpu {
             + u64::from(delta_changed) * 64
             + u64::from(scene_needed) * 256
             + u64::from(gi_plan) * 16
+            + relight_bytes
             + celestial_upload
             + aerial_plan.upload_bytes;
         if parameter_bytes > budget.upload_bytes {
@@ -809,9 +885,23 @@ impl EnvironmentGpu {
         };
         self.atmosphere_state = state.atmosphere();
         self.solar_scale = state.sun_intensity;
+        if directional_changed {
+            if let Some(gi) = &mut self.gi {
+                work.gi.upload_bytes = gi.invalidate_lighting(queue, state.tick, &mut upload)?;
+            }
+            self.directional_light = Some((
+                state.atmosphere(),
+                state.sun_intensity,
+                self.shadow_revision,
+            ));
+            self.last_gi_attempt = None;
+        }
         if gi_plan > 0 {
             let gi = self.gi.as_mut().expect("planned GI");
-            work.gi = gi.trace_tick(queue, encoder, state.tick, &mut upload, &mut budget.gi_rays);
+            let mut traced =
+                gi.trace_tick(queue, encoder, state.tick, &mut upload, &mut budget.gi_rays);
+            traced.upload_bytes += work.gi.upload_bytes;
+            work.gi = traced;
             self.last_gi_attempt = Some((state.tick, gi.source_revision()));
         }
         if work.atmosphere.passes > 0 || work.gi.updated_probes > 0 {

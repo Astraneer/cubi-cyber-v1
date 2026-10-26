@@ -93,6 +93,77 @@ fn commit(world: &mut World, runtime: &mut MobRuntime, plan: entities::PhasePlan
 }
 
 #[test]
+fn exhausted_cell_budget_preserves_unvisited_cursor_and_same_tick_retry_updates_each_body_once() {
+    let mut world = scene();
+    let mut runtime = MobRuntime::new(config(8)).unwrap();
+    for id in 1..=8 {
+        runtime
+            .insert_initial(
+                Mob::new(EntityId(id), MobKind::Pig, [id as f64 * 1.5, 1., 3.5]).unwrap(),
+                true,
+            )
+            .unwrap();
+    }
+    let tiny = runtime
+        .plan_tick(
+            &world,
+            Tick(1),
+            &[],
+            Budget {
+                actors: 8,
+                cells: 1,
+                ..Budget::default()
+            },
+        )
+        .unwrap();
+    assert!(tiny.work.budget_exhausted);
+    assert_eq!(tiny.work.visited, 0);
+    assert_eq!(
+        tiny.work.waiting_world, 0,
+        "quota pressure is distinct from actual Unknown cells"
+    );
+    assert!(
+        tiny.delta.is_empty(),
+        "no actor or cursor state is consumed without completing a plan"
+    );
+    assert!(runtime.entities().rows().iter().all(|mob| mob.age == 0));
+    let complete = runtime
+        .plan_tick(
+            &world,
+            Tick(1),
+            &[],
+            Budget {
+                actors: 8,
+                ..Budget::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(complete.work.visited, 8);
+    commit(&mut world, &mut runtime, complete);
+    assert!(
+        runtime
+            .entities()
+            .rows()
+            .iter()
+            .all(|mob| mob.age == 1 && mob.last_tick == Tick(1))
+    );
+    let repeat = runtime
+        .plan_tick(
+            &world,
+            Tick(1),
+            &[],
+            Budget {
+                actors: 8,
+                ..Budget::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(repeat.work.visited, 8);
+    assert_eq!(repeat.work.actors, 0);
+    assert!(repeat.delta.is_empty());
+}
+
+#[test]
 fn real_owner_zombie_uses_worker_path_moves_and_attacks_static_player() {
     let mut world = scene();
     let mut runtime = MobRuntime::new(config(10)).unwrap();

@@ -240,6 +240,7 @@ impl NativeState {
             scene: client::remote::RemoteSession::scene_config(),
             raster: self.raster,
             entities: true,
+            props: true,
             lighting: Some(loading::product_lighting()),
             materials: true,
             environment: true,
@@ -374,6 +375,7 @@ impl NativeState {
                     },
                     raster,
                     entities: true,
+                    props: mode == SceneMode::Product,
                     lighting: (mode == SceneMode::Product).then(loading::product_lighting),
                     materials: mode == SceneMode::Product,
                     environment: mode == SceneMode::Product,
@@ -1177,6 +1179,7 @@ fn input_key(code: KeyCode) -> Option<InputKey> {
         KeyCode::ShiftLeft | KeyCode::ShiftRight => InputKey::Sneak,
         KeyCode::KeyF => InputKey::Flight,
         KeyCode::KeyH => InputKey::Noclip,
+        KeyCode::KeyN => InputKey::ToolMode,
         KeyCode::KeyV => InputKey::Camera,
         _ => return None,
     })

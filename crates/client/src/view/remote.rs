@@ -10,6 +10,7 @@ pub struct RemoteInput {
     pub yaw: f32,
     pub pitch: f32,
     pub placing: bool,
+    pub place_pressed: bool,
 }
 impl ClientView {
     pub fn authoritative_remote(&self) -> bool {
@@ -39,10 +40,23 @@ impl ClientView {
             yaw,
             pitch,
             placing: self.keys[InputKey::Place as usize],
+            place_pressed: self.place_pressed,
         }
+    }
+    /// A short mouse click survives keyup and one transport sampling boundary.
+    /// Held repetition remains an independent level-triggered input.
+    pub fn take_remote_input(&mut self) -> RemoteInput {
+        let input = self.remote_input();
+        self.place_pressed = false;
+        input
     }
     pub fn take_remote_control(&mut self) -> Option<InputKey> {
         self.remote_controls.pop_front()
+    }
+    /// Direction is captured on N's rising edge, so a quick Shift+N remains
+    /// backward even if both keys are released before network sampling.
+    pub fn take_remote_tool_mode(&mut self) -> Option<bool> {
+        self.remote_tool_modes.pop_front()
     }
     pub fn install_remote_player(
         &mut self,

@@ -1037,6 +1037,9 @@ impl TerrainGpu {
             max_quads: self.config.max_quads,
         }
     }
+    pub fn extent(&self) -> [u32; 2] {
+        [self.width, self.height]
+    }
 
     /// Diagnostic readback of minimum opaque reverse-Z depth across all MSAA samples.
     /// Valid after a submitted `FrustumAndHiZ` frame; mip zero is padded to powers of two.

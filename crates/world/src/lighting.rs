@@ -395,6 +395,8 @@ impl Frontier {
 struct PageSeed {
     page: PageId,
     whole: bool,
+    top: bool,
+    halo: bool,
     next: usize,
     queued_at: Tick,
     priority: LightPriority,
@@ -466,6 +468,25 @@ impl LightingEngine {
         priority: LightPriority,
     ) -> Result<(), LightingBackpressure> {
         self.queue_page_kind(page, true, tick, priority)
+    }
+    /// A changed external sky certificate can affect only cells directly below
+    /// Unknown: inside a resident page this is its top256cells. Interior changes
+    /// propagate through the ordinary retained frontier, including re-addition.
+    pub fn queue_sky_boundary_page(
+        &mut self,
+        page: PageId,
+        tick: Tick,
+        priority: LightPriority,
+    ) -> Result<(), LightingBackpressure> {
+        self.queue_seed(PageSeed {
+            page,
+            whole: false,
+            top: true,
+            halo: false,
+            next: 0,
+            queued_at: tick,
+            priority,
+        })
     }
     pub fn queue_cell(
         &mut self,
@@ -668,7 +689,7 @@ impl LightingEngine {
             return Err(LightingError::TickWentBackwards);
         }
         let mut work = LightWork::default();
-        let mut backpressure = self.pump_seeds(world, budget.max_seed_cells, &mut work)?;
+        let mut backpressure = self.pump_seeds(world, tick, budget.max_seed_cells, &mut work)?;
         let mut overlay = BTreeMap::<BlockPos, LightSample>::new();
         let mut undo = Vec::new();
         let mut active_space = None;
@@ -844,6 +865,7 @@ impl LightingEngine {
     fn pump_seeds(
         &mut self,
         world: &World,
+        tick: Tick,
         budget: u64,
         work: &mut LightWork,
     ) -> Result<bool, LightingError> {
@@ -851,7 +873,17 @@ impl LightingEngine {
             let Some(key) = self
                 .seeds
                 .values()
-                .min_by_key(|seed| (seed.priority, seed.queued_at, seed.page))
+                .min_by_key(|seed| {
+                    let aged = tick.0.saturating_sub(seed.queued_at.0)
+                        >= self.limits.max_queue_age_ticks / 2;
+                    (
+                        if aged { 0 } else { seed.priority.index() + 1 },
+                        if aged { seed.queued_at } else { Tick(0) },
+                        std::cmp::Reverse(seed.page.y),
+                        seed.queued_at,
+                        seed.page,
+                    )
+                })
                 .map(|seed| seed.page)
             else {
                 break;
@@ -959,26 +991,30 @@ impl LightingEngine {
         tick: Tick,
         priority: LightPriority,
     ) -> Result<(), LightingBackpressure> {
-        if let Some(seed) = self.seeds.get_mut(&page) {
-            seed.whole |= whole;
+        self.queue_seed(PageSeed {
+            page,
+            whole,
+            top: false,
+            halo: true,
+            next: 0,
+            queued_at: tick,
+            priority,
+        })
+    }
+    fn queue_seed(&mut self, incoming: PageSeed) -> Result<(), LightingBackpressure> {
+        if let Some(seed) = self.seeds.get_mut(&incoming.page) {
+            seed.whole |= incoming.whole;
+            seed.top |= incoming.top;
+            seed.halo |= incoming.halo;
             seed.next = 0;
-            seed.queued_at = Tick(seed.queued_at.0.min(tick.0));
-            seed.priority = seed.priority.min(priority);
+            seed.queued_at = Tick(seed.queued_at.0.min(incoming.queued_at.0));
+            seed.priority = seed.priority.min(incoming.priority);
             return Ok(());
         }
         if self.seeds.len() >= self.limits.max_seed_pages {
             return Err(LightingBackpressure::SeedPagesFull);
         }
-        self.seeds.insert(
-            page,
-            PageSeed {
-                page,
-                whole,
-                next: 0,
-                queued_at: tick,
-                priority,
-            },
-        );
+        self.seeds.insert(incoming.page, incoming);
         Ok(())
     }
 }
@@ -1061,16 +1097,26 @@ enum SeedPosition {
     Cell(BlockPos),
 }
 fn page_seed_position(seed: PageSeed) -> Result<SeedPosition, LightingError> {
-    let own = if seed.whole { PAGE_VOLUME } else { 0 };
+    let own = if seed.whole {
+        PAGE_VOLUME
+    } else if seed.top {
+        256
+    } else {
+        0
+    };
     if seed.next < own {
-        return cell_position(
-            seed.page,
-            LocalIdx::new(seed.next as u16).expect("page range"),
-        )
-        .map(SeedPosition::Cell);
+        let local = if seed.whole {
+            // Seed the sky-facing row before lower rows, without omitting any
+            // interior emitter or previously stored light during recovery.
+            seed.next ^ (15 * 256)
+        } else {
+            seed.next % 16 + 16 * (seed.next / 16 + 16 * 15)
+        };
+        return cell_position(seed.page, LocalIdx::new(local as u16).expect("page range"))
+            .map(SeedPosition::Cell);
     }
     let face_index = seed.next - own;
-    if face_index >= 6 * 256 {
+    if !seed.halo || face_index >= 6 * 256 {
         return Ok(SeedPosition::End);
     }
     let face = face_index / 256;

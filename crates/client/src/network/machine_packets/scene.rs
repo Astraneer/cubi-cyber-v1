@@ -167,15 +167,43 @@ impl PacketScene {
         origin: [i64; 3],
         out: &mut [Instance],
     ) -> Result<usize, Error> {
+        self.instances_filtered(tick, alpha, origin, &|_, _, _| true, out)
+    }
+    /// Render only values still certified by the current public raw view.
+    pub fn instances_filtered(
+        &self,
+        tick: Tick,
+        alpha: f64,
+        origin: [i64; 3],
+        permitted: &impl Fn(PageId, Version, core_types::LocalIdx) -> bool,
+        out: &mut [Instance],
+    ) -> Result<usize, Error> {
         if !alpha.is_finite() {
             return Err(Error::Time);
         }
-        if out.len() < self.visible {
+        let allowed = |winner: &Winner| {
+            winner
+                .page
+                .zip(winner.pose)
+                .and_then(|(page, pose)| {
+                    self.pages
+                        .get(&page)
+                        .and_then(|p| p.view_version)
+                        .map(|view| (page, pose, view))
+                })
+                .filter(|(page, pose, view)| permitted(*page, *view, pose.index))
+        };
+        let visible = self
+            .winners
+            .values()
+            .filter(|winner| allowed(winner).is_some())
+            .count();
+        if out.len() < visible {
             return Err(Error::Capacity);
         }
         let mut count = 0;
         for winner in self.winners.values() {
-            if let Some((page, pose)) = winner.page.zip(winner.pose) {
+            if let Some((page, pose, _)) = allowed(winner) {
                 out[count] = instance_for(pose, page, tick, alpha, origin);
                 count += 1;
             }

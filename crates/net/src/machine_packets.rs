@@ -130,7 +130,10 @@ impl Frame {
         {
             return Err(Error::Bounds);
         }
-        if self.revision == 0 || self.base.is_some_and(|b| b == 0 || b >= self.revision) {
+        if self.view_version.0 == 0
+            || self.revision == 0
+            || self.base.is_some_and(|b| b == 0 || b >= self.revision)
+        {
             return Err(Error::Revision);
         }
         if self.base.is_none() && !self.removes.is_empty()
@@ -305,6 +308,9 @@ impl Request {
         };
         if !valid_page(page) {
             return Err(Error::Bounds);
+        }
+        if version.0 == 0 {
+            return Err(Error::Revision);
         }
         let mut bytes = Vec::with_capacity(37);
         bytes.extend_from_slice(b"MPQ1");

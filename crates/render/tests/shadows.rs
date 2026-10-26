@@ -8,6 +8,8 @@ use render::{
     terrain_gpu::{AtlasImage, GpuConfig, PageHandle, TerrainGpu, UploadBudget, translation},
     terrain_mesh::{CellMaterial, MeshScratch, PageHalo, PageMesh, mesh_page},
 };
+#[path = "common/h5_route.rs"]
+mod h5_route;
 #[global_allocator]
 static ALLOCATOR: telemetry::CountingAllocator<std::alloc::System> =
     telemetry::CountingAllocator::new(std::alloc::System);
@@ -359,10 +361,13 @@ struct ReceiverProbe {
 }
 impl ReceiverProbe {
     fn new(gpu: &render::Gpu, shadow: &ShadowGpu) -> Self {
+        Self::at_height(gpu, shadow, 0.)
+    }
+    fn at_height(gpu: &render::Gpu, shadow: &ShadowGpu, height: f32) -> Self {
         let shader=gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor{label:Some("fixed world receivers shadow temporal oracle"),source:wgpu::ShaderSource::Wgsl(format!("{}\n{}",include_str!("../src/shadow_sampling.wgsl"),r#"
 @vertex fn vertex(@builtin(vertex_index)i:u32)->@builtin(position)vec4<f32>{let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));return vec4(p[i],0.,1.);}
-@fragment fn fragment(@builtin(position)p:vec4<f32>)->@location(0)vec4<f32>{let receiver=vec3(-4.+p.x*0.1875,0.,-4.+p.y*0.1875);let shadow=cascade_shadow(receiver,vec3(0.,1.,0.));return vec4(vec3(shadow),1.);}
-"#).into())});
+@fragment fn fragment(@builtin(position)p:vec4<f32>)->@location(0)vec4<f32>{let receiver=vec3(-4.+p.x*0.1875,__HEIGHT__,-4.+p.y*0.1875);let shadow=cascade_shadow(receiver,vec3(0.,1.,0.));return vec4(vec3(shadow),1.);}
+"#.replace("__HEIGHT__",&format!("{height:.6}"))).into())});
         let layout = gpu
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1090,6 +1095,8 @@ fn shadow_queries_measure_actual_static_passes_and_static_cache_has_zero_queries
         assert_eq!(&graph.kinds[..6], &[1, 2, 1, 2, 1, 2]);
         assert!(graph.has_timestamps);
         shadow.copy_timestamps_into(&mut encoder, &read, 0);
+        let source = shadow.timing_source().expect("whole graph timestamps");
+        encoder.copy_buffer_to_buffer(source.buffer, 0, &read, 6 * 16, 16);
         gpu.queue.submit([encoder.finish()]);
         let bytes = read_buffer(&gpu, &read);
         let mut ns = 0u64;
@@ -1100,12 +1107,19 @@ fn shadow_queries_measure_actual_static_passes_and_static_cache_has_zero_queries
             ns += b - a;
         }
         assert!(ns > 0);
-        assert_eq!(shadow.timing_source().unwrap().count, 6);
+        let total = &bytes[6 * 16..7 * 16];
+        let begin = u64::from_le_bytes(total[..8].try_into().unwrap());
+        let end = u64::from_le_bytes(total[8..].try_into().unwrap());
+        assert!(
+            end > begin && end - begin >= ns,
+            "whole scope must contain every subpass"
+        );
+        assert_eq!(shadow.timing_source().unwrap().count, 1);
         assert_eq!(render_shadow(&gpu, &mut shadow).draw_calls, 0);
         assert_eq!(shadow.graph().count, 0);
         assert!(shadow.timing_source().is_none());
         println!(
-            "M4 actualshadowquerypasses6 elapsed{ns}ticks staticcache0queries/0draws;copies+castercomputeexcluded"
+            "M4 actualshadowquerypasses6 elapsed{ns}ticks wholeScopeIncludesAllGPUCommands staticcache0queries/0draws"
         );
     });
 }

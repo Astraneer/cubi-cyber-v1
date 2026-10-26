@@ -2,9 +2,13 @@
 #![cfg(target_arch = "wasm32")]
 mod browser_horizon;
 mod browser_network;
+mod browser_props;
+mod browser_water;
 mod generation_worker;
 mod product_ui;
+mod props_worker;
 mod sky;
+mod water_worker;
 use client::view::{ClientView, InputKey};
 use jobs::{BrowserEvent, BrowserOutcome, BrowserWorkerPool, CancellationToken, JobId};
 use render::terrain_gpu::{AtlasImage, TerrainGpu, UploadBudget};
@@ -31,6 +35,8 @@ struct BrowserState {
     workers: BrowserWorkerPool,
     running: BTreeMap<JobId, CancellationToken>,
     horizon_workers: Option<browser_horizon::BrowserHorizon>,
+    props_workers: Option<browser_props::BrowserProps>,
+    water_workers: Option<browser_water::BrowserWater>,
     last_ms: f64,
     resolve: Option<js_sys::Function>,
     reject: Option<js_sys::Function>,
@@ -106,6 +112,7 @@ impl BrowserState {
             let _ = js_sys::Reflect::set(&value, &"uiFramePending".into(), &self.ui_pending.into());
             for (name, revision) in [
                 ("uiRevision", product.layer.app.revision()),
+                ("machineAudioLoops", product.machine_loops() as u64),
                 (
                     "uiUploadedRevision",
                     product.layer.uploaded_revision().unwrap_or(0),
@@ -268,6 +275,12 @@ impl BrowserState {
         }
         if let Some(horizon) = &mut self.horizon_workers {
             horizon.pump(&mut self.view)?;
+        }
+        if let Some(props) = &mut self.props_workers {
+            props.pump(&mut self.view)?;
+        }
+        if let Some(water) = &mut self.water_workers {
+            water.pump(&mut self.view)?;
         }
         Ok(())
     }
@@ -636,6 +649,11 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                         32 * 1024 * 1024,
                     )?;
                     let horizon_workers = browser_horizon::BrowserHorizon::new(&worker, &module)?;
+                    let props_workers = browser_props::BrowserProps::new(&worker, &module)?;
+                    let water_workers = view
+                        .water_stats()
+                        .map(|_| browser_water::BrowserWater::new(&worker, &module))
+                        .transpose()?;
                     let mut borrowed = state.borrow_mut();
                     if borrowed.connection_epoch != epoch {
                         return Ok::<_, JsValue>(());
@@ -655,6 +673,8 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                     }
                     borrowed.workers = workers;
                     borrowed.horizon_workers = Some(horizon_workers);
+                    borrowed.props_workers = Some(props_workers);
+                    borrowed.water_workers = water_workers;
                     borrowed.running.clear();
                     borrowed.resetting = false;
                     drop(borrowed);
@@ -717,7 +737,7 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                     let Some(product) = &mut state.product else {
                         return;
                     };
-                    let result = prepared.and_then(|prepared| product.audio.replace_bank(prepared));
+                    let result = prepared.and_then(|prepared| product.replace_sounds(prepared));
                     product
                         .layer
                         .app
@@ -845,6 +865,8 @@ fn prepare_product_world(
     )
     .map_err(js_error)?;
     view.prepare_entities(device, queue).map_err(js_error)?;
+    view.prepare_props(device, queue, Default::default())
+        .map_err(js_error)?;
     view.prepare_horizon(device, queue, client::view::horizon::Config::default())
         .map_err(js_error)?;
     Ok(())
@@ -885,6 +907,82 @@ fn connect_socket(state: &Rc<RefCell<BrowserState>>, address: String, name: Stri
 fn stats_object(view: &ClientView) -> JsValue {
     let stats = view.stats();
     let value = js_sys::Object::new();
+    let horizon = view.horizon_stats().unwrap_or_default();
+    let props = view.props_stats().unwrap_or_default();
+    let jobs = view.horizon_job_stats().unwrap_or_default();
+    for (name, number) in [
+        ("horizonDesiredHeights", horizon.desired_height_tiles as f64),
+        ("propsInstances", props.instances as f64),
+        ("propsPendingJobs", props.pending_jobs as f64),
+        ("propsPendingRecords", props.pending_records as f64),
+        ("propsWorkerCells", props.worker_cells as f64),
+        ("propsUploadedBytes", props.upload_bytes as f64),
+        ("propsFrames", stats.props_frames as f64),
+        ("horizonCachedHeights", horizon.cached_height_tiles as f64),
+        (
+            "horizonReceivedDesiredHeights",
+            horizon.received_desired_heights as f64,
+        ),
+        ("horizonWantedRefine", horizon.wanted_refine_tiles as f64),
+        (
+            "horizonUnavailableColumns",
+            horizon.unavailable_columns as f64,
+        ),
+        (
+            "horizonKnownGeometry",
+            horizon.known_geometry_sources as f64,
+        ),
+        ("horizonPlanId", horizon.plan_id as f64),
+        ("horizonAcceptedPlanId", horizon.accepted_plan_id as f64),
+        ("horizonPlanGeneration", horizon.plan_generation as f64),
+        ("horizonHeightStaged", horizon.height_staged as f64),
+        ("horizonProxyStaged", horizon.proxy_staged as f64),
+        ("horizonFailedProxies", horizon.failed_proxy_pages as f64),
+        (
+            "horizonMissingErrorCertificates",
+            horizon.missing_error_certificates as f64,
+        ),
+        ("horizonMaximumErrorPixels", horizon.maximum_error_pixels),
+        ("horizonSseRefinements", horizon.sse_refinements as f64),
+        (
+            "horizonSelectionLeafLimited",
+            horizon.selection_leaf_limited as f64,
+        ),
+        (
+            "horizonPendingHeightConfirmations",
+            horizon.pending_height_confirmations as f64,
+        ),
+        (
+            "horizonPendingExactColumns",
+            horizon.pending_exact_columns as f64,
+        ),
+        ("horizonQueuedJobs", jobs.queued as f64),
+        ("horizonRunningJobs", jobs.running as f64),
+        ("horizonRetainedBytes", jobs.retained_bytes as f64),
+        ("horizonContexts", jobs.contexts as f64),
+        ("horizonPlansCompleted", jobs.plans_completed as f64),
+        ("horizonPlansStale", jobs.plans_stale as f64),
+        ("horizonPlansFailed", jobs.plans_failed as f64),
+        ("horizonLastPlanFailure", f64::from(jobs.last_plan_failure)),
+        ("horizonProxyResults", jobs.proxy_results as f64),
+        ("horizonWorkerFailures", jobs.worker_failures as f64),
+    ] {
+        let _ = js_sys::Reflect::set(&value, &name.into(), &number.into());
+    }
+    for (name, flag) in [
+        ("horizonNearGuardReady", horizon.near_guard_ready),
+        ("propsPrepared", view.props_stats().is_some()),
+        ("propsReady", props.ready),
+        ("horizonEnabled", horizon.enabled),
+        ("horizonCapturePending", jobs.capture_pending),
+        ("horizonResultPending", jobs.result_pending),
+        (
+            "horizonSelectionCapacityLimited",
+            horizon.selection_capacity_limited,
+        ),
+    ] {
+        let _ = js_sys::Reflect::set(&value, &name.into(), &flag.into());
+    }
     let position = stats.player_pos;
     let eye_light = view.scene.read_authoritative_light(core_types::BlockPos {
         space: view.scene.config().center.space,
@@ -1116,6 +1214,7 @@ fn key(code: &str) -> Option<InputKey> {
         "ShiftLeft" | "ShiftRight" => InputKey::Sneak,
         "KeyF" => InputKey::Flight,
         "KeyH" => InputKey::Noclip,
+        "KeyN" => InputKey::ToolMode,
         "KeyV" => InputKey::Camera,
         _ => return None,
     })
@@ -1500,6 +1599,15 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
             &module_url,
         )?)
     };
+    let props_workers = if diagnostic {
+        None
+    } else {
+        Some(browser_props::BrowserProps::new(&worker_url, &module_url)?)
+    };
+    let water_workers = view
+        .water_stats()
+        .map(|_| browser_water::BrowserWater::new(&worker_url, &module_url))
+        .transpose()?;
     let mut resolve_fn = None;
     let mut reject_fn = None;
     let ready = js_sys::Promise::new(&mut |resolve, reject| {
@@ -1515,6 +1623,8 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
         workers,
         running: BTreeMap::new(),
         horizon_workers,
+        props_workers,
+        water_workers,
         last_ms: window.performance().map_or(0.0, |p| p.now()),
         resolve: resolve_fn,
         reject: reject_fn,

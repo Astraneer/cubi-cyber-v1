@@ -80,6 +80,7 @@ pub struct TransportCounters {
     pub peak_connections: usize,
     pub peak_udp_queue_packets: usize,
     pub peak_ws_staged_bytes: usize,
+    pub ingress_backpressure: u64,
 }
 
 enum SocketEvent {
@@ -193,6 +194,10 @@ impl Runtime {
         self.reap_workers();
         self.accept_ws(now_ms)?;
         for _ in 0..RECEIVE_BUDGET {
+            if self.server.inbox_capacity() == 0 {
+                self.counters.ingress_backpressure += 1;
+                break;
+            }
             match self.incoming_rx.try_recv() {
                 Ok(SocketEvent::Frame(connection, bytes)) => {
                     if let Some(peer) = self.ws.get_mut(&connection) {
@@ -302,6 +307,12 @@ impl Runtime {
         // One extra byte detects and rejects truncated/oversize datagrams.
         let mut buffer = [0; MAX_DATAGRAM + 1];
         for _ in 0..RECEIVE_BUDGET {
+            // One UDP datagram completes at most one application frame. Do not
+            // acknowledge it until a canonical inbox slot can retain that frame.
+            if self.server.inbox_capacity() == 0 {
+                self.counters.ingress_backpressure += 1;
+                break;
+            }
             let (length, address) = match self.udp_socket.recv_from(&mut buffer) {
                 Ok(received) => received,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -658,43 +669,95 @@ fn websocket_worker(
     if let Ok(mut websocket) =
         tungstenite::accept_hdr_with_config(socket, check_origin, Some(config))
     {
-        let _ = websocket
-            .get_mut()
-            .set_read_timeout(Some(Duration::from_millis(5)));
+        if websocket.get_mut().set_nonblocking(true).is_err() {
+            return;
+        }
+        let mut pending_ingress = None;
+        let mut pending_outgoing = None;
         'connection: while !stop.load(Ordering::Acquire) {
-            for _ in 0..WS_OUTGOING_CAPACITY {
-                match outgoing.try_recv() {
-                    Ok(bytes) => {
-                        if websocket.send(Message::Binary(bytes.into())).is_err() {
+            let mut progress = false;
+            let writable = match websocket.flush() {
+                Ok(()) => true,
+                Err(WebSocketError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                    false
+                }
+                Err(_) => break,
+            };
+            if writable {
+                for _ in 0..WS_OUTGOING_CAPACITY {
+                    let message = if let Some(message) = pending_outgoing.take() {
+                        message
+                    } else {
+                        match outgoing.try_recv() {
+                            Ok(bytes) => Message::Binary(bytes.into()),
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => break 'connection,
+                        }
+                    };
+                    match websocket.write(message) {
+                        Ok(()) => progress = true,
+                        // Tungstenite retains this accepted message internally.
+                        Err(WebSocketError::Io(error))
+                            if error.kind() == io::ErrorKind::WouldBlock =>
+                        {
+                            progress = true;
+                            break;
+                        }
+                        Err(WebSocketError::WriteBufferFull(message)) => {
+                            pending_outgoing = Some(*message);
+                            break;
+                        }
+                        Err(error) => {
+                            eprintln!("authority websocket write failure: {error}");
                             break 'connection;
                         }
                     }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => break 'connection,
+                }
+                match websocket.flush() {
+                    Ok(()) => {}
+                    Err(WebSocketError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                    }
+                    Err(_) => break,
                 }
             }
-            match websocket.read() {
-                Ok(Message::Binary(bytes)) => {
-                    if incoming
-                        .try_send(SocketEvent::Frame(connection, bytes.to_vec()))
-                        .is_err()
-                    {
-                        break;
+            let mut can_read = true;
+            if let Some(event) = pending_ingress.take() {
+                match incoming.try_send(event) {
+                    Ok(()) => progress = true,
+                    Err(TrySendError::Full(event)) => {
+                        pending_ingress = Some(event);
+                        can_read = false;
                     }
+                    Err(TrySendError::Disconnected(_)) => break,
                 }
-                Ok(Message::Ping(_) | Message::Pong(_)) => {
-                    if websocket.flush().is_err() {
-                        break;
-                    }
-                }
-                Ok(_) => break,
-                Err(WebSocketError::Io(error))
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) => {}
-                Err(_) => break,
             }
+            if can_read {
+                for _ in 0..WS_OUTGOING_CAPACITY {
+                    match websocket.read() {
+                        Ok(Message::Binary(bytes)) => {
+                            progress = true;
+                            match incoming.try_send(SocketEvent::Frame(connection, bytes.to_vec()))
+                            {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(event)) => {
+                                    pending_ingress = Some(event);
+                                    break;
+                                }
+                                Err(TrySendError::Disconnected(_)) => break 'connection,
+                            }
+                        }
+                        Ok(Message::Ping(_) | Message::Pong(_)) => progress = true,
+                        Ok(_) => break 'connection,
+                        Err(WebSocketError::Io(error))
+                            if error.kind() == io::ErrorKind::WouldBlock =>
+                        {
+                            break;
+                        }
+                        Err(_) => break 'connection,
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(if progress { 1 } else { 4 }));
         }
     }
     let _ = incoming.try_send(SocketEvent::Closed(connection));
@@ -809,6 +872,173 @@ mod tests {
         ] {
             assert!(!loopback_origin(origin), "{origin}");
         }
+    }
+
+    #[test]
+    fn real_websocket_retains_burst_while_the_canonical_inbox_is_full() {
+        use core_types::{Cell, PageId, SpaceId, Tick};
+        use net::{ClientMessage, Hello, PlayerId, ServerMessage};
+        use std::{
+            collections::BTreeSet,
+            net::TcpStream,
+            path::PathBuf,
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+        use tungstenite::{Error as WsError, Message};
+        use world::{Transaction, World};
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = Directory(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.local/tmp")
+                .join(format!("inbox-backpressure-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(&directory.0).unwrap();
+        let mut config = crate::ServerConfig::new(&directory.0);
+        config.generation_enabled = false;
+        config.spawn_override = Some([8.5, 1., 8.5]);
+        let mut world = World::new(rules::properties, 4096);
+        let mut cells = vec![Cell::AIR; 4096];
+        cells[..256].fill(Cell::from_parts(rules::ids::STONE, 0));
+        let mut tx = Transaction::new(Tick(0), SpaceId(0));
+        tx.create_page(
+            PageId {
+                space: SpaceId(0),
+                x: 0,
+                y: 0,
+                z: 0,
+            },
+            cells,
+        );
+        world.commit(tx).unwrap();
+        let server = crate::Server::open_with_world(config, world).unwrap();
+        let mut runtime = super::Runtime::bind(
+            server,
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let address = runtime.ws_address().unwrap();
+        let (joined_tx, joined_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let client = thread::spawn(move || {
+            let socket = TcpStream::connect(address).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let (mut socket, _) = tungstenite::client(format!("ws://{address}/"), socket).unwrap();
+            let hello = ClientMessage::Hello(Hello {
+                identity: PlayerId::default(),
+                name: "ingress-pressure".into(),
+                credential: None,
+            });
+            socket
+                .send(Message::Binary(net::encode_client(&hello).unwrap().into()))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut joined = false;
+            let mut pongs = BTreeSet::new();
+            loop {
+                assert!(Instant::now() < deadline, "real socket ingress deadline");
+                match socket.read() {
+                    Ok(Message::Binary(bytes)) => match net::decode_server(&bytes).unwrap() {
+                        ServerMessage::Welcome(_) if !joined => {
+                            joined = true;
+                            joined_tx.send(()).unwrap();
+                            start_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                            for nonce in 10_000..10_600 {
+                                socket
+                                    .send(Message::Binary(
+                                        net::encode_client(&ClientMessage::Ping(nonce))
+                                            .unwrap()
+                                            .into(),
+                                    ))
+                                    .unwrap();
+                            }
+                        }
+                        ServerMessage::Pong(nonce) if nonce >= 10_000 => {
+                            assert!(pongs.insert(nonce));
+                            if pongs.len() == 600 {
+                                done_tx.send(pongs.len()).unwrap();
+                                return;
+                            }
+                        }
+                        ServerMessage::Error(reason) => {
+                            panic!("valid retained ingress was rejected: {reason:?}")
+                        }
+                        _ => {}
+                    },
+                    Err(WsError::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    other => panic!("real socket closed before600retained requests: {other:?}"),
+                }
+            }
+        });
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(15);
+        let mut filled = false;
+        loop {
+            assert!(Instant::now() < deadline, "real authority ingress deadline");
+            let now = started.elapsed().as_millis() as u64;
+            runtime.poll(now).unwrap();
+            assert!(
+                !runtime.server.is_failed(),
+                "authority failure {:?}",
+                runtime.server.counters()
+            );
+            if !filled && joined_rx.try_recv().is_ok() {
+                // A bounded deterministic owner pause supplies the same pressure
+                // as a slow durable checkpoint, without changing socket quotas.
+                assert!(runtime.server.inbox.is_empty());
+                runtime.server.next_tick_at = now + 300;
+                for nonce in 0..crate::MAX_INBOX {
+                    runtime
+                        .server
+                        .inbox
+                        .push_back((1, ClientMessage::Ping(nonce as u64), now));
+                }
+                assert_eq!(runtime.server.inbox_capacity(), 0);
+                filled = true;
+                start_tx.send(()).unwrap();
+            }
+            match done_rx.try_recv() {
+                Ok(count) => {
+                    assert_eq!(count, 600);
+                    break;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => panic!(
+                    "socket exited: {:?} {:?}",
+                    runtime.counters(),
+                    runtime.server.counters()
+                ),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        client.join().unwrap();
+        assert!(filled);
+        assert!(!runtime.server.is_failed());
+        assert!(runtime.counters.ingress_backpressure > 0);
+        assert_eq!(runtime.counters.queue_overflows, 0);
+        assert_eq!(runtime.server.counters.protocol_rejections, 0);
+        assert_eq!(
+            runtime.server.counters.inbox_backpressure, 0,
+            "transport retained each message before admission"
+        );
+        assert!(runtime.server.counters.inbox_high_water <= crate::MAX_INBOX);
     }
 
     #[test]

@@ -1140,7 +1140,10 @@ impl ClientLighting {
     ) -> Result<ShadowWork, ClientLightingError> {
         self.shadows.update_view(center, sun)?;
         let work = self.shadows.encode_dynamic(queue, encoder, caster)?;
-        if work.cascade_updates > 0 || work.dynamic_copy_bytes > 0 {
+        if work.cascade_updates > 0
+            || work.dynamic_copy_bytes > 0
+            || work.dynamic_restore_pixels > 0
+        {
             terrain.invalidate();
         }
         Ok(work)
@@ -1155,7 +1158,10 @@ impl ClientLighting {
     ) -> Result<ShadowWork, ClientLightingError> {
         self.shadows.update_view(center, sun)?;
         let work = self.shadows.encode(queue, encoder);
-        if work.cascade_updates > 0 || work.dynamic_copy_bytes > 0 {
+        if work.cascade_updates > 0
+            || work.dynamic_copy_bytes > 0
+            || work.dynamic_restore_pixels > 0
+        {
             terrain.invalidate();
         }
         Ok(work)

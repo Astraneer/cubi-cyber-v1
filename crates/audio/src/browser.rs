@@ -739,6 +739,78 @@ pub fn set_audio_cave(cave: bool) -> Result<(), JsValue> {
         })
     })
 }
+
+/// Exercise real browser node identity and lifetime, separately from the CPU
+/// mixer. Node creation does not establish hardware audibility.
+#[wasm_bindgen]
+pub async fn audio_loop_lifecycle_oracle() -> Result<String, JsValue> {
+    let mut output = WebOutput::open(1)?;
+    let mut bank = crate::Mixer::new(48000, 1, 1 << 20).map_err(js_error)?;
+    let pcm = Pcm::mono(vec![0.001; 4800], 48000).map_err(js_error)?;
+    let clip = bank.add_clip(pcm.clone()).map_err(js_error)?;
+    output.prepare_clip(clip, &pcm)?;
+    output.volume(Some(Category::Machines), 0.3)?;
+    let emitter = crate::EmitterId(42);
+    let mut request = VoiceRequest::local(clip, emitter, Category::Machines);
+    request.looping = true;
+    request.position = Some([2., 0., 4.]);
+    let first = output.play(request)?;
+    output.resume().await?;
+    let source = output.voices[usize::from(first.slot)]
+        .as_ref()
+        .unwrap()
+        .source
+        .clone();
+    let updated = output.play(request)?;
+    let current = &output.voices[usize::from(updated.slot)]
+        .as_ref()
+        .unwrap()
+        .source;
+    if first != updated || !js_sys::Object::is(source.as_ref(), current.as_ref()) {
+        return Err(js_error("loop refresh replaced the live source node"));
+    }
+    if output.stop_emitter(emitter)? != 1 || output.stop(first)? {
+        return Err(js_error("emitter stop did not revoke the old handle"));
+    }
+    let recovered = output.play(request)?;
+    if recovered == first {
+        return Err(js_error("recovery reused a revoked generation"));
+    }
+    let mut other = request;
+    other.emitter = crate::EmitterId(43);
+    let stolen = output.play(other)?;
+    if output.stop(recovered)? {
+        return Err(js_error("evicted handle remained valid"));
+    }
+    let returned = output.play(request)?;
+    if returned == stolen {
+        return Err(js_error("evicted loop was not recovered"));
+    }
+    output.replace_bank(&bank)?;
+    let replaced = output.play(request)?;
+    if output.stop(returned)?
+        || replaced == returned
+        || (output.categories[Category::Machines as usize]
+            .gain()
+            .value()
+            - 0.3)
+            .abs()
+            > 1e-6
+    {
+        return Err(js_error(
+            "bank replacement lost controls or handle generation",
+        ));
+    }
+    if output.stop_emitter(emitter)? != 1 || output.voices.iter().any(Option::is_some) {
+        return Err(js_error("final emitter stop left a live source"));
+    }
+    let work = output.work();
+    output.close().await?;
+    Ok(format!(
+        "{{\"sameNodeOnRefresh\":true,\"recoveredAfterStop\":true,\"recoveredAfterEviction\":true,\"bankControlsPreserved\":true,\"staleHandlesRejected\":true,\"started\":{},\"loopUpdates\":{},\"stopped\":{},\"hardwareAudibility\":false}}",
+        work.started, work.loop_updates, work.stopped
+    ))
+}
 #[wasm_bindgen]
 pub async fn stop_audio_benchmark() -> Result<(), JsValue> {
     let output = LIVE.with(|live| live.borrow_mut().take());

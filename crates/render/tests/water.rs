@@ -5,6 +5,8 @@ use render::{
     water_gpu::{WaterConfig, WaterDraw, WaterError, WaterGpu, WaterInputs, WaterQuad, WaterState},
 };
 const SIZE: u32 = 32;
+#[path = "common/msaa.rs"]
+mod msaa;
 fn read_buffer(gpu: &render::Gpu, b: &wgpu::Buffer) -> Vec<u8> {
     let (tx, rx) = std::sync::mpsc::channel();
     b.slice(..)
@@ -408,6 +410,178 @@ fn physical_absorption_fresnel_match_independent_f64_and_preserve_msaa() {
                 counters[0]
             );
         }
+    });
+}
+#[test]
+fn incomplete_physical_cover_preserves_opaque_samples_and_retains_its_arena() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let s = sources(&gpu, true, 5);
+        let mut water = WaterGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            config(),
+            SIZE,
+            SIZE,
+            inputs(&s),
+            None,
+        )
+        .unwrap();
+        populate(&gpu, &mut water);
+        water.set_surface_enabled(false);
+        assert_eq!(water.worst_reflection_steps(), 0);
+        draw(&gpu, &mut water, state());
+        let fallback = image(&gpu, water.resolved_texture());
+        assert!(fallback.iter().all(|pixel| *pixel == [1., 0.5, 0.5, 1.]));
+        assert_eq!(stats(&gpu, &water)[0], 0);
+        assert_eq!(water.active_quad_count(), 1);
+        water.set_surface_enabled(true);
+        draw(&gpu, &mut water, state());
+        let physical = image(&gpu, water.resolved_texture());
+        assert!(physical.iter().zip(&fallback).all(|(a, b)| a != b));
+        assert!(stats(&gpu, &water)[0] > 0);
+        water.set_surface_enabled(false);
+        draw(&gpu, &mut water, state());
+        assert_eq!(image(&gpu, water.resolved_texture()), fallback);
+        assert_eq!(water.active_quad_count(), 1);
+    });
+}
+#[test]
+fn underwater_interface_has_the_independent_snell_critical_angle_and_no_transmission_above_it() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let s = sources(&gpu, false, 0);
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &s._sky,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&[1f32; 4]),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(16),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let mut water = WaterGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            WaterConfig {
+                absorption: [0.; 3],
+                ..config()
+            },
+            SIZE,
+            SIZE,
+            inputs(&s),
+            None,
+        )
+        .unwrap();
+        populate(&gpu, &mut water);
+        let eye = [8., -2., 8.];
+        let camera = Camera::perspective(eye, [11., 1., 8.], [0., 0., -1.], 1., 1., 0.1, 100.);
+        let state = WaterState {
+            camera,
+            eye,
+            underwater: true,
+            ..state()
+        };
+        draw(&gpu, &mut water, state);
+        let actual = image(&gpu, water.resolved_texture());
+        let inverse = camera.inverse_view_projection().unwrap();
+        let samples = msaa::locations(&gpu);
+        let mut max_error = 0f64;
+        let mut transmitted = 0;
+        let mut totally_reflected = Vec::new();
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let mut expected = 0.;
+                let mut valid = true;
+                let mut all_tir = true;
+                for sample in samples {
+                    let q = transform(
+                        inverse,
+                        [
+                            (f64::from(x) + sample[0]) / f64::from(SIZE) * 2. - 1.,
+                            1. - (f64::from(y) + sample[1]) / f64::from(SIZE) * 2.,
+                            0.,
+                            1.,
+                        ],
+                    );
+                    let ray = [q[0] / q[3] - 8., q[1] / q[3] + 2., q[2] / q[3] - 8.];
+                    let length = ray.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    let direction = ray.map(|v| v / length);
+                    let distance = 2. / direction[1];
+                    let surface = [8. + direction[0] * distance, 8. + direction[2] * distance];
+                    if direction[1] <= 0. || surface.iter().any(|v| *v < 0.1 || *v > 15.9) {
+                        valid = false;
+                        break;
+                    }
+                    let cosine = direction[1];
+                    let sine2 = 1.333f64.powi(2) * (1. - cosine * cosine);
+                    if sine2 >= 1. {
+                        continue;
+                    }
+                    all_tir = false;
+                    let transmitted_cosine = (1. - sine2).sqrt();
+                    let rs = (1.333 * cosine - transmitted_cosine)
+                        / (1.333 * cosine + transmitted_cosine);
+                    let rp = (1.333 * transmitted_cosine - cosine)
+                        / (1.333 * transmitted_cosine + cosine);
+                    expected += (1. - (rs * rs + rp * rp) * 0.5) * 0.25;
+                }
+                if !valid {
+                    continue;
+                }
+                let index = (x + SIZE * y) as usize;
+                max_error = max_error.max((f64::from(actual[index][0]) - expected).abs());
+                if all_tir {
+                    totally_reflected.push(index);
+                    assert_eq!(
+                        actual[index],
+                        [0., 0., 0., 1.],
+                        "TIR pixel{x},{y}, samples{samples:?}"
+                    );
+                } else {
+                    transmitted += 1;
+                }
+            }
+        }
+        assert!(transmitted > 100 && totally_reflected.len() > 100);
+        assert!(
+            max_error < 0.003,
+            "Snell/Fresnel 4-sample oracle error {max_error}"
+        );
+        draw(
+            &gpu,
+            &mut water,
+            WaterState {
+                underwater: false,
+                ..state
+            },
+        );
+        let wrong_medium = image(&gpu, water.resolved_texture());
+        assert!(
+            totally_reflected
+                .iter()
+                .all(|&i| wrong_medium[i][0] > 0.005),
+            "air→water negative control must miss total internal reflection"
+        );
+        println!(
+            "M10 underwater Snell criticalAngle={}deg transmitted={transmitted} totalInternal={} HDRerror={max_error} wrongMediumNegative=true",
+            (1f64 / 1.333).asin().to_degrees(),
+            totally_reflected.len()
+        );
     });
 }
 #[test]

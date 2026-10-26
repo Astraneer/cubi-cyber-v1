@@ -18,6 +18,7 @@ pub struct RemoteCounters {
     pub prediction_changes: u64,
     pub imported_light_pages: u64,
     pub imported_light_samples: u64,
+    pub imported_props_frames: u64,
 }
 pub struct RemoteSession {
     connection: Connection,
@@ -35,6 +36,7 @@ pub struct RemoteSession {
     wanted_heights: Vec<net::height::HeightKey>,
     height_interest: BTreeSet<net::height::HeightKey>,
     humans: crate::remote_humans::RemoteHumans,
+    props_restore_cursor: Option<core_types::PageId>,
 }
 impl RemoteSession {
     pub fn new(config: NetworkConfig) -> Result<Self, String> {
@@ -50,12 +52,13 @@ impl RemoteSession {
             counters: RemoteCounters::default(),
             entity_instances: vec![
                 rules::entities::mob::Instance::default();
-                net::entities::MAX_ENTITIES + 64
+                net::entities::MAX_ENTITIES + 64 + 2048
             ],
             wanted_pages: Vec::with_capacity(config.maximum_pages),
             page_capacity: config.maximum_pages,
             wanted_heights: Vec::with_capacity(512),
             height_interest: BTreeSet::new(),
+            props_restore_cursor: None,
             humans: crate::remote_humans::RemoteHumans::new(64)
                 .map_err(|e| format!("public human capacity: {e:?}"))?,
         })
@@ -117,11 +120,26 @@ impl RemoteSession {
                     .map_err(error)?;
             }
         }
-        let input = view.remote_input();
+        while let Some(back) = view.take_remote_tool_mode() {
+            if self
+                .connection
+                .inventory()
+                .is_some_and(|inventory| inventory.hand().item() == rules::items::I_CONFIGURATOR)
+            {
+                self.connection
+                    .cycle_tool_mode(back, now_ms)
+                    .map_err(error)?;
+            }
+        }
+        let input = view.take_remote_input();
         let changes = self.pump_scene(&mut view.scene, input, now_ms)?;
         for change in changes {
+            for page in change.pages.iter().filter(|page| page.removed) {
+                view.remove_remote_props(page.page)?;
+            }
             view.note_remote_change(&change)?;
         }
+        self.pump_props(view)?;
         if let Some(player) = self.connection.player() {
             view.install_remote_player(player, self.connection.predicted_tick())?;
         }
@@ -145,10 +163,82 @@ impl RemoteSession {
                     &mut self.entity_instances[count..],
                 )
                 .map_err(|e| format!("public human interpolation: {e:?}"))?;
-            view.set_remote_entities(&self.entity_instances[..count + humans], space, [0; 3])?;
+            let tick = Tick(time.floor() as u64);
+            let alpha = time.fract();
+            let packets = self
+                .connection
+                .packet_scene()
+                .instances_filtered(
+                    tick,
+                    alpha,
+                    [0; 3],
+                    &|page, version, index| {
+                        page.space == space
+                            && self.connection.replica().page(page).is_some_and(|raw| {
+                                raw.version == version.0
+                                    && raw.cells[usize::from(index.get())].id()
+                                        == rules::ids::LOGISTICAL_TRANSPORTER
+                            })
+                            && view
+                                .scene
+                                .authoritative_version(page)
+                                .is_some_and(|raw| raw.view == version.0)
+                    },
+                    &mut self.entity_instances[count + humans..],
+                )
+                .map_err(|e| format!("public packet interpolation: {e:?}"))?;
+            view.set_remote_entities(
+                &self.entity_instances[..count + humans + packets],
+                space,
+                [0; 3],
+            )?;
         }
         if self.configured && self.connection.player().is_some() {
             self.pump_horizon(view, now_ms)?;
+        }
+        Ok(())
+    }
+    fn pump_props(&mut self, view: &mut ClientView) -> Result<(), String> {
+        if !self.configured {
+            return Ok(());
+        }
+        for _ in 0..4 {
+            let Some(frame) = self.connection.take_props_update() else {
+                break;
+            };
+            if view
+                .scene
+                .authoritative_version(frame.page)
+                .is_some_and(|raw| raw.view == frame.cell_view)
+            {
+                self.counters.imported_props_frames += u64::from(view.publish_remote_props(frame)?);
+            }
+        }
+        let start = self.props_restore_cursor;
+        let mut visited = 0;
+        for frame in self
+            .connection
+            .props_frames()
+            .filter(|frame| start.is_none_or(|page| frame.page > page))
+            .take(4)
+        {
+            visited += 1;
+            self.props_restore_cursor = Some(frame.page);
+            let matched = view
+                .scene
+                .authoritative_version(frame.page)
+                .is_some_and(|raw| raw.view == frame.cell_view);
+            let installed = view
+                .props_source()
+                .and_then(|source| source.public_binding(frame.page))
+                == Some((frame.cell_view, frame.view));
+            if matched && !installed {
+                self.counters.imported_props_frames +=
+                    u64::from(view.publish_remote_props(frame.clone())?);
+            }
+        }
+        if visited == 0 {
+            self.props_restore_cursor = None;
         }
         Ok(())
     }
@@ -208,6 +298,20 @@ impl RemoteSession {
                     self.height_interest.insert(key);
                     added += 1;
                 }
+                Err(NetworkError::Capacity) => break,
+                Err(e) => return Err(error(e)),
+            }
+        }
+        let mut promoted = 0;
+        for key in view.horizon_wanted_exact_height() {
+            if promoted >= 4 {
+                break;
+            }
+            if !self.height_interest.contains(&key) || self.connection.height_is_exact(key) {
+                continue;
+            }
+            match self.connection.request_height_exact(key, now_ms) {
+                Ok(()) => promoted += 1,
                 Err(NetworkError::Capacity) => break,
                 Err(e) => return Err(error(e)),
             }
@@ -427,6 +531,11 @@ impl RemoteSession {
                 .map_err(error)?;
             self.target = frame.target_tick;
             self.next_input_ms = now_ms.saturating_add(50);
+        }
+        // A latched click is independent of the20Hz movement-sampling gate.
+        // Aimed actions carry current validated angles; placement keeps its own
+        //200ms rate bound and never uploads a client position.
+        if self.connection.player().is_some() {
             self.interactions(input, now_ms)?;
         }
         let target = Tick(
@@ -453,7 +562,7 @@ impl RemoteSession {
             self.mining = None;
         }
         let attacking = input.keys & net::InputFrame::ATTACK != 0;
-        if !attacking && !input.placing {
+        if !attacking && !input.placing && !input.place_pressed {
             if self.mining.take().is_some() {
                 self.connection
                     .aimed_action(Action::StopMining, false, now_ms, input.yaw, input.pitch)
@@ -527,7 +636,7 @@ impl RemoteSession {
                 .map_err(error)?;
             self.mining = Some((position, expected, id));
         }
-        if input.placing
+        if (input.placing || input.place_pressed)
             && now_ms >= self.next_place_ms
             && let Some(hit) = hit
         {

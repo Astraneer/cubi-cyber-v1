@@ -12,6 +12,44 @@ static ALLOCATOR: CountingAllocator<System> = CountingAllocator::new(System);
 struct Landscape {
     phase: usize,
 }
+#[test]
+fn ten_seconds_survive_repeated_authority_reconciliation_without_allocations() {
+    let mut recorder = Recorder::new(sim::replay::DEFAULT_STEPS).unwrap();
+    let mut player = Player::new([0.5, 3.0, 0.5]);
+    let world = Landscape { phase: 0 };
+    let keys = Keys {
+        fwd: true,
+        ..Keys::default()
+    };
+    let scope = AllocationScope::begin().unwrap();
+    for tick in 0..=240_u64 {
+        recorder.set_time(tick * 50_000_000).unwrap();
+        let authority = PredictionState::capture(&player).unwrap();
+        // Six real simulation attempts per tick model repeated rollback and
+        // prediction replay. They share a wall clock but are all reproducible.
+        for _ in 0..6 {
+            authority.apply_authoritative(&mut player).unwrap();
+            recorder.tick(&mut player, &world, keys, false);
+        }
+    }
+    let allocations = scope.finish();
+    assert_eq!(allocations.allocating_calls(), 0);
+    assert_eq!(allocations.dealloc_calls, 0);
+    let stats = recorder.stats();
+    assert_eq!(stats.steps, 1206);
+    assert_eq!(stats.capacity_losses, 0);
+    assert_eq!(stats.invalid_steps, 0);
+    assert!(stats.complete_window);
+    let replay = Archive::decode(&recorder.encode().unwrap())
+        .unwrap()
+        .replay()
+        .unwrap();
+    assert_eq!(replay.steps, stats.steps);
+    assert_eq!(
+        replay.final_hash,
+        PredictionState::capture(&player).unwrap().hash()
+    );
+}
 impl QueryWorld for Landscape {
     fn cell(&self, p: [i32; 3]) -> CellRead {
         if self.phase == 3 && p[0] > 4 {

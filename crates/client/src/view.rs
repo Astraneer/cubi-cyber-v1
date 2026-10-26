@@ -18,11 +18,16 @@ mod entities;
 pub mod environment;
 pub mod horizon;
 mod horizon_runtime;
+pub use horizon_runtime::HorizonJobStats;
 mod lighting;
+pub mod props;
 mod remote;
+pub mod water;
+pub mod water_model;
 pub use entities::{EntityStats, ViewEntities};
 pub use environment::{EnvironmentProfile, EnvironmentStats, ViewEnvironment};
 pub use lighting::{LightingStats, ViewLighting};
+pub use props::{PropsStats, ViewProps};
 pub use remote::RemoteInput;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +45,7 @@ pub enum InputKey {
     Camera,
     Attack,
     Place,
+    ToolMode,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -47,6 +53,7 @@ pub struct ViewStats {
     pub resident_pages: usize,
     pub resident_quads: usize,
     pub terrain_frames: u64,
+    pub props_frames: u64,
     pub loaded_pages: usize,
     pub queued_jobs: usize,
     pub running_jobs: usize,
@@ -162,6 +169,8 @@ pub struct ClientView {
     renderer: TerrainGpu,
     lighting: Option<Box<ViewLighting>>,
     entities: Option<Box<ViewEntities>>,
+    props: Option<Box<ViewProps>>,
+    water: Option<Box<water::ViewWater>>,
     environment: Option<Box<PreparedEnvironment>>,
     horizon: Option<Box<horizon_runtime::PreparedHorizon>>,
     frame_upload_remaining: u64,
@@ -190,12 +199,15 @@ pub struct ClientView {
     base_rebases: u64,
     edit_revision: u64,
     rendered_edit_revision: u64,
-    keys: [bool; 12],
+    keys: [bool; 13],
+    place_pressed: bool,
     remote_controls: VecDeque<InputKey>,
+    remote_tool_modes: VecDeque<bool>,
     remote_look: Option<[f32; 2]>,
     remote_signature: Option<u64>,
     retained_gpu_work: telemetry::WorkCounters,
     retained_foreground_work: telemetry::WorkCounters,
+    retained_worker_work: telemetry::WorkCounters,
     last_reported_mesh_cells: u64,
     last_reported_mesh_quads: u64,
     last_frame_work: telemetry::WorkCounts,
@@ -208,6 +220,8 @@ pub struct ClientView {
     resident: BTreeMap<PageId, Resident>,
     page_links_dirty: bool,
     terrain_frames: u64,
+    props_frames: u64,
+    props_content_encoded: bool,
     upload_bytes_total: u64,
     pipeline_compilations: u64,
     frame_pipeline_compilations: u64,
@@ -251,6 +265,8 @@ impl ClientView {
             renderer,
             lighting: None,
             entities: None,
+            props: None,
+            water: None,
             environment: None,
             horizon: None,
             frame_upload_remaining: 0,
@@ -288,12 +304,15 @@ impl ClientView {
             base_rebases: 0,
             edit_revision: 0,
             rendered_edit_revision: 0,
-            keys: [false; 12],
-            remote_controls: VecDeque::new(),
+            keys: [false; 13],
+            place_pressed: false,
+            remote_controls: VecDeque::with_capacity(32),
+            remote_tool_modes: VecDeque::with_capacity(32),
             remote_look: None,
             remote_signature: None,
             retained_gpu_work: telemetry::WorkCounters::new(),
             retained_foreground_work: telemetry::WorkCounters::new(),
+            retained_worker_work: telemetry::WorkCounters::new(),
             last_reported_mesh_cells: 0,
             last_reported_mesh_quads: 0,
             last_frame_work: telemetry::WorkCounts::ZERO,
@@ -306,6 +325,8 @@ impl ClientView {
             resident: BTreeMap::new(),
             page_links_dirty: false,
             terrain_frames: 0,
+            props_frames: 0,
+            props_content_encoded: false,
             upload_bytes_total: 0,
             pipeline_compilations: setup.pipeline_compilations,
             frame_pipeline_compilations: 0,
@@ -355,6 +376,7 @@ impl ClientView {
     ) -> Result<(), String> {
         if self.lighting.is_some()
             || self.entities.is_some()
+            || self.props.is_some()
             || self.environment.is_some()
             || self.horizon.is_some()
             || self.terrain_frames != 0
@@ -443,6 +465,176 @@ impl ClientView {
     pub fn entities_mut(&mut self) -> Option<&mut ViewEntities> {
         self.entities.as_deref_mut()
     }
+    pub fn prepare_props(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        limits: crate::props_source::PropsLimits,
+    ) -> Result<(), String> {
+        if self.props.is_some() || self.terrain_frames != 0 || !self.resident.is_empty() {
+            return Err("block model pipelines must be prepared once during loading".into());
+        }
+        if self
+            .lighting
+            .as_ref()
+            .is_some_and(|lighting| !lighting.owner.shadows().cache().config().dynamic_casters)
+        {
+            return Err("prepare dynamic shadow casters before block models".into());
+        }
+        let props = ViewProps::prepare(
+            device,
+            queue,
+            &self.renderer,
+            &mut self.scene,
+            self.lighting.as_deref(),
+            self.environment
+                .as_ref()
+                .map(|environment| &environment.owner),
+            limits,
+        )?;
+        self.pipeline_compilations += u64::from(props.stats.pipeline_compilations);
+        self.props = Some(Box::new(props));
+        self.invalidate();
+        Ok(())
+    }
+    pub fn props_source(&self) -> Option<&crate::props_source::PropsSource> {
+        self.props.as_ref().map(|props| &props.source)
+    }
+    /// Attach the bounded source only after the optional physical-water GPU
+    /// resources have been prepared, and before the first scene upload.
+    pub fn prepare_water(&mut self, config: water::Config) -> Result<(), String> {
+        if self.water.is_some() || self.terrain_frames != 0 || !self.resident.is_empty() {
+            return Err("water source must be prepared once during loading".into());
+        }
+        let gpu = self
+            .environment
+            .as_mut()
+            .and_then(|environment| environment.owner.gpu.water_mut())
+            .ok_or("prepare the optional environment water GPU before its source")?;
+        self.water = Some(Box::new(
+            water::ViewWater::prepare(&mut self.scene, gpu, config)
+                .map_err(|error| error.to_string())?,
+        ));
+        Ok(())
+    }
+    pub fn water_stats(&self) -> Option<water::Stats> {
+        self.water.as_ref().map(|water| water.stats())
+    }
+    pub fn take_water_task(
+        &mut self,
+    ) -> Result<Option<jobs::Dispatch<crate::water_source::WaterJob>>, String> {
+        self.water.as_mut().map_or(Ok(None), |water| {
+            water
+                .take_task(&self.scene, self.tick)
+                .map_err(|error| error.to_string())
+        })
+    }
+    pub fn encode_water_task(
+        &mut self,
+        dispatch: &jobs::Dispatch<crate::water_source::WaterJob>,
+    ) -> Result<Vec<u8>, String> {
+        let water = self.water.as_mut().ok_or("water source not prepared")?;
+        let before = water.stats().wire_halo_reads;
+        let bytes = water
+            .encode_task(dispatch)
+            .map_err(|error| error.to_string())?;
+        self.retained_foreground_work.record(telemetry::WorkCounts {
+            cells_scanned: water.stats().wire_halo_reads - before,
+            ..telemetry::WorkCounts::ZERO
+        });
+        Ok(bytes)
+    }
+    pub fn requeue_water_task(
+        &mut self,
+        dispatch: jobs::Dispatch<crate::water_source::WaterJob>,
+    ) -> Result<(), String> {
+        self.water
+            .as_mut()
+            .ok_or("water source not prepared")?
+            .requeue(&self.scene, dispatch)
+            .map_err(|error| error.to_string())
+    }
+    pub fn complete_water_bytes(&mut self, id: jobs::JobId, bytes: &[u8]) -> Result<(), String> {
+        self.water
+            .as_mut()
+            .ok_or("water source not prepared")?
+            .complete_bytes(&self.scene, id, bytes)
+            .map_err(|error| error.to_string())
+    }
+    pub fn fail_water_task(&mut self, id: jobs::JobId) -> Result<(), String> {
+        self.water
+            .as_mut()
+            .ok_or("water source not prepared")?
+            .fail_task(&self.scene, id)
+            .map_err(|error| error.to_string())
+    }
+    pub fn request_water_model_update(&mut self) {
+        if let Some(water) = &mut self.water {
+            water.request_model_update();
+        }
+    }
+    pub fn invalidate_water_tints(&mut self) -> Result<(), String> {
+        if let Some(water) = &mut self.water {
+            water
+                .invalidate_tints(&self.scene)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+    pub fn props_stats(&self) -> Option<PropsStats> {
+        self.props.as_ref().map(|props| props.stats)
+    }
+    pub fn publish_remote_props(
+        &mut self,
+        frame: std::sync::Arc<net::props::Frame>,
+    ) -> Result<bool, String> {
+        self.props.as_mut().map_or(Ok(false), |props| {
+            props.publish_public_frame(&self.scene, frame)
+        })
+    }
+    pub fn remove_remote_props(&mut self, page: PageId) -> Result<bool, String> {
+        self.props.as_mut().map_or(Ok(false), |props| {
+            props
+                .source
+                .revoke_public_frame(page, self.tick)
+                .map_err(|error| error.to_string())
+        })
+    }
+    pub fn take_props_task(&mut self) -> Option<jobs::Dispatch<crate::props_source::PropsTask>> {
+        self.props.as_mut()?.take_task(&self.scene, self.tick)
+    }
+    pub fn requeue_props_task(
+        &mut self,
+        task: jobs::Dispatch<crate::props_source::PropsTask>,
+    ) -> Result<(), String> {
+        self.props
+            .as_mut()
+            .ok_or("block models not prepared")?
+            .requeue_task(task)
+    }
+    pub fn complete_props_bytes(&mut self, id: jobs::JobId, bytes: &[u8]) -> Result<(), String> {
+        self.props
+            .as_mut()
+            .ok_or("block models not prepared")?
+            .complete_bytes(&self.scene, id, bytes)
+    }
+    pub fn fail_props_task(&mut self, id: jobs::JobId) -> Result<(), String> {
+        self.props
+            .as_mut()
+            .ok_or("block models not prepared")?
+            .fail(&self.scene, id)
+    }
+    fn record_props_work(&mut self, work: crate::props_source::PropsWork) {
+        self.retained_worker_work.record(telemetry::WorkCounts {
+            cells_scanned: work.worker_cells,
+            ..telemetry::WorkCounts::ZERO
+        });
+        self.retained_foreground_work.record(telemetry::WorkCounts {
+            cells_scanned: work.owner_light_reads,
+            upload_bytes: work.upload_bytes,
+            ..telemetry::WorkCounts::ZERO
+        });
+    }
     #[allow(clippy::too_many_arguments)] // Explicit loading resource/profile context.
     pub fn prepare_environment(
         &mut self,
@@ -456,6 +648,7 @@ impl ClientView {
     ) -> Result<(), String> {
         if self.environment.is_some()
             || self.entities.is_some()
+            || self.props.is_some()
             || self.horizon.is_some()
             || self.terrain_frames != 0
             || !self.resident.is_empty()
@@ -591,12 +784,29 @@ impl ClientView {
     }
 
     pub fn set_key(&mut self, key: InputKey, down: bool) {
+        self.set_key_inner(key, down, None);
+    }
+    /// Physical Shift is independent of the player's rebindable Sneak action.
+    pub fn set_tool_mode_key(&mut self, down: bool, back: bool) {
+        self.set_key_inner(InputKey::ToolMode, down, Some(back));
+    }
+    fn set_key_inner(&mut self, key: InputKey, down: bool, tool_back: Option<bool>) {
         let rising = down && !self.keys[key as usize];
         self.keys[key as usize] = down;
         if down {
             self.activate_player();
         }
         if !rising {
+            return;
+        }
+        if key == InputKey::Place {
+            self.place_pressed = true;
+        }
+        if self.authoritative_remote() && key == InputKey::ToolMode {
+            if self.active && self.remote_tool_modes.len() < 32 {
+                self.remote_tool_modes
+                    .push_back(tool_back.unwrap_or(self.keys[InputKey::Sneak as usize]));
+            }
             return;
         }
         if self.authoritative_remote() && matches!(key, InputKey::Flight | InputKey::Noclip) {
@@ -634,6 +844,7 @@ impl ClientView {
     }
     pub fn clear_keys(&mut self) {
         self.keys.fill(false);
+        self.place_pressed = false;
     }
     pub fn input_buttons(&self) -> u32 {
         self.keys
@@ -775,7 +986,8 @@ impl ClientView {
                     false,
                 );
                 let attack = self.keys[InputKey::Attack as usize];
-                let place = self.keys[InputKey::Place as usize];
+                let place_pressed = std::mem::take(&mut self.place_pressed);
+                let place = self.keys[InputKey::Place as usize] || place_pressed;
                 if attack || place {
                     self.player.swing_hand();
                 }
@@ -804,6 +1016,23 @@ impl ClientView {
             lighting
                 .advance_cpu(&mut self.scene)
                 .map_err(|error| error.to_string())?;
+        }
+        if let Some(props) = &mut self.props {
+            props.set_visual_alpha(self.accumulator / sim::TICK_SECONDS);
+            let work = props.advance_cpu(&mut self.scene, self.tick)?;
+            self.record_props_work(work);
+        }
+        if let Some(water) = &mut self.water {
+            #[cfg(not(target_arch = "wasm32"))]
+            let stats = water.pump_native(&mut self.scene, self.tick);
+            #[cfg(target_arch = "wasm32")]
+            let stats = water.phase(&mut self.scene, self.tick);
+            let stats = stats.map_err(|error| error.to_string())?;
+            self.retained_worker_work.record(telemetry::WorkCounts {
+                cells_scanned: stats.work.worker_cells + stats.work.worker_halo_samples,
+                quads_emitted: stats.work.worker_quads,
+                ..telemetry::WorkCounts::ZERO
+            });
         }
         Ok(())
     }
@@ -1501,6 +1730,40 @@ impl ClientView {
                     parameters.projection(environment.width, environment.height),
                 )
             });
+        if let Some(props) = &mut self.props {
+            let work = props.upload_ready(&self.scene, queue, budget, self.tick)?;
+            if work.changed {
+                self.renderer.invalidate();
+            }
+            self.record_props_work(work);
+        }
+        let near_ready = self.near_meshes_ready();
+        if let (Some(water), Some(environment)) = (&mut self.water, &mut self.environment) {
+            let gpu = environment
+                .owner
+                .gpu
+                .water_mut()
+                .ok_or("water GPU detached from its source")?;
+            let before = budget.remaining_bytes;
+            let stats = water
+                .flush(queue, gpu, &self.scene, budget, |page| {
+                    water_model::page_model(self.scene.world(), page, [0.; 3])
+                })
+                .map_err(|error| error.to_string())?;
+            let bytes = before - budget.remaining_bytes;
+            self.retained_foreground_work.record(telemetry::WorkCounts {
+                upload_bytes: bytes,
+                ..telemetry::WorkCounts::ZERO
+            });
+            if bytes > 0 {
+                self.renderer.invalidate();
+            }
+            environment
+                .owner
+                .gpu
+                .set_water_cover_ready(&mut self.renderer, stats.ready && near_ready)
+                .map_err(|error| error.to_string())?;
+        }
         if let (Some(environment), Some((eye, camera))) = (&mut self.environment, source_camera) {
             let before = budget.remaining_bytes;
             let work = environment
@@ -1708,7 +1971,16 @@ impl ClientView {
         }
         let center = self.lighting_center();
         if let Some(lighting) = &mut self.lighting {
-            let work = if let Some(entities) = &mut self.entities {
+            let work = if let (Some(entities), Some(props)) = (&mut self.entities, &mut self.props)
+            {
+                let mut pair = render::shadows::ShadowCasterPair {
+                    first: &mut entities.gpu,
+                    second: &mut props.gpu,
+                };
+                lighting.encode_models(queue, encoder, &mut self.renderer, center, &mut pair)
+            } else if let Some(props) = &mut self.props {
+                lighting.encode_models(queue, encoder, &mut self.renderer, center, &mut props.gpu)
+            } else if let Some(entities) = &mut self.entities {
                 lighting.encode_models(
                     queue,
                     encoder,
@@ -1736,7 +2008,7 @@ impl ClientView {
         }
         let state = self.environment_state(parameters.eye);
         let scene_needed = self.environment.as_ref().is_none_or(|environment| {
-            environment.owner.gpu.scene_needed(
+            environment.owner.scene_needed(
                 &self.renderer,
                 &camera,
                 CullingMode::FrustumAndHiZ,
@@ -1767,13 +2039,28 @@ impl ClientView {
                 ..telemetry::WorkCounts::ZERO
             });
         }
+        if scene_needed && let Some(props) = &mut self.props {
+            let work = props.prepare_camera(queue, encoder, camera)?;
+            self.frame_upload_remaining -= work.camera_upload_bytes;
+            self.retained_foreground_work.record(telemetry::WorkCounts {
+                upload_bytes: work.camera_upload_bytes,
+                ..telemetry::WorkCounts::ZERO
+            });
+        }
         let entities = self.entities.as_ref();
         let horizon = self.horizon.as_ref();
+        let props = self.props.as_ref();
+        let props_encoded = std::cell::Cell::new(false);
         let extra = |pass: &mut wgpu::RenderPass<'_>| {
-            entities
+            let entity_draws = entities
                 .filter(|entities| entities.stats.primary_records != 0)
-                .map_or(0, |entities| entities.draw(pass))
-                + horizon.map_or(0, |horizon| horizon.owner.draw(pass))
+                .map_or(0, |entities| entities.draw(pass));
+            let horizon_draws = horizon.map_or(0, |horizon| horizon.owner.draw(pass));
+            let model_draws = props.map_or(0, |props| props.draw(pass));
+            props_encoded.set(
+                model_draws > 0 && props.is_some_and(|props| props.gpu.active_instances() > 0),
+            );
+            entity_draws + horizon_draws + model_draws
         };
         let work = if let Some(environment) = &mut self.environment {
             // An acquired surface needs a complete background even when only
@@ -1819,6 +2106,10 @@ impl ClientView {
             self.frame_upload_remaining -= work.camera_upload_bytes;
             work
         };
+        if scene_needed {
+            self.props_content_encoded = props_encoded.get();
+            self.props_frames += u64::from(self.props_content_encoded);
+        }
         self.self_model_rendered = self.entities.as_ref().map_or_else(
             || {
                 self.self_uploaded_pose.is_some_and(|pose| pose.visible)
@@ -1865,7 +2156,7 @@ impl ClientView {
         let renderer = self.retained_gpu_work.take();
         let foreground = self.retained_foreground_work.take();
         let scene = self.scene.stats();
-        let workers = telemetry::WorkCounts {
+        let mut workers = telemetry::WorkCounts {
             cells_scanned: scene
                 .mesh_cells_scanned
                 .saturating_sub(self.last_reported_mesh_cells),
@@ -1874,6 +2165,7 @@ impl ClientView {
                 .saturating_sub(self.last_reported_mesh_quads),
             ..telemetry::WorkCounts::ZERO
         };
+        workers.accumulate(self.retained_worker_work.take());
         self.last_reported_mesh_cells = scene.mesh_cells_scanned;
         self.last_reported_mesh_quads = scene.mesh_quads;
         let mut total = renderer;
@@ -1906,6 +2198,20 @@ impl ClientView {
         self.last_frame_work_details
     }
     pub fn is_ready(&self) -> bool {
+        self.near_meshes_ready()
+            && self
+                .lighting
+                .as_ref()
+                .is_none_or(|lighting| lighting.is_ready(&self.scene))
+            && self.props.as_ref().is_none_or(|props| props.stats.ready)
+            && ((self.resident.values().any(|p| p.quads > 0) && self.terrain_frames > 0)
+                || (self.props_content_encoded
+                    && self
+                        .props
+                        .as_ref()
+                        .is_some_and(|props| props.gpu.active_instances() > 0)))
+    }
+    fn near_meshes_ready(&self) -> bool {
         !self.page_links_dirty
             && self.scene.visible_pages().all(|p| {
                 self.resident.get(&p).is_some_and(|resident| {
@@ -1917,12 +2223,6 @@ impl ClientView {
                         })
                 })
             })
-            && self
-                .lighting
-                .as_ref()
-                .is_none_or(|lighting| lighting.is_ready(&self.scene))
-            && self.resident.values().any(|p| p.quads > 0)
-            && self.terrain_frames > 0
     }
     pub fn stats(&self) -> ViewStats {
         let scene = self.scene.stats();
@@ -1935,6 +2235,7 @@ impl ClientView {
             resident_pages: self.resident.len(),
             resident_quads: self.resident.values().map(|p| p.quads).sum(),
             terrain_frames: self.terrain_frames,
+            props_frames: self.props_frames,
             loaded_pages: scene.loaded_pages,
             queued_jobs: scene.queued_jobs,
             running_jobs: scene.running_jobs,

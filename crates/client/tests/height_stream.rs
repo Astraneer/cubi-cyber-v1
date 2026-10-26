@@ -51,6 +51,14 @@ fn point(x: i32, y: i32, z: i32) -> BlockPos {
         z,
     }
 }
+fn pace_clock(started: Instant, next_ms: u64) {
+    // Network virtual time must not race ahead of the real fsync/worker clocks.
+    // Keep the same75±20ms/loss profile and60s bounds on a slower CI host.
+    let remaining = Duration::from_millis(next_ms).saturating_sub(started.elapsed());
+    if !remaining.is_zero() {
+        thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
+}
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
@@ -468,12 +476,22 @@ fn actual_legacy_index_and_distant_height_tiles_recover_without_ore_or_rawpage_l
             ended = now;
             break;
         }
-        thread::sleep(Duration::from_micros(200));
+        pace_clock(started, now + 5);
     }
     assert!(
         done,
-        "heightstream incomplete phase{phase} server={:?} tilecounts={:?}",
-        runtime.server().counters(),
+        "heightstream incomplete phase{phase}: tick={} durable={} storage_stalls={} committed={} height_ready={} awaiting_wal={} height_jobs={}/{}/{} migrations={}/{} tilecounts={:?}",
+        runtime.server().counters().ticks,
+        runtime.server().counters().durable_batches,
+        runtime.server().counters().storage_stalls,
+        runtime.server().counters().committed_transactions,
+        runtime.server().height_ready_for_publication(),
+        runtime.server().awaiting_durability(),
+        runtime.server().counters().height_submitted,
+        runtime.server().counters().height_published,
+        runtime.server().counters().height_discarded,
+        runtime.server().counters().height_migration_pages,
+        runtime.server().counters().height_migration_cells,
         bots.iter()
             .map(|b| (
                 b.tiles.len(),
@@ -513,7 +531,7 @@ fn actual_legacy_index_and_distant_height_tiles_recover_without_ore_or_rawpage_l
             evicted = true;
             break;
         }
-        thread::sleep(Duration::from_micros(200));
+        pace_clock(started, now + 5);
     }
     assert!(
         evicted,

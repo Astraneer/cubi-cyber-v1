@@ -18,6 +18,7 @@ pub struct PublicTerrainSurface {
 pub struct PublicHeightTile {
     pub key: TileKey,
     pub source: u64,
+    pub error: Option<net::height::HeightErrorBound>,
     pub heights: [i32; 289],
     pub known: [u8; 37],
     pub atlas: [u16; 256],
@@ -83,6 +84,10 @@ pub struct HeightBuildWork {
     pub protected_cells: u64,
     pub world_reads: u64,
     pub canonical_noise_columns: u64,
+    pub error_intervals: u64,
+    pub error_unit_cells: u64,
+    pub error_noise_evaluations: u64,
+    pub error_columns: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeightBuildError {
@@ -154,6 +159,7 @@ pub fn build_tile_with_regions(
     let mut tile = PublicHeightTile {
         key: edits.key,
         source: edits.source,
+        error: None,
         heights: [0; 289],
         known: [0; 37],
         atlas: [0; 256],
@@ -292,7 +298,7 @@ pub fn build_canonical_tile(
     }
     let bounds = generator.public_structure_bounds();
     let regions = bounds.as_slice();
-    let (tile, mut work) = build_tile_with_regions(
+    let (mut tile, mut work) = build_tile_with_regions(
         edits,
         regions,
         |x, z| {
@@ -316,8 +322,55 @@ pub fn build_canonical_tile(
         },
         limits,
     )?;
+    let tile_bounds = edits.key.bounds().ok_or(HeightBuildError::InvalidInput)?;
+    let Ok(bound) = generator.public_height_error(
+        [tile_bounds[0] as i32, tile_bounds[1] as i32],
+        edits.key.level,
+    ) else {
+        // The final legal tile can have a closed endpoint one past i32::MAX.
+        // Its unavailable corner stays Unknown; do not invent a certificate.
+        work.canonical_noise_columns = work.baseline_columns * 5;
+        return Ok((tile, work));
+    };
+    let scaled = bound.max_error_blocks * 1024.;
+    let mut max_error_q1024 = scaled as u64;
+    if (max_error_q1024 as f64) < scaled {
+        max_error_q1024 += 1;
+    }
+    tile.error = Some(net::height::HeightErrorBound {
+        max_error_q1024,
+        min_height: bound.min_height,
+        max_height: bound.max_height,
+    });
+    work.error_intervals = bound.intervals;
+    work.error_unit_cells = bound.unit_cells;
+    work.error_noise_evaluations = bound.noise_evaluations;
+    work.error_columns = bound.sampled_columns;
     work.canonical_noise_columns = work.baseline_columns * 5;
     Ok((tile, work))
+}
+
+/// A camera may request the exact public representation of a non-flat leaf.
+/// This only promotes representation metadata; the existing stream must still
+/// obtain all canonical pages and source/view manifests before publication.
+/// World source, sampled heights, materials, tints and error remain immutable.
+pub fn promote_exact_leaf(tile: &mut PublicHeightTile) -> Result<bool, HeightBuildError> {
+    if tile.key.level != 0 {
+        return Err(HeightBuildError::InvalidInput);
+    }
+    if matches!(tile.replacement, ReplacementRequirement::Column { .. }) {
+        return Ok(false);
+    }
+    if tile.error.is_none_or(|error| error.max_error_q1024 == 0) {
+        return Ok(false);
+    }
+    tile.protected.fill(255);
+    tile.replacement = ReplacementRequirement::Column {
+        source: tile.source,
+        min_page_y: 0,
+        max_page_y: (r#gen::PROFILE_HEIGHT - 1).div_euclid(16),
+    };
+    Ok(true)
 }
 
 fn protect(tile: &mut PublicHeightTile, x: i32, z: i32) {

@@ -666,6 +666,86 @@ fn increased_attenuation_readds_unchanged_neighbor_light_after_withdrawal() {
 }
 
 #[test]
+fn sky_certificate_changes_seed_only_resident_top_faces_and_keep_real_rgb_sources() {
+    let mut initial = world(&[page(0, 0, 0), page(0, 1, 0)]);
+    let mut setup = LightingEngine::attach(&mut initial, limits()).unwrap();
+    set(&mut initial, &[(pos(8, 8, 8), 2)]);
+    for y in 0..2 {
+        setup
+            .queue_page(page(0, y, 0), Tick(1), LightPriority::Interactive)
+            .unwrap();
+    }
+    settle(&mut initial, &mut setup, &|p: BlockPos| {
+        (p.y == 31).then_some(15)
+    });
+    let mut costs = [0; 2];
+    for top_only in [false, true] {
+        let mut world = World::restore(
+            properties,
+            JournalLimits::default(),
+            initial.checkpoint().to_restore_state(),
+        )
+        .unwrap();
+        let mut engine = LightingEngine::attach(&mut world, limits()).unwrap();
+        for y in 0..2 {
+            if top_only {
+                engine
+                    .queue_sky_boundary_page(page(0, y, 0), Tick(1), LightPriority::Interactive)
+                    .unwrap();
+            } else {
+                engine
+                    .queue_page(page(0, y, 0), Tick(1), LightPriority::Interactive)
+                    .unwrap();
+            }
+        }
+        for _ in 0..2000 {
+            let step = engine
+                .step(&mut world, Tick(1), budget(), &|_| None)
+                .unwrap();
+            costs[usize::from(top_only)] += step.work.seed_cells_examined;
+            if engine.is_idle() {
+                break;
+            }
+        }
+        assert!(engine.is_idle());
+        assert_reference(&world, &|_| None);
+        assert_eq!(stored(&world, pos(8, 0, 8)).sky, 0);
+        assert_eq!(stored(&world, pos(8, 8, 8)).rgb, [15, 3, 0]);
+    }
+    assert!(costs[1] * 4 < costs[0]);
+    println!(
+        "SKY_BOUNDARY full_seed_cells={} top_seed_cells={} samples8192exact",
+        costs[0], costs[1]
+    );
+}
+
+#[test]
+fn a_full_page_request_and_sky_boundary_request_coalesce_without_losing_either_kind() {
+    for top_first in [false, true] {
+        let mut world = world(&[page(0, 0, 0)]);
+        set(&mut world, &[(pos(8, 8, 8), 2)]);
+        let mut engine = LightingEngine::attach(&mut world, limits()).unwrap();
+        for top in [top_first, !top_first] {
+            if top {
+                engine
+                    .queue_sky_boundary_page(page(0, 0, 0), Tick(1), LightPriority::Interactive)
+                    .unwrap();
+            } else {
+                engine
+                    .queue_page(page(0, 0, 0), Tick(1), LightPriority::Background)
+                    .unwrap();
+            }
+        }
+        assert_eq!(engine.pending_seed_pages(), 1);
+        settle(&mut world, &mut engine, &|p: BlockPos| {
+            (p.y == 15).then_some(15)
+        });
+        assert_reference(&world, &|p: BlockPos| (p.y == 15).then_some(15));
+        assert_eq!(stored(&world, pos(8, 8, 8)).rgb, [15, 3, 0]);
+    }
+}
+
+#[test]
 fn near_edits_have_reserved_slots_and_small_work_budgets_are_resumable() {
     let mut world = world(&[page(0, 0, 0)]);
     let policy = LightingLimits {

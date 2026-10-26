@@ -21,6 +21,7 @@ pub struct Snapshot {
     generator: r#gen::Generator,
     pages: BTreeMap<PageId, Captured>,
     observed: BTreeSet<PageId>,
+    spawn_protection: Option<([f64; 2], i32)>,
 }
 impl Snapshot {
     /// The caller explicitly certifies settled authoritative light per page.
@@ -55,7 +56,19 @@ impl Snapshot {
             generator,
             pages: captured,
             observed: BTreeSet::new(),
+            spawn_protection: None,
         })
+    }
+    pub fn with_spawn_protection(mut self, center: [f64; 2], radius: i32) -> Result<Self, Error> {
+        if radius < 0
+            || center
+                .iter()
+                .any(|v| !v.is_finite() || v.abs() > 30_000_000.)
+        {
+            return Err(Error::Bounds);
+        }
+        self.spawn_protection = Some((center, radius));
+        Ok(self)
     }
     pub fn inputs(&self) -> Vec<jobs::InputVersion> {
         self.observed
@@ -128,6 +141,10 @@ impl SpawnWorld for Snapshot {
     }
     fn protected(&self, p: BlockPos) -> bool {
         self.generator.protects_spawn(p.x, p.z)
+            || self.spawn_protection.is_some_and(|(center, radius)| {
+                (f64::from(p.x) - center[0]).abs() <= f64::from(radius)
+                    && (f64::from(p.z) - center[1]).abs() <= f64::from(radius)
+            })
     }
 }
 pub struct Task {

@@ -13,10 +13,12 @@ struct Row {
     kind: u8,
     flags: u16,
     phase: f32,
+    ambient_at: u64,
 }
 pub struct EntitySounds {
     session: Option<(u64, PlayerId)>,
     revision: Option<u64>,
+    tick: Option<core_types::Tick>,
     rows: Vec<Row>,
     next: Vec<Row>,
     pub emitted: u64,
@@ -27,6 +29,7 @@ impl Default for EntitySounds {
         Self {
             session: None,
             revision: None,
+            tick: None,
             rows: Vec::with_capacity(net::entities::MAX_ENTITIES),
             next: Vec::with_capacity(net::entities::MAX_ENTITIES),
             emitted: 0,
@@ -38,6 +41,7 @@ impl EntitySounds {
     pub fn clear(&mut self) {
         self.session = None;
         self.revision = None;
+        self.tick = None;
         self.rows.clear();
         self.next.clear();
     }
@@ -60,10 +64,12 @@ impl EntitySounds {
             self.session = session;
         }
         let replica = network.entity_replica();
-        if replica.revision() == self.revision {
+        let tick = network.acknowledged_tick();
+        if replica.revision() == self.revision && self.tick == Some(tick) {
             return 0;
         }
         self.revision = replica.revision();
+        self.tick = Some(tick);
         self.next.clear();
         let mut count = 0;
         for pose in replica.poses() {
@@ -79,10 +85,19 @@ impl EntitySounds {
             {
                 continue;
             }
+            let mut ambient_at = tick.0.saturating_add(ambient_period(pose.id));
             if let Ok(index) = self.rows.binary_search_by_key(&pose.id, |row| row.id) {
                 let old = self.rows[index];
                 if old.kind == pose.kind {
-                    for event in transitions(old, &pose).into_iter().flatten() {
+                    ambient_at = old.ambient_at;
+                    let ambient =
+                        if pose.flags & 4 == 0 && ambient_at != u64::MAX && tick.0 >= ambient_at {
+                            ambient_at = tick.0.saturating_add(ambient_period(pose.id));
+                            Some(ambient_event(pose.kind))
+                        } else {
+                            None
+                        };
+                    for event in transitions(old, &pose).into_iter().flatten().chain(ambient) {
                         if count == MAX_CUES {
                             self.dropped = self.dropped.saturating_add(1);
                             continue;
@@ -103,11 +118,26 @@ impl EntitySounds {
                 kind: pose.kind,
                 flags: pose.flags,
                 phase: pose.limb_phase,
+                ambient_at,
             });
         }
         std::mem::swap(&mut self.rows, &mut self.next);
         self.emitted = self.emitted.saturating_add(count as u64);
         count
+    }
+}
+// Presentation timing is derived only from public ticks and IDs. It never
+// reads the authority's private AI/RNG and never replays missed intervals.
+fn ambient_period(id: u64) -> u64 {
+    300 + id % 200
+}
+fn ambient_event(kind: u8) -> &'static str {
+    match kind {
+        0 => "entity.pig.ambient",
+        1 => "entity.cow.ambient",
+        2 => "entity.sheep.ambient",
+        3 => "entity.chicken.ambient",
+        _ => "entity.zombie.ambient",
     }
 }
 fn transitions(old: Row, pose: &EntityPose) -> [Option<&'static str>; 3] {

@@ -137,6 +137,47 @@ fn only_exact_confirmed_active_bindings_start_loops_and_raw_view_change_stops_be
     assert_eq!(sound.visit(1, &scene, &source, [0.; 3], |_| {}).stopped, 1);
 }
 #[test]
+fn confirmed_cube_machine_activity_is_audible_independent_of_its_geometry_owner() {
+    for item in [
+        rules::ids::ENRICHMENT_CHAMBER,
+        rules::ids::ENERGIZED_SMELTER,
+        rules::ids::CRUSHER,
+        rules::ids::PURIFICATION_CHAMBER,
+        rules::ids::CHEST,
+    ] {
+        let mut scene = scene();
+        let update = PageUpdate::Snapshot(PageSnapshot {
+            page: page(),
+            version: 11,
+            source_version: Version(200),
+            cells: Box::new([Cell::from_parts(item, 0); 4096]),
+        });
+        scene.import_authoritative_page(&update, Tick(1)).unwrap();
+        let mut source = source();
+        source
+            .publish_public_frame(frame(1, 11, 1, true), 11)
+            .unwrap();
+        let mut sound = MachineSounds::default();
+        let mut event = None;
+        let work = sound.visit(1, &scene, &source, [0.; 3], |command| {
+            if let MachineCommand::Start(cue) = command {
+                event = Some(cue.event);
+            }
+        });
+        if item == rules::ids::CHEST {
+            assert_eq!(
+                work.started, 0,
+                "a machine-shaped hint cannot turn a chest into a machine"
+            );
+            assert_eq!(event, None);
+        } else {
+            assert_eq!(work.started, 1);
+            assert_eq!(event, Some("machine.loop"));
+        }
+    }
+}
+
+#[test]
 fn discovery_voice_count_and_idle_allocations_are_bounded() {
     let scene = scene();
     let mut source = source();

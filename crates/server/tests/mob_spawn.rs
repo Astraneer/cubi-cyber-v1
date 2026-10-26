@@ -4,6 +4,9 @@ use rules::{
     ids::*,
 };
 use server::mob_spawn::*;
+use telemetry::{AllocationCounts, AllocationScope, CountingAllocator};
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator::new(std::alloc::System);
 struct Flat {
     floor: i32,
     unknown: bool,
@@ -401,4 +404,37 @@ fn actual_native_spawn_worker_defers_missing_pages_without_generating_or_marking
             .is_none()
     );
     workers.cancel_all();
+}
+
+#[test]
+fn invalid_spawn_bounds_reject_before_queries_and_idle_worker_polling_allocates_nothing() {
+    for column in [[i32::MIN / 16, 0], [i32::MAX / 16, 0], [1_875_000, 0]] {
+        assert!(matches!(
+            plan(
+                &mut Flat::default(),
+                Request { column, ..herd(3) },
+                &[],
+                Budget::default()
+            ),
+            Err(Error::Bounds)
+        ));
+    }
+    assert!(matches!(
+        plan(
+            &mut Flat::default(),
+            herd(3),
+            &[],
+            Budget {
+                min_y: i32::MIN,
+                ..Budget::default()
+            }
+        ),
+        Err(Error::Bounds)
+    ));
+    let workers = Workers::new(1, 2).unwrap();
+    let scope = AllocationScope::begin().unwrap();
+    for _ in 0..10_000 {
+        assert!(workers.try_recv().is_none());
+    }
+    assert_eq!(scope.finish(), AllocationCounts::ZERO);
 }

@@ -8,6 +8,7 @@ fn tile() -> HeightTile {
             z: 0,
         },
         source: 1,
+        error: None,
         heights: [0; 289],
         known: [0; 37],
         atlas: [0; 256],
@@ -111,4 +112,80 @@ fn outer_height_messages_keep_tags_bounded_and_roundtrip_replacement_evidence() 
         })
         .is_err()
     );
+}
+
+#[test]
+fn height_error_is_source_bound_quantized_metadata_and_unknown_is_distinct() {
+    let mut t = tile();
+    let without = encode(&t).unwrap();
+    assert_eq!(&without[..4], b"HTI2");
+    t.error = Some(HeightErrorBound {
+        max_error_q1024: 1025,
+        min_height: -32,
+        max_height: 128,
+    });
+    let bytes = encode(&t).unwrap();
+    assert_eq!(bytes.len(), without.len() + 16);
+    assert_eq!(decode(&bytes).unwrap(), t);
+    assert_eq!(
+        decode(&bytes).unwrap().error.unwrap().blocks(),
+        1.0009765625
+    );
+    t.error.as_mut().unwrap().min_height = 129;
+    assert_eq!(encode(&t), Err(HeightError::Bounds));
+    t.error = Some(HeightErrorBound {
+        max_error_q1024: 0,
+        min_height: 1,
+        max_height: 2,
+    });
+    t.known[0] = 1;
+    assert_eq!(
+        encode(&t),
+        Err(HeightError::Bounds),
+        "known corner outside claimed enclosure"
+    );
+    t.error = None;
+    assert!(
+        encode(&t).is_ok(),
+        "Unknown error is allowed but never inferred as zero"
+    );
+}
+
+#[test]
+fn exact_leaf_requests_have_an_additive_bounded_tag_and_preserve_normal_bytes() {
+    let key = HeightKey {
+        space: 0,
+        level: 0,
+        x: -2,
+        z: 5,
+    };
+    let ordinary = net::ClientMessage::RequestHeight {
+        key,
+        known: Some(7),
+    };
+    let exact = net::ClientMessage::RequestExactHeight {
+        key,
+        known: Some(7),
+    };
+    let a = net::encode_client(&ordinary).unwrap();
+    let b = net::encode_client(&exact).unwrap();
+    assert_eq!(a.len(), b.len());
+    assert_ne!(a, b);
+    assert_eq!(net::decode_client(&a).unwrap(), ordinary);
+    assert_eq!(net::decode_client(&b).unwrap(), exact);
+    for n in 0..b.len() {
+        assert!(net::decode_client(&b[..n]).is_err());
+    }
+    assert!(
+        net::encode_client(&net::ClientMessage::RequestExactHeight {
+            key: HeightKey { level: 1, ..key },
+            known: None
+        })
+        .is_err()
+    );
+    let mut changed = b;
+    // Versioned outer prefix is four-byte magic plus the request tag.
+    let tag = a.iter().zip(&changed).position(|(a, b)| a != b).unwrap();
+    changed[tag] = 255;
+    assert!(net::decode_client(&changed).is_err());
 }
