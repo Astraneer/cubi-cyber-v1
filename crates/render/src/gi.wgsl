@@ -49,8 +49,12 @@ fn trace_ray(origin:vec3<f32>,direction:vec3<f32>,evaluate_radiance:bool)->Ray {
         distance=min(next.x,min(next.y,next.z));
         if distance>=params.trace.x{return Ray(vec3(0.0),params.trace.x,steps,0u,0u);}
         let crossing=next<=vec3(distance+0.00001);
-        var axis=0u;if next.y<next.x{axis=1u;}if next.z<next[axis]{axis=2u;}
-        normal=vec3(0.0);normal[axis]=-f32(advance[axis]);
+        // Component assignments avoid a dynamically indexed local-vector
+        // l-value, which FXC cannot address inside the bounded DDA loop.
+        // Preserve the original X, then Y, then Z priority at exact ties.
+        if next.x<=next.y&&next.x<=next.z{normal=vec3(-f32(advance.x),0.,0.);}
+        else if next.y<=next.z{normal=vec3(0.,-f32(advance.y),0.);}
+        else{normal=vec3(0.,0.,-f32(advance.z));}
         cell+=select(vec3(0),advance,crossing);next+=select(vec3(0.0),delta,crossing);
     }
     // Budget exhaustion is dark, with a conservative visibility boundary.

@@ -364,7 +364,7 @@ pub struct LodProxyGpu {
     free_slots: Vec<u32>,
     free_spans: Vec<Span>,
     revision: u64,
-    last_frame: Option<(ProxyCamera, u64)>,
+    last_frame: Option<(ProxyCamera, u64, u32)>,
     work: ProxyWork,
 }
 impl LodProxyGpu {
@@ -962,7 +962,26 @@ impl LodProxyGpu {
         encoder: &mut wgpu::CommandEncoder,
         camera: ProxyCamera,
     ) -> Result<ProxyWork, ProxyError> {
-        if camera.viewport_height == 0
+        let focal = |row: usize| {
+            (0..3)
+                .map(|axis| f64::from(camera.camera.view_projection[axis][row]).powi(2))
+                .sum::<f64>()
+                .sqrt()
+        };
+        let width = (f64::from(camera.viewport_height) * focal(1) / focal(0)).round() as u32;
+        self.prepare_frame_extent(queue, encoder, camera, width)
+    }
+    /// Explicit attachment width for asymmetric projections; the compatibility
+    /// method above infers the aspect of standard symmetric camera matrices.
+    pub fn prepare_frame_extent(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: ProxyCamera,
+        viewport_width: u32,
+    ) -> Result<ProxyWork, ProxyError> {
+        if viewport_width == 0
+            || camera.viewport_height == 0
             || camera
                 .eye
                 .iter()
@@ -977,7 +996,7 @@ impl LodProxyGpu {
         if let Some(counters) = &self.counters {
             encoder.clear_buffer(counters, 0, None);
         }
-        if self.last_frame == Some((camera, self.revision)) {
+        if self.last_frame == Some((camera, self.revision, viewport_width)) {
             return Ok(ProxyWork::default());
         }
         let direction = camera.orthographic_direction.unwrap_or([0.; 3]);
@@ -994,7 +1013,12 @@ impl LodProxyGpu {
                 },
             ],
             direction: [direction[0], direction[1], direction[2], 0.],
-            params: [self.config.max_objects, camera.viewport_height, 0, 0],
+            params: [
+                self.config.max_objects,
+                camera.viewport_height,
+                viewport_width,
+                0,
+            ],
         };
         queue.write_buffer(&self.camera, 0, bytemuck::bytes_of(&uniform));
         {
@@ -1008,7 +1032,7 @@ impl LodProxyGpu {
             pass.set_pipeline(&self.cull);
             pass.dispatch_workgroups(self.config.max_objects.div_ceil(64), 1, 1);
         }
-        self.last_frame = Some((camera, self.revision));
+        self.last_frame = Some((camera, self.revision, viewport_width));
         Ok(ProxyWork {
             cull_dispatches: 2,
             objects_considered: self.config.max_objects,
