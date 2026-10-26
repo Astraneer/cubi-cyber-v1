@@ -2,6 +2,52 @@
 //! first submitted frame that represents it. Encoding alone is not completion.
 use std::collections::VecDeque;
 const MAX_GROUPS: usize = 64;
+/// The exact CPU upload stamp used by UiLayer. A later world frame can use the
+/// same UI without creating a new UI presentation requirement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UiStamp {
+    pub revision: u64,
+    pub width: u32,
+    pub height: u32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UiSubmissionReceipt {
+    pub stamp: UiStamp,
+    pub frame: u64,
+}
+/// Latches the first actually submitted/presented frame for each upload stamp.
+/// Completion is still proved by the existing queue completion counter.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UiSubmission {
+    last_submitted: u64,
+    receipt: Option<UiSubmissionReceipt>,
+}
+impl UiSubmission {
+    /// Surface or View replacement invalidates the old image even when the UI
+    /// revision and dimensions happen to be unchanged. Frame IDs stay monotone.
+    pub fn invalidate(&mut self) {
+        self.receipt = None;
+    }
+    /// Call only after successful queue submission AND surface presentation,
+    /// with the UI stamp encoded in that same foreground turn. Abandoned
+    /// encoders never call this method; callbacks never move the receipt.
+    pub fn submitted(&mut self, frame: u64, stamp: Option<UiStamp>) {
+        if frame <= self.last_submitted {
+            return;
+        }
+        self.last_submitted = frame;
+        let Some(stamp) = stamp.filter(|stamp| stamp.width != 0 && stamp.height != 0) else {
+            self.receipt = None;
+            return;
+        };
+        if self.receipt.is_none_or(|receipt| receipt.stamp != stamp) {
+            self.receipt = Some(UiSubmissionReceipt { stamp, frame });
+        }
+    }
+    pub fn receipt(&self) -> Option<UiSubmissionReceipt> {
+        self.receipt
+    }
+}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameCompletion {
     pub frame: u64,
@@ -102,6 +148,65 @@ impl PresentationProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn ui(revision: u64, width: u32, height: u32) -> UiStamp {
+        UiStamp {
+            revision,
+            width,
+            height,
+        }
+    }
+    #[test]
+    fn completed_ui_does_not_wait_for_a_new_heavy_world_frame() {
+        let mut receipt = UiSubmission::default();
+        receipt.submitted(100, Some(ui(7, 780, 437)));
+        let completed = 100;
+        // This Scene is still pending, but the exact requested UI was already
+        // displayed by frame100. The old latest-submission fence waited101.
+        receipt.submitted(101, Some(ui(7, 780, 437)));
+        assert_eq!(receipt.receipt().unwrap().frame, 100);
+        assert!(completed >= receipt.receipt().unwrap().frame);
+        assert!(completed < receipt.last_submitted);
+    }
+    #[test]
+    fn uploaded_but_abandoned_and_coalesced_revisions_do_not_get_false_receipts() {
+        let mut receipt = UiSubmission::default();
+        receipt.submitted(10, Some(ui(4, 780, 437)));
+        let abandoned_upload = ui(5, 780, 437);
+        assert!(receipt.receipt().unwrap().stamp.revision < abandoned_upload.revision);
+        // Revision5's encoder was abandoned. A subsequent upload coalesces it
+        // into revision6; only its real submission can qualify the newer UI.
+        receipt.submitted(11, Some(ui(6, 780, 437)));
+        assert_eq!(receipt.receipt().unwrap().stamp.revision, 6);
+        assert!(receipt.receipt().unwrap().frame > 10);
+        receipt.submitted(10, Some(abandoned_upload)); // stale ID cannot undo it
+        assert_eq!(receipt.receipt().unwrap().stamp.revision, 6);
+        assert_eq!(receipt.receipt().unwrap().frame, 11);
+    }
+    #[test]
+    fn resize_and_same_size_view_replacement_need_their_own_submissions() {
+        let mut receipt = UiSubmission::default();
+        receipt.submitted(20, Some(ui(8, 780, 437)));
+        receipt.invalidate(); // same-size surface recreation/reprepare
+        assert!(receipt.receipt().is_none());
+        receipt.submitted(20, Some(ui(8, 780, 437)));
+        assert!(receipt.receipt().is_none());
+        receipt.submitted(21, Some(ui(8, 780, 437)));
+        assert_eq!(receipt.receipt().unwrap().frame, 21);
+        receipt.invalidate(); // actual resize, without changing UI revision
+        receipt.submitted(22, Some(ui(8, 960, 540)));
+        assert_eq!(receipt.receipt().unwrap().stamp, ui(8, 960, 540));
+        assert_eq!(receipt.receipt().unwrap().frame, 22);
+    }
+    #[test]
+    fn non_ui_or_zero_extent_work_cannot_certify_a_ui_image() {
+        let mut receipt = UiSubmission::default();
+        receipt.submitted(1, None);
+        assert!(receipt.receipt().is_none());
+        receipt.submitted(2, Some(ui(1, 0, 437)));
+        assert!(receipt.receipt().is_none());
+        receipt.submitted(3, Some(ui(1, 780, 437)));
+        assert_eq!(receipt.receipt().unwrap().frame, 3);
+    }
     #[test]
     fn one_old_frame_then_edit_is_two_completed_frames() {
         let mut probe = PresentationProbe::new(0);

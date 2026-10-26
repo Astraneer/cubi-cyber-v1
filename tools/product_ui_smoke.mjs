@@ -5,6 +5,7 @@ import {spawn,spawnSync} from 'node:child_process';
 import {mkdir,mkdtemp,readFile,writeFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {withBrowser,pngPixels,pause,root} from './browser.mjs';
+import {UI_PRESENTATION_SNAPSHOT,waitForUiPresentation} from './ui_presentation_barrier.mjs';
 import {componentProfile,graphicsControls,horizonProfile} from './ui_graphics_controls.mjs';
 await mkdir(join(root,'.local/tmp'),{recursive:true});
 const folder=await mkdtemp(join(root,'.local/tmp/product-authority-'));
@@ -31,7 +32,7 @@ try{
   await withBrowser({width:780,height:437,path:'/'},async({call,evaluate,waitFor,onEvent})=>{
     await waitFor('document.documentElement?.dataset.app',s=>s==='ready');
     const componentOnly=process.env.CUBI_UI_COMPONENT_ONLY==='1';
-    const status=()=>evaluate('window.__M2Stats()');const ui=()=>evaluate('window.__CUBI.product_ui_stats()');const waitUi=async(predicate,timeout=120000)=>{try{return await waitFor('window.__CUBI.product_ui_stats()',predicate,timeout);}catch(error){console.error('PRODUCT_TIMEOUT_STATE '+JSON.stringify(await status()));throw error;}};const painted=async()=>{const revision=(await status()).uiRevision;const frame=await waitFor('window.__M2Stats()',s=>s.uiUploadedRevision>=revision&&!s.uiFramePending,15000);return waitFor('window.__M2Stats()',s=>s.completedFrames>=frame.submittedFrames,15000);};
+    const status=()=>evaluate('window.__M2Stats()');const ui=()=>evaluate('window.__CUBI.product_ui_stats()');const waitUi=async(predicate,timeout=120000)=>{try{return await waitFor('window.__CUBI.product_ui_stats()',predicate,timeout);}catch(error){console.error('PRODUCT_TIMEOUT_STATE '+JSON.stringify(await status()));throw error;}};const painted=()=>waitForUiPresentation({read:()=>evaluate(UI_PRESENTATION_SNAPSHOT),pause});
     const key=async(code,key=code)=>{await call('Input.dispatchKeyEvent',{type:'keyDown',code,key});await call('Input.dispatchKeyEvent',{type:'keyUp',code,key});};
     const type=async text=>{for(const char of text)await key(char>='0'&&char<='9'?`Digit${char}`:char==='.'?'Period':char===':'?'Semicolon':'KeyX',char);};
     const click=async(x,y,button='left')=>{await painted();await call('Input.dispatchMouseEvent',{type:'mouseMoved',x,y});await call('Input.dispatchMouseEvent',{type:'mousePressed',x,y,button,clickCount:1});await call('Input.dispatchMouseEvent',{type:'mouseReleased',x,y,button,clickCount:1});await pause(150);};

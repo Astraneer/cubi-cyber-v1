@@ -64,6 +64,7 @@ struct BrowserState {
     last_present_ms: f64,
     last_profiler_ms: f64,
     ui_pending: bool,
+    ui_submission: client::presentation::UiSubmission,
     connection_epoch: u64,
     local_materials_revision: u64,
     local_materials_resolution: u32,
@@ -169,6 +170,29 @@ impl BrowserState {
             ] {
                 let _ = js_sys::Reflect::set(&value, &name.into(), &(revision as f64).into());
             }
+            let receipt = self.ui_submission.receipt();
+            let _ = js_sys::Reflect::set(
+                &value,
+                &"uiSubmissionValid".into(),
+                &receipt.is_some().into(),
+            );
+            for (name, number) in [
+                ("uiSubmittedFrame", receipt.map_or(0, |r| r.frame)),
+                (
+                    "uiSubmittedRevision",
+                    receipt.map_or(0, |r| r.stamp.revision),
+                ),
+                (
+                    "uiSubmittedWidth",
+                    receipt.map_or(0, |r| u64::from(r.stamp.width)),
+                ),
+                (
+                    "uiSubmittedHeight",
+                    receipt.map_or(0, |r| u64::from(r.stamp.height)),
+                ),
+            ] {
+                let _ = js_sys::Reflect::set(&value, &name.into(), &(number as f64).into());
+            }
             let _ = js_sys::Reflect::set(
                 &value,
                 &"interactionMode".into(),
@@ -246,6 +270,7 @@ impl BrowserState {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.gpu.device, &self.config);
+            self.ui_submission.invalidate();
             if !self.resetting {
                 self.view
                     .resize(&self.gpu.device, width, height)
@@ -496,6 +521,7 @@ impl BrowserState {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.surface.configure(&self.gpu.device, &self.config);
+                self.ui_submission.invalidate();
                 self.view.invalidate();
                 return Ok(false);
             }
@@ -588,6 +614,19 @@ impl BrowserState {
             .checked_add(1)
             .ok_or("frame sequence exhausted")?;
         let submitted = self.submitted;
+        self.ui_submission.submitted(
+            u64::from(submitted),
+            self.product.as_ref().and_then(|product| {
+                product
+                    .layer
+                    .uploaded_stamp()
+                    .map(|(revision, width, height)| client::presentation::UiStamp {
+                        revision,
+                        width,
+                        height,
+                    })
+            }),
+        );
         if let Some(product) = &mut self.product {
             let game_ui = used_cached
                 && product.needs_game_ui()
@@ -763,6 +802,7 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
             let (fresh, epoch) = {
                 let mut state = state.borrow_mut();
                 state.connection_epoch = state.connection_epoch.wrapping_add(1);
+                state.ui_submission.invalidate();
                 state.socket = None;
                 let fresh = !state.resetting
                     && state.view.environment_stats().is_some()
@@ -849,6 +889,7 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                         borrowed.water_workers = None;
                         borrowed.gi_workers = None;
                         borrowed.view = placeholder;
+                        borrowed.ui_submission.invalidate();
                         borrowed.local_materials_revision = 0;
                         borrowed.local_materials_resolution = 0;
                         borrowed.local_materials_layers = 0;
@@ -920,6 +961,7 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                     view.resize(&device, borrowed.config.width, borrowed.config.height)
                         .map_err(js_error)?;
                     borrowed.view = view;
+                    borrowed.ui_submission.invalidate();
                     if let Some(recorder) = &mut borrowed.recorder {
                         recorder
                             .begin_input_epoch()
@@ -964,6 +1006,7 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
         product_ui::Command::Disconnect | product_ui::Command::Quit => {
             let mut state = state.borrow_mut();
             state.connection_epoch = state.connection_epoch.wrapping_add(1);
+            state.ui_submission.invalidate();
             state.socket = None;
             state.resetting = false;
             state.view.clear_keys();
@@ -2156,6 +2199,7 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
         local_materials_layers: 0,
         local_materials_upload_bytes: 0,
         ui_pending: false,
+        ui_submission: client::presentation::UiSubmission::default(),
         connection_epoch: 0,
         presentation_probe: client::presentation::PresentationProbe::new(0),
         presentation_completion: Arc::new(Mutex::new(

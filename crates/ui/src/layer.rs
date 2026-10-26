@@ -31,6 +31,9 @@ impl UiLayer {
     pub fn uploaded_revision(&self) -> Option<u64> {
         self.last.map(|stamp| stamp.0)
     }
+    pub fn uploaded_stamp(&self) -> Option<(u64, u32, u32)> {
+        self.last
+    }
     pub fn upload(
         &mut self,
         queue: &wgpu::Queue,
