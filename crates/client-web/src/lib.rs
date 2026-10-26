@@ -1272,7 +1272,8 @@ fn stats_object(view: &ClientView) -> JsValue {
         &"sunClockKnown".into(),
         &view.sun_clock().is_some().into(),
     );
-    let horizon = view.horizon_stats().unwrap_or_default();
+    let horizon_stats = view.horizon_stats();
+    let horizon = horizon_stats.unwrap_or_default();
     let far_water = view.horizon_water_stats().unwrap_or_default();
     let far_shadows = view.distant_shadow_stats().unwrap_or_default();
     let props = view.props_stats().unwrap_or_default();
@@ -1301,6 +1302,24 @@ fn stats_object(view: &ClientView) -> JsValue {
         ),
         ("horizonPlanId", horizon.plan_id as f64),
         ("horizonAcceptedPlanId", horizon.accepted_plan_id as f64),
+        ("horizonCandidatePlanId", horizon.candidate_plan_id as f64),
+        ("horizonCommittedPlanId", horizon.committed_plan_id as f64),
+        (
+            "horizonRequestedErrorPixels",
+            horizon.requested_error_pixels,
+        ),
+        (
+            "horizonCommittedMissingErrorCertificates",
+            horizon.committed_missing_error_certificates as f64,
+        ),
+        (
+            "horizonCommittedSelectionLeafLimited",
+            horizon.committed_selection_leaf_limited as f64,
+        ),
+        (
+            "horizonCommittedMaximumErrorPixels",
+            horizon.committed_maximum_error_pixels,
+        ),
         ("horizonPlanGeneration", horizon.plan_generation as f64),
         ("horizonHeightStaged", horizon.height_staged as f64),
         ("horizonProxyStaged", horizon.proxy_staged as f64),
@@ -1352,6 +1371,11 @@ fn stats_object(view: &ClientView) -> JsValue {
     for (name, flag) in [
         ("horizonNearGuardReady", horizon.near_guard_ready),
         ("horizonCommittedFront", view.has_committed_far_front()),
+        ("horizonProjectionPresent", horizon.projection_present),
+        (
+            "horizonCommittedSelectionCapacityLimited",
+            horizon.committed_selection_capacity_limited,
+        ),
         ("farShadowsEnabled", far_shadows.enabled),
         ("propsPrepared", view.props_stats().is_some()),
         ("propsReady", props.ready),
@@ -1365,6 +1389,13 @@ fn stats_object(view: &ClientView) -> JsValue {
     ] {
         let _ = js_sys::Reflect::set(&value, &name.into(), &flag.into());
     }
+    let _ = js_sys::Reflect::set(
+        &value,
+        &"horizonCommittedRequestedErrorPixels".into(),
+        &horizon
+            .committed_requested_error_pixels
+            .map_or(JsValue::NULL, JsValue::from),
+    );
     let position = stats.player_pos;
     let eye_light = view.scene.read_authoritative_light(core_types::BlockPos {
         space: view.scene.config().center.space,
@@ -1373,14 +1404,8 @@ fn stats_object(view: &ClientView) -> JsValue {
         z: position[2].floor() as i32,
     });
     for (name, number) in [
-        (
-            "horizonHeightFront",
-            view.horizon_stats().map_or(0, |s| s.height_front) as f64,
-        ),
-        (
-            "horizonProxyFront",
-            view.horizon_stats().map_or(0, |s| s.proxy_front) as f64,
-        ),
+        ("horizonHeightFront", horizon.height_front as f64),
+        ("horizonProxyFront", horizon.proxy_front as f64),
         (
             "pendingLightSourcePages",
             view.lighting_stats().map_or(0, |s| s.pending_source_pages) as f64,
@@ -1417,7 +1442,7 @@ fn stats_object(view: &ClientView) -> JsValue {
                 .is_some_and(|s| s.authoritative_source),
         ),
         ("environmentPrepared", view.environment_stats().is_some()),
-        ("horizonPrepared", view.horizon_stats().is_some()),
+        ("horizonPrepared", horizon_stats.is_some()),
         ("publicEyeLightKnown", eye_light.is_some()),
         ("lightReady", view.lighting_stats().is_some_and(|s| s.ready)),
     ] {

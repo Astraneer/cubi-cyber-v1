@@ -1,4 +1,5 @@
 //! Native event/file/device glue for the same Rust UI and authority adapter.
+mod consumable_diagnostics;
 use audio::{
     EmitterId,
     scene::{NativeScene, PreparedSounds},
@@ -56,6 +57,7 @@ pub struct ProductUi {
     sequence: u64,
     preferences: PathBuf,
     diagnostics: bool,
+    consumable_diagnostics: consumable_diagnostics::Observations,
     last_diagnostic: Option<DiagnosticStamp>,
     last_aim: Option<(Option<[i32; 3]>, u16)>,
     last_world_diagnostic: Option<(usize, usize, bool, Option<u8>)>,
@@ -149,6 +151,7 @@ impl ProductUi {
             sequence: 0,
             preferences,
             diagnostics: std::env::var_os("CUBI_UI_DIAGNOSTICS").is_some(),
+            consumable_diagnostics: Default::default(),
             last_diagnostic: None,
             last_aim: None,
             last_world_diagnostic: None,
@@ -701,13 +704,21 @@ impl ProductUi {
                     );
                 });
                 self.causal_sounds.visit(network, player.eye(1.0), |cue| {
-                    let _ = audio.event_gain(
-                        cue.event,
-                        cue.emitter,
-                        Some(cue.position),
-                        cue.seed,
-                        cue.gain,
-                    );
+                    let played = audio
+                        .event_gain(
+                            cue.event,
+                            cue.emitter,
+                            Some(cue.position),
+                            cue.seed,
+                            cue.gain,
+                        )
+                        .is_ok();
+                    if self.diagnostics {
+                        println!(
+                            "NATIVE_UI_CAUSAL_AUDIO {{\"event\":\"{}\",\"emitter\":{},\"seed\":{},\"played\":{}}}",
+                            cue.event, cue.emitter.0, cue.seed, played,
+                        );
+                    }
                 });
             }
             let world = view.scene.world();
@@ -740,6 +751,10 @@ impl ProductUi {
         self.bridge
             .sync_authority(&mut self.layer.app, network)
             .map_err(str::to_owned)?;
+        if self.diagnostics {
+            self.consumable_diagnostics
+                .observe(network, self.layer.app.snapshot.hp);
+        }
         self.report_state();
         Ok(())
     }

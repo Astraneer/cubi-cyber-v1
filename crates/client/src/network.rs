@@ -341,6 +341,13 @@ impl Connection {
     pub fn player(&self) -> Option<&Player> {
         self.player.as_ref()
     }
+    /// Last decoded authority checkpoint, without collision scratch allocation
+    /// or local prediction. Diagnostic consumers must not label player() as
+    /// confirmed movement/health after it has advanced beyond this tick.
+    pub fn confirmed_motion(&self) -> Option<(Tick, sim::prediction::AudioMotion)> {
+        let (tick, _, state) = self.last_authority.as_ref()?;
+        Some((*tick, state.audio_motion().ok()?))
+    }
     pub fn replica(&self) -> &Replica {
         &self.replica
     }

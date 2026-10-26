@@ -469,3 +469,44 @@ fn new_session_resets_food_state_and_welcome_cannot_replace_a_live_connection() 
         [(ActionId(1), Action::UseFood { held: true, .. })]
     ));
 }
+#[test]
+fn confirmed_consumable_observation_never_labels_local_prediction_as_authority() {
+    let (mut s, _) = session(rules::items::I_APPLE, 10.);
+    ground(&mut s);
+    let original = s.connection().confirmed_motion().unwrap();
+    assert_eq!(original.0, Tick(0));
+    assert_eq!(forward_factor(&mut s), 1.);
+    assert_ne!(s.connection().player().unwrap().pos, original.1.position);
+    assert_eq!(s.connection().confirmed_motion(), Some(original));
+    let mut actual = sim::Player::new([8.5, 1., 9.5]);
+    actual.health = 9.;
+    let prediction = |tick| ServerMessage::Prediction {
+        tick,
+        player: PlayerState {
+            health: actual.health,
+            position: actual.pos,
+            velocity: actual.vel,
+            yaw: actual.yaw,
+            pitch: actual.pitch,
+            mode: actual.mode as u8,
+            on_ground: actual.on_ground,
+            flying: actual.flying,
+            noclip: actual.noclip,
+            ..Default::default()
+        },
+        continuation: sim::prediction::PredictionState::capture(&actual)
+            .unwrap()
+            .as_bytes()
+            .to_vec(),
+    };
+    receive_encoded(&mut s, prediction(Tick(0)), 10);
+    assert_eq!(s.connection().confirmed_motion(), Some(original));
+    receive_encoded(&mut s, prediction(Tick(8)), 11);
+    let confirmed = s.connection().confirmed_motion().unwrap();
+    assert_eq!(confirmed.0, Tick(8));
+    assert_eq!(confirmed.1.health, 9.);
+    assert_eq!(confirmed.1.position, actual.pos);
+    // The new authority is pending reconciliation; observation already names
+    // the decoded checkpoint, not the previous locally advanced Player.
+    assert_eq!(s.connection().player().unwrap().health, 10.);
+}
