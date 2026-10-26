@@ -28,6 +28,13 @@ fn gpu_diagnostics(gpu: &render::Gpu) -> Arc<MaterialGpuDiagnostics> {
         phase: AtomicU32::new(0),
         lost: Mutex::new(None),
     });
+    // Read-only COM reference, retained independently of wgpu's lost-device
+    // guard. No backend resources are mutated or destroyed through this handle.
+    #[cfg(windows)]
+    // SAFETY: We only clone the live COM device interface. The HAL guard is
+    // dropped after the query; no raw resource is changed or destroyed.
+    let native_device = unsafe { gpu.device.as_hal::<wgpu::hal::api::Dx12>() }
+        .map(|device| device.raw_device().clone());
     let lost = Arc::clone(&diagnostics);
     gpu.device.set_device_lost_callback(move |reason, message| {
         if reason != wgpu::DeviceLostReason::Destroyed {
@@ -35,6 +42,19 @@ fn gpu_diagnostics(gpu: &render::Gpu) -> Arc<MaterialGpuDiagnostics> {
                 "phase={} reason={reason:?} message={message}",
                 lost.phase.load(Ordering::Relaxed)
             );
+            #[cfg(windows)]
+            if let Some(native) = &native_device {
+                // SAFETY: GetDeviceRemovedReason only queries the live COM
+                // device; the cloned interface remains alive for this call.
+                let code = unsafe { native.GetDeviceRemovedReason() }
+                    .err()
+                    .map_or(0, |error| error.code().0 as u32);
+                action_annotation(
+                    "error",
+                    lost.phase.load(Ordering::Relaxed),
+                    &format!("device removed HRESULT=0x{code:08x}"),
+                );
+            }
             action_annotation("error", lost.phase.load(Ordering::Relaxed), "device lost");
             eprintln!("MATERIAL_DEVICE_LOST {text}");
             *lost.lost.lock().unwrap() = Some(text);
