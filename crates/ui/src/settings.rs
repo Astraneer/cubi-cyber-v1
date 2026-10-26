@@ -283,6 +283,7 @@ pub struct Reduction {
     pub saving_measured: bool,
 }
 /// Runtime overrides have a bounded stack and a ten-second decision cooldown.
+#[derive(Clone)]
 pub struct AutoQuality {
     effective: [i32; COUNT],
     history: [Option<Reduction>; 32],
@@ -311,6 +312,18 @@ impl AutoQuality {
     pub fn reset(&mut self, settings: &Settings) {
         *self = Self::new(settings);
     }
+    /// A prepared backend acknowledges a decision only after its resources and
+    /// effective values have changed. Its cooldown starts at that point.
+    pub fn acknowledged_at(&mut self, now_ms: u64) {
+        self.last_decision_ms = now_ms;
+        self.slow_windows = 0;
+        self.fast_windows = 0;
+    }
+    pub fn effective_settings(&self, saved: &Settings) -> Settings {
+        let mut result = saved.clone();
+        result.values = self.effective;
+        result
+    }
     /// Each sample represents a complete one-second window, with enough frames to
     /// reject a single hitch. Savings are measured by the caller's GPU pass timers.
     pub fn observe(
@@ -321,7 +334,20 @@ impl AutoQuality {
         p95_us: u32,
         headroom_us: u32,
     ) -> Option<Reduction> {
-        if settings.get(Setting::Hold60) == 0 || frames < 30 {
+        self.observe_supported(settings, now_ms, frames, p95_us, headroom_us, u32::MAX)
+    }
+    /// Only settings with an actual prepared backend may be proposed. A missing
+    /// earlier lever does not prevent the next supported lever from being used.
+    pub fn observe_supported(
+        &mut self,
+        settings: &Settings,
+        now_ms: u64,
+        frames: u16,
+        p95_us: u32,
+        headroom_us: u32,
+        supported: u32,
+    ) -> Option<Reduction> {
+        if settings.get(Setting::Hold60) == 0 || frames < 8 {
             return None;
         }
         self.slow_windows = if p95_us > 18000 {
@@ -339,7 +365,8 @@ impl AutoQuality {
         }
         if self.fast_windows >= 5 && self.len > 0 {
             let reduction = self.history[self.len - 1]?;
-            if !reduction.saving_measured
+            if supported & (1 << reduction.setting as u32) == 0
+                || !reduction.saving_measured
                 || headroom_us < reduction.saved_microseconds.saturating_add(1500)
             {
                 return None;
@@ -361,6 +388,9 @@ impl AutoQuality {
         let mut next = None;
         // Remove quality above the selected preset ceiling first.
         for id in [Setting::Clouds, Setting::Gi] {
+            if supported & (1 << id as u32) == 0 {
+                continue;
+            }
             let ceiling = if settings.preset == Preset::Heavy {
                 SCHEMA[id as usize].heavy
             } else {
@@ -382,6 +412,9 @@ impl AutoQuality {
                 Setting::ShadowResolution,
                 Setting::Cascades,
             ] {
+                if supported & (1 << id as u32) == 0 {
+                    continue;
+                }
                 if id == Setting::Scale && settings.get(Setting::AllowResolution) == 0 {
                     continue;
                 }

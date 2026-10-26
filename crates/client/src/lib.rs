@@ -19,6 +19,7 @@ mod overrides;
 pub mod packet_source;
 pub mod presentation;
 pub mod props_source;
+pub mod quality;
 mod rebase;
 pub mod remote;
 pub mod remote_humans;
