@@ -16,6 +16,12 @@ pub(super) struct LightOwner {
     durable_ops: Vec<u8>,
 }
 impl LightOwner {
+    pub(super) fn is_idle(&self) -> bool {
+        self.pending.is_none()
+            && self.sky_pending.is_empty()
+            && self.source_pending.is_empty()
+            && self.engine.is_idle()
+    }
     pub(super) fn attach(
         world: &mut World,
         budget: world::lighting::LightBudget,

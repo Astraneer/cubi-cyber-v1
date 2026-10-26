@@ -110,6 +110,7 @@ jobs:
           source tools/env.sh
           bash tools/check_one.sh 'Windows WARP SMAA reference and post' cargo test --locked -p render --test smaa_gpu --test smaa_post -- --test-threads=1 --nocapture
           bash tools/check_one.sh 'Windows WARP distant shadow backend' cargo test --locked -p render --test distant_shadows -- --test-threads=1 --nocapture
+          bash tools/check_one.sh 'Windows WARP builtin and imported emission' cargo test --locked -p render --test builtin_emission -- --test-threads=1 --nocapture
           bash tools/check_one.sh 'Windows WARP complete visual owners' cargo test --locked -p client --test visual_settings_gpu --test view_far_shadows -- --test-threads=1 --nocapture
       - name: Present three native Windows frames
         run: bash tools/windows_native_smoke.sh
@@ -129,8 +130,12 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install trusted bootstrap development prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev
       - name: Bootstrap locked toolchain and dependencies
-        run: bash tools/bootstrap.sh
+        run: bash tools/check_one.sh 'Server scale bootstrap' bash tools/bootstrap.sh
       - name: Required 32 UDP peers, 5000 actors, 10000 machines and 100000 fluid events
         run: bash tools/check_server_scale.sh
       - name: Preserve full owner counts, traffic, allocations and recovery evidence
@@ -142,6 +147,7 @@ jobs:
             .local/artifacts/spec86-*.jsonl
             .local/artifacts/spec86-source-sha.txt
             .local/artifacts/check_Canonical_server_scale*.log
+            .local/artifacts/check_Server_scale_bootstrap.log
           include-hidden-files: true
           if-no-files-found: error
 

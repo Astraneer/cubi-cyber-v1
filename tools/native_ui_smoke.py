@@ -219,6 +219,12 @@ EndSection
             rows=list(re.finditer(r"NATIVE_UI_WORLD light_pages=([1-9][0-9]*) far_tiles=("+far_pattern+r") environment=true authoritative=true eye_sky=Some\(([0-9]+)\)",text()))
             return rows[-1] if rows else None
         profile = wait(confirmed_profile, "confirmed authoritative LIGHT/far cover unavailable", 120)
+        committed_receipts=None
+        if not component_only:
+            def strict_receipts():
+                rows=re.findall(r"NATIVE_UI_SETTINGS applied=(\d+) pending=(\d+) reload=(\d+)",text())
+                return int(rows[-1][0]) if rows and int(rows[-1][0])&7==7 else None
+            committed_receipts=wait(strict_receipts,"strict committed Horizon/LodError/Near receipts unavailable",120)
         if component_settings:
             def effective_receipt():
                 rows=re.findall(r"NATIVE_UI_SETTINGS applied=(\d+) pending=(\d+) reload=(\d+)",text())
@@ -387,6 +393,7 @@ EndSection
         result = {"visualChoices":visual_choices,"graphics":graphics,"componentSettings":component_settings,"fullProfileAccepted":not component_only,"scope":"UI/audio/replay components; M5 excluded" if component_only else "full product profile","mainStackLimitKiB": stack_kib or None, "productProfile":{"authoritativeLightPages":int(profile[1]),"farHeightTiles":int(profile[2]),"knownEyeSky":int(profile[3]),"atmospherePost":True,"shadowResolution":2048}, "ownerAuthenticated":owner,"authoritativeCraft":crafted,"authoritativeChestTransfer":chest_transfer,"authorizedCreativeNeiGrant":creative_grant, "welcomePixels": welcome, "settingsPixels": settings, "inventoryPixels": inventory, "rosterPixels": roster, "profilerPixels": profiler, "authority": True, "guardedInventory": True, "chat": True, "serverMeasuredPing": True, "virtualAudioVoiceSamples": max(voices), "hardwareAudibilityProven": False, "movementReplaySteps": report["movementReplay"]["steps"], "offlineReplay": True, "persistedIdentityResumed": True, "freshViewReconnect": True}
         result["authoritativeConfiguratorCycle"]=configurator_cycle
         result["manualHorizonProfile"]=manual_horizon
+        result["strictCommittedHorizonLodNearReceipts"]=committed_receipts
         (ARTIFACTS / (("native-owner-ui-components.json" if owner else "native-product-ui-components.json") if component_only else ("native-owner-ui-smoke.json" if owner else "native-product-ui-smoke.json"))).write_text(json.dumps(result, indent=2) + "\n")
         (ARTIFACTS / ("native-owner-ui-smoke.log" if owner else "native-product-ui-smoke.log")).write_text(log.read_text())
         print(("NATIVE_PRODUCT_UI_COMPONENTS_OK " if component_only else "NATIVE_PRODUCT_UI_OK ") + json.dumps(result))

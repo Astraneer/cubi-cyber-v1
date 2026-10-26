@@ -8,8 +8,16 @@ def widget_controls(*,text,click,wheel,wait):
         log=text(); batches=list(re.finditer(r"NATIVE_UI_PAINTED [^\n]*",log))
         if not batches:return None
         start=batches[-2].end() if len(batches)>1 else 0
-        match=re.search(r"NATIVE_UI_WIDGET name="+re.escape(name)+r" x=([0-9.e+-]+) y=([0-9.e+-]+) width=([0-9.e+-]+) height=([0-9.e+-]+)",log[start:batches[-1].start()])
-        return tuple(map(float,match.groups())) if match else None
+        # Older diagnostic whitelists omit these two real controls. Locate
+        # their adjacent rows from measured controls; only XTest clicks act.
+        candidates=[(name,0)]
+        if name=="Setting(Hold60)":candidates.extend([("Setting(Gi)",72),("Setting(Exposure)",-72)])
+        if name=="Setting(Near)":candidates.append(("Setting(Horizon)",36))
+        for candidate,dy in candidates:
+            match=re.search(r"NATIVE_UI_WIDGET name="+re.escape(candidate)+r" x=([0-9.e+-]+) y=([0-9.e+-]+) width=([0-9.e+-]+) height=([0-9.e+-]+)",log[start:batches[-1].start()])
+            if match:
+                x,y,w,h=map(float,match.groups());return x,y+dy,w,h
+        return None
     def widget(name,scroll=False,button=1):
         for _ in range(32):
             box=bounds(name)
@@ -33,7 +41,7 @@ def component_profile(*,text,click,key,painted,wheel,wait):
     assert int(re.findall(r"NATIVE_UI_SAVED_EFFECTS [^\n]*horizon=(\d+)",text())[-1])==16
     for name in ["Ssao","Reflections","Clouds","Gi","Hold60"]:
         before=len(text());widget(f"Setting({name})",True,3)
-        wait(lambda:"NATIVE_UI_PAINTED" in text()[before:],"manual component setting paint missing",30)
+        wait(lambda:re.search(r"NATIVE_UI_SAVED_EFFECTS [^\n]*"+name.lower()+r"=0(?: |\n)",text()[before:]),"manual component saved choice missing: "+name,30)
     latest=re.findall(r"NATIVE_UI_SAVED_EFFECTS clouds=(\d+) gi=(\d+) reflections=(\d+)",text())[-1]
     assert latest==("0","0","0"),("actual manual low-effects choices missing",latest)
     assert re.findall(r"NATIVE_UI_SAVED_EFFECTS [^\n]*ssao=(\d+)",text())[-1]=="0"

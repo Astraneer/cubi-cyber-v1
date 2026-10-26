@@ -11,22 +11,22 @@ fn cross_at(p:vec2<i32>,vertical:bool)->i32 {
  if vertical {return crossing(edge(p-vec2(1,0)).g,edge(p).g);}
  return crossing(edge(p-vec2(0,1)).r,edge(p).r);
 }
+fn diagonal_neighbor(p:vec2<i32>,left:i32,right:i32,vertical:bool,direction:i32)->bool {
+ let slope=select(-1,1,left<right);
+ var q=p+vec2(direction,direction*slope);
+ if vertical {q=p+vec2(direction*slope,direction);}
+ let tangent=select(vec2(1,0),vec2(0,1),vertical);
+ let size=vec2<i32>(textureDimensions(edges));
+ if !inside(q-tangent) || !inside(q+tangent) || q.x<=0 || q.y<=0 || q.x>=size.x-1 || q.y>=size.y-1 {return false;}
+ if sample_edge(q,vertical)<.5 || sample_edge(q-tangent,vertical)>.5 || sample_edge(q+tangent,vertical)>.5 {return false;}
+ return cross_at(q,vertical)==left && cross_at(q+tangent,vertical)==right;
+}
 fn diagonal_valid(p:vec2<i32>,left:i32,right:i32,vertical:bool)->bool {
- let slope=select(-1,1,left<right);var matched=1u;
- for(var direction=-1;direction<=1;direction+=2) {
-  for(var step=1u;step<=8u;step++) {
-   if step>params.diagonal {break;}
-   var q=p+vec2(i32(step)*direction,i32(step)*direction*slope);
-   if vertical {q=p+vec2(i32(step)*direction*slope,i32(step)*direction);}
-   let tangent=select(vec2(1,0),vec2(0,1),vertical);
-   let size=vec2<i32>(textureDimensions(edges));
-   if !inside(q-tangent) || !inside(q+tangent) || q.x<=0 || q.y<=0 || q.x>=size.x-1 || q.y>=size.y-1 {break;}
-   if sample_edge(q,vertical)<.5 || sample_edge(q-tangent,vertical)>.5 || sample_edge(q+tangent,vertical)>.5 {break;}
-   if cross_at(q,vertical)!=left || cross_at(q+tangent,vertical)!=right {break;}
-   matched+=1u;
-  }
- }
- return matched>=2u;
+ // The previous bounded walk started with one match and accepted two. A first
+ // mismatch stopped that direction, so no later step could change this result.
+ // Two explicit neighbors preserve the predicate without nested FXC loops.
+ if params.diagonal==0u {return false;}
+ return diagonal_neighbor(p,left,right,vertical,-1) || diagonal_neighbor(p,left,right,vertical,1);
 }
 fn weights(p:vec2<i32>,vertical:bool)->vec2<f32> {
  if sample_edge(p,vertical)<.5 {return vec2(0.);}

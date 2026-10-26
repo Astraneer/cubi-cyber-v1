@@ -52,7 +52,21 @@ struct Image {
     revision: u64,
     poses: BTreeMap<u64, EntityPose>,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OwnerKey {
+    mobs: [u64; 3],
+    items: [u64; 3],
+    space: SpaceId,
+    interest: [u64; 5],
+    budget: [u64; 3],
+}
+#[derive(Clone, Copy)]
+struct CachedOwner {
+    key: OwnerKey,
+    blocked: bool,
+}
 pub struct EntityHistory {
+    cached_owner: Option<CachedOwner>,
     images: VecDeque<Image>,
     visible: BTreeSet<u64>,
     confirmed: Option<u64>,
@@ -77,6 +91,7 @@ impl EntityHistory {
             return Err(EntityError::Capacity);
         }
         Ok(Self {
+            cached_owner: None,
             images: VecDeque::with_capacity(versions),
             visible: BTreeSet::new(),
             confirmed: None,
@@ -99,13 +114,64 @@ impl EntityHistory {
                     return false;
                 }
                 self.confirmed = Some(revision);
+                self.cached_owner = None;
                 true
             }
             EntityRequest::Full { .. } => {
                 self.force_full = true;
+                self.cached_owner = None;
                 true
             }
         }
+    }
+    /// The owner supplies committed runtime generations, not caller-guessed
+    /// versions. Unchanged sources/viewers do no spatial query or pose copying.
+    pub(crate) fn plan_owner(
+        &mut self,
+        mobs: &super::MobRuntime,
+        items: &super::items::ItemRuntime,
+        interest: Interest,
+        tick: Tick,
+        budget: QueryBudget,
+    ) -> Result<(Option<EntityFrame>, Work), EntityError> {
+        if !interest.valid() {
+            return Err(EntityError::InvalidPosition);
+        }
+        let key = OwnerKey {
+            mobs: mobs.public_projection_stamp(),
+            items: items.public_projection_stamp(),
+            space: interest.space,
+            interest: [
+                interest.center[0].to_bits(),
+                interest.center[1].to_bits(),
+                interest.center[2].to_bits(),
+                interest.enter.to_bits(),
+                interest.retain.to_bits(),
+            ],
+            budget: [budget.buckets, budget.probes, budget.candidates],
+        };
+        if let Some(cached) = self.cached_owner.filter(|cached| cached.key == key) {
+            if cached.blocked {
+                return Err(EntityError::Capacity);
+            }
+            if !self.force_full {
+                return Ok((None, Work::default()));
+            }
+        }
+        let result = self.plan(mobs.entities(), items.entities(), interest, tick, budget);
+        match &result {
+            Ok((None, _)) => {
+                self.cached_owner = Some(CachedOwner {
+                    key,
+                    blocked: false,
+                })
+            }
+            Err(EntityError::Capacity) => {
+                self.cached_owner = Some(CachedOwner { key, blocked: true })
+            }
+            _ => {}
+        }
+        result
     }
     /// Failure leaves history/hysteresis unchanged; source overflows never
     /// become a partial full image that silently despawns nearby actors.
@@ -117,6 +183,7 @@ impl EntityHistory {
         tick: Tick,
         mut budget: QueryBudget,
     ) -> Result<(Option<EntityFrame>, Work), EntityError> {
+        self.cached_owner = None;
         if !interest.valid() {
             return Err(EntityError::InvalidPosition);
         }
@@ -249,3 +316,6 @@ fn public_pose(
     pose.validate().map_err(|_| EntityError::InvalidEncoding)?;
     Ok(pose)
 }
+
+#[cfg(test)]
+mod idle_tests;

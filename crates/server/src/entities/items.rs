@@ -92,6 +92,7 @@ pub struct ImportPlan {
     sources: Vec<(ComponentId, Version)>,
 }
 pub struct ItemRuntime {
+    source_epoch: u64,
     store: ItemStore,
     seed: u64,
     revision: u64,
@@ -104,6 +105,7 @@ pub struct ItemRuntime {
 impl ItemRuntime {
     pub fn new(maximum: usize, seed: u64) -> Result<Self, EntityError> {
         Ok(Self {
+            source_epoch: super::next_source_epoch()?,
             store: ItemStore::new(maximum)?,
             seed,
             revision: 0,
@@ -116,6 +118,9 @@ impl ItemRuntime {
     }
     pub fn entities(&self) -> &ItemStore {
         &self.store
+    }
+    pub(crate) fn public_projection_stamp(&self) -> [u64; 3] {
+        [self.source_epoch, self.revision, self.store.len() as u64]
     }
     pub fn insert_initial(&mut self, item: ItemEntity, active: bool) -> Result<(), EntityError> {
         self.store.insert(item, active)

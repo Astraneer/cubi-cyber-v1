@@ -15,6 +15,7 @@ pub mod height_authority;
 pub mod height_heads;
 pub mod height_index;
 pub mod height_migration;
+pub mod height_queue;
 mod height_stream;
 pub mod height_tile;
 mod light_owner;
@@ -293,7 +294,7 @@ struct Peer {
     geometry_requests: VecDeque<(PageId, Option<Version>)>,
     geometry_subscriptions: BTreeMap<PageId, Version>,
     geometry_views: BTreeMap<PageId, u64>,
-    height_requests: VecDeque<(net::height::HeightKey, Option<u64>)>,
+    height_requests: height_queue::HeightQueue,
     height_subscriptions: BTreeMap<net::height::HeightKey, u64>,
     height_exact: BTreeSet<net::height::HeightKey>,
     last_view_position: [f64; 3],
@@ -735,6 +736,10 @@ impl Server {
     }
     pub fn current_tick(&self) -> Tick {
         self.tick
+    }
+    /// Owner-side convergence observation, including retained input obligations.
+    pub fn lighting_idle(&self) -> bool {
+        self.lighting.is_idle()
     }
     pub fn counters(&self) -> ServerCounters {
         self.counters
@@ -1576,14 +1581,10 @@ impl Server {
                     }
                     if peer.height_exact.contains(&key) {
                         known = None;
-                        if let Some((_, old)) =
-                            peer.height_requests.iter_mut().find(|(k, _)| *k == key)
-                        {
-                            *old = None;
-                        }
+                        peer.height_requests.force_full(&key);
                     }
                     if peer.height_requests.len() < height_stream::MAX_TILES
-                        && !peer.height_requests.iter().any(|(k, _)| *k == key)
+                        && !peer.height_requests.contains_key(&key)
                     {
                         peer.height_requests.push_back((key, known));
                     }
@@ -1666,7 +1667,7 @@ impl Server {
                 self.far_water.forget_column(connection, key);
                 peer.height_subscriptions.remove(&key);
                 peer.height_exact.remove(&key);
-                peer.height_requests.retain(|(k, _)| *k != key);
+                peer.height_requests.remove(&key);
             }
             ClientMessage::ForgetGeometry(page) => {
                 self.far_water.forget(connection, page);
@@ -1947,7 +1948,7 @@ impl Server {
                 geometry_requests: VecDeque::new(),
                 geometry_subscriptions: BTreeMap::new(),
                 geometry_views: BTreeMap::new(),
-                height_requests: VecDeque::new(),
+                height_requests: height_queue::HeightQueue::new(),
                 height_subscriptions: BTreeMap::new(),
                 height_exact: BTreeSet::new(),
                 last_view_position: position,

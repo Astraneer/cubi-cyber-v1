@@ -224,6 +224,10 @@ fn surface_light(albedo:vec3<f32>,ao:f32,normal:vec3<f32>,slot:u32,local_positio
     // END_DEFAULT_LIGHTING
 }
 
+fn material_radiance(lit:vec3<f32>,albedo:vec3<f32>,material:vec4<u32>)->vec3<f32>{
+    if (material.z&1u)==0u{return lit;}
+    return lit+albedo*bitcast<f32>(material.w);
+}
 fn shade(uv:vec2<f32>,ao_vertex:f32,normal:vec3<f32>,material_id:u32,tint:vec3<f32>,bucket:u32,uniform_ao:f32,slot:u32,local_position:vec3<f32>,local_normal:vec3<f32>,world_position:vec3<f32>)->vec4<f32> {
     let material = materials[material_id];
     let layer = i32(material.x);
@@ -234,5 +238,5 @@ fn shade(uv:vec2<f32>,ao_vertex:f32,normal:vec3<f32>,material_id:u32,tint:vec3<f
     // Water is a plain material bucket in M2; physical water is explicitly M10.
     let coverage = select(1.0,texel.a,bucket==1u);
     let ao=select(ao_vertex,uniform_ao,uniform_ao>=0.0);
-    return vec4(surface_light(texel.rgb*tinted,ao,normal,slot,local_position,local_normal,world_position),coverage);
+    return vec4(material_radiance(surface_light(texel.rgb*tinted,ao,normal,slot,local_position,local_normal,world_position),texel.rgb*tinted,material),coverage);
 }

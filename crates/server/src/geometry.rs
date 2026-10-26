@@ -148,14 +148,11 @@ impl Server {
                 {
                     peer.geometry_requests.push_back((page, None));
                 }
-                if peer.height_subscriptions.contains_key(&key) {
-                    if let Some((_, known)) =
-                        peer.height_requests.iter_mut().find(|(k, _)| *k == key)
-                    {
-                        *known = None;
-                    } else if peer.height_requests.len() < crate::height_stream::MAX_TILES {
-                        peer.height_requests.push_back((key, None));
-                    }
+                if peer.height_subscriptions.contains_key(&key)
+                    && !peer.height_requests.force_full(&key)
+                    && peer.height_requests.len() < crate::height_stream::MAX_TILES
+                {
+                    peer.height_requests.push_back((key, None));
                 }
             }
         }

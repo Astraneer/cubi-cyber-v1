@@ -529,7 +529,7 @@ impl TerrainGpu {
         });
         let (atlas_view, mask_view, texture_bytes) = upload_atlas(device, queue, atlas);
         let materials: Vec<[u32; 4]> = (0..atlas.layers)
-            .map(|layer| [layer, u32::from(layer == 40 || layer == 41), 0, 0])
+            .map(crate::material_pack::builtin_material)
             .collect();
         let material_buffer = storage(
             "material table",

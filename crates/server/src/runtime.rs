@@ -697,7 +697,13 @@ impl Server {
                 probes: 65_536,
                 candidates: 4096,
             };
-            match history.plan(mobs, items, interest, self.tick, budget) {
+            match history.plan_owner(
+                &self.runtimes.mobs,
+                &self.runtimes.items,
+                interest,
+                self.tick,
+                budget,
+            ) {
                 Ok((frame, work)) => {
                     self.counters.entity_buckets += work.buckets;
                     self.counters.entity_poses += work.poses;

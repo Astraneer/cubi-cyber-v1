@@ -239,3 +239,44 @@ fn invalid_later_queue_operation_rolls_back_earlier_operations_exactly() {
     assert!(restored.apply_durable_delta(delta).is_err());
     assert!(restored.durable_snapshot().unwrap().encode().unwrap() == initial);
 }
+
+#[test]
+fn unread_semantic_input_is_not_idle_before_ingest_or_after_snapshot_restore() {
+    let mut live = world();
+    let mut engine = LightingEngine::attach(&mut live, limits()).unwrap();
+    engine.enable_durable_inputs().unwrap();
+    assert!(engine.is_idle());
+    let mut tx = Transaction::new(Tick(1), SpaceId(0));
+    tx.set_cell(position(8), Cell::from_parts(2, 0));
+    let change = live.commit(tx).unwrap();
+    engine.observe_durable_change(&live, &change).unwrap();
+    assert_eq!(engine.pending_cells(), 0);
+    assert_eq!(engine.pending_seed_pages(), 0);
+    assert!(
+        !engine.is_idle(),
+        "the solver has not ingested the emitter yet"
+    );
+    assert!(engine.take_durable_delta().unwrap().is_some());
+    let bytes = engine.durable_snapshot().unwrap().encode().unwrap();
+    let mut world = World::restore(
+        properties,
+        JournalLimits::default(),
+        live.checkpoint().to_restore_state(),
+    )
+    .unwrap();
+    let mut restored =
+        LightingEngine::restore_durable(&mut world, limits(), Snapshot::decode(&bytes).unwrap())
+            .unwrap();
+    assert_eq!(restored.pending_cells(), 0);
+    assert_eq!(restored.pending_seed_pages(), 0);
+    assert!(
+        !restored.is_idle(),
+        "an unread durable feed survives restart"
+    );
+    let progress = restored
+        .ingest(&mut world, Tick(1), LightIngestBudget::default())
+        .unwrap();
+    assert_eq!(progress.work.journal_records, 1);
+    assert!(restored.pending_cells() > 0);
+    assert!(!restored.is_idle());
+}

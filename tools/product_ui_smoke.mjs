@@ -52,7 +52,8 @@ try{
     let socketFrames=0;const unsubscribe=onEvent('Network.webSocketFrameSent',()=>socketFrames++);await call('Network.enable');
     await click(350,250);await waitFor('window.__M2Stats()',s=>s.connected&&s.playerSpawned,120000);
     if(process.env.CUBI_UI_DIAGNOSTIC_ONLY==='1'){
-      const samples=[];for(let i=0;i<60;i++){const sample=await status();samples.push(sample);if(sample.uiScreen==='Game'&&sample.lightReady&&sample.horizonHeightFront>0)break;await pause(500);}
+      const seconds=Number(process.env.CUBI_UI_DIAGNOSTIC_SECONDS??30);assert(Number.isFinite(seconds)&&seconds>0&&seconds<=120,'diagnostic deadline must stay within strict120s');
+      const deadline=Date.now()+seconds*1000,samples=[];while(Date.now()<deadline){const sample=await status();sample.strictCommittedReceipts=(await ui()).settingsApplied&7;samples.push(sample);if(sample.uiScreen==='Game'&&sample.lightReady&&sample.horizonHeightFront>0&&sample.strictCommittedReceipts===7)break;await pause(500);}
       await writeFile(join(root,'.local/artifacts/product-loading-diagnostics.json'),JSON.stringify({acceptance:false,samples},null,2)+'\n');
       await call('Browser.setDownloadBehavior',{behavior:'allow',downloadPath:downloads,eventsEnabled:true});await key('F8','F8');
       for(let i=0;i<150;i++){try{const bytes=await readFile(join(downloads,'cubi-flight-recorder.json'));JSON.parse(bytes);await writeFile(join(root,'.local/artifacts/product-loading-flight.json'),bytes);break;}catch{}await pause(100);}
@@ -60,8 +61,10 @@ try{
     }
     await waitUi(s=>s.screen==='Game',120000);
     const productProfile=await waitFor('window.__M2Stats()',s=>s.authoritativeLighting&&s.environmentPrepared&&s.horizonPrepared&&s.authoritativeLightPages>0&&s.publicEyeLightKnown&&s.publicEyeSky>=0&&s.publicEyeSky<=15&&(componentOnly||s.horizonHeightFront>0),120000);
+    if(!componentOnly)await waitUi(s=>(s.settingsApplied&7)===7,120000);
     assert.equal((await status()).interactionMode,'authoritative-remote');assert(socketFrames>0);
     if(componentSettings){const mask=(1<<9)|(1<<10)|(1<<11)|(1<<12);const receipt=await waitUi(s=>(s.settingsApplied&mask)===mask);componentSettings.controlReceipts={ssao:true,reflections:true,clouds:true,gi:true,horizonCommitted:!!(receipt.settingsApplied&1),appliedMask:receipt.settingsApplied};}
+    if(process.env.CUBI_UI_COMPONENT_SMAA==='1'){const receipt=await waitUi(s=>s.smaaPrepared===1&&s.smaaReservedBytes>0&&(s.settingsApplied&8)===8);assert.equal(productProfile.sampleCount,1);componentSettings.controlReceipts.smaaPrepared=true;componentSettings.controlReceipts.smaaReservedBytes=receipt.smaaReservedBytes;}
     const graphics=process.env.CUBI_UI_GRAPHICS==='1'?await graphicsControls({call,evaluate,waitFor,waitUi,painted,key,click,status,ui,requireFar:!componentOnly}):undefined;
     if(process.env.CUBI_UI_GRAPHICS_ONLY==='1'){assert(graphics);unsubscribe();console.log('PRODUCT_GRAPHICS_OK '+JSON.stringify(graphics));return;}
     await waitUi(s=>s.players===1&&s.pingMeasured,10000);

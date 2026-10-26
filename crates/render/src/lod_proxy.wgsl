@@ -19,6 +19,10 @@ fn palette_index(object:Object,index:u32)->u32{
 }
 fn illumination(object:Object,world:vec3<f32>,normal:vec3<f32>)->vec3<f32>{// ILLUMINATION
 }
+fn material_radiance(lit:vec3<f32>,albedo:vec3<f32>,material:vec4<u32>)->vec3<f32>{
+    if (material.z&1u)==0u{return lit;}
+    return lit+albedo*bitcast<f32>(material.w);
+}
 struct FragmentOut{@location(0)color:vec4<f32>,@builtin(frag_depth)depth:f32};
 // Translation-independent projective rays. Interpolating a box's local point
 // inherits rounded MVP translation cancellation and changes UVs after rebasing.
@@ -40,7 +44,7 @@ fn trace_fragment(input:VertexOut)->FragmentOut{
     for(var steps=1u;steps<=46u;steps++){
         let index=u32(cell.x)+16u*(u32(cell.z)+16u*u32(cell.y));let bits=payload[object.data.x+index/32u];if (bits&(1u<<(index%32u)))!=0u {
             let palette=object.data.y+palette_index(object,index)*2u;let info=payload[palette];if ((info>>16u)&3u)==0u {let material=materials[info&65535u];let point=origin+direction*t;var uv=vec2(point.x,point.y);if abs(normal.x)>0.5 {uv=vec2(point.z,point.y)*vec2(-normal.x,1.);}else if abs(normal.y)>0.5{uv=vec2(point.x,point.z)*vec2(1.,-normal.y);}else{uv=vec2(point.x,point.y)*vec2(normal.z,1.);}let world=object.model*vec4(point,1.);let world_normal=normalize((transpose(object.inverse_model)*vec4(normal,0.)).xyz);let projection_pixels=f32(camera.params.y)*0.5*length(vec3(camera.view_projection[0].y,camera.view_projection[1].y,camera.view_projection[2].y));let cell_scale=length(object.model[0].xyz);let relative=(object.model*vec4(point,0.)).xyz+(object.model[3].xyz-camera.eye.xyz);let distance=max(length(relative),0.001);let cell_pixels=projection_pixels*cell_scale/select(distance,1.,camera.eye.w>0.5);let mip=clamp(log2(f32(textureDimensions(colors).x)/max(cell_pixels,0.001)),0.,f32(textureNumLevels(colors)-1u));let texel=textureSampleLevel(colors,texels,uv,i32(material.x),mip);let kind=(info>>16u)&3u;
-            if kind!=1u||texel.a>=0.5 {let mask=textureSampleLevel(tint_masks,texels,uv,i32(material.x),mip).r;let tint=unpack4x8unorm(payload[palette+1u]).rgb;let tinted=mix(vec3(1.),tint*tint,select(1.,mask,(material.y&1u)!=0u));let clip=camera.view_projection*world;var out:FragmentOut;out.color=vec4(texel.rgb*tinted*illumination(object,world.xyz,world_normal),select(1.,texel.a,kind==1u));out.depth=clip.z/clip.w;record_trace(steps,true,false);return out;}}
+            if kind!=1u||texel.a>=0.5 {let mask=textureSampleLevel(tint_masks,texels,uv,i32(material.x),mip).r;let tint=unpack4x8unorm(payload[palette+1u]).rgb;let tinted=mix(vec3(1.),tint*tint,select(1.,mask,(material.y&1u)!=0u));let clip=camera.view_projection*world;var out:FragmentOut;out.color=vec4(material_radiance(texel.rgb*tinted*illumination(object,world.xyz,world_normal),texel.rgb*tinted,material),select(1.,texel.a,kind==1u));out.depth=clip.z/clip.w;record_trace(steps,true,false);return out;}}
         }
         let crossing=min(next.x,min(next.y,next.z));if crossing>exit {record_trace(steps,false,false);return FragmentOut(vec4(0.,0.,0.,1.),-1.);}t=crossing;var advanced=false;for(var axis=0u;axis<3u;axis++){if next[axis]<=crossing+0.000001 {cell[axis]+=stride[axis];next[axis]+=delta[axis];if !advanced {normal=vec3(0.);normal[axis]=-f32(stride[axis]);advanced=true;}}}if any(cell<vec3(0))||any(cell>=vec3(16)){record_trace(steps,false,false);return FragmentOut(vec4(0.,0.,0.,1.),-1.);}
     }

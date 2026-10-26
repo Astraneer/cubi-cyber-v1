@@ -251,6 +251,23 @@ fn actual_burst(gui_interval: Duration, shared: bool) {
         std::thread::sleep(Duration::from_millis(8));
         session = shared_session.lock().unwrap();
     }
+    if gui_interval == Duration::from_millis(4000) {
+        // Put the two sentinels first in the typed outbox. This does not discard
+        // earlier work: the real socket must transfer it under the existing
+        // burst deadline, retaining every queue's original bound.
+        while session.connection().queue_depths().outgoing > 0 {
+            assert!(
+                Instant::now() < bulk_deadline,
+                "pre-sentinel outbox did not drain"
+            );
+            let now = start.elapsed().as_millis() as u64;
+            socket.pump(&mut session, now).unwrap();
+            bulk += drain(&mut session, &mut accepted, &mut replies);
+            drop(session);
+            std::thread::sleep(Duration::from_millis(8));
+            session = shared_session.lock().unwrap();
+        }
+    }
     // Queue enough real requests before the new controls to exercise the exact
     // FIFO and bounded33-frame native ingress, including paused GUI consumption.
     socket.pump(&mut session, now).unwrap();
@@ -272,6 +289,60 @@ fn actual_burst(gui_interval: Duration, shared: bool) {
     let mut legacy_hol_observed = false;
     let control_start = Instant::now();
     let control_deadline = control_start + Duration::from_secs(20);
+    if gui_interval == Duration::from_millis(4000) {
+        // Legacy pump admits incoming frames BEFORE transferring these newly
+        // queued actions. Its reply therefore cannot already be in Connection.
+        // Shared pump only checks lifecycle; the worker owns typed admission.
+        socket.pump(&mut session, now).unwrap();
+        let parked = Instant::now();
+        drop(session);
+        loop {
+            let counters = authority.counters();
+            if counters.staged_accepted_actions_123[1] > 0
+                && counters.staged_accepted_actions_123[2] > 0
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < control_deadline,
+                "server did not durably accept parked-GUI controls: {counters:?}"
+            );
+            assert!(!authority.is_finished());
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        if let Some(remaining) = gui_interval.checked_sub(parked.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+        session = shared_session.lock().unwrap();
+        if shared {
+            // No GUI socket pump/receive_frame/drain ran while parked. Verify
+            // the actual background protocol owner has processed both replies.
+            while session.connection().action_pending(second)
+                || session.connection().action_pending(third)
+            {
+                assert!(
+                    Instant::now() < control_deadline,
+                    "shared protocol admission required a GUI pump"
+                );
+                drop(session);
+                std::thread::sleep(Duration::from_millis(8));
+                session = shared_session.lock().unwrap();
+            }
+            bulk += drain(&mut session, &mut accepted, &mut replies);
+            assert!(accepted.contains(&second) && accepted.contains(&third));
+            eprintln!(
+                "NATIVE_SOCKET_SHARED_PARKED_GUI_ACCEPTED no_gui_pumps=true server_fsync_accepted=true"
+            );
+        } else {
+            assert!(session.connection().action_pending(second));
+            assert!(session.connection().action_pending(third));
+            assert!(!accepted.contains(&second) && !accepted.contains(&third));
+            legacy_hol_observed = true;
+            eprintln!(
+                "NATIVE_SOCKET_LEGACY_GUI_GATE_NEGATIVE no_gui_pumps=true server_fsync_accepted=true client_protocol_pending=true"
+            );
+        }
+    }
     while !(accepted.contains(&second) && accepted.contains(&third)) {
         if Instant::now() >= control_deadline {
             let counters = authority.counters();
@@ -326,12 +397,17 @@ fn actual_burst(gui_interval: Duration, shared: bool) {
     if !shared && gui_interval == Duration::from_millis(4000) {
         assert!(
             legacy_hol_observed,
-            "legacy fixture must expose the GUI head-of-line delay"
+            "legacy protocol admission must remain gated by the parked GUI"
         );
     }
     assert!(
         bulk > 0 && after.sent_frames > sent_before.sent_frames,
         "the real courier must run concurrently"
+    );
+    assert_eq!(
+        session.connection().counters().accepted_actions,
+        3,
+        "unique authoritative actions are retired exactly once"
     );
     eprintln!(
         "NATIVE_SOCKET_ACTION_BURST_OK shared={shared} gui_interval_ms={} pumps={} elapsed_ms={} accepted_ids=1,2,3 bulk_updates={} server_frames_delta={} queue_caps_unchanged=true height_requests648=true accepted_reply_counts={replies:?} final_queues={:?}",
@@ -347,7 +423,7 @@ fn actual_burst(gui_interval: Duration, shared: bool) {
     drop(authority);
 }
 #[test]
-fn actual_native_socket_shared_owner_keeps_control_admission_independent_of_gui_and_preserves_legacy_negative()
+fn actual_native_socket_shared_owner_keeps_control_admission_independent_of_gui_and_proves_legacy_gui_gate()
  {
     actual_burst(Duration::from_millis(8), false);
     actual_burst(Duration::from_millis(4000), false);

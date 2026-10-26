@@ -34,6 +34,19 @@ use std::{
 };
 use world::{CellRead, Transaction, World};
 
+// Local source identities invalidate derived public caches after replacement or
+// restore, even when the new ledger has the same persisted revision and length.
+// They never enter simulation snapshots, hashes or public packets.
+static NEXT_SOURCE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn next_source_epoch() -> Result<u64, EntityError> {
+    use std::sync::atomic::Ordering;
+    NEXT_SOURCE_EPOCH
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| EntityError::Capacity)
+}
+
 const CHANNELS: ChannelMask = ChannelMask(
     ChannelMask::COLLISION.0
         | ChannelMask::FLUID.0
@@ -149,6 +162,7 @@ struct Route {
     inputs: Vec<jobs::InputVersion>,
 }
 pub struct MobRuntime {
+    source_epoch: u64,
     store: EntityStore,
     seed: u64,
     revision: u64,
@@ -163,6 +177,7 @@ pub struct MobRuntime {
 impl MobRuntime {
     pub fn new(config: Config) -> Result<Self, EntityError> {
         Ok(Self {
+            source_epoch: next_source_epoch()?,
             store: EntityStore::new(config.maximum_entities)?,
             seed: config.seed,
             revision: 0,
@@ -177,6 +192,9 @@ impl MobRuntime {
     }
     pub fn entities(&self) -> &EntityStore {
         &self.store
+    }
+    pub(crate) fn public_projection_stamp(&self) -> [u64; 3] {
+        [self.source_epoch, self.revision, self.store.len() as u64]
     }
     pub fn path_counters(&self) -> path_jobs::Counters {
         self.paths.counters

@@ -7,6 +7,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use world::lighting::SkyAccess;
 use world::{Transaction, World};
 
 const ENTROPY: [u8; 32] = [19; 32];
@@ -246,6 +247,7 @@ fn active_surface_gets_real_profile_daylight_and_unloaded_high_roof_stays_dark_a
     h.server
         .queue_transaction(roof)
         .unwrap_or_else(|_| panic!("queue roof edits"));
+    let roof_deadline = Instant::now() + Duration::from_secs(120);
     let mut last_diag = 0;
     let start_cells = h.server.counters().light_cells;
     let start_tick = h.server.current_tick().0;
@@ -312,9 +314,55 @@ fn active_surface_gets_real_profile_daylight_and_unloaded_high_roof_stays_dark_a
     h.until("checkpoint admission", |s| !s.awaiting_durability());
     assert!(h.server.request_checkpoint());
     h.settle();
-    drop(h);
+    let control_directory = Directory(directory.0.with_extension("control"));
+    std::fs::create_dir_all(&control_directory.0).unwrap();
+    for entry in std::fs::read_dir(&directory.0).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), control_directory.0.join(entry.file_name())).unwrap();
+        }
+    }
+    // A real quiescent persisted authority proof, independent of the solver's
+    // current samples. Eviction must not erase any high opaque roof edit.
+    let (store, recovered_store) = save::Store::open(&control_directory.0).unwrap();
+    assert!(recovered_store.batches.is_empty());
+    let snapshot = recovered_store.snapshot.unwrap();
+    let hid = &snapshot
+        .runtimes
+        .iter()
+        .find(|r| r.kind == save::RUNTIME_HEIGHT)
+        .unwrap()
+        .payload;
+    let authority = server::height_authority::HeightAuthority::restore(
+        hid,
+        server::height_authority::Config::default(),
+    )
+    .unwrap();
+    assert!(authority.is_ready());
+    let proof = authority.sky_proof(SpaceId(0), None).unwrap();
+    for z in -16..32 {
+        for x in -16..32 {
+            assert_eq!(
+                proof.incoming_from_unknown_above(BlockPos {
+                    space: SpaceId(0),
+                    x,
+                    y: 127,
+                    z
+                }),
+                None
+            );
+        }
+    }
+    eprintln!(
+        "persisted roof proof blocker_columns={} hid_digest={} pending_at_checkpoint={:?}",
+        authority.blocker_columns(),
+        blake3::hash(hid),
+        h.server.load_metrics()
+    );
+    drop(store);
+    h.server.disconnect(1);
     let mut recovered = Harness {
-        server: Server::open(directory.config(feet)).unwrap(),
+        server: Server::open(control_directory.config(feet)).unwrap(),
         now: 0,
     };
     assert_eq!(sky(&recovered.server, feet), 0);
@@ -325,8 +373,60 @@ fn active_surface_gets_real_profile_daylight_and_unloaded_high_roof_stays_dark_a
     );
     for _ in 0..500 {
         recovered.step();
+        while h.server.current_tick() < recovered.server.current_tick() {
+            h.step();
+        }
     }
     recovered.settle();
+    h.settle();
+    eprintln!(
+        "paired roof continuation liveSky={} recoveredSky={} liveTick{:?} recoveredTick{:?} livePending{:?} recoveredPending{:?}",
+        sky(&h.server, feet),
+        sky(&recovered.server, feet),
+        h.server.current_tick(),
+        recovered.server.current_tick(),
+        h.server.load_metrics(),
+        recovered.server.load_metrics()
+    );
+    assert_eq!(h.server.current_tick(), recovered.server.current_tick());
+    assert_eq!(
+        h.server.world().canonical_hash(),
+        recovered.server.world().canonical_hash(),
+        "unfinished roof withdrawal follows exactly the uninterrupted continuation"
+    );
+    // A first zero at one cell is not convergence of the surrounding frontier:
+    // both branches can briefly re-add old neighbouring sky while withdrawing.
+    // Keep them paired at every logical boundary; quiescence is the actual
+    // engine/input/bootstrap/sky/source state, not a second sample of one cell.
+    while !h.server.lighting_idle()
+        || !recovered.server.lighting_idle()
+        || h.server.awaiting_durability()
+        || recovered.server.awaiting_durability()
+    {
+        assert!(
+            Instant::now() < roof_deadline,
+            "bounded paired roof quiescence"
+        );
+        assert!(h.server.current_tick().0 - start_tick <= 14_000);
+        assert!(h.server.counters().light_cells - start_cells <= 12_000_000);
+        assert!(recovered.server.counters().light_cells <= 12_000_000);
+        recovered.step();
+        while h.server.current_tick() < recovered.server.current_tick() {
+            h.step();
+        }
+        h.settle();
+        recovered.settle();
+        assert_eq!(h.server.current_tick(), recovered.server.current_tick());
+    }
+    assert_eq!(
+        h.server.world().canonical_hash(),
+        recovered.server.world().canonical_hash()
+    );
+    assert_eq!(
+        sky(&h.server, feet),
+        0,
+        "the uninterrupted queue also fully withdraws"
+    );
     assert_eq!(
         sky(&recovered.server, feet),
         0,

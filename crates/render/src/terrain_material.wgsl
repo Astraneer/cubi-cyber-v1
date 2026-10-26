@@ -45,7 +45,8 @@ fn shade(uv:vec2<f32>,ao_vertex:f32,normal:vec3<f32>,material_id:u32,tint:vec3<f
     let tinted=mix(vec3(1.0),tint,select(1.0,mask,(material.y&1u)!=0u));
     if bucket==1u&&texel.a<0.001{discard;}
     let coverage=select(1.0,texel.a,bucket==1u);
-    let pbr=decode_labpbr(textureSample(material_normals,texels,adjusted,layer),textureSample(material_specs,texels,adjusted,layer));
+    var pbr=decode_labpbr(textureSample(material_normals,texels,adjusted,layer),textureSample(material_specs,texels,adjusted,layer));
+    if (material.z&2u)!=0u{pbr.emission=1.0;}
     let mapped_normal=labpbr_world_normal(pbr,tangent_u,tangent_v,normal);
     let ao=select(ao_vertex,uniform_ao,uniform_ao>=0.0)*pbr.ao;
     return vec4(pack_light(texel.rgb*tinted,pbr,ao,mapped_normal,view,slot,local_position,local_normal,world_position),coverage);

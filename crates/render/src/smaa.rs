@@ -269,14 +269,14 @@ impl SmaaGpu {
         queue.write_buffer(&area, 0, bytemuck::cast_slice(&areas));
         let edge_pipeline = pipeline(
             device,
-            "SMAA perceptual contrast edges",
+            "SMAA Edge perceptual contrast",
             include_str!("smaa_edges.wgsl"),
             &[texture_entry(0), buffer_entry(1, true)],
             wgpu::TextureFormat::Rg8Unorm,
         );
         let weight_pipeline = pipeline(
             device,
-            "SMAA bounded patterns and exact area",
+            "SMAA Weights bounded patterns and exact area",
             include_str!("smaa_weights.wgsl"),
             &[
                 texture_entry(0),
@@ -294,7 +294,7 @@ impl SmaaGpu {
         }
         let blend_pipeline = pipeline(
             device,
-            "SMAA linear neighborhood and final transfer",
+            "SMAA Blend linear neighborhood and final transfer",
             &blend_source,
             &[texture_entry(0), texture_entry(1)],
             format,

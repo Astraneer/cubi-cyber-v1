@@ -38,6 +38,12 @@ export async function componentProfile({call,evaluate,painted,click,ui}) {
     }
     assert(found,`component settings control missing: ${name}`);
   }
+  if(process.env.CUBI_UI_COMPONENT_SMAA==='1') {
+    await click(130,78);await painted();
+    const msaa=await evaluate("window.__CUBI.product_ui_widget('Setting(Msaa)')");assert(msaa);
+    await click(msaa[0]+msaa[2]/2,msaa[1]+msaa[3]/2);
+    assert.equal((await ui()).requestedSamples,1);choices.requestedSamples=1;
+  }
   await painted();
   const box=await evaluate("window.__CUBI.product_ui_widget('Back')");assert(box);
   await click(box[0]+box[2]/2,box[1]+box[3]/2);

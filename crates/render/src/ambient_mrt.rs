@@ -111,8 +111,8 @@ pub(crate) fn terrain(source: &str, lit: bool, atmosphere: bool, gi: bool, pack:
     );
     source = changed(
         &source,
-        "return vec4(surface_light(texel.rgb*tinted,ao,normal,slot,local_position,local_normal,world_position),coverage);",
-        "return AmbientOutput(vec4(surface_light(texel.rgb*tinted,ao,normal,slot,local_position,local_normal,world_position),coverage),vec4(select(surface_ambient(texel.rgb*tinted,ao,normal,slot,local_position,local_normal,world_position),vec3(0.0),bucket%3u==2u),coverage));",
+        "return vec4(material_radiance(surface_light(texel.rgb*tinted,ao,normal,slot,local_position,local_normal,world_position),texel.rgb*tinted,material),coverage);",
+        "return AmbientOutput(vec4(material_radiance(surface_light(texel.rgb*tinted,ao,normal,slot,local_position,local_normal,world_position),texel.rgb*tinted,material),coverage),vec4(select(surface_ambient(texel.rgb*tinted,ao,normal,slot,local_position,local_normal,world_position),vec3(0.0),bucket%3u==2u),coverage));",
     );
     let input = if lit {
         "let light=sample_page_light(slot,local_position,local_normal);"

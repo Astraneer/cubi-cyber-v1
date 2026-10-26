@@ -53,6 +53,41 @@ impl MaterialState {
     }
 }
 impl TerrainGpu {
+    fn publish_material_metadata(
+        &self,
+        queue: &wgpu::Queue,
+        pack: &MaterialPackGpu,
+        enabled: bool,
+    ) -> u64 {
+        let previous = self.local_materials.as_ref().filter(|state| state.enabled);
+        if (0..self.atlas_layers).all(|layer| {
+            let builtin = crate::material_pack::builtin_material(layer);
+            let old = previous.map_or(builtin, |state| {
+                state.pack.material_metadata[layer as usize]
+            });
+            let new = if enabled {
+                pack.material_metadata[layer as usize]
+            } else {
+                builtin
+            };
+            old == new
+        }) {
+            return 0;
+        }
+        if enabled {
+            queue.write_buffer(
+                &self.materials,
+                0,
+                bytemuck::cast_slice(&pack.material_metadata),
+            );
+        } else {
+            let entries: Vec<_> = (0..self.atlas_layers)
+                .map(crate::material_pack::builtin_material)
+                .collect();
+            queue.write_buffer(&self.materials, 0, bytemuck::cast_slice(&entries));
+        }
+        u64::from(self.atlas_layers) * 16
+    }
     /// Prepare the optional material shader before any frame. An initially
     /// disabled bank permits later OS-picker imports without runtime compilation.
     pub fn prepare_material_pack(
@@ -65,7 +100,10 @@ impl TerrainGpu {
         if self.last_render.is_some() {
             return Err(TerrainError::LatePreparation);
         }
-        if pack.layers != self.atlas_layers || pack.reserved_metals {
+        if pack.layers != self.atlas_layers
+            || pack.material_metadata.len() != self.atlas_layers as usize
+            || pack.reserved_metals
+        {
             return Err(TerrainError::InvalidMaterial);
         }
         let control = device.create_buffer(&wgpu::BufferDescriptor {
@@ -74,7 +112,7 @@ impl TerrainGpu {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let uploaded = pack.upload_bytes;
+        let uploaded = pack.upload_bytes + self.publish_material_metadata(queue, &pack, enabled);
         self.local_materials = Some(MaterialState {
             pack,
             control,
@@ -99,14 +137,20 @@ impl TerrainGpu {
         pack: MaterialPackGpu,
         enabled: bool,
     ) -> Result<(), TerrainError> {
-        if pack.layers != self.atlas_layers || pack.reserved_metals {
+        if pack.layers != self.atlas_layers
+            || pack.material_metadata.len() != self.atlas_layers as usize
+            || pack.reserved_metals
+        {
             return Err(TerrainError::InvalidMaterial);
         }
+        if self.local_materials.is_none() {
+            return Err(TerrainError::LatePreparation);
+        }
+        let uploaded = pack.upload_bytes + self.publish_material_metadata(queue, &pack, enabled);
         let state = self
             .local_materials
             .as_mut()
             .ok_or(TerrainError::LatePreparation)?;
-        let uploaded = pack.upload_bytes;
         state.pack = pack;
         state.enabled = enabled;
         state.write(queue);

@@ -44,11 +44,24 @@ pub struct PreparedMaterials {
     atlas: AtlasImage,
     normal: Vec<Vec<u8>>,
     specular: Vec<Vec<u8>>,
+    material_metadata: Vec<[u32; 4]>,
     pub revision: u64,
     pub imported_layers: usize,
     pub decoded_pngs: usize,
     pub animation_strips: usize,
     pub gpu_bytes: u64,
+}
+/// The shared 16-byte table also serves far proxies, without another binding.
+/// Bit 0 enables albedo-scaled emission; bit 1 selects the builtin fallback in
+/// the near PBR shader. An explicitly supplied `_s` always replaces that fallback.
+pub(crate) fn builtin_material(layer: u32) -> [u32; 4] {
+    let lava = layer == 185;
+    [
+        layer,
+        u32::from(layer == 40 || layer == 41),
+        if lava { 3 } else { 0 },
+        if lava { 1.0f32.to_bits() } else { 0 },
+    ]
 }
 struct Image {
     size: u32,
@@ -353,6 +366,7 @@ impl PreparedMaterials {
         }
         let mut decoded_pngs = 0;
         let mut animation_strips = 0;
+        let mut material_metadata: Vec<_> = (0..base.layers).map(builtin_material).collect();
         for source in sources {
             for (bytes, destination, filter) in [
                 (source.albedo_png, &mut color, Filter::Color),
@@ -368,6 +382,20 @@ impl PreparedMaterials {
                         source.layer as usize * resolution as usize * resolution as usize * 4;
                     destination[offset..offset + data.len()].copy_from_slice(&data);
                 }
+            }
+            if source.specular_png.is_some() {
+                let pixels = resolution as usize * resolution as usize;
+                let offset = source.layer as usize * pixels * 4;
+                let sum: u64 = specular[offset..offset + pixels * 4]
+                    .chunks_exact(4)
+                    .map(|pixel| u64::from(if pixel[3] == 255 { 0 } else { pixel[3] }))
+                    .sum();
+                // Proxies use a layer average. Near PBR retains the original
+                // per-texel channel, including both 0/255 non-emission sentinels.
+                let emission = (sum as f64 / (pixels as f64 * 254.0)) as f32;
+                let entry = &mut material_metadata[source.layer as usize];
+                entry[2] = u32::from(emission > 0.0);
+                entry[3] = emission.to_bits();
             }
         }
         let mut atlas = AtlasImage {
@@ -427,6 +455,7 @@ impl PreparedMaterials {
             atlas,
             normal: normals,
             specular: speculars,
+            material_metadata,
             revision,
             imported_layers: sources.len(),
             decoded_pngs,
@@ -437,8 +466,14 @@ impl PreparedMaterials {
     pub fn atlas(&self) -> &AtlasImage {
         &self.atlas
     }
+    /// Layer-average far emission and near builtin-fallback flags. Import is
+    /// local; this table contains no resource bytes or network state.
+    pub fn material_metadata(&self) -> &[[u32; 4]] {
+        &self.material_metadata
+    }
 }
 pub struct MaterialPackGpu {
+    pub(crate) material_metadata: Vec<[u32; 4]>,
     pub albedo: wgpu::TextureView,
     pub normal: wgpu::TextureView,
     pub specular: wgpu::TextureView,
@@ -592,6 +627,7 @@ impl MaterialPackGpu {
             ..Default::default()
         });
         Ok(Self {
+            material_metadata: prepared.material_metadata.clone(),
             albedo: view(&albedo),
             normal: view(&normal),
             specular: view(&specular),

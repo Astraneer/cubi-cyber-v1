@@ -57,6 +57,15 @@ impl HeightWorker {
     }
 }
 impl Server {
+    /// Cumulative work of currently live peer queues. Disconnect retires that
+    /// peer's counts; this is a bootstrap snapshot, not a process-lifetime total.
+    pub fn pending_height_queue_work(&self) -> crate::height_queue::Work {
+        let mut work = crate::height_queue::Work::default();
+        for peer in self.peers.values() {
+            work += peer.height_requests.work();
+        }
+        work
+    }
     fn height_allowed(&self, peer: &Peer, key: HeightKey) -> bool {
         if key.space != 0 || peer.space != SpaceId(0) || key.validate().is_err() {
             return false;
@@ -78,7 +87,7 @@ impl Server {
                     .source(authority_key(*key))
                     .is_ok_and(|s| self.height_heads.private_source(connection, *key) != Some(s))
                     && peer.height_requests.len() < MAX_TILES
-                    && !peer.height_requests.iter().any(|(k, _)| k == key)
+                    && !peer.height_requests.contains_key(key)
                 {
                     peer.height_requests.push_back((*key, None));
                 }
@@ -147,7 +156,7 @@ impl Server {
             }
             if self.runtimes.height.index().source(tile.key) != Ok(tile.source) {
                 let peer = self.peers.get_mut(&connection).expect("present peer");
-                if !peer.height_requests.iter().any(|(k, _)| *k == key) {
+                if !peer.height_requests.contains_key(&key) {
                     peer.height_requests.push_back((key, None));
                 }
                 self.counters.height_discarded += 1;
