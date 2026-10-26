@@ -426,6 +426,11 @@ impl ContactAoGpu {
     pub fn startup_pipeline_compilations(&self) -> u32 {
         1
     }
+    /// Read-only diagnostics can isolate shader entry code while retaining the
+    /// exact same parameters and source textures. No resources are created.
+    pub fn diagnostic_bindings(&self) -> (&wgpu::BindGroupLayout, &wgpu::BindGroup) {
+        (&self.layout, &self.bind)
+    }
     pub fn graph(&self) -> crate::gpu_time::PassGraph<1> {
         self.timer.graph()
     }

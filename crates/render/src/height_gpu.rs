@@ -340,38 +340,12 @@ impl HeightGpu {
         // Only active3D cuts need sample-frequency world positions. Preserve
         // pixel-frequency shading and exact legacy pixels when no cut exists.
         let near_pipeline = {
-            let source = shader_source(
+            let source = near_shader_source(
                 shadows.is_some(),
                 atmosphere.is_some(),
                 geometry.ambient_mrt,
-            )
-            .replace(
-                "let slot=visible[ii];",
-                "let slot=visible[ii+camera.params.x];",
+                sample_count > 1,
             );
-            let source = if sample_count > 1 {
-                // The near mask is a per-sample ownership decision. Keep the
-                // sample index live through a dynamic, prepared sample-count
-                // guard as well as requesting sample-qualified interpolation.
-                assert!(source.contains("@fragment fn fragment(input:Out)"));
-                assert!(
-                    source.contains(
-                        "{let texel=textureSample(atlas,texels,input.uv,i32(input.layer));"
-                    )
-                );
-                source.replace(
-                    "@location(2)world:vec3<f32>",
-                    "@location(2)@interpolate(perspective,sample)world:vec3<f32>",
-                ).replace(
-                    "@fragment fn fragment(input:Out)",
-                    "@fragment fn fragment(input:Out,@builtin(sample_index)sample:u32)",
-                ).replace(
-                    "{let texel=textureSample(atlas,texels,input.uv,i32(input.layer));",
-                    "{if sample>=camera.reserved.x{discard;}let texel=textureSample(atlas,texels,input.uv,i32(input.layer));",
-                )
-            } else {
-                source
-            };
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("sample-exact3D near coverage"),
                 source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -895,6 +869,60 @@ fn texture_layout(
         count: None,
     }
 }
+/// The exact prepared primary near-coverage shader, also used by backend oracles.
+pub fn near_shader_source(
+    shadows: bool,
+    atmosphere: bool,
+    ambient_mrt: bool,
+    sample_frequency: bool,
+) -> String {
+    let source = shader_source(shadows, atmosphere, ambient_mrt).replace(
+        "let slot=visible[ii];",
+        "let slot=visible[ii+camera.params.x];",
+    );
+    assert!(source.contains("out.world=p;"));
+    let source = source
+        .replace(
+            "@location(4)@interpolate(flat)tint:vec3<f32>};",
+            "@location(4)@interpolate(flat)tint:vec3<f32>,@location(5)@interpolate(flat)cell_min:vec3<f32>,@location(6)@interpolate(flat)cell_max:vec3<f32>};",
+        )
+        .replace(
+            "out.world=p;",
+            "out.world=p;out.cell_min=tile.origin+vec3(f32(x)*tile.step,min(min(h00,h10),min(h01,h11)),f32(z)*tile.step)-normal*0.0001;out.cell_max=tile.origin+vec3(f32(x+1u)*tile.step,max(max(h00,h10),max(h01,h11)),f32(z+1u)*tile.step)-normal*0.0001;",
+        )
+        .replace(
+            "if covered_by_near(input.world-normalize(input.normal)*0.0001){discard;}",
+            "let ownership=height_cell_class(input.cell_min,input.cell_max);if ownership==1u||(ownership==2u&&covered_by_near(input.world-normalize(input.normal)*0.0001)){discard;}",
+        );
+    if !sample_frequency {
+        return format!("{source}\n{}", include_str!("height_cell.wgsl"));
+    }
+    // The near mask is a per-sample ownership decision. Keep the sample index
+    // live through the prepared sample-count guard. Some drivers apply the
+    // perspective divisor at the pixel center while evaluating the numerator
+    // at the sample. A homogeneous world coordinate cancels that shared factor
+    // without dividing by clip.w before near clipping.
+    assert!(source.contains("@fragment fn fragment(input:Out)"));
+    assert!(source.contains("out.world=p;"));
+    assert!(source.contains("{let texel=textureSample(atlas,texels,input.uv,i32(input.layer));"));
+    let source = source
+        .replace(
+            "@location(2)world:vec3<f32>",
+            "@location(2)@interpolate(perspective,sample)world_h:vec4<f32>",
+        )
+        .replace("out.world=p;", "out.world_h=vec4(p,1.);")
+        .replace("input.world", "sample_world")
+        .replace(
+            "@fragment fn fragment(input:Out)",
+            "@fragment fn fragment(input:Out,@builtin(sample_index)sample:u32)",
+        )
+        .replace(
+            "{let texel=textureSample(atlas,texels,input.uv,i32(input.layer));",
+            "{if sample>=camera.reserved.x{discard;}let sample_world=input.world_h.xyz/input.world_h.w;let texel=textureSample(atlas,texels,input.uv,i32(input.layer));",
+        );
+    format!("{source}\n{}", include_str!("height_cell.wgsl"))
+}
+
 pub fn shader_source(shadows: bool, atmosphere: bool, ambient_mrt: bool) -> String {
     let source = crate::atmosphere::surface_shader(
         include_str!("height_grid.wgsl"),

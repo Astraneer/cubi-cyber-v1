@@ -370,9 +370,6 @@ fn compare_image(before: &[u8], after: &[u8], samples: u32, frame: u32, label: &
     let first = before.iter().zip(after).position(|(a, b)| a != b);
     let differing = before.iter().zip(after).filter(|(a, b)| a != b).count();
     if before == after {
-        eprintln!(
-            "::notice title=BUILTIN_EMISSION_CONTROL::AA{samples} frame{frame} {label} exact"
-        );
         return true;
     }
     eprintln!(
@@ -455,11 +452,21 @@ struct V{@builtin(position)position:vec4<f32>,@location(0)@interpolate(linear,sa
                 ),
             }],
         });
+        Self::with_bindings(gpu, samples, &layout, bind, &source, label)
+    }
+    fn with_bindings(
+        gpu: &render::Gpu,
+        samples: u32,
+        layout: &wgpu::BindGroupLayout,
+        bind: wgpu::BindGroup,
+        source: &str,
+        label: &'static str,
+    ) -> Self {
         let pipeline_layout = gpu
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(label),
-                bind_group_layouts: &[&layout],
+                bind_group_layouts: &[layout],
                 push_constant_ranges: &[],
             });
         let shader = gpu
@@ -593,8 +600,99 @@ fn source_passthrough_controls(samples: u32) {
     )
     .unwrap()
     .unwrap();
+    let source = render::contact_ao::shader(samples, false);
+    let (prefix, _) = source.split_once("@fragment fn fragment").unwrap();
+    let same_bind_entry = r#"
+@fragment fn fragment(input:ScreenVertex,@builtin(sample_index)sample:u32)->@location(0)vec4<f32>{
+ return textureLoad(hdr,vec2<i32>(input.uv*DIMENSIONS),i32(sample));
+}
+"#;
+    let (layout, bind) = scene.ao.diagnostic_bindings();
+    for (label, dimensions) in [
+        ("bind constant dimensions", "vec2(128.,64.)"),
+        ("bind uniform dimensions", "vec2<f32>(params.image.xy)"),
+    ] {
+        controls.push(CopyControl::with_bindings(
+            &gpu,
+            samples,
+            layout,
+            bind.clone(),
+            &format!(
+                "{prefix}{}",
+                same_bind_entry.replace("DIMENSIONS", dimensions)
+            ),
+            label,
+        ));
+    }
+    let no_visibility = source.replace("let ao=visibility(position,sample);", "let ao=1.;");
+    assert_ne!(source, no_visibility);
+    controls.push(CopyControl::with_bindings(
+        &gpu,
+        samples,
+        layout,
+        bind.clone(),
+        &no_visibility,
+        "full entry no visibility call",
+    ));
+    let legacy_two_return = format!(
+        r#"{prefix}
+@fragment fn fragment(input:ScreenVertex,@builtin(sample_index)sample:u32)->@location(0)vec4<f32>{{
+ let position=vec4(input.uv*vec2<f32>(params.image.xy),0.,1.);record_fragment();
+ let pixel=vec2<i32>(position.xy);let original=textureLoad(hdr,pixel,i32(sample));
+ let component=textureLoad(ambient,pixel,i32(sample)).rgb;
+ if all(component==vec3(0.)){{return original;}}
+ let ao=visibility(position,sample);if ao==1.{{return original;}}
+ return vec4(max(original.rgb-component*(1.-ao),vec3(0.)),original.a);
+}}
+"#
+    );
+    controls.push(CopyControl::with_bindings(
+        &gpu,
+        samples,
+        layout,
+        bind.clone(),
+        &legacy_two_return,
+        "legacy two-return calibration",
+    ));
+    let counters = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("AO WARP actual fragment counters"),
+        size: 16,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    gpu.queue.write_buffer(&counters, 0, &[0; 16]);
+    let mut instrumented = ContactAoGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        W,
+        H,
+        samples,
+        ContactAoConfig::default(),
+        ContactAoInputs {
+            hdr: scene.terrain.scene_color_msaa_view().unwrap(),
+            ambient: scene.terrain.ambient_msaa_view().unwrap(),
+            depth: scene.terrain.scene_depth_msaa_view(),
+            statistics: Some(&counters),
+        },
+        &mut UploadBudget::new(10000),
+    )
+    .unwrap()
+    .unwrap();
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     scene.encode_scene(&gpu, &mut encoder);
+    scene
+        .ao
+        .encode(
+            &gpu.queue,
+            &mut encoder,
+            scene.camera,
+            scene.terrain.hdr_revision(),
+            &mut UploadBudget::new(10000),
+            10_000_000,
+        )
+        .unwrap();
     for control in &controls {
         control.encode(&mut encoder);
     }
@@ -607,30 +705,80 @@ fn source_passthrough_controls(samples: u32) {
         10_000_000,
     )
     .unwrap();
+    instrumented
+        .encode(
+            &gpu.queue,
+            &mut encoder,
+            scene.camera,
+            scene.terrain.hdr_revision(),
+            &mut UploadBudget::new(10000),
+            10_000_000,
+        )
+        .unwrap();
     gpu.queue.submit([encoder.finish()]);
     let before = read(&gpu, scene.terrain.resolved_hdr_texture());
     assert_eq!(energy(&before, 1.), 192);
     let mut exact = true;
+    let mut matrix = Vec::new();
     for control in &controls {
-        exact &= compare_image(
-            &before,
-            &read(&gpu, &control.resolved),
-            samples,
-            0,
-            control.label,
-        );
+        let image = read(&gpu, &control.resolved);
+        if control.label == "legacy two-return calibration" {
+            // Historical failing shader is diagnostic only. Every production
+            // path below retains its exact, unconditional image assertion.
+            matrix.push(format!("legacyTwoReturn={}", u32::from(before == image)));
+            continue;
+        }
+        let passed = compare_image(&before, &image, samples, 0, control.label);
+        exact &= passed;
+        matrix.push(format!("{}={}", control.label, u32::from(passed)));
     }
-    exact &= compare_image(
-        &before,
-        &read(&gpu, zero.resolved_texture()),
-        samples,
-        0,
-        "shipping AO strength0",
+    for (label, texture) in [
+        ("shipping", scene.ao.resolved_texture()),
+        ("strength0", zero.resolved_texture()),
+        ("instrumented", instrumented.resolved_texture()),
+    ] {
+        let passed = compare_image(&before, &read(&gpu, texture), samples, 0, label);
+        exact &= passed;
+        matrix.push(format!("{label}={}", u32::from(passed)));
+    }
+    let stats = read_counters(&gpu, &counters);
+    let expected_fragments = W * H * samples;
+    eprintln!(
+        "::notice title=AO_CONTROL_MATRIX::AA{samples} sourceNonzero={} {} counters={stats:?} expectedFragments={expected_fragments}",
+        before.iter().filter(|&&byte| byte != 0).count(),
+        matrix.join("; "),
+    );
+    assert_eq!(
+        stats[0], expected_fragments,
+        "actual AO fragment invocations"
     );
     assert!(
         exact,
         "AA{samples} actual same-frame passthrough controls differ"
     );
+}
+fn read_counters(gpu: &render::Gpu, source: &wgpu::Buffer) -> [u32; 4] {
+    let target = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("AO WARP counter readback"),
+        size: 16,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    encoder.copy_buffer_to_buffer(source, 0, &target, 0, 16);
+    gpu.queue.submit([encoder.finish()]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    target.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+        tx.send(r).unwrap();
+    });
+    gpu.device.poll(wgpu::PollType::Wait).unwrap();
+    rx.recv().unwrap().unwrap();
+    let words = {
+        let data = target.slice(..).get_mapped_range();
+        std::array::from_fn(|i| u32::from_le_bytes(data[i * 4..i * 4 + 4].try_into().unwrap()))
+    };
+    target.unmap();
+    words
 }
 #[test]
 fn contact_ao_source_passthrough_aa1_controls() {

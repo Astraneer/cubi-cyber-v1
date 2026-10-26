@@ -420,7 +420,7 @@ fn actual_gpu_preserves_linear_channels_sentinels_directx_axes_and_bounded_pom()
         near(before[13], 0.0);
         assert_eq!(
             material_pack::apply_albedo_in_place(&gpu.queue, terrain.geometry(), &prepared),
-            Ok((4, 4 * (16 + 4 + 1) * 5))
+            Ok((4, 4 * (16 + 4 + 1) * 5 + 4 * 4))
         );
         let after = probe(
             &gpu,

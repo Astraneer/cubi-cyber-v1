@@ -745,7 +745,8 @@ pub fn shader_sources(opaque_start: u32, cutout_start: u32) -> [String; 4] {
         .expect("cutout shader prefix")
         .replace(LOD_CAMERA, CAMERA_SHADER);
     let cutout = format!(
-        "{cutout}\n@fragment fn fragment(input:VertexOut){{let material=materials[input.material];if textureSampleLevel(colors,texels,input.uv,i32(material.x),0.).a<0.5{{discard;}}}}"
+        "{cutout}\n{}\n@fragment fn fragment(input:VertexOut){{if !shadow_alpha_pass(input.material,input.uv){{discard;}}}}",
+        crate::shadow_alpha::WGSL
     );
     [cull, height, opaque, cutout]
 }

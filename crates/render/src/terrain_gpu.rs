@@ -280,6 +280,7 @@ pub struct TerrainGeometry<'a> {
     pub colors: &'a wgpu::TextureView,
     pub tint_masks: &'a wgpu::TextureView,
     pub sampler: &'a wgpu::Sampler,
+    pub shadow_alpha_state: &'a std::sync::Arc<crate::shadow_alpha::AtlasState>,
     pub edit_masks: &'a wgpu::Buffer,
     pub edit_neighbors: &'a wgpu::Buffer,
     pub patch_states: &'a wgpu::Buffer,
@@ -304,6 +305,8 @@ pub struct TerrainGpu {
     patch_clear: Box<[u32; 4096]>,
     patch_state_staging: Vec<u32>,
     materials: wgpu::Buffer,
+    shadow_alpha_classification: Box<[u32]>,
+    shadow_alpha_state: std::sync::Arc<crate::shadow_alpha::AtlasState>,
     colors: wgpu::TextureView,
     tint_masks: wgpu::TextureView,
     sampler: wgpu::Sampler,
@@ -431,6 +434,8 @@ impl TerrainGpu {
             return Err(TerrainError::InvalidSize);
         }
         assert!(transfer != OutputTransfer::ShaderSrgb || !format.is_srgb());
+        let shadow_alpha_classification =
+            crate::shadow_alpha::classify_mip0(atlas).map_err(|_| TerrainError::InvalidMaterial)?;
         let storage = |label, size, usage| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -529,7 +534,13 @@ impl TerrainGpu {
         });
         let (atlas_view, mask_view, texture_bytes) = upload_atlas(device, queue, atlas);
         let materials: Vec<[u32; 4]> = (0..atlas.layers)
-            .map(crate::material_pack::builtin_material)
+            .map(|layer| {
+                crate::shadow_alpha::merge(
+                    crate::material_pack::builtin_material(layer),
+                    &shadow_alpha_classification,
+                    true,
+                )
+            })
             .collect();
         let material_buffer = storage(
             "material table",
@@ -866,6 +877,8 @@ impl TerrainGpu {
             patch_clear: Box::new([0; 4096]),
             patch_state_staging: Vec::with_capacity(4096),
             materials: material_buffer,
+            shadow_alpha_classification,
+            shadow_alpha_state: std::sync::Arc::new(crate::shadow_alpha::AtlasState::default()),
             colors: atlas_view,
             tint_masks: mask_view,
             sampler,
@@ -1086,6 +1099,7 @@ impl TerrainGpu {
             colors: &self.colors,
             tint_masks: &self.tint_masks,
             sampler: &self.sampler,
+            shadow_alpha_state: &self.shadow_alpha_state,
             edit_masks: &self.edit_masks,
             edit_neighbors: &self.edit_neighbors,
             patch_states: &self.patch_states,

@@ -44,12 +44,21 @@ jobs:
           xvfb-run -a node tools/web_smoke.mjs --headed
           xvfb-run -a node tools/terrain_smoke.mjs --headed
       - name: Build portable Linux and web bundles
+        id: linux_release
         run: bash tools/build_release.sh linux --web
+      - name: Launch extracted Linux and WebGPU bundles
+        run: |
+          source tools/env.sh
+          xvfb-run -a python3 tools/smoke_release.py --archive .local/artifacts/dist/cubi-linux.zip --report .local/artifacts/release-smoke/linux/result.json
+          xvfb-run -a python3 tools/smoke_release.py --archive .local/artifacts/dist/cubi-web.zip --report .local/artifacts/release-smoke/web/result.json --browser
       - name: Preserve portable Linux and web bundles
+        if: ${{ !cancelled() && steps.linux_release.outcome == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: cubi-linux-and-web
-          path: .local/artifacts/dist/*
+          path: |
+            .local/artifacts/dist/*
+            .local/artifacts/release-smoke/**
           include-hidden-files: true
           if-no-files-found: error
       - name: Preserve actual browser and GPU evidence
@@ -129,12 +138,18 @@ jobs:
       - name: Present three native Windows frames
         run: bash tools/windows_native_smoke.sh
       - name: Build portable Windows bundle
+        id: windows_release
         run: bash tools/build_release.sh windows
+      - name: Launch extracted Windows bundle and window route
+        run: python tools/smoke_release.py --archive .local/artifacts/dist/cubi-windows.zip --report .local/artifacts/release-smoke/windows/result.json
       - name: Preserve portable Windows bundle
+        if: ${{ !cancelled() && steps.windows_release.outcome == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: cubi-windows
-          path: .local/artifacts/dist/*
+          path: |
+            .local/artifacts/dist/*
+            .local/artifacts/release-smoke/**
           include-hidden-files: true
           if-no-files-found: error
 

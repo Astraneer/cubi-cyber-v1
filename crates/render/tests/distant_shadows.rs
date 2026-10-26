@@ -192,6 +192,9 @@ fn whole_ns(gpu: &render::Gpu, timings: &wgpu::Buffer) -> [f64; 2] {
     ns
 }
 fn depth(gpu: &render::Gpu, shadow: &ShadowGpu) -> Vec<u8> {
+    depth_texture(gpu, shadow, shadow.sampled_texture())
+}
+fn depth_texture(gpu: &render::Gpu, shadow: &ShadowGpu, texture: &wgpu::Texture) -> Vec<u8> {
     let n = shadow.cache().config().resolution;
     let row = n * 4;
     assert_eq!(row % 256, 0);
@@ -204,7 +207,7 @@ fn depth(gpu: &render::Gpu, shadow: &ShadowGpu) -> Vec<u8> {
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
-            texture: shadow.sampled_texture(),
+            texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::DepthOnly,
@@ -820,5 +823,424 @@ fn active_public_hill_and_building_cast_on_near_receivers_and_sparse_matches_ful
             depth(&gpu, &sparse).iter().all(|b| *b == 0),
             "revoked front retained stale shadow"
         );
+    });
+}
+
+// Exact specialization control: same immutable atlas, public quads and camera;
+// the reference clears only the new facts and therefore executes the old sample.
+struct AlphaBank {
+    terrain: TerrainGpu,
+    heights: HeightGpu,
+    proxies: LodProxyGpu,
+    shadow: ShadowGpu,
+    far: DistantShadowGpu,
+    handle: render::lod_gpu::ProxyHandle,
+}
+impl AlphaBank {
+    fn new(gpu: &render::Gpu, atlas: &AtlasImage, facts: bool) -> Self {
+        Self::with_resolution(gpu, atlas, facts, 128)
+    }
+    fn with_resolution(
+        gpu: &render::Gpu,
+        atlas: &AtlasImage,
+        facts: bool,
+        resolution: u32,
+    ) -> Self {
+        let mut terrain = TerrainGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            64,
+            64,
+            OutputTransfer::Attachment,
+            GpuConfig {
+                max_pages: 4,
+                max_quads: 4096,
+                occlusion: false,
+            },
+            atlas,
+        )
+        .unwrap();
+        if !facts {
+            for layer in 0..atlas.layers {
+                let tint = u32::from(layer == 40 || layer == 41);
+                gpu.queue.write_buffer(
+                    terrain.geometry().materials,
+                    u64::from(layer) * 16 + 4,
+                    &tint.to_le_bytes(),
+                );
+            }
+        }
+        let mut cells = [0; 4096];
+        for y in 0..16 {
+            for z in 4..12 {
+                for x in 4..12 {
+                    cells[x + 16 * (z + 16 * y)] = 1;
+                }
+            }
+        }
+        let mut mesh = render::terrain_mesh::PageMesh::default();
+        render::terrain_mesh::mesh_page(
+            &render::terrain_mesh::PageHalo::from_page(&cells, 0),
+            |cell| {
+                if cell == 0 {
+                    render::terrain_mesh::CellMaterial::EMPTY
+                } else {
+                    render::terrain_mesh::CellMaterial {
+                        class: render::terrain_mesh::MeshClass::Cutout,
+                        ..render::terrain_mesh::CellMaterial::opaque(4)
+                    }
+                }
+            },
+            &mut render::terrain_mesh::MeshScratch::new(),
+            &mut mesh,
+        );
+        let mut budget = UploadBudget::new(1_000_000);
+        terrain
+            .upload_page(
+                &gpu.queue,
+                None,
+                1,
+                translation([0., 16., 16.]),
+                &mesh,
+                &mut budget,
+            )
+            .unwrap();
+        let heights = HeightGpu::new(
+            &gpu.device,
+            terrain.geometry(),
+            HeightGpuConfig {
+                max_tiles: 8,
+                atlas_layers: 186,
+            },
+            None,
+        )
+        .unwrap();
+        let mut proxies = LodProxyGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            terrain.geometry(),
+            ProxyConfig {
+                max_objects: 8,
+                max_payload_words: 65536,
+                atlas_layers: 186,
+                instrument: false,
+            },
+            None,
+        )
+        .unwrap();
+        let handle = proxies
+            .upload(
+                &gpu.queue,
+                None,
+                1,
+                translation([32., 16., 16.]),
+                [0.; 4],
+                &building(SurfaceKind::Cutout, 4),
+                &mut budget,
+            )
+            .unwrap();
+        let shadow = ShadowGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            terrain.geometry(),
+            ShadowConfig {
+                resolution,
+                half_widths: [64., 128., 256.],
+                depth_half_extent: 256.,
+                max_updates_per_frame: 3,
+                sun_step_radians: 1e-6,
+                dynamic_casters: true,
+                projected_bounds: true,
+                ..Default::default()
+            },
+            [16., 0., 16.],
+            [1., 1., 0.],
+        )
+        .unwrap();
+        let mut far = DistantShadowGpu::new(
+            &gpu.device,
+            heights.shadow_source(),
+            proxies.shadow_source(),
+            &shadow,
+            HeightShadowPolicy::from_opaque_layers([0]).unwrap(),
+        )
+        .unwrap();
+        far.set_enabled(true);
+        Self {
+            terrain,
+            heights,
+            proxies,
+            shadow,
+            far,
+            handle,
+        }
+    }
+    fn set_material(&mut self, gpu: &render::Gpu, material: u16, version: u64) {
+        self.proxies
+            .upload(
+                &gpu.queue,
+                Some(self.handle),
+                version,
+                translation([32., 16., 16.]),
+                [0.; 4],
+                &building(SurfaceKind::Cutout, material),
+                &mut UploadBudget::new(1_000_000),
+            )
+            .unwrap();
+        self.far
+            .synchronize_sources(self.heights.shadow_source(), self.proxies.shadow_source())
+            .unwrap();
+    }
+    fn frame(&mut self, gpu: &render::Gpu) -> ShadowWork {
+        frame(gpu, &mut self.shadow, &mut self.far)
+    }
+}
+#[test]
+fn mip0_alpha_specialization_is_bitwise_and_inplace_atlas_revokes_both_shadow_caches() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut atlas = AtlasImage::donor().unwrap();
+        for mip in &mut atlas.mips {
+            let pixels = (mip.size * mip.size) as usize;
+            for (layer, alpha) in [(1, 0), (2, 127), (3, 128), (4, 255), (5, 0)] {
+                for (i, pixel) in mip.rgba[layer * pixels * 4..(layer + 1) * pixels * 4]
+                    .chunks_exact_mut(4)
+                    .enumerate()
+                {
+                    pixel[3] = if layer == 5 && i % 2 == 0 { 255 } else { alpha };
+                }
+            }
+        }
+        let mut fast = AlphaBank::new(&gpu, &atlas, true);
+        let mut reference = AlphaBank::new(&gpu, &atlas, false);
+        for (version, material) in [1, 2, 3, 4, 5].into_iter().enumerate() {
+            fast.set_material(&gpu, material, version as u64 + 2);
+            reference.set_material(&gpu, material, version as u64 + 2);
+            fast.frame(&gpu);
+            reference.shadow.invalidate_all();
+            reference.frame(&gpu);
+            assert_eq!(
+                depth(&gpu, &fast.shadow),
+                depth(&gpu, &reference.shadow),
+                "alpha material{material} changed depth"
+            );
+            assert_eq!(
+                depth_texture(&gpu, &fast.shadow, fast.shadow.texture()),
+                depth_texture(&gpu, &reference.shadow, reference.shadow.texture())
+            );
+        }
+        fast.set_material(&gpu, 4, 20);
+        reference.set_material(&gpu, 4, 20);
+        fast.frame(&gpu);
+        reference.frame(&gpu);
+        let original = depth(&gpu, &fast.shadow);
+        assert!(original.iter().any(|v| *v != 0));
+        for (index, alpha) in [0, 127, 128, 255, 17, 255].into_iter().enumerate() {
+            let mut changed = AtlasImage::donor().unwrap();
+            for mip in &mut changed.mips {
+                let pixels = (mip.size * mip.size) as usize;
+                for (i, pixel) in mip.rgba[4 * pixels * 4..5 * pixels * 4]
+                    .chunks_exact_mut(4)
+                    .enumerate()
+                {
+                    pixel[3] = if alpha == 17 {
+                        if i % 2 == 0 { 255 } else { 0 }
+                    } else {
+                        alpha
+                    };
+                }
+            }
+            let prepared = render::material_pack::PreparedMaterials::prepare(
+                &changed,
+                &[],
+                index as u64 + 1,
+                Default::default(),
+            )
+            .unwrap();
+            let before = fast.terrain.geometry().shadow_alpha_state.revision();
+            render::material_pack::apply_albedo_in_place(
+                &gpu.queue,
+                fast.terrain.geometry(),
+                &prepared,
+            )
+            .unwrap();
+            render::material_pack::apply_albedo_in_place(
+                &gpu.queue,
+                reference.terrain.geometry(),
+                &prepared,
+            )
+            .unwrap();
+            assert_eq!(
+                fast.terrain.geometry().shadow_alpha_state.revision(),
+                before + 1
+            );
+            assert!(fast.shadow.needs_work());
+            assert!(!fast.shadow.presentation_ready());
+            let work = fast.frame(&gpu);
+            reference.shadow.invalidate_all();
+            reference.frame(&gpu);
+            assert_eq!(
+                work.static_updated_mask, 7,
+                "fixed Sun/source did not rebuild all near maps"
+            );
+            assert_eq!(
+                work.gpu_restore_mask, 7,
+                "fixed Sun/source did not rebuild combined far maps"
+            );
+            assert!(fast.shadow.presentation_ready());
+            assert!(!fast.shadow.needs_work());
+            let actual = depth(&gpu, &fast.shadow);
+            assert_eq!(actual, depth(&gpu, &reference.shadow));
+            let near = depth_texture(&gpu, &fast.shadow, fast.shadow.texture());
+            assert_eq!(
+                near,
+                depth_texture(&gpu, &reference.shadow, reference.shadow.texture())
+            );
+            if alpha < 128 && alpha != 17 {
+                assert!(actual.iter().all(|v| *v == 0));
+                assert!(near.iter().all(|v| *v == 0));
+            }
+            if alpha == 255 {
+                assert_eq!(
+                    actual, original,
+                    "reset to original atlas did not restore image"
+                );
+            }
+        }
+        // Reject incompatible input before any texture/metadata/epoch publication.
+        let invalid = render::material_pack::PreparedMaterials::prepare(
+            &AtlasImage {
+                tile_size: 4,
+                layers: 1,
+                mips: vec![render::terrain_gpu::AtlasMip {
+                    size: 4,
+                    rgba: vec![255; 64],
+                    tint_mask: vec![255; 16],
+                }],
+            },
+            &[],
+            99,
+            Default::default(),
+        )
+        .unwrap();
+        let before = fast.terrain.geometry().shadow_alpha_state.revision();
+        assert_eq!(
+            render::material_pack::apply_albedo_in_place(
+                &gpu.queue,
+                fast.terrain.geometry(),
+                &invalid
+            ),
+            Err(render::material_pack::MaterialError::Target)
+        );
+        assert_eq!(
+            fast.terrain.geometry().shadow_alpha_state.revision(),
+            before
+        );
+        assert!(!fast.shadow.needs_work());
+        assert_eq!(depth(&gpu, &fast.shadow), original);
+        // Hidden cascades keep their old-epoch obligation until enabled again.
+        fast.shadow.set_visibility(true, 1).unwrap();
+        fast.frame(&gpu);
+        let reset =
+            render::material_pack::PreparedMaterials::prepare(&atlas, &[], 100, Default::default())
+                .unwrap();
+        render::material_pack::apply_albedo_in_place(&gpu.queue, fast.terrain.geometry(), &reset)
+            .unwrap();
+        assert!(!fast.shadow.presentation_ready());
+        let one = fast.frame(&gpu);
+        assert_eq!(one.static_updated_mask, 1);
+        assert!(fast.shadow.presentation_ready());
+        assert!(!fast.shadow.needs_work());
+        fast.shadow.set_visibility(true, 3).unwrap();
+        assert!(!fast.shadow.presentation_ready());
+        let other = fast.frame(&gpu);
+        assert_eq!(other.static_updated_mask, 6);
+        assert!(fast.shadow.presentation_ready());
+        assert!(!fast.shadow.needs_work());
+        assert_eq!(depth(&gpu, &fast.shadow), original);
+        let mut e = gpu.device.create_command_encoder(&Default::default());
+        let scope = telemetry::AllocationScope::begin().unwrap();
+        for _ in 0..1000 {
+            assert!(!fast.shadow.needs_work());
+            let work = fast
+                .shadow
+                .encode_dynamic(&gpu.queue, &mut e, &mut fast.far)
+                .unwrap();
+            assert_eq!(
+                work.cascade_updates + work.dynamic_draw_calls + work.dynamic_cull_dispatches,
+                0
+            );
+            assert_eq!(work.uniform_upload_bytes, 0);
+        }
+        let counts = scope.finish();
+        assert_eq!(counts.allocating_calls(), 0);
+        assert_eq!(counts.dealloc_calls, 0);
+        gpu.queue.submit([e.finish()]);
+        gpu.device.poll(wgpu::PollType::Wait).unwrap();
+        println!(
+            "ALPHA_NATIVE exact0/127/128/255/mixed=BITWISE inplace6=fixedSunNearAndFarRefresh reset=BITWISE idle1000=0alloc"
+        );
+    });
+}
+
+#[test]
+fn loading_alpha_cost_uses_identical_public_quads_and_reports_mixed_fallback_separately() {
+    pollster::block_on(async {
+        let gpu = diagnostic_gpu(&render::instance()).await;
+        for mixed in [false, true] {
+            let mut atlas = AtlasImage::donor().unwrap();
+            for mip in &mut atlas.mips {
+                let pixels = (mip.size * mip.size) as usize;
+                for (i, pixel) in mip.rgba[4 * pixels * 4..5 * pixels * 4]
+                    .chunks_exact_mut(4)
+                    .enumerate()
+                {
+                    pixel[3] = if mixed && i % 2 == 0 { 0 } else { 255 };
+                }
+            }
+            let mut fast = AlphaBank::with_resolution(&gpu, &atlas, true, 2048);
+            let mut sampled = AlphaBank::with_resolution(&gpu, &atlas, false, 2048);
+            fast.frame(&gpu);
+            sampled.frame(&gpu);
+            let timings = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("identical alpha fact/sample total scopes"),
+                size: 6 * 32,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            for frame in 0..6u64 {
+                let angle = std::f64::consts::FRAC_PI_4 + (frame + 1) as f64 * 0.0004;
+                let sun = [angle.cos() as f32, angle.sin() as f32, 0.];
+                fast.shadow.update_view([16., 0., 16.], sun).unwrap();
+                sampled.shadow.update_view([16., 0., 16.], sun).unwrap();
+                let mut works = [ShadowWork::default(); 2];
+                // Balance first/second encoder and texture-cache order.
+                for kind in if frame % 2 == 0 { [0, 1] } else { [1, 0] } {
+                    let bank = if kind == 0 { &mut fast } else { &mut sampled };
+                    works[kind] = frame_timed(
+                        &gpu,
+                        &mut bank.shadow,
+                        &mut bank.far,
+                        Some((&timings, frame * 32 + kind as u64 * 16)),
+                        None,
+                    );
+                }
+                assert_eq!(
+                    works[0], works[1],
+                    "alpha specialization changed actual shadow graph work"
+                );
+            }
+            assert_eq!(depth(&gpu, &fast.shadow), depth(&gpu, &sampled.shadow));
+            let ns = whole_ns(&gpu, &timings);
+            println!(
+                "\n::notice title=H5 alpha exact same-scene control::mixed={mixed} currentSun6 resolution2048 maps96MiB publicObjects1 cutoutQuads64 sourceEdits0 facts_ns={} original_sample_ns={} original_over_facts={:.6} depth=BITWISE work=EXACT timestamps=TOTAL order=alternating noNodeQueries=1",
+                ns[0],
+                ns[1],
+                ns[1] / ns[0]
+            );
+        }
     });
 }

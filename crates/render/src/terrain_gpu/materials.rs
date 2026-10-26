@@ -59,6 +59,13 @@ impl TerrainGpu {
         pack: &MaterialPackGpu,
         enabled: bool,
     ) -> u64 {
+        let _gate = self
+            .shadow_alpha_state
+            .lock()
+            .expect("atlas metadata update gate");
+        let valid = self.shadow_alpha_state.revision() == 0;
+        let project =
+            |entry| crate::shadow_alpha::merge(entry, &self.shadow_alpha_classification, valid);
         let previous = self.local_materials.as_ref().filter(|state| state.enabled);
         if (0..self.atlas_layers).all(|layer| {
             let builtin = crate::material_pack::builtin_material(layer);
@@ -70,22 +77,20 @@ impl TerrainGpu {
             } else {
                 builtin
             };
-            old == new
+            project(old) == project(new)
         }) {
             return 0;
         }
-        if enabled {
-            queue.write_buffer(
-                &self.materials,
-                0,
-                bytemuck::cast_slice(&pack.material_metadata),
-            );
-        } else {
-            let entries: Vec<_> = (0..self.atlas_layers)
-                .map(crate::material_pack::builtin_material)
-                .collect();
-            queue.write_buffer(&self.materials, 0, bytemuck::cast_slice(&entries));
-        }
+        let entries: Vec<_> = (0..self.atlas_layers)
+            .map(|layer| {
+                project(if enabled {
+                    pack.material_metadata[layer as usize]
+                } else {
+                    crate::material_pack::builtin_material(layer)
+                })
+            })
+            .collect();
+        queue.write_buffer(&self.materials, 0, bytemuck::cast_slice(&entries));
         u64::from(self.atlas_layers) * 16
     }
     /// Prepare the optional material shader before any frame. An initially

@@ -50,7 +50,10 @@ struct ScreenVertex{@builtin(position)position:vec4<f32>,@location(0)@interpolat
 @vertex fn vertex(@builtin(vertex_index)i:u32)->ScreenVertex{let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));var out:ScreenVertex;out.position=vec4(p[i],0.,1.);out.uv=vec2(p[i].x*.5+.5,.5-p[i].y*.5);return out;}
 @fragment fn fragment(input:ScreenVertex,@builtin(sample_index)sample:u32)->@location(0)vec4<f32>{
  let position=vec4(input.uv*vec2<f32>(params.image.xy),0.,1.);record_fragment();let pixel=vec2<i32>(position.xy);let original=textureLoad(hdr,pixel,i32(sample));let component=textureLoad(ambient,pixel,i32(sample)).rgb;
- if all(component==vec3(0.)){return original;}
- let ao=visibility(position,sample);if ao==1.{return original;}
- return vec4(max(original.rgb-component*(1.-ao),vec3(0.)),original.a);
+ var result=original;
+ if !all(component==vec3(0.)){
+  let ao=visibility(position,sample);
+  if ao!=1.{result=vec4(max(original.rgb-component*(1.-ao),vec3(0.)),original.a);}
+ }
+ return result;
 }

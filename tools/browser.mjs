@@ -59,7 +59,9 @@ export async function withBrowser(options, action) {
   let server, browser, socket, serverLog='', browserLog='';
   const errors=[], pending=new Map(), listeners=new Map(); let nextId=0;
   try {
-    server=spawn(process.env.PYTHON??'python3',['tools/serve_web.py','--port','0'],{cwd:root,stdio:['ignore','pipe','pipe'],env:{...process.env,TMPDIR:tmp,PYTHONDONTWRITEBYTECODE:'1'}});
+    const serverArgs=[process.env.CUBI_WEB_SERVER_SCRIPT??'tools/serve_web.py','--port','0'];
+    if(process.env.CUBI_WEB_DIST)serverArgs.push('--directory',process.env.CUBI_WEB_DIST);
+    server=spawn(process.env.PYTHON??'python3',serverArgs,{cwd:root,stdio:['ignore','pipe','pipe'],env:{...process.env,TMPDIR:tmp,PYTHONDONTWRITEBYTECODE:'1'}});
     server.on('error',e=>{serverLog+=e;});
     server.stdout.on('data',d=>{serverLog+=d;}); server.stderr.on('data',d=>{serverLog+=d;});
     const startup=Date.now()+30_000; let port;

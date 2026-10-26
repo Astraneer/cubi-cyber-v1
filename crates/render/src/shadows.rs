@@ -673,6 +673,9 @@ pub struct ShadowGpu {
     max_quads: u32,
     sampling_dirty: bool,
     visibility_dirty: bool,
+    atlas_state: std::sync::Arc<crate::shadow_alpha::AtlasState>,
+    atlas_revision: u64,
+    atlas_refresh_mask: u32,
     combined: Option<CombinedDepth>,
     last_dynamic: Option<DynamicStamp>,
     timer: crate::gpu_time::GpuPassTimer<9>,
@@ -1149,6 +1152,9 @@ impl ShadowGpu {
             max_quads: geometry.max_quads,
             sampling_dirty: false,
             visibility_dirty: false,
+            atlas_state: std::sync::Arc::clone(geometry.shadow_alpha_state),
+            atlas_revision: geometry.shadow_alpha_state.revision(),
+            atlas_refresh_mask: 0,
             combined,
             last_dynamic: None,
             last_static_rects: [None; CASCADES],
@@ -1191,10 +1197,37 @@ impl ShadowGpu {
         Ok(changed)
     }
     pub fn presentation_ready(&self) -> bool {
-        !self.visibility_dirty && self.cache.presentation_ready()
+        !self.visibility_dirty
+            && (self.active_mask() == 0 || self.atlas_revision == self.atlas_state.revision())
+            && self.atlas_refresh_mask & self.active_mask() == 0
+            && self.cache.presentation_ready()
     }
     pub fn needs_work(&self) -> bool {
-        self.sampling_dirty || self.cache.pending() != 0
+        self.sampling_dirty
+            || self.cache.pending() != 0
+            || self.atlas_revision != self.atlas_state.revision()
+            || self.atlas_refresh_mask & self.active_mask() != 0
+    }
+    fn active_mask(&self) -> u32 {
+        if self.cache.config.enabled {
+            (1 << self.cache.config.active_cascades) - 1
+        } else {
+            0
+        }
+    }
+    /// Albedo imports mutate the shared color array without geometry/Sun changes.
+    /// Keep the exact epoch separate from caster keys; both static and combined
+    /// depth must be refreshed, including inactive layers before later reuse.
+    fn synchronize_atlas(&mut self) {
+        let revision = self.atlas_state.revision();
+        if self.atlas_revision != revision {
+            self.cache.invalidate_all();
+            self.last_dynamic = None;
+            self.sampling_dirty = true;
+            self.visibility_dirty = true;
+            self.atlas_refresh_mask = (1 << CASCADES) - 1;
+            self.atlas_revision = revision;
+        }
     }
     pub fn enabled(&self) -> bool {
         self.cache.config.enabled
@@ -1297,6 +1330,7 @@ impl ShadowGpu {
         if !caster.available() {
             return Err(ShadowError::CasterUnavailable);
         }
+        self.synchronize_atlas();
         if self.cache.pending() != 0 {
             self.total_timer.start(encoder);
         }
@@ -1504,6 +1538,7 @@ impl ShadowGpu {
         }
         self.timer.begin();
         self.total_timer.begin_frame();
+        self.synchronize_atlas();
         if self.cache.pending() != 0 || self.last_dynamic.is_some() {
             self.total_timer.start(encoder);
         }
@@ -1689,6 +1724,7 @@ impl ShadowGpu {
         }
         work.pending_cascades = self.cache.pending();
         work.oldest_age_frames = self.cache.oldest_age();
+        self.atlas_refresh_mask &= !work.static_updated_mask;
         work
     }
 }

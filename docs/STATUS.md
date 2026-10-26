@@ -8,23 +8,23 @@
 | M1 | Версии/Unknown,4 PROBE_REF, native/WASM детерминизм;100000 правок→1 производная задача. |
 | M2 | Лес9915квадов×16Б; FLIP=0, Hi-Z66→54объекта без изменения кадра. |
 | M3 | Правка видна за1завершённый кадр; физика/полёт/откат проверены. |
-| M4 | Непрерывный Sun: побитная глубина sparse/full; LVP4,66×. Windows/WARP1,38× вместо≥2× — открытый блокер; per-node замеры показали стоимость Cutout. |
-| M5 | H4:50построек/8,29млн проверок; два seed≤31,98px при цели32. Полный1024/Near32-профиль и переносимые JOIN ещё проверяются. |
+| M4 | Непрерывный Sun: побитная глубина sparse/full; LVP4,66×. Windows/WARP1,38–1,64× вместо≥2× — открытый блокер; per-node замеры показали стоимость Cutout. |
+| M5 | H4:50построек/8,29млн проверок; два seed≤31,98px при цели32. JOIN18Dawn/обаMesa прошли; полный1024/Near32-профиль ещё проверяется. |
 | M6 | UDP75±20мс/2%:0коррекций; Raw/LIGHT privacy, Forget/ABA/restart. Взрыв10000блоков: оба клиента точны,28770/29275Б. |
 | M7 | GPU-инстансинг, ИИ/PvP/смерть/дропы/respawn/WAL;7 owner-сценариев. |
 | M8 | Golden выживания/жидкостей/фермы/окон; печь:тик200. Заряд180000J сохранён. Серверный ввод еды/вёдер ещё подключается. |
-| M9 | §8.6:32UDP/5000мобов/10000машин/100000событий — локальный PASS217с; три настоящих CI load-job прошли. World+LIGHT после WAL совпадают точно. |
+| M9 | §8.6:32UDP/5000мобов/10000машин/100000событий — локальный PASS217с; четыре настоящих CI load-job прошли. World+LIGHT после WAL совпадают точно. |
 | M10 | Native+Dawn GI/вода/SSR/SSAO/labPBR, SMAA, Scale85–100%, HDR-свечение лавы. TAA компоненты проверены отдельно; общий View ещё собирается, UI скрыт. |
-| M11 | Native:36действий, день/ночь/экспозиция,69предметов/reconnect, SMAA/Scale85, Near48 явно отклонён с сохранением32. Облегчённый профиль; полный впереди. |
+| M11 | Свежая пара/native1МиБ: Owner-крафт/сундук/creative/config/reconnect и F8/80шагов прошли. HDR488→HUD489, повтор735→736. Облегчённый профиль; полный впереди. |
 | M12 | Браузер: реальный локальный импорт пака/.minecraft,0HTTP/утечек; WebAudio/CPAL. Новый допуск UI проверен: HDR1243→cached HUD1244→ввод; ранний E заблокирован. Последующие долгие кадры ещё исправляются. |
-| M13 | F3/F8/HTML/compare,1800оконных кадров; полный10с F8 и независимый повтор есть. Новые ZIP Linux/Windows/web ещё впереди. |
+| M13 | F3/F8/HTML/compare,1800оконных кадров; полный10с F8 и независимый повтор есть. Debug-ZIP web/native распакованы и запущены: Sky3,WINDOW18/18GPU+HTML,WS ping. Release Windows ещё впереди. |
 
-**Последние проверки:** `faed14e` —1602зафиксированных входа, workspace/all-targets Clippy. Сервер:326тестов/66наборов без ошибок; mandatory release §8.6 отдельно. На `b37d6ee` Windows успешно компилирует прежний FXC-сбой, но H5 cost остаётся красным; серверный CI прошёл за5м35с.
+**Последние проверки:** Новый snapshot1619входов: workspace/all-targets и WASM Clippy PASS; Alpha/Height/AO объединены без optional TAA.  `faed14e` —1602зафиксированных входа, workspace/all-targets Clippy. Сервер:326тестов/66наборов без ошибок; mandatory release §8.6 отдельно. На `b37d6ee` Windows успешно компилирует прежний FXC-сбой, но H5 cost остаётся красным; серверный CI прошёл за5м35с.
 
 **Сейчас исправляется:**
 
 1. Raw:90cec0e устраняет очередь254/256 с дубликатами;4unit,9privacy/source и3×3WebSocket-теста прошли. Активный repair сохраняется при полном256; прежние15с/800мс stall сохранены.
 2. GPU/UI:675входов свежей native/WASM-пары неизменны при сборке. Browser допускает ввод после реальных HDR+HUD completions (99,65с); новый следующий кадр может быть занят. Полный профиль/инвентарь на этой паре ещё не приняты.
-3. Windows1bb: H5=1,38×; общий Cutout553,6мс доминирует, opaque DDA0,56мс. SMAA/complete View прошли; отдельный lava/AO выявил расхождение. Строгие пороги сохранены, готовятся исправления и новый CI.
+3. Windows1bb: H5=1,38×; общий Cutout553,6мс доминирует, opaque DDA0,56мс. SMAA/complete View прошли; lava/AO кандидат прошёл native+Dawn, WARP впереди. Linux прошёл workspace, затем выявил отсутствующий дамп model GI: bootstrap исправлен.
 
-[Последний CI1bb8672](https://github.com/Astraneer/cubi-cyber-v1/actions/runs/40363418690): Linux/Windows красные, server_scale зелёный. [Последний принятый Linux+Windows CI](https://github.com/Astraneer/cubi-cyber-v1/actions/runs/40240830659). PR отсутствуют: GitHub HTTP403; main не менялся. Подробности: [история](STATUS_HISTORY.md), M4–M13, PUBLIC-PRIVACY.md, GPU-TRACE.md, SERVER_SCALE.md. VPS/DNS/секреты не менялись.
+[Последний CI4fbee68](https://github.com/Astraneer/cubi-cyber-v1/actions/runs/40369598208): Linux/Windows красные, server_scale зелёный. [Последний принятый Linux+Windows CI](https://github.com/Astraneer/cubi-cyber-v1/actions/runs/40240830659). PR отсутствуют: GitHub HTTP403; main не менялся. Подробности: [история](STATUS_HISTORY.md), M4–M13, PUBLIC-PRIVACY.md, GPU-TRACE.md, SERVER_SCALE.md. VPS/DNS/секреты не менялись.

@@ -677,6 +677,19 @@ pub fn apply_albedo_in_place(
     if prepared.atlas.mips.len() - first != color.mip_level_count() as usize {
         return Err(MaterialError::Target);
     }
+    if geometry.materials.size() < u64::from(layers) * 16
+        || prepared.material_metadata.len() != layers as usize
+    {
+        return Err(MaterialError::Target);
+    }
+    let _gate = geometry
+        .shadow_alpha_state
+        .lock()
+        .map_err(|_| MaterialError::Target)?;
+    let revision = geometry
+        .shadow_alpha_state
+        .next_revision()
+        .ok_or(MaterialError::Limit)?;
     let mut bytes = 0;
     for (mip, image) in prepared.atlas.mips[first..].iter().enumerate() {
         write(queue, color, mip as u32, image.size, layers, 4, &image.rgba);
@@ -691,5 +704,13 @@ pub fn apply_albedo_in_place(
         );
         bytes += image.rgba.len() as u64 + image.tint_mask.len() as u64;
     }
+    // Any in-place upload/reset invalidates constructor-time classification.
+    // Preserve Z/W emission and clear only the shared Y facts before publishing.
+    for (layer, metadata) in prepared.material_metadata.iter().enumerate() {
+        let y = metadata[1] & !crate::shadow_alpha::FLAGS;
+        queue.write_buffer(geometry.materials, layer as u64 * 16 + 4, &y.to_le_bytes());
+        bytes += 4;
+    }
+    geometry.shadow_alpha_state.publish_uploaded(revision);
     Ok((size, bytes))
 }

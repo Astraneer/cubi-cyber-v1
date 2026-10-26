@@ -54,5 +54,34 @@ fn main() {
             ProxyPayload::from_public(&MaskedRayProxy::from_protected(&page, 4), 186).unwrap();
         std::fs::write(path.join(format!("{name}.pxp")), payload.encode_public()).unwrap();
     }
-    println!("distant_shadow_inputs fourExactShaders camera144B publicPXP2 ready");
+    // The browser consumes flags computed by the exact loading classifier, not
+    // a second JavaScript approximation of the threshold.
+    let mut atlas = render::terrain_gpu::AtlasImage {
+        tile_size: 16,
+        layers: 5,
+        mips: vec![render::terrain_gpu::AtlasMip {
+            size: 16,
+            rgba: vec![255; 16 * 16 * 5 * 4],
+            tint_mask: vec![255; 16 * 16 * 5],
+        }],
+    };
+    for (layer, alpha) in [0, 127, 128, 255, 0].into_iter().enumerate() {
+        for (index, pixel) in atlas.mips[0].rgba[layer * 1024..(layer + 1) * 1024]
+            .chunks_exact_mut(4)
+            .enumerate()
+        {
+            pixel[3] = if layer == 4 && index % 2 == 0 {
+                255
+            } else {
+                alpha
+            };
+        }
+    }
+    std::fs::write(
+        path.join("alpha-flags.bin"),
+        bytemuck::cast_slice(&render::shadow_alpha::classify_mip0(&atlas).unwrap()),
+    )
+    .unwrap();
+    std::fs::write(path.join("alpha-rgba.bin"), &atlas.mips[0].rgba).unwrap();
+    println!("distant_shadow_inputs fourExactShaders camera144B publicPXP2 alpha5 ready");
 }
