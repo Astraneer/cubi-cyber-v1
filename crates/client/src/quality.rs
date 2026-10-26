@@ -2,7 +2,7 @@
 //! timestamps. Saved preferences and proposals awaiting a GPU receipt are kept
 //! separate. Every container is reserved in the fixed-size owner below.
 use telemetry::flight::Sample;
-use ui::settings::{AutoQuality, Reduction, Setting, Settings};
+use ui::settings::{AutoQuality, Reduction, SCHEMA, Section, Setting, Settings};
 
 const PENDING_FRAMES: usize = 64;
 const WINDOW_FRAMES: usize = 256;
@@ -87,7 +87,11 @@ impl QualityRuntime {
         &self.target
     }
     pub fn confirmed(&self, setting: Setting) -> i32 {
-        self.applied.effective(setting)
+        if SCHEMA[setting as usize].section == Section::Graphics {
+            self.applied.effective(setting)
+        } else {
+            self.saved.get(setting)
+        }
     }
     pub fn reductions(&self) -> impl Iterator<Item = &Reduction> {
         self.applied.reductions()
@@ -98,13 +102,28 @@ impl QualityRuntime {
     pub fn stats(&self) -> QualityStats {
         self.stats
     }
-    /// A user edit invalidates an outstanding proposal. Its later completion
-    /// cannot acknowledge a different value or rewrite the user's new choice.
+    /// A graphics edit invalidates outstanding proposals. Other sections keep
+    /// temporary graphics choices while inheriting the user's new preferences.
     pub fn update_saved(&mut self, saved: &Settings, now_ms: u64) {
         if self.saved == *saved {
             return;
         }
+        let graphics_changed = self.saved.preset != saved.preset
+            || SCHEMA.iter().any(|definition| {
+                definition.section == Section::Graphics
+                    && self.saved.get(definition.id) != saved.get(definition.id)
+            });
         self.saved = saved.clone();
+        if !graphics_changed {
+            self.target = if let Some(proposal) = &mut self.proposal {
+                proposal.request.target = proposal.quality.effective_settings(saved);
+                proposal.request.target.clone()
+            } else {
+                self.applied.effective_settings(saved)
+            };
+            self.clear_window();
+            return;
+        }
         self.target = saved.clone();
         self.applied.reset(saved);
         self.applied.acknowledged_at(now_ms);

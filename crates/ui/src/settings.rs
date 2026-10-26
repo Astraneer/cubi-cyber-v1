@@ -321,7 +321,11 @@ impl AutoQuality {
     }
     pub fn effective_settings(&self, saved: &Settings) -> Settings {
         let mut result = saved.clone();
-        result.values = self.effective;
+        for definition in SCHEMA {
+            if definition.section == Section::Graphics {
+                result.values[definition.id as usize] = self.effective(definition.id);
+            }
+        }
         result
     }
     /// Each sample represents a complete one-second window, with enough frames to

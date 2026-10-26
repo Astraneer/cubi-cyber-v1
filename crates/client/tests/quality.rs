@@ -143,6 +143,41 @@ fn user_edit_or_failed_preparation_invalidates_receipts_and_preserves_confirmed_
 }
 
 #[test]
+fn sound_controls_and_interface_changes_keep_confirmed_and_pending_graphics_reductions() {
+    let mut saved = Settings::default();
+    let mut runtime = QualityRuntime::new(&saved);
+    runtime.set_active(true, 0);
+    let mut frame = 0;
+    let mut request = None;
+    for start in [10_000, 12_000, 14_000] {
+        let now = window(&mut runtime, &mut frame, start, 22_000, 13_000, true);
+        request = runtime.poll(now, bit(Setting::Reflections));
+    }
+    let request = request.unwrap();
+    saved.set(Setting::Master, 50).unwrap();
+    saved.set(Setting::Sensitivity, 155).unwrap();
+    saved.set(Setting::UiScale, 125).unwrap();
+    runtime.update_saved(&saved, 18_000);
+    assert_eq!(runtime.pending().unwrap().id, request.id);
+    assert_eq!(runtime.target().get(Setting::Reflections), 0);
+    assert_eq!(runtime.target().get(Setting::Master), 50);
+    assert_eq!(runtime.target().get(Setting::Sensitivity), 155);
+    assert_eq!(runtime.target().get(Setting::UiScale), 125);
+    assert!(runtime.acknowledge(request.id, 20_000, bit(Setting::Reflections)));
+    saved.set(Setting::Master, 25).unwrap();
+    runtime.update_saved(&saved, 21_000);
+    assert_eq!(runtime.confirmed(Setting::Reflections), 0);
+    assert_eq!(runtime.confirmed(Setting::Master), 25);
+    assert_eq!(runtime.target().get(Setting::Master), 25);
+    assert_eq!(runtime.reductions().count(), 1);
+    saved.set(Setting::Exposure, 120).unwrap();
+    runtime.update_saved(&saved, 22_000);
+    assert_eq!(runtime.confirmed(Setting::Reflections), 1);
+    assert_eq!(runtime.target(), &saved);
+    assert_eq!(runtime.reductions().count(), 0);
+}
+
+#[test]
 fn completed_windows_proposals_receipts_and_recovery_allocate_nothing() {
     let saved = Settings::default();
     let mut runtime = QualityRuntime::new(&saved);
