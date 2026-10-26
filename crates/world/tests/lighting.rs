@@ -475,6 +475,182 @@ fn bounded_frontier_reports_pressure_and_resumes_without_losing_light_edges() {
 }
 
 #[test]
+fn a_blocked_interactive_head_does_not_starve_the_other_retained_work() {
+    let mut world = world(&[page(0, 0, 0)]);
+    let mut tx = Transaction::new(Tick(1), SpaceId(0));
+    for i in 0..PAGE_VOLUME {
+        let local = LocalIdx::new(i as u16).unwrap();
+        let (x, y, z) = local.xyz();
+        tx.set_cell(
+            pos(i32::from(x), i32::from(y), i32::from(z)),
+            Cell::from_parts(1, 0),
+        );
+    }
+    tx.set_cell(pos(8, 8, 8), Cell::from_parts(5, 0));
+    world.commit(tx).unwrap();
+    let policy = LightingLimits {
+        max_frontier_cells: 16,
+        reserved_interactive_cells: 0,
+        max_seed_pages: 1,
+        max_queue_age_ticks: 40,
+    };
+    let mut engine = LightingEngine::attach(&mut world, policy).unwrap();
+    engine
+        .queue_cell(pos(8, 8, 8), Tick(1), LightPriority::Interactive)
+        .unwrap();
+    for x in 0..15 {
+        engine
+            .queue_cell(pos(x, 0, 0), Tick(1), LightPriority::Background)
+            .unwrap();
+    }
+    let first = engine
+        .step(&mut world, Tick(1), budget(), &|_| None)
+        .unwrap();
+    assert!(
+        first.work.frontier_deferrals > 0,
+        "the actual full frontier exercised blocked fanout"
+    );
+    assert!(
+        first.work.cells_examined > 1,
+        "other priorities must be able to drain"
+    );
+    assert_eq!(stored(&world, pos(8, 8, 8)).rgb, [3, 1, 0]);
+    assert_eq!(engine.pending_cells(), 0);
+    assert_reference(&world, &|_| None);
+}
+
+#[test]
+fn blocked_head_rotations_roll_back_when_the_world_rejects_the_light_batch() {
+    let mut initial = world(&[page(0, 0, 0)]);
+    let mut tx = Transaction::new(Tick(1), SpaceId(0));
+    for i in 0..PAGE_VOLUME {
+        let (x, y, z) = LocalIdx::new(i as u16).unwrap().xyz();
+        tx.set_cell(
+            pos(i32::from(x), i32::from(y), i32::from(z)),
+            Cell::from_parts(1, 0),
+        );
+    }
+    let emitters = [pos(6, 8, 6), pos(10, 8, 10)];
+    for p in emitters {
+        tx.set_cell(p, Cell::from_parts(5, 0));
+    }
+    initial.commit(tx).unwrap();
+    // Restore permits a journal smaller than a page-birth record. Exactly one
+    // LIGHT change fits; the two-source batch must fail atomically.
+    let one_update = std::mem::size_of::<world::WorldChange>()
+        + std::mem::size_of::<world::PageChange>()
+        + std::mem::size_of::<world::LightChange>();
+    let mut world = World::restore(
+        properties,
+        JournalLimits {
+            max_records: 16,
+            max_bytes: one_update,
+            max_age_ticks: 1200,
+        },
+        initial.checkpoint().to_restore_state(),
+    )
+    .unwrap();
+    let mut engine = LightingEngine::attach(
+        &mut world,
+        LightingLimits {
+            max_frontier_cells: 16,
+            reserved_interactive_cells: 0,
+            max_seed_pages: 1,
+            max_queue_age_ticks: 40,
+        },
+    )
+    .unwrap();
+    for p in emitters {
+        engine
+            .queue_cell(p, Tick(1), LightPriority::Interactive)
+            .unwrap();
+    }
+    for x in 0..14 {
+        engine
+            .queue_cell(pos(x, 0, 0), Tick(1), LightPriority::Background)
+            .unwrap();
+    }
+    let before = world.canonical_hash();
+    assert!(matches!(
+        engine.step(&mut world, Tick(1), budget(), &|_| None),
+        Err(LightingError::Commit(_))
+    ));
+    assert_eq!(world.canonical_hash(), before);
+    assert_eq!(engine.pending_cells(), 16);
+    let mut deferrals = 0;
+    for _ in 0..20 {
+        let retry = engine
+            .step(
+                &mut world,
+                Tick(1),
+                LightBudget {
+                    max_updates: 1,
+                    ..budget()
+                },
+                &|_| None,
+            )
+            .unwrap();
+        deferrals += retry.work.frontier_deferrals;
+        if engine.is_idle() {
+            break;
+        }
+    }
+    assert!(deferrals > 0);
+    assert_eq!(engine.pending_cells(), 0);
+    assert_reference(&world, &|_| None);
+}
+
+#[test]
+fn bounded_seed_admission_drains_a_large_daylight_removal_without_growing_the_frontier() {
+    let mut world = world(&[page(0, 0, 0), page(0, 1, 0)]);
+    let policy = LightingLimits {
+        max_frontier_cells: 1024,
+        reserved_interactive_cells: 64,
+        max_seed_pages: 2,
+        max_queue_age_ticks: 40,
+    };
+    let mut engine = LightingEngine::attach(&mut world, policy).unwrap();
+    let step_budget = LightBudget {
+        max_cells: 512,
+        max_neighbor_reads: 3072,
+        max_seed_cells: 512,
+        max_updates: 512,
+    };
+    let mut phases = 0;
+    for daylight in [true, false] {
+        for y in 0..2 {
+            engine
+                .queue_page(page(0, y, 0), Tick(0), LightPriority::Interactive)
+                .unwrap();
+        }
+        let sky = |p: BlockPos| (daylight && p.y == 31).then_some(15);
+        let mut settled = false;
+        for _ in 0..2000 {
+            let step = engine.step(&mut world, Tick(0), step_budget, &sky).unwrap();
+            assert!(step.pending_cells <= 1024);
+            assert!(step.pending_seed_pages <= 2);
+            assert!(step.work.cells_examined <= 512 && step.work.neighbor_reads <= 3072);
+            assert!(step.work.seed_cells_examined <= 512 && step.work.light_updates <= 512);
+            phases += 1;
+            if engine.is_idle() {
+                settled = true;
+                break;
+            }
+        }
+        assert!(
+            settled,
+            "daylight={daylight} retained frontier must drain at fixed quota"
+        );
+        assert_reference(&world, &sky);
+        assert_eq!(
+            stored(&world, pos(8, 0, 8)).sky,
+            if daylight { 15 } else { 0 }
+        );
+    }
+    println!("LIGHT_DRAIN phases={phases} fixed_frontier=1024 pages=2 all8192samples_exact");
+}
+
+#[test]
 fn near_edits_have_reserved_slots_and_small_work_budgets_are_resumable() {
     let mut world = world(&[page(0, 0, 0)]);
     let policy = LightingLimits {

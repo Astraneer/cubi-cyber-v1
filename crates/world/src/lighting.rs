@@ -104,6 +104,7 @@ pub struct LightWork {
     pub transactions: u64,
     pub journal_records: u64,
     pub journal_entries_examined: u64,
+    pub frontier_deferrals: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -330,9 +331,24 @@ impl Frontier {
             }
         }
     }
-    fn next(&self, now: Tick, max_age: u64, space: Option<SpaceId>) -> Option<usize> {
+    fn rotate(&mut self, index: usize, undo: &mut Vec<Undo>) {
+        let entry = self.entries[index].expect("queued cell");
+        undo.push(Undo::Changed(index, entry));
+        self.detach(index);
+        self.append(index);
+    }
+    fn next(
+        &self,
+        now: Tick,
+        max_age: u64,
+        space: Option<SpaceId>,
+        blocked: [bool; 3],
+    ) -> Option<usize> {
         self.chains
             .iter()
+            .enumerate()
+            .filter(|(priority, _)| !blocked[*priority])
+            .map(|(_, chain)| chain)
             .filter_map(|chain| chain.first)
             .filter(|index| {
                 space
@@ -615,11 +631,16 @@ impl LightingEngine {
                     work.seed_cells_examined += 1;
                     if let Some(target) = target
                         && world.page(target.page()).is_some()
-                        && self
+                    {
+                        if self.admission_deferred(target) {
+                            return Ok(RecordStatus::Budget);
+                        }
+                        if self
                             .queue_cell(target, record.queued_at, LightPriority::Interactive)
                             .is_err()
-                    {
-                        return Ok(RecordStatus::Backpressure);
+                        {
+                            return Ok(RecordStatus::Backpressure);
+                        }
                     }
                     record.neighbor += 1;
                 }
@@ -632,8 +653,10 @@ impl LightingEngine {
     }
 
     /// Advance a bounded deterministic frontier. If admission cannot retain every
-    /// affected neighbor the cell remains queued; increase capacity or relieve
-    /// pressure before retrying. No dropped edge is disguised as convergence.
+    /// affected neighbor the cell remains queued. Blocked heads rotate so other
+    /// retained work can drain; external seed/journal admission leaves room for
+    /// propagation. A genuinely undersized frontier still reports backpressure.
+    /// No dropped edge is disguised as convergence.
     pub fn step(
         &mut self,
         world: &mut World,
@@ -649,18 +672,28 @@ impl LightingEngine {
         let mut overlay = BTreeMap::<BlockPos, LightSample>::new();
         let mut undo = Vec::new();
         let mut active_space = None;
+        let mut blocked_anchor = [None; 3];
+        let mut blocked_chains = [false; 3];
         while work.cells_examined < budget.max_cells {
-            let Some(index) =
-                self.frontier
-                    .next(tick, self.limits.max_queue_age_ticks, active_space)
-            else {
+            let Some(index) = self.frontier.next(
+                tick,
+                self.limits.max_queue_age_ticks,
+                active_space,
+                blocked_chains,
+            ) else {
                 break;
             };
             let entry = self.frontier.entries[index].expect("queued cell");
-            active_space = Some(entry.position.space);
+            let priority = entry.priority.index();
+            if blocked_anchor[priority] == Some(index) {
+                blocked_chains[priority] = true;
+                continue;
+            }
             work.cells_examined += 1;
             let CellRead::Known(cell) = world.read(entry.position) else {
                 self.frontier.remove(index, Some(&mut undo));
+                blocked_anchor = [None; 3];
+                blocked_chains = [false; 3];
                 continue;
             };
             if budget
@@ -727,8 +760,12 @@ impl LightingEngine {
                     Some(index),
                 ) {
                     backpressure = true;
-                    break;
+                    work.frontier_deferrals += 1;
+                    blocked_anchor[priority].get_or_insert(index);
+                    self.frontier.rotate(index, &mut undo);
+                    continue;
                 }
+                active_space = Some(entry.position.space);
                 overlay.insert(entry.position, next);
                 work.light_updates += 1;
                 self.frontier.remove(index, Some(&mut undo));
@@ -743,6 +780,8 @@ impl LightingEngine {
             } else {
                 self.frontier.remove(index, Some(&mut undo));
             }
+            blocked_anchor = [None; 3];
+            blocked_chains = [false; 3];
         }
         if let Some(space) = active_space {
             let mut transaction = Transaction::new(tick, space);
@@ -800,13 +839,18 @@ impl LightingEngine {
                     }
                 };
                 work.seed_cells_examined += 1;
-                if world.page(position.page()).is_some()
-                    && self
+                if world.page(position.page()).is_some() {
+                    if self.admission_deferred(position) {
+                        self.seeds.insert(key, seed);
+                        return Ok(false);
+                    }
+                    if self
                         .queue_cell(position, seed.queued_at, seed.priority)
                         .is_err()
-                {
-                    self.seeds.insert(key, seed);
-                    return Ok(true);
+                    {
+                        self.seeds.insert(key, seed);
+                        return Ok(true);
+                    }
                 }
                 seed.next += 1;
             }
@@ -816,6 +860,17 @@ impl LightingEngine {
             }
         }
         Ok(false)
+    }
+
+    fn admission_deferred(&self, position: BlockPos) -> bool {
+        // Existing entries can always coalesce/promote. New external work uses
+        // at most a quarter of the configured frontier; relaxation may use the
+        // rest. Retained page/record cursors resume without losing an event.
+        let capacity = self.limits.max_frontier_cells;
+        let admission = (capacity / 4).max(7).min(capacity);
+        admission < capacity
+            && self.frontier.len() >= admission
+            && !self.frontier.positions.contains_key(&position)
     }
 
     fn can_add_positions(
