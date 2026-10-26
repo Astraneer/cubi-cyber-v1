@@ -191,6 +191,7 @@ struct Slot {
     model: [[f32; 4]; 4],
 }
 pub struct WaterGpu {
+    sample_count: u32,
     config: WaterConfig,
     width: u32,
     height: u32,
@@ -239,6 +240,31 @@ impl WaterGpu {
         inputs: WaterInputs<'_>,
         shadows: Option<&ShadowGpu>,
     ) -> Result<Self, WaterError> {
+        Self::new_with_samples(
+            device,
+            queue,
+            config,
+            width,
+            height,
+            inputs,
+            shadows,
+            MSAA_SAMPLES,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_samples(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: WaterConfig,
+        width: u32,
+        height: u32,
+        inputs: WaterInputs<'_>,
+        shadows: Option<&ShadowGpu>,
+        sample_count: u32,
+    ) -> Result<Self, WaterError> {
+        if !matches!(sample_count, 1 | 4) {
+            return Err(WaterError::InvalidConfig);
+        }
         if width == 0
             || height == 0
             || width.max(height) > device.limits().max_texture_dimension_2d
@@ -339,17 +365,10 @@ impl WaterGpu {
             wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let opaque = opaque_texture.create_view(&Default::default());
-        let msaa_texture = texture(
-            "physical water separate HDR MSAA4",
-            wgpu::TextureFormat::Rgba16Float,
-            MSAA_SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let msaa = msaa_texture.create_view(&Default::default());
         let depth_texture = texture(
             "water depth with preserved opaque MSAA samples",
             wgpu::TextureFormat::Depth32Float,
-            MSAA_SAMPLES,
+            sample_count,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let depth = depth_texture.create_view(&Default::default());
@@ -361,6 +380,17 @@ impl WaterGpu {
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
         );
+        let msaa_texture = if sample_count == 1 {
+            resolved.clone()
+        } else {
+            texture(
+                "physical water separate HDR MSAA4",
+                wgpu::TextureFormat::Rgba16Float,
+                sample_count,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            )
+        };
+        let msaa = msaa_texture.create_view(&Default::default());
         let resolved_view = resolved.create_view(&Default::default());
         let v = wgpu::ShaderStages::VERTEX;
         let f = wgpu::ShaderStages::FRAGMENT;
@@ -372,9 +402,9 @@ impl WaterGpu {
             buffer_layout(3, v, false, true),
             texture_layout(4, f, false, false),
             texture_layout(5, f, false, false),
-            texture_layout(6, f, true, true),
+            texture_layout(6, f, true, sample_count > 1),
             texture_layout(7, f, false, false),
-            texture_layout(12, f, false, true),
+            texture_layout(12, f, false, sample_count > 1),
         ];
         if config.instrument {
             entries.push(buffer_layout(8, f, false, false))
@@ -418,7 +448,7 @@ impl WaterGpu {
             label: Some("opaque MSAA resolve before water"),
             entries: &[
                 buffer_layout(0, c, true, true),
-                texture_layout(1, c, false, true),
+                texture_layout(1, c, false, sample_count > 1),
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: c,
@@ -487,7 +517,7 @@ impl WaterGpu {
         let source=include_str!("water.wgsl").replace("// SHADOWS",if shadows.is_some(){include_str!("shadow_sampling.wgsl")}else{"fn cascade_shadow(p:vec3<f32>,n:vec3<f32>)->f32{return 1.;}"}).replace("// STATS",if config.instrument{"struct Stats{fragments:atomic<u32>,steps:atomic<u32>,hits:atomic<u32>,fallbacks:atomic<u32>};@group(0)@binding(8)var<storage,read_write>stats:Stats;fn record(steps:u32,hit:bool){atomicAdd(&stats.fragments,1u);atomicAdd(&stats.steps,steps);if hit{atomicAdd(&stats.hits,1u);}else{atomicAdd(&stats.fallbacks,1u);}}"}else{"fn record(steps:u32,hit:bool){}"});
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("original Fresnel Beer refraction SSR wave optics"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::sampling::shader(&source, sample_count)),
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("water MSAA HDR pipeline"),
@@ -529,7 +559,7 @@ impl WaterGpu {
                     bias: Default::default(),
                 }),
                 multisample: wgpu::MultisampleState {
-                    count: MSAA_SAMPLES,
+                    count: sample_count,
                     ..Default::default()
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -575,7 +605,10 @@ impl WaterGpu {
         let cull = compute("cull", &cull_layout);
         let snapshot_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("water full-resolution opaque snapshot"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("water_snapshot.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::sampling::shader(
+                include_str!("water_snapshot.wgsl"),
+                sample_count,
+            )),
         });
         let spl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("water snapshot layout"),
@@ -591,6 +624,7 @@ impl WaterGpu {
             cache: None,
         });
         Ok(Self {
+            sample_count,
             config,
             width,
             height,
@@ -952,6 +986,7 @@ impl WaterGpu {
         height: u32,
         inputs: WaterInputs<'_>,
     ) -> Result<(), WaterError> {
+        let sample_count = self.sample_count;
         if width == 0 || height == 0 || width.max(height) > device.limits().max_texture_dimension_2d
         {
             return Err(WaterError::InvalidConfig);
@@ -979,17 +1014,10 @@ impl WaterGpu {
             wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let opaque = opaque_texture.create_view(&Default::default());
-        let msaa_texture = texture(
-            "resized physical water MSAA4",
-            wgpu::TextureFormat::Rgba16Float,
-            MSAA_SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let msaa = msaa_texture.create_view(&Default::default());
         let depth_texture = texture(
             "resized physical water MSAA4 depth",
             wgpu::TextureFormat::Depth32Float,
-            MSAA_SAMPLES,
+            sample_count,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let depth = depth_texture.create_view(&Default::default());
@@ -1001,6 +1029,17 @@ impl WaterGpu {
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
         );
+        let msaa_texture = if sample_count == 1 {
+            resolved.clone()
+        } else {
+            texture(
+                "resized physical water MSAA4",
+                wgpu::TextureFormat::Rgba16Float,
+                sample_count,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            )
+        };
+        let msaa = msaa_texture.create_view(&Default::default());
         let resolved_view = resolved.create_view(&Default::default());
         let tex = |binding, view| wgpu::BindGroupEntry {
             binding,
@@ -1262,7 +1301,7 @@ impl WaterGpu {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.msaa,
                     depth_slice: None,
-                    resolve_target: Some(&self.resolved_view),
+                    resolve_target: (self.sample_count > 1).then_some(&self.resolved_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,

@@ -27,6 +27,7 @@ pub mod terrain_unit;
 pub mod water_gpu;
 
 pub const MSAA_SAMPLES: u32 = 4;
+mod sampling;
 pub const MAX_FRAMES_IN_FLIGHT: u32 = 2;
 pub const PROBE_WIDTH: u32 = 64;
 pub const PROBE_HEIGHT: u32 = 64;

@@ -1,7 +1,6 @@
 //! Immutable block-model catalog and bounded GPU instance buckets. The catalog is
 //! built once from allowed asset data; edits upload records, never model vertices.
 use crate::{
-    MSAA_SAMPLES,
     shadows::{
         DynamicShadowCaster, ShadowDamageTracker, ShadowGpu, ShadowPrepareWork, ShadowRect,
         WorldBounds, crop_camera,
@@ -288,6 +287,7 @@ impl BlockModelsGpu {
         shadows: Option<&ShadowGpu>,
         atmosphere: Option<&crate::atmosphere::AtmosphereGpu>,
     ) -> Result<Self, BlockError> {
+        let sample_count = geometry.sample_count;
         if config.max_instances == 0
             || config.atlas_layers < 185
             || u64::from(config.max_instances) * 64
@@ -458,8 +458,8 @@ impl BlockModelsGpu {
             label: Some("GPU static block poses"),
             source: wgpu::ShaderSource::Wgsl(source.clone().into()),
         });
-        let pipeline = render_pipeline(device, &render_layout, &shader, false, false);
-        let glass = render_pipeline(device, &render_layout, &shader, false, true);
+        let pipeline = render_pipeline(device, &render_layout, &shader, false, false, sample_count);
+        let glass = render_pipeline(device, &render_layout, &shader, false, true, sample_count);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("GPU static block frustum buckets"),
             source: wgpu::ShaderSource::Wgsl(include_str!("block_models_cull.wgsl").into()),
@@ -523,7 +523,7 @@ impl BlockModelsGpu {
                 binds,
                 cull_binds,
                 indirect,
-                pipeline: render_pipeline(device, &layout, &shader, true, false),
+                pipeline: render_pipeline(device, &layout, &shader, true, false, sample_count),
             })
         } else {
             None
@@ -862,8 +862,8 @@ fn block_shadow_bounds(
     })
 }
 fn same_shadow(a: Option<&BlockInstance>, b: Option<&BlockInstance>) -> bool {
-    let a = a.filter(|v| v.flags & PORT_MARKER_ONLY == 0);
-    let b = b.filter(|v| v.flags & PORT_MARKER_ONLY == 0);
+    let a = a.filter(|v| v.flags & (PORT_MARKER_ONLY | HIDDEN) == 0);
+    let b = b.filter(|v| v.flags & (PORT_MARKER_ONLY | HIDDEN) == 0);
     match (a, b) {
         (None, None) => true,
         (Some(a), Some(b)) => same_geometry(a, b),
@@ -983,6 +983,7 @@ fn render_pipeline(
     shader: &wgpu::ShaderModule,
     shadow: bool,
     glass: bool,
+    sample_count: u32,
 ) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("static block vertex pulling"),
@@ -991,7 +992,7 @@ fn render_pipeline(
     });
     let color_targets = [Some(wgpu::ColorTargetState {
         format: wgpu::TextureFormat::Rgba16Float,
-        blend: if glass {
+        blend: if glass || sample_count == 1 {
             Some(wgpu::BlendState::ALPHA_BLENDING)
         } else {
             None
@@ -1019,8 +1020,8 @@ fn render_pipeline(
             bias: Default::default(),
         }),
         multisample: wgpu::MultisampleState {
-            count: if shadow { 1 } else { MSAA_SAMPLES },
-            alpha_to_coverage_enabled: !shadow && !glass,
+            count: if shadow { 1 } else { sample_count },
+            alpha_to_coverage_enabled: sample_count > 1 && !shadow && !glass,
             ..Default::default()
         },
         fragment: Some(wgpu::FragmentState {

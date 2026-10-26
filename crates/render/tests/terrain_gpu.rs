@@ -2582,3 +2582,68 @@ fn gpu_unit_raster_preserves_greedy_upload_and_rejects_visibility_overflow_atomi
         "H1_GPU_UNIT_REFERENCE_OK greedy_descriptors=6 descriptor_upload_bytes=224 visible_instances=1536 vertex_invocations=6144 CPU_unit_reference_bitwise=true HiZ_bitwise=true object_limit=2 composite_overflow_atomic=true oversized_area_rejected=true"
     );
 }
+
+#[test]
+fn one_sample_terrain_keeps_hiz_conservative_and_real_hdr_output() {
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let atlas = AtlasImage::donor().unwrap();
+    let mut renderer = TerrainGpu::new_with_samples(
+        &gpu.device,
+        &gpu.queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        129,
+        97,
+        OutputTransfer::ShaderSrgb,
+        GpuConfig {
+            max_pages: 4,
+            max_quads: 1024,
+            occlusion: true,
+        },
+        &atlas,
+        1,
+    )
+    .unwrap();
+    assert_eq!(renderer.sample_count(), 1);
+    let mut budget = UploadBudget::new(100_000);
+    for z in [0., -32.] {
+        renderer
+            .upload_page(
+                &gpu.queue,
+                None,
+                1,
+                translation([0., 0., z]),
+                &cube(3),
+                &mut budget,
+            )
+            .unwrap();
+    }
+    let camera = Camera::perspective(
+        [24., 20., 64.],
+        [8., 8., 0.],
+        [0., 1., 0.],
+        0.95,
+        129. / 97.,
+        0.1,
+        200.,
+    );
+    renderer.take_work();
+    let (all, _) = frame(&gpu, &mut renderer, &camera, CullingMode::None, 129, 97);
+    let (culled, _) = frame(
+        &gpu,
+        &mut renderer,
+        &camera,
+        CullingMode::FrustumAndHiZ,
+        129,
+        97,
+    );
+    assert_eq!(
+        all, culled,
+        "single-sample Hi-Z culled actual visible pixels"
+    );
+    let coverage = conservative_depth(&gpu, &renderer, 129, 97);
+    assert!(coverage.iter().any(|&d| d > 0.));
+    assert!(coverage.contains(&0.));
+    let hdr = colour_coverage(&gpu, &renderer, 129, 97);
+    assert!(hdr.iter().any(|&v| v != 0));
+    assert_eq!(renderer.take_work().pipeline_compilations, 0);
+}

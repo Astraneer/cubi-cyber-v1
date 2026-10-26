@@ -272,6 +272,7 @@ struct HiZ {
 /// Shared immutable terrain inputs for independent camera passes such as cascaded shadows.
 /// Consumers must compact their own visibility rather than reuse the player's culled list.
 pub struct TerrainGeometry<'a> {
+    pub sample_count: u32,
     pub objects: &'a wgpu::Buffer,
     pub quads: &'a wgpu::Buffer,
     pub materials: &'a wgpu::Buffer,
@@ -286,6 +287,7 @@ pub struct TerrainGeometry<'a> {
 }
 
 pub struct TerrainGpu {
+    sample_count: u32,
     config: GpuConfig,
     unit_raster: bool,
     width: u32,
@@ -378,6 +380,35 @@ impl TerrainGpu {
         config: GpuConfig,
         atlas: &AtlasImage,
     ) -> Result<Self, TerrainError> {
+        Self::new_with_samples(
+            device,
+            queue,
+            format,
+            width,
+            height,
+            transfer,
+            config,
+            atlas,
+            MSAA_SAMPLES,
+        )
+    }
+    /// Select a prepared WebGPU sample variant during loading. Existing callers
+    /// retain four samples; one sample never allocates a multisample color target.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_samples(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+        transfer: OutputTransfer,
+        config: GpuConfig,
+        atlas: &AtlasImage,
+        sample_count: u32,
+    ) -> Result<Self, TerrainError> {
+        if !matches!(sample_count, 1 | 4) {
+            return Err(TerrainError::InvalidSize);
+        }
         let limits = device.limits();
         let padded_width = width.checked_next_power_of_two().unwrap_or(u32::MAX);
         let padded_height = height.checked_next_power_of_two().unwrap_or(u32::MAX);
@@ -567,6 +598,7 @@ impl TerrainGpu {
             false,
             false,
             false,
+            sample_count,
         );
         let cutout_pipeline = terrain_pipeline(
             device,
@@ -575,6 +607,7 @@ impl TerrainGpu {
             true,
             false,
             false,
+            sample_count,
         );
         let masked_opaque_pipeline = terrain_pipeline(
             device,
@@ -583,6 +616,7 @@ impl TerrainGpu {
             false,
             false,
             true,
+            sample_count,
         );
         let masked_cutout_pipeline = terrain_pipeline(
             device,
@@ -591,6 +625,7 @@ impl TerrainGpu {
             true,
             false,
             true,
+            sample_count,
         );
         let depth_pipeline = config.occlusion.then(|| {
             terrain_pipeline(
@@ -600,6 +635,7 @@ impl TerrainGpu {
                 false,
                 true,
                 false,
+                sample_count,
             )
         });
         let masked_depth_pipeline = config.occlusion.then(|| {
@@ -610,6 +646,7 @@ impl TerrainGpu {
                 false,
                 true,
                 true,
+                sample_count,
             )
         });
         let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -633,7 +670,7 @@ impl TerrainGpu {
             primitive: Default::default(),
             depth_stencil: Some(depth_state(false, wgpu::CompareFunction::Always)),
             multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
+                count: sample_count,
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {
@@ -705,7 +742,7 @@ impl TerrainGpu {
         let hiz_cull_pipeline = config
             .occlusion
             .then(|| compute_pipeline(device, &cull_pl, &cull_shader, "occlusion"));
-        let targets = create_targets(device, width, height, &tone_layout, false);
+        let targets = create_targets(device, width, height, &tone_layout, false, sample_count);
         let (hiz_base_layout, hiz_reduce_layout, hiz_base_pipeline, hiz_reduce_pipeline, hiz) =
             if config.occlusion {
                 let base = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -716,7 +753,7 @@ impl TerrainGpu {
                             compute,
                             wgpu::TextureViewDimension::D2,
                             wgpu::TextureSampleType::Depth,
-                            true,
+                            sample_count > 1,
                         ),
                         storage_texture_entry(1, compute),
                     ],
@@ -736,7 +773,10 @@ impl TerrainGpu {
                 });
                 let base_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("reverse-Z coverage depth"),
-                    source: wgpu::ShaderSource::Wgsl(include_str!("depth.wgsl").into()),
+                    source: wgpu::ShaderSource::Wgsl(crate::sampling::shader(
+                        include_str!("depth.wgsl"),
+                        sample_count,
+                    )),
                 });
                 let reduce_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("minimum reverse-Z pyramid"),
@@ -802,6 +842,7 @@ impl TerrainGpu {
                 period: queue.get_timestamp_period(),
             });
         Ok(Self {
+            sample_count,
             config,
             unit_raster: false,
             width,
@@ -1009,9 +1050,10 @@ impl TerrainGpu {
             }
             self.lighting_bindings = Some(materials::LightingBindings::new(shadows, lights, gi));
         }
-        self.atmosphere_sky = Some(crate::atmosphere::AtmosphereSkyGpu::new(
+        self.atmosphere_sky = Some(crate::atmosphere::AtmosphereSkyGpu::new_with_samples(
             device,
             atmosphere.sky_view(),
+            self.sample_count,
         ));
         self.atmosphere_lighting = Some(atmosphere.lighting_buffer().clone());
         self.work.record(telemetry::WorkCounts {
@@ -1024,6 +1066,7 @@ impl TerrainGpu {
 
     pub fn geometry(&self) -> TerrainGeometry<'_> {
         TerrainGeometry {
+            sample_count: self.sample_count,
             objects: &self.objects,
             quads: &self.quads,
             materials: &self.materials,
@@ -1036,6 +1079,9 @@ impl TerrainGpu {
             max_pages: self.config.max_pages,
             max_quads: self.config.max_quads,
         }
+    }
+    pub fn sample_count(&self) -> u32 {
+        self.sample_count
     }
     pub fn extent(&self) -> [u32; 2] {
         [self.width, self.height]
@@ -1054,9 +1100,12 @@ impl TerrainGpu {
             return Err(TerrainError::LatePreparation);
         }
         if !self.targets.sampled {
-            let color = create_scene_color(device, self.width, self.height, true);
-            self.targets.color = color.create_view(&Default::default());
-            self.targets._color = color;
+            if self.sample_count > 1 {
+                let color =
+                    create_scene_color(device, self.width, self.height, true, self.sample_count);
+                self.targets.color = color.create_view(&Default::default());
+                self.targets._color = color;
+            }
             self.targets.sampled = true;
         }
         Ok(())
@@ -2092,6 +2141,7 @@ impl TerrainGpu {
             height,
             &self.tone_layout,
             self.targets.sampled,
+            self.sample_count,
         );
         self.hiz = match (&self.hiz_base_layout, &self.hiz_reduce_layout) {
             (Some(base), Some(reduce)) => Some(create_hiz(
@@ -2302,10 +2352,10 @@ impl TerrainGpu {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.targets.color,
                     depth_slice: None,
-                    resolve_target: Some(&self.targets.resolved),
+                    resolve_target: (self.sample_count > 1).then_some(&self.targets.resolved),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: if output.is_none() {
+                        store: if output.is_none() || self.sample_count == 1 {
                             wgpu::StoreOp::Store
                         } else {
                             wgpu::StoreOp::Discard
@@ -2726,6 +2776,7 @@ fn terrain_pipeline(
     cutout: bool,
     depth_only: bool,
     masked: bool,
+    sample_count: u32,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(if depth_only {
@@ -2749,8 +2800,8 @@ fn terrain_pipeline(
         },
         depth_stencil: Some(depth_state(true, wgpu::CompareFunction::GreaterEqual)),
         multisample: wgpu::MultisampleState {
-            count: MSAA_SAMPLES,
-            alpha_to_coverage_enabled: cutout && !depth_only,
+            count: sample_count,
+            alpha_to_coverage_enabled: sample_count > 1 && cutout && !depth_only,
             ..Default::default()
         },
         fragment: (!depth_only || masked).then_some(wgpu::FragmentState {
@@ -2783,6 +2834,7 @@ fn create_scene_color(
     width: u32,
     height: u32,
     sampled: bool,
+    sample_count: u32,
 ) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("HDR MSAA4 color"),
@@ -2792,7 +2844,7 @@ fn create_scene_color(
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: MSAA_SAMPLES,
+        sample_count,
         dimension: wgpu::TextureDimension::D2,
         format: HDR_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -2811,6 +2863,7 @@ fn create_targets(
     height: u32,
     tone_layout: &wgpu::BindGroupLayout,
     sampled: bool,
+    sample_count: u32,
 ) -> Targets {
     let texture = |label, format, count, usage| {
         device.create_texture(&wgpu::TextureDescriptor {
@@ -2828,7 +2881,6 @@ fn create_targets(
             view_formats: &[],
         })
     };
-    let color = create_scene_color(device, width, height, sampled);
     let resolved = texture(
         "resolved linear HDR",
         HDR_FORMAT,
@@ -2837,10 +2889,15 @@ fn create_targets(
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC,
     );
+    let color = if sample_count == 1 {
+        resolved.clone()
+    } else {
+        create_scene_color(device, width, height, sampled, sample_count)
+    };
     let depth = texture(
         "actual reverse-Z MSAA4",
         DEPTH_FORMAT,
-        MSAA_SAMPLES,
+        sample_count,
         wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
     );
     let color_view = color.create_view(&Default::default());

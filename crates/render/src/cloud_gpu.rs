@@ -107,6 +107,7 @@ struct Params {
     optics: [f32; 4],
 }
 pub struct CloudGpu {
+    sample_count: u32,
     config: CloudConfig,
     width: u32,
     height: u32,
@@ -139,6 +140,21 @@ impl CloudGpu {
         height: u32,
         inputs: CloudInputs<'_>,
     ) -> Result<Self, CloudError> {
+        Self::new_with_samples(device, queue, config, width, height, inputs, MSAA_SAMPLES)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_samples(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: CloudConfig,
+        width: u32,
+        height: u32,
+        inputs: CloudInputs<'_>,
+        sample_count: u32,
+    ) -> Result<Self, CloudError> {
+        if !matches!(sample_count, 1 | 4) {
+            return Err(CloudError::InvalidConfig);
+        }
         let uniform_density = match config.density {
             CloudDensity::Procedural => -1.,
             CloudDensity::Uniform(d) if d.is_finite() && (0.0..=1.0).contains(&d) => d,
@@ -232,14 +248,6 @@ impl CloudGpu {
             storage,
         );
         let end_view = end.create_view(&Default::default());
-        let msaa_texture = texture(
-            "separate cloud-composited HDR MSAA4",
-            [width, height],
-            wgpu::TextureFormat::Rgba16Float,
-            MSAA_SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let msaa = msaa_texture.create_view(&Default::default());
         let resolved = texture(
             "cloud-composited resolved HDR",
             [width, height],
@@ -249,6 +257,18 @@ impl CloudGpu {
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
         );
+        let msaa_texture = if sample_count == 1 {
+            resolved.clone()
+        } else {
+            texture(
+                "separate cloud-composited HDR MSAA4",
+                [width, height],
+                wgpu::TextureFormat::Rgba16Float,
+                sample_count,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            )
+        };
+        let msaa = msaa_texture.create_view(&Default::default());
         let resolved_view = resolved.create_view(&Default::default());
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("physical cloud state176B"),
@@ -304,7 +324,7 @@ impl CloudGpu {
                 uniform_entry(c),
                 sample(1, c, false, false),
                 sample(2, c, false, false),
-                sample(3, c, true, true),
+                sample(3, c, true, sample_count > 1),
                 store(4, wgpu::TextureFormat::Rgba16Float),
                 store(5, wgpu::TextureFormat::Rgba16Float),
                 store(6, wgpu::TextureFormat::R32Float),
@@ -327,8 +347,8 @@ impl CloudGpu {
                 sample(1, f, false, false),
                 sample(2, f, false, false),
                 sample(3, f, false, false),
-                sample(4, f, true, true),
-                sample(5, f, false, true),
+                sample(4, f, true, sample_count > 1),
+                sample(5, f, false, sample_count > 1),
             ],
         });
         let texture_entry = |binding, view| wgpu::BindGroupEntry {
@@ -372,7 +392,10 @@ impl CloudGpu {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("original physical cloud density integration"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("clouds.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::sampling::shader(
+                include_str!("clouds.wgsl"),
+                sample_count,
+            )),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("cloud compute"),
@@ -393,7 +416,10 @@ impl CloudGpu {
         let march = compute("march");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cloud MSAA4 depth-aware HDR reconstruction"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("cloud_composite.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::sampling::shader(
+                include_str!("cloud_composite.wgsl"),
+                sample_count,
+            )),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("cloud composition"),
@@ -412,7 +438,7 @@ impl CloudGpu {
             primitive: Default::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
+                count: sample_count,
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {
@@ -429,6 +455,7 @@ impl CloudGpu {
             cache: None,
         });
         Ok(Self {
+            sample_count,
             config,
             width,
             height,
@@ -465,6 +492,7 @@ impl CloudGpu {
         height: u32,
         inputs: CloudInputs<'_>,
     ) -> Result<(), CloudError> {
+        let sample_count = self.sample_count;
         if width == 0 || height == 0 || width.max(height) > device.limits().max_texture_dimension_2d
         {
             return Err(CloudError::InvalidConfig);
@@ -524,14 +552,6 @@ impl CloudGpu {
             storage,
         );
         let end_view = end.create_view(&Default::default());
-        let msaa_texture = texture(
-            "resized cloud HDR MSAA4",
-            [width, height],
-            wgpu::TextureFormat::Rgba16Float,
-            MSAA_SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let msaa = msaa_texture.create_view(&Default::default());
         let resolved = texture(
             "resized cloud resolved HDR",
             [width, height],
@@ -541,6 +561,18 @@ impl CloudGpu {
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
         );
+        let msaa_texture = if sample_count == 1 {
+            resolved.clone()
+        } else {
+            texture(
+                "resized cloud HDR MSAA4",
+                [width, height],
+                wgpu::TextureFormat::Rgba16Float,
+                sample_count,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            )
+        };
+        let msaa = msaa_texture.create_view(&Default::default());
         let resolved_view = resolved.create_view(&Default::default());
         let tex = |binding, view| wgpu::BindGroupEntry {
             binding,
@@ -624,7 +656,9 @@ impl CloudGpu {
             march_pixels: pixels,
             max_view_steps: pixels * steps,
             max_density_samples: pixels * steps * (1 + lights),
-            composition_samples: u64::from(self.width) * u64::from(self.height) * 4,
+            composition_samples: u64::from(self.width)
+                * u64::from(self.height)
+                * u64::from(self.sample_count),
             passes: 2,
             draws: 1,
             ..CloudWork::default()
@@ -733,7 +767,7 @@ impl CloudGpu {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.msaa,
                     depth_slice: None,
-                    resolve_target: Some(&self.resolved_view),
+                    resolve_target: (self.sample_count > 1).then_some(&self.resolved_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,

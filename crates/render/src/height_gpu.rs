@@ -1,7 +1,6 @@
 //! Bounded actual-world height tiles, with implicit grid vertices and GPU culling.
 //! This renderer accepts only validated public tiles. It never generates terrain.
 use crate::{
-    MSAA_SAMPLES,
     height_tile::{HeightTile, HeightTileKey},
     shadows::ShadowGpu,
     terrain_gpu::{Camera, TerrainGeometry, UploadBudget},
@@ -134,6 +133,7 @@ impl HeightGpu {
         shadows: Option<&ShadowGpu>,
         atmosphere: Option<&crate::atmosphere::AtmosphereGpu>,
     ) -> Result<Self, HeightGpuError> {
+        let sample_count = geometry.sample_count;
         if config.max_tiles == 0
             || config.atlas_layers == 0
             || u64::from(config.max_tiles) * TILE_BYTES
@@ -307,7 +307,7 @@ impl HeightGpu {
                 bias: Default::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
+                count: sample_count,
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {

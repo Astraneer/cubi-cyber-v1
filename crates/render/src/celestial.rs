@@ -110,6 +110,19 @@ impl CelestialGpu {
         config: CelestialConfig,
         budget: &mut UploadBudget,
     ) -> Result<Self, CelestialError> {
+        Self::new_with_samples(device, queue, atmosphere, config, budget, MSAA_SAMPLES)
+    }
+    pub fn new_with_samples(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        atmosphere: &AtmosphereGpu,
+        config: CelestialConfig,
+        budget: &mut UploadBudget,
+        sample_count: u32,
+    ) -> Result<Self, CelestialError> {
+        if !matches!(sample_count, 1 | 4) {
+            return Err(CelestialError::InvalidConfig);
+        }
         if config.stars > 8192
             || config.sun_style > 2
             || config.moon_style > 1
@@ -258,7 +271,7 @@ impl CelestialGpu {
                 bias: Default::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
+                count: sample_count,
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {

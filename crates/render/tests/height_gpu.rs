@@ -9,7 +9,10 @@ use render::{
 static ALLOCATOR: telemetry::CountingAllocator<std::alloc::System> =
     telemetry::CountingAllocator::new(std::alloc::System);
 fn terrain(gpu: &render::Gpu) -> TerrainGpu {
-    TerrainGpu::new(
+    terrain_samples(gpu, 4)
+}
+fn terrain_samples(gpu: &render::Gpu, sample_count: u32) -> TerrainGpu {
+    TerrainGpu::new_with_samples(
         &gpu.device,
         &gpu.queue,
         wgpu::TextureFormat::Rgba8Unorm,
@@ -22,6 +25,7 @@ fn terrain(gpu: &render::Gpu) -> TerrainGpu {
             occlusion: false,
         },
         &AtlasImage::donor().unwrap(),
+        sample_count,
     )
     .unwrap()
 }
@@ -155,11 +159,18 @@ fn tile(key: HeightTileKey) -> HeightTile {
 }
 #[test]
 fn gpu_tiles_preserve_unknown_and_protected_air_and_reject_partial_publication() {
+    height_tiles_sample_mode(4);
+}
+#[test]
+fn one_sample_height_tiles_keeps_actual_pixels_and_publication_guards() {
+    height_tiles_sample_mode(1);
+}
+fn height_tiles_sample_mode(sample_count: u32) {
     pollster::block_on(async {
         let gpu = render::Gpu::request(&render::instance(), None, true)
             .await
             .unwrap();
-        let mut terrain = terrain(&gpu);
+        let mut terrain = terrain_samples(&gpu, sample_count);
         let mut heights = HeightGpu::new(
             &gpu.device,
             terrain.geometry(),

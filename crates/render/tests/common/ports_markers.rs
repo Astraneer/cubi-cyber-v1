@@ -85,6 +85,9 @@ fn cube_machine_annotations_have_no_body_or_shadow_and_preserve_terrain() {
             Some(&shadow),
         )
         .unwrap();
+        models
+            .reserve_slots(&gpu.queue, 4, &mut UploadBudget::new(256))
+            .unwrap();
         models.take_work();
         let catalog = read_model(&gpu, &models);
         let mut row = BlockInstance {

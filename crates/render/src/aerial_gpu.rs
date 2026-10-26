@@ -84,6 +84,7 @@ struct Targets {
     resolved_view: wgpu::TextureView,
 }
 pub struct AerialGpu {
+    sample_count: u32,
     config: AerialConfig,
     width: u32,
     height: u32,
@@ -158,21 +159,12 @@ fn texture(
         view_formats: &[],
     })
 }
-fn targets(device: &wgpu::Device, width: u32, height: u32) -> Targets {
+fn targets(device: &wgpu::Device, width: u32, height: u32, sample_count: u32) -> Targets {
     let size = wgpu::Extent3d {
         width,
         height,
         depth_or_array_layers: 1,
     };
-    let color = texture(
-        device,
-        "separate MSAA aerial output",
-        size,
-        wgpu::TextureDimension::D2,
-        MSAA_SAMPLES,
-        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-    );
-    let view = color.create_view(&Default::default());
     let resolved = texture(
         device,
         "resolved aerial HDR",
@@ -183,6 +175,19 @@ fn targets(device: &wgpu::Device, width: u32, height: u32) -> Targets {
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC,
     );
+    let color = if sample_count == 1 {
+        resolved.clone()
+    } else {
+        texture(
+            device,
+            "separate MSAA aerial output",
+            size,
+            wgpu::TextureDimension::D2,
+            sample_count,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        )
+    };
+    let view = color.create_view(&Default::default());
     let resolved_view = resolved.create_view(&Default::default());
     Targets {
         _color: color,
@@ -200,6 +205,20 @@ impl AerialGpu {
         height: u32,
         inputs: AerialInputs<'_>,
     ) -> Result<Self, AerialError> {
+        Self::new_with_samples(device, queue, config, width, height, inputs, MSAA_SAMPLES)
+    }
+    pub fn new_with_samples(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: AerialConfig,
+        width: u32,
+        height: u32,
+        inputs: AerialInputs<'_>,
+        sample_count: u32,
+    ) -> Result<Self, AerialError> {
+        if !matches!(sample_count, 1 | 4) {
+            return Err(AerialError::InvalidConfig);
+        }
         if config.grid.iter().any(|v| *v == 0 || *v > 128)
             || config.grid[2] < 2
             || config.steps == 0
@@ -210,7 +229,10 @@ impl AerialGpu {
             || height == 0
             || width > device.limits().max_texture_dimension_2d
             || height > device.limits().max_texture_dimension_2d
-            || u64::from(width) * u64::from(height) * 40 > config.max_target_bytes
+            || u64::from(width)
+                * u64::from(height)
+                * crate::sampling::color_bytes_per_pixel(sample_count)
+                > config.max_target_bytes
         {
             return Err(AerialError::InvalidConfig);
         }
@@ -297,8 +319,22 @@ impl AerialGpu {
             label: Some("sample-preserving aerial composition"),
             entries: &[
                 buffer_layout(0, f),
-                texture_layout(1, f, wgpu::TextureViewDimension::D2, true, false, false),
-                texture_layout(2, f, wgpu::TextureViewDimension::D2, true, true, false),
+                texture_layout(
+                    1,
+                    f,
+                    wgpu::TextureViewDimension::D2,
+                    sample_count > 1,
+                    false,
+                    false,
+                ),
+                texture_layout(
+                    2,
+                    f,
+                    wgpu::TextureViewDimension::D2,
+                    sample_count > 1,
+                    true,
+                    false,
+                ),
                 texture_layout(3, f, wgpu::TextureViewDimension::D3, false, false, true),
                 texture_layout(4, f, wgpu::TextureViewDimension::D3, false, false, true),
                 wgpu::BindGroupLayoutEntry {
@@ -363,7 +399,10 @@ impl AerialGpu {
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("original aerial MSAA composition"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("aerial_composite.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::sampling::shader(
+                include_str!("aerial_composite.wgsl"),
+                sample_count,
+            )),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("aerial composition pipeline"),
@@ -382,7 +421,7 @@ impl AerialGpu {
             primitive: Default::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
+                count: sample_count,
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {
@@ -399,6 +438,7 @@ impl AerialGpu {
             cache: None,
         });
         Ok(Self {
+            sample_count,
             config,
             width,
             height,
@@ -412,7 +452,7 @@ impl AerialGpu {
             composite_bind,
             compute,
             composite,
-            targets: targets(device, width, height),
+            targets: targets(device, width, height, sample_count),
             last: None,
             timer: GpuPassTimer::new(device, queue, "aerial perspective pass times"),
             startup: AerialWork {
@@ -421,7 +461,9 @@ impl AerialGpu {
                     * u64::from(config.grid[1])
                     * u64::from(config.grid[2])
                     * 16,
-                target_bytes: u64::from(width) * u64::from(height) * 40,
+                target_bytes: u64::from(width)
+                    * u64::from(height)
+                    * crate::sampling::color_bytes_per_pixel(sample_count),
                 ..Default::default()
             },
             shadowed: inputs.shadows.is_some(),
@@ -561,7 +603,9 @@ impl AerialGpu {
                 * u64::from(self.config.grid[1])
                 * u64::from(self.config.grid[2])
                 * u64::from(self.config.steps),
-            composition_samples: u64::from(self.width) * u64::from(self.height) * 4,
+            composition_samples: u64::from(self.width)
+                * u64::from(self.height)
+                * u64::from(self.sample_count),
             upload_bytes: u64::from(volume) * 112,
             shadow_samples: u64::from(volume && self.shadowed)
                 * u64::from(self.config.grid[0])
@@ -649,7 +693,7 @@ impl AerialGpu {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.targets.color,
                     depth_slice: None,
-                    resolve_target: Some(&self.targets.resolved_view),
+                    resolve_target: (self.sample_count > 1).then_some(&self.targets.resolved_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -683,7 +727,7 @@ impl AerialGpu {
         {
             return Err(AerialError::InvalidConfig);
         }
-        self.targets = targets(device, width, height);
+        self.targets = targets(device, width, height, self.sample_count);
         self.compute_bind = Self::compute_bind(
             device,
             &self.compute.get_bind_group_layout(0),
@@ -711,6 +755,9 @@ impl AerialGpu {
             || height == 0
             || width > device.limits().max_texture_dimension_2d
             || height > device.limits().max_texture_dimension_2d
-            || u64::from(width) * u64::from(height) * 40 > self.config.max_target_bytes)
+            || u64::from(width)
+                * u64::from(height)
+                * crate::sampling::color_bytes_per_pixel(self.sample_count)
+                > self.config.max_target_bytes)
     }
 }

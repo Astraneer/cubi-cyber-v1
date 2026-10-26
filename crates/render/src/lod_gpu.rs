@@ -2,7 +2,6 @@
 //! traversal; exact protected openings need no refined geometry. Unknown input
 //! cannot replace an earlier valid representation.
 use crate::{
-    MSAA_SAMPLES,
     lod::{MaskedRayProxy, PublicVoxel, SurfaceKind},
     shadows::ShadowGpu,
     terrain_gpu::{Camera, TerrainGeometry, UploadBudget},
@@ -397,6 +396,7 @@ impl LodProxyGpu {
         shadows: Option<&ShadowGpu>,
         atmosphere: Option<&crate::atmosphere::AtmosphereGpu>,
     ) -> Result<Self, ProxyError> {
+        let sample_count = geometry.sample_count;
         let limits = device.limits();
         if config.max_objects == 0
             || config.max_payload_words == 0
@@ -610,8 +610,8 @@ impl LodProxyGpu {
                 bias: Default::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                alpha_to_coverage_enabled: true,
+                count: sample_count,
+                alpha_to_coverage_enabled: sample_count > 1,
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {

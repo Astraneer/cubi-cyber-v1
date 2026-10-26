@@ -675,6 +675,14 @@ pub struct AtmosphereSkyGpu {
 }
 impl AtmosphereSkyGpu {
     pub fn new(device: &wgpu::Device, sky_view: &wgpu::TextureView) -> Self {
+        Self::new_with_samples(device, sky_view, crate::MSAA_SAMPLES)
+    }
+    pub fn new_with_samples(
+        device: &wgpu::Device,
+        sky_view: &wgpu::TextureView,
+        sample_count: u32,
+    ) -> Self {
+        assert!(matches!(sample_count, 1 | 4));
         let camera = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("atmosphere camera inverse"),
             size: 64,
@@ -765,7 +773,7 @@ impl AtmosphereSkyGpu {
                 bias: Default::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: crate::MSAA_SAMPLES,
+                count: sample_count,
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {

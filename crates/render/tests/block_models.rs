@@ -8,7 +8,10 @@ use render::{
 static ALLOCATOR: telemetry::CountingAllocator<std::alloc::System> =
     telemetry::CountingAllocator::new(std::alloc::System);
 fn terrain(gpu: &render::Gpu) -> TerrainGpu {
-    TerrainGpu::new(
+    terrain_samples(gpu, 4)
+}
+fn terrain_samples(gpu: &render::Gpu, sample_count: u32) -> TerrainGpu {
+    TerrainGpu::new_with_samples(
         &gpu.device,
         &gpu.queue,
         wgpu::TextureFormat::Rgba8Unorm,
@@ -21,6 +24,7 @@ fn terrain(gpu: &render::Gpu) -> TerrainGpu {
             occlusion: false,
         },
         &AtlasImage::donor().unwrap(),
+        sample_count,
     )
     .unwrap()
 }
@@ -173,11 +177,18 @@ fn prop(kind: u32) -> BlockInstance {
 }
 #[test]
 fn actual_static_block_models_gpu_state_changes_and_budget_are_atomic() {
+    block_catalog_sample_mode(4);
+}
+#[test]
+fn one_sample_block_catalog_keeps_actual_pixels_and_publication_guards() {
+    block_catalog_sample_mode(1);
+}
+fn block_catalog_sample_mode(sample_count: u32) {
     pollster::block_on(async {
         let gpu = render::Gpu::request(&render::instance(), None, true)
             .await
             .unwrap();
-        let mut terrain = terrain(&gpu);
+        let mut terrain = terrain_samples(&gpu, sample_count);
         let mut models = BlockModelsGpu::new(
             &gpu.device,
             &gpu.queue,
@@ -191,7 +202,7 @@ fn actual_static_block_models_gpu_state_changes_and_budget_are_atomic() {
         .unwrap();
         let startup = models.take_work();
         assert_eq!(startup.startup_vertices, 7512);
-        assert_eq!(startup.pipeline_compilations, 3);
+        assert_eq!(startup.pipeline_compilations, 4);
         let vertices = read_model(&gpu, &models);
         let mut records = (0..MODEL_KINDS as u32).map(prop).collect::<Vec<_>>();
         let mut hidden = prop(kind::CHEST);

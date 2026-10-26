@@ -253,17 +253,61 @@ impl TerrainGpu {
             label: Some("prepared terrain optional material variant"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
         });
-        self.opaque_pipeline = terrain_pipeline(device, &layout, &shader, false, false, false);
-        self.cutout_pipeline = terrain_pipeline(device, &layout, &shader, true, false, false);
-        self.masked_opaque_pipeline =
-            terrain_pipeline(device, &layout, &shader, false, false, true);
-        self.masked_cutout_pipeline = terrain_pipeline(device, &layout, &shader, true, false, true);
+        self.opaque_pipeline = terrain_pipeline(
+            device,
+            &layout,
+            &shader,
+            false,
+            false,
+            false,
+            self.sample_count,
+        );
+        self.cutout_pipeline = terrain_pipeline(
+            device,
+            &layout,
+            &shader,
+            true,
+            false,
+            false,
+            self.sample_count,
+        );
+        self.masked_opaque_pipeline = terrain_pipeline(
+            device,
+            &layout,
+            &shader,
+            false,
+            false,
+            true,
+            self.sample_count,
+        );
+        self.masked_cutout_pipeline = terrain_pipeline(
+            device,
+            &layout,
+            &shader,
+            true,
+            false,
+            true,
+            self.sample_count,
+        );
         if self.config.occlusion {
             self.depth_pipeline = Some(terrain_pipeline(
-                device, &layout, &shader, false, true, false,
+                device,
+                &layout,
+                &shader,
+                false,
+                true,
+                false,
+                self.sample_count,
             ));
-            self.masked_depth_pipeline =
-                Some(terrain_pipeline(device, &layout, &shader, true, true, true));
+            self.masked_depth_pipeline = Some(terrain_pipeline(
+                device,
+                &layout,
+                &shader,
+                true,
+                true,
+                true,
+                self.sample_count,
+            ));
         }
         self.work.record(telemetry::WorkCounts {
             pipeline_compilations: if self.config.occlusion { 6 } else { 4 },

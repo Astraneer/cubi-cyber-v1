@@ -1,7 +1,6 @@
 //! Static model catalog + 64-byte entity records. Pose generation and visibility
 //! run on GPU. Frame uploads contain no vertices or per-part CPU matrices.
 use crate::{
-    MSAA_SAMPLES,
     entity_models::{MODEL_KINDS, ModelCatalog, ModelVertex, model_atlas},
     light_volume::PackedLight,
     shadows::{
@@ -194,6 +193,7 @@ impl EntityGpu {
         items: Option<&crate::terrain_gpu::AtlasImage>,
         atmosphere: Option<&crate::atmosphere::AtmosphereGpu>,
     ) -> Result<Self, EntityError> {
+        let sample_count = geometry.sample_count;
         if config.max_entities == 0
             || config.atlas_layers == 0
             || u64::from(config.max_entities) * 64
@@ -561,8 +561,8 @@ impl EntityGpu {
                 bias: Default::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
-                alpha_to_coverage_enabled: true,
+                count: sample_count,
+                alpha_to_coverage_enabled: sample_count > 1,
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {

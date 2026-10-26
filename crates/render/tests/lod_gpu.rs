@@ -11,7 +11,10 @@ fn proxy(page: &PublicPage) -> MaskedRayProxy {
     MaskedRayProxy::from_protected(page, 4)
 }
 fn terrain(gpu: &render::Gpu) -> TerrainGpu {
-    TerrainGpu::new(
+    terrain_samples(gpu, 4)
+}
+fn terrain_samples(gpu: &render::Gpu, sample_count: u32) -> TerrainGpu {
+    TerrainGpu::new_with_samples(
         &gpu.device,
         &gpu.queue,
         wgpu::TextureFormat::Rgba8Unorm,
@@ -24,6 +27,7 @@ fn terrain(gpu: &render::Gpu) -> TerrainGpu {
             occlusion: false,
         },
         &AtlasImage::donor().unwrap(),
+        sample_count,
     )
     .unwrap()
 }
@@ -196,11 +200,18 @@ fn unknown_water_and_invalid_material_do_not_become_rendered_air() {
 }
 #[test]
 fn masked_proxy_preserves_actual_window_coverage_with_msaa_and_reverse_depth() {
+    masked_proxies_sample_mode(4);
+}
+#[test]
+fn one_sample_masked_proxies_keeps_actual_pixels_and_publication_guards() {
+    masked_proxies_sample_mode(1);
+}
+fn masked_proxies_sample_mode(sample_count: u32) {
     pollster::block_on(async {
         let gpu = render::Gpu::request(&render::instance(), None, true)
             .await
             .unwrap();
-        let mut terrain = terrain(&gpu);
+        let mut terrain = terrain_samples(&gpu, sample_count);
         let mut page = PublicPage::filled(PublicVoxel::Air);
         for y in 2..14 {
             for x in 2..14 {

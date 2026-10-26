@@ -147,6 +147,7 @@ impl AerialShadowOwner {
     }
 }
 pub struct EnvironmentGpu {
+    sample_count: u32,
     config: EnvironmentConfig,
     atmosphere: AtmosphereGpu,
     atmosphere_state: AtmosphereState,
@@ -159,6 +160,7 @@ pub struct EnvironmentGpu {
     celestial: Option<CelestialGpu>,
     moon_phase: u8,
     rotation_offset: f32,
+    rotation_exact: Option<f32>,
     encoded: bool,
     water_cover_ready: bool,
     precloud_revision: u64,
@@ -189,6 +191,7 @@ impl EnvironmentGpu {
         lighting: Option<(&ShadowGpu, &LightVolumeGpu)>,
         budget: &mut UploadBudget,
     ) -> Result<Self, EnvironmentError> {
+        let sample_count = terrain.sample_count();
         if !state.valid() {
             return Err(EnvironmentError::InvalidState);
         }
@@ -206,7 +209,7 @@ impl EnvironmentGpu {
         terrain.prepare_scene_sampling(device)?;
         terrain.attach_environment_lighting(device, &atmosphere, lighting, gi.as_ref())?;
         let mut water = if let Some(config) = config.water {
-            Some(WaterGpu::new(
+            Some(WaterGpu::new_with_samples(
                 device,
                 queue,
                 config,
@@ -219,12 +222,13 @@ impl EnvironmentGpu {
                     transmittance: atmosphere.transmittance_view(),
                 },
                 lighting.map(|pair| pair.0),
+                sample_count,
             )?)
         } else {
             None
         };
         let clouds = if let Some(config) = config.clouds {
-            Some(CloudGpu::new(
+            Some(CloudGpu::new_with_samples(
                 device,
                 queue,
                 config,
@@ -241,6 +245,7 @@ impl EnvironmentGpu {
                         .as_ref()
                         .map_or_else(|| terrain.scene_depth_msaa_view(), WaterGpu::depth_msaa),
                 },
+                sample_count,
             )?)
         } else {
             None
@@ -274,6 +279,7 @@ impl EnvironmentGpu {
             water.set_surface_enabled(false);
         }
         Ok(Self {
+            sample_count,
             config,
             atmosphere,
             atmosphere_state: state.atmosphere(),
@@ -286,6 +292,7 @@ impl EnvironmentGpu {
             celestial: None,
             moon_phase: 0,
             rotation_offset: 0.0,
+            rotation_exact: None,
             encoded: false,
             water_cover_ready: false,
             precloud_revision: 0,
@@ -421,7 +428,14 @@ impl EnvironmentGpu {
         if self.encoded || self.celestial.is_some() {
             return Err(EnvironmentError::Terrain(TerrainError::LatePreparation));
         }
-        let mut celestial = CelestialGpu::new(device, queue, &self.atmosphere, config, budget)?;
+        let mut celestial = CelestialGpu::new_with_samples(
+            device,
+            queue,
+            &self.atmosphere,
+            config,
+            budget,
+            self.sample_count,
+        )?;
         self.startup_pipeline_compilations += celestial.take_work().pipeline_compilations;
         self.celestial = Some(celestial);
         Ok(())
@@ -464,7 +478,7 @@ impl EnvironmentGpu {
         if budget.remaining_bytes < self.post.resize_upload_bytes(width, height) {
             return Err(EnvironmentError::UploadBudget);
         }
-        let mut aerial = AerialGpu::new(
+        let mut aerial = AerialGpu::new_with_samples(
             device,
             queue,
             config,
@@ -484,6 +498,7 @@ impl EnvironmentGpu {
                 shadows: self.aerial_shadows.as_ref().map(AerialShadowOwner::refs),
                 transmittance: self.atmosphere.transmittance_view(),
             },
+            self.sample_count,
         )?;
         self.startup_pipeline_compilations += aerial.take_startup_work().pipeline_compilations;
         if let Some(clouds) = &mut self.clouds {
@@ -537,6 +552,21 @@ impl EnvironmentGpu {
         }
         self.moon_phase = phase;
         self.rotation_offset = rotation_offset;
+        self.rotation_exact = None;
+        Ok(())
+    }
+    /// A public canonical clock already supplies the full rotation. Do not add
+    /// local presentation elapsed time a second time.
+    pub fn set_celestial_clock(
+        &mut self,
+        phase: u8,
+        rotation_radians: f32,
+    ) -> Result<(), EnvironmentError> {
+        if phase > 7 || !rotation_radians.is_finite() {
+            return Err(EnvironmentError::InvalidState);
+        }
+        self.moon_phase = phase;
+        self.rotation_exact = Some(rotation_radians.rem_euclid(std::f32::consts::TAU));
         Ok(())
     }
     /// Update after M4 shadow encoding; source-only color edits need no fog rebuild.
@@ -548,8 +578,9 @@ impl EnvironmentGpu {
             camera,
             sun: state.sun,
             moon: state.sun.map(|v| -v),
-            rotation_radians: self.rotation_offset
-                + state.time_seconds * (std::f32::consts::TAU / 1200.0),
+            rotation_radians: self.rotation_exact.unwrap_or(
+                self.rotation_offset + state.time_seconds * (std::f32::consts::TAU / 1200.0),
+            ),
             time_seconds: state.time_seconds,
             moon_phase: self.moon_phase,
             sun_enabled: true,
@@ -560,6 +591,12 @@ impl EnvironmentGpu {
     }
     pub fn atmosphere(&self) -> &AtmosphereGpu {
         &self.atmosphere
+    }
+    pub fn post(&self) -> &PostGpu {
+        &self.post
+    }
+    pub fn post_mut(&mut self) -> &mut PostGpu {
+        &mut self.post
     }
     /// Loading-only first bounce using the same atmosphere and cached cascades.
     pub fn prepare_directional_gi(

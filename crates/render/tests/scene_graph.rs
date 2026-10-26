@@ -578,6 +578,13 @@ fn terrain_gi_receiver_uses_reflection_without_scalar_block_light_double_count()
 
 #[test]
 fn environment_graph_preflights_budgets_reuses_static_scene_and_keeps_all_timing_sources() {
+    environment_graph_sample_mode(4);
+}
+#[test]
+fn one_sample_environment_keeps_water_aerial_clouds_celestials_and_static_reuse() {
+    environment_graph_sample_mode(1);
+}
+fn environment_graph_sample_mode(sample_count: u32) {
     use render::{
         atmosphere::AtmosphereConfig,
         environment_gpu::{
@@ -597,7 +604,7 @@ fn environment_graph_preflights_budgets_reuses_static_scene_and_keeps_all_timing
             tint_mask: vec![255; 2],
         }],
     };
-    let mut terrain = TerrainGpu::new(
+    let mut terrain = TerrainGpu::new_with_samples(
         &gpu.device,
         &gpu.queue,
         wgpu::TextureFormat::Rgba8Unorm,
@@ -610,6 +617,7 @@ fn environment_graph_preflights_budgets_reuses_static_scene_and_keeps_all_timing
             occlusion: true,
         },
         &atlas,
+        sample_count,
     )
     .unwrap();
     let state = EnvironmentState {
@@ -815,6 +823,14 @@ fn environment_graph_preflights_budgets_reuses_static_scene_and_keeps_all_timing
     assert_eq!(first.celestial.vertices, 8);
     assert_eq!(first.aerial.passes, 2);
     assert_eq!(first.aerial.integration_steps, 8192);
+    assert_eq!(
+        first.aerial.composition_samples,
+        u64::from(W * H * sample_count)
+    );
+    assert_eq!(
+        first.clouds.composition_samples,
+        u64::from(W * H * sample_count)
+    );
     assert!(matches!(
         environment.prepare_celestials(
             &gpu.device,
@@ -964,8 +980,8 @@ fn environment_graph_preflights_budgets_reuses_static_scene_and_keeps_all_timing
     );
     assert!(environment.needs_redraw(&terrain, &camera, CullingMode::FrustumAndHiZ, state));
     println!(
-        "M10_ENVIRONMENT_GPU_OK passes={} actual_timed_passes={} nonzero_GPU_durations={} static_passes=0 static_upload_bytes=0 budget_refusal_atomic=true resize_pipeline_compilations=0",
-        first.passes, actual_passes, nonzero
+        "M10_ENVIRONMENT_GPU_OK samples={} passes={} actual_timed_passes={} nonzero_GPU_durations={} static_passes=0 static_upload_bytes=0 budget_refusal_atomic=true resize_pipeline_compilations=0",
+        sample_count, first.passes, actual_passes, nonzero
     );
 }
 
