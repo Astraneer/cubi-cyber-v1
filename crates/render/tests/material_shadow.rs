@@ -1,6 +1,6 @@
-//! Differential execution of the production material fragment and vertex pull.
-//! Shader variants change only shadow functions; the 416-byte uniform and full
-//! eight-storage-buffer binding layout remain identical on every fresh device.
+//! Real production material vertex/fragment execution with the complete binding
+//! layout. The Windows shader regression uses the same 1536 terrain unit draws,
+//! 416-byte shadow uniform and eight storage buffers as the diagnostic fixture.
 #![cfg(not(target_arch = "wasm32"))]
 
 use render::{
@@ -13,109 +13,12 @@ use render::{
 };
 use wgpu::util::DeviceExt;
 
-const CURRENT: &str = include_str!("../src/shadow_sampling.wgsl");
-// Own project implementation from 13d0484, the last verified Windows revision.
-// Keep the CURRENT struct/bindings above it; this is a function-only control.
-const LEGACY_FUNCTION: &str = r#"
-fn cascade_shadow(world_position:vec3<f32>,world_normal:vec3<f32>)->f32 {
-    let direction=normalize(shadow_sampling.sun.xyz);
-    let bias=shadow_sampling.sun.w*(1.0+2.0*(1.0-max(dot(world_normal,direction),0.0)));
-    for(var cascade=0u;cascade<3u;cascade++) {
-        if (shadow_sampling.params.x&(1u<<cascade))==0u {continue;}
-        let p=shadow_sampling.matrices[cascade]*vec4(world_position,1.0);
-        if abs(p.x)>0.96||abs(p.y)>0.96||p.z<0.0||p.z>1.0 {continue;}
-        let uv=vec2(p.x*0.5+0.5,0.5-p.y*0.5);
-        let texel=1.0/f32(shadow_sampling.params.y);
-        var visibility=0.0;
-        for(var y=0;y<2;y++){for(var x=0;x<2;x++){
-            let offset=(vec2<f32>(f32(x),f32(y))-vec2(0.5))*texel;
-            visibility+=textureSampleCompareLevel(shadow_depth,shadow_compare,uv+offset,i32(cascade),p.z+bias);
-        }}
-        return visibility*0.25;
-    }
-    return 1.0;
-}
-"#;
-
-#[derive(Clone, Copy, Debug)]
-enum Variant {
-    Current,
-    LegacyFunction,
-    ConstantLayers,
-    ExplicitPcf,
-    ConstantExplicitPcf,
-}
-
-fn annotation(variant: Variant, status: &str) {
+fn annotation(status: &str) {
     use std::io::Write;
     let _ = writeln!(
         std::io::stdout().lock(),
-        "\n::notice title=Shadow fragment differential::{variant:?} {status} struct=416 storage=8 trace_dispatches=0"
+        "\n::notice title=Shadow fragment differential::Production {status} struct=416 storage=8 trace_dispatches=0"
     );
-}
-
-fn sampling_source(variant: Variant) -> String {
-    let (declarations, functions) = CURRENT.split_once("fn shadow_layer(").unwrap();
-    match variant {
-        Variant::Current => CURRENT.to_owned(),
-        Variant::LegacyFunction => format!("{declarations}{LEGACY_FUNCTION}"),
-        Variant::ExplicitPcf => explicit_pcf(CURRENT),
-        Variant::ConstantExplicitPcf => explicit_pcf(&sampling_source(Variant::ConstantLayers)),
-        Variant::ConstantLayers => {
-            let layer = functions.split_once("fn cascade_shadow(").unwrap().0;
-            let layer = format!("fn shadow_layer({layer}");
-            let layer = layer.replacen("cascade:u32,", "", 1);
-            let mut output = declarations.to_owned();
-            for cascade in 0..3 {
-                output.push_str(
-                    &layer
-                        .replace("shadow_layer", &format!("constant_layer_{cascade}"))
-                        .replace("cascade", &format!("{cascade}u")),
-                );
-            }
-            output.push_str("fn cascade_shadow(world_position:vec3<f32>,world_normal:vec3<f32>)->f32 {let direction=normalize(shadow_sampling.sun.xyz);let bias=shadow_sampling.sun.w*(1.+2.*(1.-max(dot(world_normal,direction),0.)));\n");
-            for cascade in 0..3 {
-                output.push_str(&format!(
-                    "if (shadow_sampling.params.x&{mask}u)!=0u {{let p=shadow_sampling.desired_matrices[{cascade}u]*vec4(world_position,1.);let edge=max(abs(p.x),abs(p.y));if !(edge>=.96||p.z<0.||p.z>1.) {{let here=constant_layer_{cascade}(world_position,bias,world_normal);if here.y!=0. {{\n",
-                    mask=1<<cascade
-                ));
-                if cascade != 2 {
-                    output.push_str("if edge>.60 {\n");
-                    for farther in cascade + 1..3 {
-                        output.push_str(&format!("let next{farther}=constant_layer_{farther}(world_position,bias,world_normal);if next{farther}.y>0. {{return mix(here.x,next{farther}.x,smoothstep(.60,.96,edge));}}\n"));
-                    }
-                    output.push_str("}\n");
-                }
-                output.push_str("return here.x;}}}\n");
-            }
-            output.push_str("return 1.;}\n");
-            output
-        }
-    }
-}
-
-fn explicit_pcf(source: &str) -> String {
-    let mut output = source.to_owned();
-    while let Some(start) = output.find("    for(var y=0;") {
-        let end = start + output[start..].find("    return vec2(visibility").unwrap();
-        let mut taps = String::new();
-        // The constant-layer variant has literal indices instead of the original
-        // parameter. Preserve that function's argument in all four taps.
-        let body = &output[start..end];
-        let argument = body
-            .split_once("i32(")
-            .unwrap()
-            .1
-            .split_once(')')
-            .unwrap()
-            .0;
-        // Keep the original y-major tap order and floating-point addition order.
-        for offset in ["-.5,-.5", ".5,-.5", "-.5,.5", ".5,.5"] {
-            taps.push_str(&format!("visibility+=textureSampleCompareLevel(shadow_depth,shadow_compare,uv+vec2({offset})*texel,i32({argument}),p.z+bias+plane_bias);\n"));
-        }
-        output.replace_range(start..end, &taps);
-    }
-    output
 }
 
 fn buffer_layout(
@@ -168,7 +71,7 @@ fn binary16(bits: u16) -> f32 {
     }
 }
 
-fn differential(variant: Variant) {
+fn production_shadow_execution() {
     let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
     gpu.device.on_uncaptured_error(Box::new(move |error| {
         let message = error.to_string();
@@ -182,14 +85,14 @@ fn differential(variant: Variant) {
             .collect::<Vec<_>>()
             .join(" ");
         let details: String = details.chars().take(500).collect();
-        annotation(variant, &format!("FAIL validation {details}"));
-        panic!("{variant:?} GPU validation {message}");
+        annotation(&format!("FAIL validation {details}"));
+        panic!("production GPU validation {message}");
     }));
     gpu.device.set_device_lost_callback(move |reason, message| {
         if reason != wgpu::DeviceLostReason::Destroyed {
-            annotation(variant, "FAIL device lost");
+            annotation("FAIL device lost");
             eprintln!(
-                "SHADOW_DIFFERENTIAL_DEVICE_LOST {variant:?} reason={reason:?} message={message}"
+                "SHADOW_DIFFERENTIAL_DEVICE_LOST production reason={reason:?} message={message}"
             );
         }
     });
@@ -429,8 +332,6 @@ fn differential(variant: Variant) {
         ],
     });
     let source = render::terrain_gpu::material_shader_source(true, true);
-    assert_eq!(source.matches(CURRENT).count(), 1);
-    let source = source.replace(CURRENT, &sampling_source(variant));
     let shader = gpu
         .device
         .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -579,14 +480,14 @@ fn differential(variant: Variant) {
             let _ = send.send(result);
         });
     if let Err(error) = gpu.device.poll(wgpu::PollType::Wait) {
-        annotation(variant, "FAIL poll");
-        panic!("{variant:?} poll {error:?}");
+        annotation("FAIL poll");
+        panic!("production poll {error:?}");
     }
     let result = receive
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("bounded material map callback");
     if result.is_err() {
-        annotation(variant, "FAIL map");
+        annotation("FAIL map");
     }
     result.unwrap();
     let bytes = readback.slice(..).get_mapped_range();
@@ -604,28 +505,10 @@ fn differential(variant: Variant) {
     assert!(pixels.iter().flatten().all(|value| value.is_finite()));
     let red = pixels.iter().filter(|p| p[0] > p[1] + 0.01).count();
     assert!(red > 100, "actual red terrain must be visible: {red}");
-    annotation(variant, "PASS actual1536units");
+    annotation("PASS actual1536units");
 }
 
 #[test]
-fn current_shadow_function_with_current_uniform_layout() {
-    differential(Variant::Current);
-}
-#[test]
-fn legacy_shadow_function_with_current_uniform_layout() {
-    differential(Variant::LegacyFunction);
-}
-#[test]
-fn constant_shadow_layers_with_current_uniform_layout() {
-    differential(Variant::ConstantLayers);
-}
-
-#[test]
-fn explicit_pcf_taps_with_current_uniform_layout() {
-    differential(Variant::ExplicitPcf);
-}
-
-#[test]
-fn constant_layers_and_explicit_pcf_taps_with_current_uniform_layout() {
-    differential(Variant::ConstantExplicitPcf);
+fn production_shadow_function_with_current_uniform_layout() {
+    production_shadow_execution();
 }
