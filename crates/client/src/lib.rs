@@ -10,6 +10,7 @@ pub mod edit_shell;
 pub mod entities;
 pub mod gi_source;
 pub mod height_cache;
+pub mod height_neighbors;
 pub mod lighting;
 pub mod local_materials;
 pub mod lodcache;

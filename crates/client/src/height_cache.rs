@@ -49,6 +49,12 @@ pub struct Work {
     pub seams_checked: usize,
     pub upload_bytes: u64,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlanWork {
+    pub ancestor_lookups: u64,
+    pub neighbour_lookups: u64,
+    pub adjacent_pairs: usize,
+}
 #[derive(Clone)]
 struct Resident {
     tile: Arc<HeightTile>,
@@ -60,6 +66,9 @@ struct Resident {
 pub struct HeightCache {
     config: Config,
     desired: BTreeMap<HeightTileKey, u32>,
+    neighbours: Vec<(HeightTileKey, HeightTileKey)>,
+    plan_work: PlanWork,
+    seams_checked_epoch: Option<u64>,
     sources: BTreeMap<HeightTileKey, Arc<HeightTile>>,
     front: BTreeMap<HeightTileKey, Resident>,
     staged: BTreeMap<HeightTileKey, Resident>,
@@ -85,6 +94,9 @@ impl HeightCache {
         Ok(Self {
             config,
             desired: BTreeMap::new(),
+            neighbours: Vec::with_capacity(config.max_tiles * 4),
+            plan_work: PlanWork::default(),
+            seams_checked_epoch: None,
             sources: BTreeMap::new(),
             front: BTreeMap::new(),
             staged: BTreeMap::new(),
@@ -112,6 +124,9 @@ impl HeightCache {
     }
     pub fn epoch(&self) -> u64 {
         self.published_epoch
+    }
+    pub fn plan_work(&self) -> PlanWork {
+        self.plan_work
     }
     pub fn front_source(&self, key: HeightTileKey) -> Option<u64> {
         self.front.get(&key).map(|r| r.tile.source)
@@ -152,19 +167,7 @@ impl HeightCache {
                 return Err(Error::InvalidPlan);
             }
         }
-        for (i, a) in plan.tiles.iter().enumerate() {
-            for b in &plan.tiles[i + 1..] {
-                if a.key.space != b.key.space {
-                    continue;
-                }
-                validate_neighbours(*a, *b)?;
-                let a = a.key.bounds().ok_or(Error::InvalidPlan)?;
-                let b = b.key.bounds().ok_or(Error::InvalidPlan)?;
-                if a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3] {
-                    return Err(Error::InvalidPlan);
-                }
-            }
-        }
+        let (neighbours, plan_work) = index_plan(&desired)?;
         if self.desired == desired {
             return Ok(false);
         }
@@ -173,6 +176,8 @@ impl HeightCache {
             .checked_add(1)
             .ok_or(Error::EpochExhausted)?;
         self.desired = desired;
+        self.neighbours = neighbours;
+        self.plan_work = plan_work;
         self.dirty = true;
         self.sources.retain(|key, _| {
             self.desired.contains_key(key)
@@ -236,6 +241,29 @@ impl HeightCache {
         max_uploads: usize,
         protected_ready: impl Fn(&HeightTile) -> bool,
     ) -> Result<Work, Error> {
+        self.pump_inner(gpu, queue, budget, max_uploads, protected_ready, true)
+    }
+    /// Preload received tiles while authority leases or exact replacement
+    /// manifests are still arriving. Every new GPU handle remains inactive;
+    /// this path can never replace or enable the active cover.
+    pub fn pump_staging(
+        &mut self,
+        gpu: &mut HeightGpu,
+        queue: &wgpu::Queue,
+        budget: &mut UploadBudget,
+        max_uploads: usize,
+    ) -> Result<Work, Error> {
+        self.pump_inner(gpu, queue, budget, max_uploads, |_| false, false)
+    }
+    fn pump_inner(
+        &mut self,
+        gpu: &mut HeightGpu,
+        queue: &wgpu::Queue,
+        budget: &mut UploadBudget,
+        max_uploads: usize,
+        protected_ready: impl Fn(&HeightTile) -> bool,
+        allow_publish: bool,
+    ) -> Result<Work, Error> {
         let before = budget.remaining_bytes;
         let mut work = Work::default();
         while let Some(handle) = self.retired.last().copied() {
@@ -258,8 +286,8 @@ impl HeightCache {
             // an obsolete staged representation must never release that front.
             if self
                 .front
-                .values()
-                .any(|front| front.handle == resident.handle)
+                .get(key)
+                .is_some_and(|front| front.handle == resident.handle)
             {
                 self.staged.remove(key);
                 continue;
@@ -328,6 +356,11 @@ impl HeightCache {
             );
             work.staged += 1;
         }
+        if !allow_publish {
+            work.held_previous = true;
+            work.upload_bytes = before - budget.remaining_bytes;
+            return Ok(work);
+        }
         let mut ready = true;
         for key in self.desired.keys() {
             let resident = self
@@ -342,21 +375,20 @@ impl HeightCache {
                 break;
             }
         }
-        if ready {
+        if ready && self.seams_checked_epoch != Some(self.desired_epoch) {
             // Only a completed cover can replace the previous cover. This also
             // checks same-level edges, since editing a shared endpoint changes
             // both neighbours even without a LOD transition.
-            for (i, a) in self.desired.keys().enumerate() {
-                for b in self.desired.keys().skip(i + 1) {
-                    let a = self.sources.get(a).expect("ready source");
-                    let b = self.sources.get(b).expect("ready source");
-                    if adjacent(a, b) {
-                        work.seams_checked += 1;
-                        if check_seam(a, b).is_err() {
-                            ready = false;
-                        }
-                    }
+            for (a, b) in &self.neighbours {
+                let a = self.sources.get(a).expect("ready source");
+                let b = self.sources.get(b).expect("ready source");
+                work.seams_checked += 1;
+                if check_seam(a, b).is_err() {
+                    ready = false;
                 }
+            }
+            if ready {
+                self.seams_checked_epoch = Some(self.desired_epoch);
             }
         }
         if ready {
@@ -484,12 +516,71 @@ fn intersects(key: HeightTileKey, space: u32, bounds: [i64; 4]) -> bool {
     };
     tile[0] < bounds[2] && bounds[0] < tile[2] && tile[1] < bounds[3] && bounds[1] < tile[3]
 }
-fn adjacent(a: &HeightTile, b: &HeightTile) -> bool {
-    if a.key.space != b.key.space {
+type NeighbourPairs = Vec<(HeightTileKey, HeightTileKey)>;
+fn index_plan(desired: &BTreeMap<HeightTileKey, u32>) -> Result<(NeighbourPairs, PlanWork), Error> {
+    use crate::height_neighbors::ancestor_neighbour;
+    use render::height_tile::{MAX_LEVEL, PlannedHeightTile};
+    let mut work = PlanWork::default();
+    // Dyadic rectangles overlap exactly when one selected key is an ancestor
+    // of another. Same-level duplicates were rejected while building the map.
+    for key in desired.keys() {
+        for level in key.level + 1..=MAX_LEVEL {
+            let divisor = 1_i32 << (level - key.level);
+            let parent = HeightTileKey {
+                level,
+                x: key.x.div_euclid(divisor),
+                z: key.z.div_euclid(divisor),
+                ..*key
+            };
+            work.ancestor_lookups += 1;
+            if desired.contains_key(&parent) {
+                return Err(Error::InvalidPlan);
+            }
+        }
+    }
+    let limit = desired.len().checked_mul(4).ok_or(Error::Capacity)?;
+    let mut pairs = Vec::with_capacity(limit);
+    for (&key, &seams) in desired {
+        for level in key.level..=MAX_LEVEL {
+            for edge in 0..4 {
+                work.neighbour_lookups += 1;
+                let Some(other) = ancestor_neighbour(key, edge, level) else {
+                    continue;
+                };
+                if level == key.level && key >= other {
+                    continue;
+                }
+                let Some(&other_seams) = desired.get(&other) else {
+                    continue;
+                };
+                if !adjacent_keys(key, other) {
+                    continue;
+                }
+                validate_neighbours(
+                    PlannedHeightTile { key, seams },
+                    PlannedHeightTile {
+                        key: other,
+                        seams: other_seams,
+                    },
+                )?;
+                // A disjoint rectangular forest has fewer than four edge pairs
+                // per leaf. Keep an explicit bound even for malformed callers.
+                if pairs.len() == limit {
+                    return Err(Error::Capacity);
+                }
+                pairs.push((key, other));
+            }
+        }
+    }
+    work.adjacent_pairs = pairs.len();
+    Ok((pairs, work))
+}
+fn adjacent_keys(a: HeightTileKey, b: HeightTileKey) -> bool {
+    if a.space != b.space {
         return false;
     }
-    let a = a.key.bounds().expect("validated");
-    let b = b.key.bounds().expect("validated");
+    let a = a.bounds().expect("validated");
+    let b = b.bounds().expect("validated");
     ((a[2] == b[0] || a[0] == b[2]) && a[1] < b[3] && b[1] < a[3])
         || ((a[3] == b[1] || a[1] == b[3]) && a[0] < b[2] && b[0] < a[2])
 }
@@ -557,4 +648,152 @@ fn check_seam(a: &HeightTile, b: &HeightTile) -> Result<(), HeightError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod indexed_tests {
+    use super::*;
+    use render::height_tile::PlannedHeightTile;
+    use std::collections::BTreeSet;
+    fn key(level: u8, x: i32, z: i32) -> HeightTileKey {
+        HeightTileKey {
+            space: 0,
+            level,
+            x,
+            z,
+        }
+    }
+    #[test]
+    fn four_thousand_leaf_plan_has_linear_bounded_validation_and_exact_grid_edges() {
+        let mut cache = HeightCache::new(Config {
+            max_tiles: 4096,
+            max_sources: 8192,
+            ..Default::default()
+        })
+        .unwrap();
+        let plan = HeightPlan {
+            tiles: (-32..32)
+                .flat_map(|x| {
+                    (-32..32).map(move |z| PlannedHeightTile {
+                        key: key(0, x, z),
+                        seams: 0,
+                    })
+                })
+                .collect(),
+            visited_nodes: 4096,
+            outer_bounds_pages: [-32, -32, 32, 32],
+        };
+        assert!(cache.set_plan(&plan).unwrap());
+        let work = cache.plan_work();
+        assert_eq!(work.adjacent_pairs, 2 * 64 * 63);
+        assert_eq!(work.ancestor_lookups, 4096 * 10);
+        assert!(work.neighbour_lookups <= 4096 * 4 * 11);
+        let scope = telemetry::AllocationScope::begin().unwrap();
+        for _ in 0..100 {
+            assert!(!cache.set_plan(&plan).unwrap());
+        }
+        let counts = scope.finish();
+        assert_eq!(counts.allocating_calls(), 0);
+        assert_eq!(counts.dealloc_calls, 0);
+        let mut invalid = HeightPlan {
+            tiles: vec![
+                PlannedHeightTile {
+                    key: key(1, 0, 0),
+                    seams: 0,
+                },
+                PlannedHeightTile {
+                    key: key(0, 0, 0),
+                    seams: 0,
+                },
+            ],
+            visited_nodes: 2,
+            outer_bounds_pages: [0; 4],
+        };
+        assert_eq!(cache.set_plan(&invalid), Err(Error::InvalidPlan));
+        invalid.tiles[1].key = key(0, -1, 0);
+        invalid.tiles[0].key = key(2, 0, 0);
+        invalid.tiles[1].seams = 2;
+        assert_eq!(cache.set_plan(&invalid), Err(Error::InvalidPlan));
+        assert_eq!(cache.wanted().count(), 4096);
+        assert_eq!(cache.plan_work(), work);
+    }
+    #[test]
+    fn indexed_pairs_equal_independent_all_pairs_on_negative_mixed_forests_and_spaces() {
+        for seed in 0..16_u64 {
+            let mut state = seed + 1;
+            let mut next = || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                state
+            };
+            let mut keys = Vec::new();
+            for x in -4..=4 {
+                for z in -4..=4 {
+                    if next() % 5 == 0 {
+                        continue;
+                    }
+                    if next() % 2 == 0 {
+                        keys.push(key(2, x, z));
+                    } else {
+                        for dx in 0..2 {
+                            for dz in 0..2 {
+                                if next() % 7 != 0 {
+                                    keys.push(key(1, 2 * x + dx, 2 * z + dz));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            keys.push(HeightTileKey {
+                space: 1,
+                ..key(1, 0, 0)
+            });
+            let mut desired: BTreeMap<_, _> = keys.iter().map(|&k| (k, 0)).collect();
+            let mut expected = BTreeSet::new();
+            for (i, &a) in keys.iter().enumerate() {
+                for &b in &keys[i + 1..] {
+                    if a.space != b.space {
+                        continue;
+                    }
+                    let ab = a.bounds().unwrap();
+                    let bb = b.bounds().unwrap();
+                    let x_overlap = ab[0] < bb[2] && bb[0] < ab[2];
+                    let z_overlap = ab[1] < bb[3] && bb[1] < ab[3];
+                    assert!(!(x_overlap && z_overlap));
+                    if !(((ab[2] == bb[0] || bb[2] == ab[0]) && z_overlap)
+                        || ((ab[3] == bb[1] || bb[3] == ab[1]) && x_overlap))
+                    {
+                        continue;
+                    }
+                    expected.insert(if a < b { (a, b) } else { (b, a) });
+                    if a.level != b.level {
+                        let (fine, fb, coarse) = if a.level < b.level {
+                            (a, ab, bb)
+                        } else {
+                            (b, bb, ab)
+                        };
+                        let mask = if fb[2] == coarse[0] {
+                            2
+                        } else if fb[0] == coarse[2] {
+                            1
+                        } else if fb[3] == coarse[1] {
+                            8
+                        } else {
+                            4
+                        };
+                        *desired.get_mut(&fine).unwrap() |= mask;
+                    }
+                }
+            }
+            let (pairs, work) = index_plan(&desired).unwrap();
+            let count = pairs.len();
+            let actual = pairs
+                .into_iter()
+                .map(|(a, b)| if a < b { (a, b) } else { (b, a) })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual, expected, "forest seed{seed}");
+            assert_eq!(count, actual.len(), "duplicate edge seed{seed}");
+            assert_eq!(work.adjacent_pairs, count);
+        }
+    }
 }

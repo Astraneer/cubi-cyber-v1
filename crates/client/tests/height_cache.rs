@@ -758,3 +758,115 @@ fn moving_near_unknown_cutout_is_atomic_and_survives_an_old_pending_cover() {
         assert_ne!(right_cutout.0, left_cutout.0);
     });
 }
+
+#[test]
+fn staging_overlaps_authority_delivery_but_cannot_publish_until_the_explicit_front_gate() {
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let mut terrain = renderer(&gpu);
+    let mut height = heights(&gpu, &terrain, 8);
+    let mut cache = HeightCache::new(Config {
+        max_tiles: 4,
+        max_sources: 8,
+        atlas_layers: 186,
+    })
+    .unwrap();
+    cache.set_plan(&plan(&[key(0)])).unwrap();
+    cache.ingest(tile(key(0), 1, 0)).unwrap();
+    assert!(
+        cache
+            .pump(
+                &mut height,
+                &gpu.queue,
+                &mut UploadBudget::new(100000),
+                1,
+                |_| true
+            )
+            .unwrap()
+            .published
+    );
+    let before = image(&gpu, &mut terrain, &mut height);
+    let epoch = cache.epoch();
+    cache.set_plan(&plan(&[key(0), key(1)])).unwrap();
+    cache.ingest(tile(key(0), 2, 2)).unwrap();
+    let first = cache
+        .pump_staging(&mut height, &gpu.queue, &mut UploadBudget::new(100000), 1)
+        .unwrap();
+    assert_eq!(first.staged, 1);
+    assert!(!first.published);
+    assert_eq!(cache.epoch(), epoch);
+    assert_eq!(image(&gpu, &mut terrain, &mut height), before);
+    cache.ingest(tile(key(1), 1, 2)).unwrap();
+    let second = cache
+        .pump_staging(&mut height, &gpu.queue, &mut UploadBudget::new(100000), 1)
+        .unwrap();
+    assert_eq!(second.staged, 1);
+    assert!(!second.published);
+    assert_eq!(cache.epoch(), epoch);
+    assert_eq!(image(&gpu, &mut terrain, &mut height), before);
+    let held = cache
+        .pump_staging(&mut height, &gpu.queue, &mut UploadBudget::new(0), 4)
+        .unwrap();
+    assert!(!held.published);
+    assert!(held.held_previous);
+    assert_eq!(held.seams_checked, 0);
+    let held = cache
+        .pump(
+            &mut height,
+            &gpu.queue,
+            &mut UploadBudget::new(11),
+            4,
+            |_| true,
+        )
+        .unwrap();
+    assert!(!held.published);
+    assert_eq!(held.seams_checked, 1);
+    let repeated = cache
+        .pump(
+            &mut height,
+            &gpu.queue,
+            &mut UploadBudget::new(11),
+            4,
+            |_| true,
+        )
+        .unwrap();
+    assert!(!repeated.published);
+    assert_eq!(
+        repeated.seams_checked, 0,
+        "valid unchanged seam epoch is cached"
+    );
+    assert_eq!(image(&gpu, &mut terrain, &mut height), before);
+    let done = cache
+        .pump(
+            &mut height,
+            &gpu.queue,
+            &mut UploadBudget::new(12),
+            4,
+            |_| true,
+        )
+        .unwrap();
+    assert!(done.published);
+    assert_eq!(done.upload_bytes, 12);
+    assert_eq!(done.seams_checked, 0);
+    assert!(cache.epoch() > epoch);
+    let current = image(&gpu, &mut terrain, &mut height);
+    assert_ne!(current, before);
+    assert_eq!(current.1, 2);
+    cache.ingest(tile(key(0), 3, 3)).unwrap();
+    let incompatible = cache
+        .pump(
+            &mut height,
+            &gpu.queue,
+            &mut UploadBudget::new(100000),
+            4,
+            |_| true,
+        )
+        .unwrap();
+    assert!(incompatible.held_previous);
+    assert!(!incompatible.published);
+    assert_eq!(incompatible.seams_checked, 1);
+    assert_eq!(
+        image(&gpu, &mut terrain, &mut height),
+        current,
+        "changed source invalidates cached seam proof"
+    );
+}
