@@ -72,6 +72,15 @@ fn frame(
     output: &wgpu::Texture,
     revision: u64,
 ) -> (Vec<u8>, post::PostWork) {
+    frame_mode(gpu, post, output, revision, false)
+}
+fn frame_mode(
+    gpu: &render::Gpu,
+    post: &mut PostGpu,
+    output: &wgpu::Texture,
+    revision: u64,
+    cached: bool,
+) -> (Vec<u8>, post::PostWork) {
     let width = output.width();
     let height = output.height();
     let row = (width * 4).div_ceil(256) * 256;
@@ -82,14 +91,13 @@ fn frame(
         mapped_at_creation: false,
     });
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
-    let work = post
-        .encode(
-            &mut encoder,
-            &output.create_view(&Default::default()),
-            revision,
-            &mut 1_000_000,
-        )
-        .unwrap();
+    let view = output.create_view(&Default::default());
+    let work = if cached {
+        post.present_cached(&mut encoder, &view, &mut 1_000_000)
+    } else {
+        post.encode(&mut encoder, &view, revision, &mut 1_000_000)
+    }
+    .unwrap();
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: output,
@@ -228,6 +236,48 @@ fn manual_post_matches_numeric_tone_and_reuses_pipelines_on_resize() {
         }
         assert_eq!(post.set_delta(&gpu.queue, 0.01, &mut budget).unwrap(), 0);
         assert_eq!(exposure(&gpu, &post)[0], 0.5);
+        let prior_state = exposure(&gpu, &post);
+        assert_eq!(
+            post.set_compensation(&gpu.queue, 2., &mut UploadBudget::new(63)),
+            Err(PostError::UploadBudget)
+        );
+        assert_eq!(post.compensation(), 1.);
+        assert!(!post.needs_redraw(1));
+        assert_eq!(
+            post.set_compensation(&gpu.queue, f32::NAN, &mut budget),
+            Err(PostError::InvalidConfig)
+        );
+        assert_eq!(
+            post.set_compensation(&gpu.queue, 2., &mut UploadBudget::new(64))
+                .unwrap(),
+            64
+        );
+        let (brighter, changed) = frame(&gpu, &mut post, &out, 1);
+        assert_ne!(brighter, actual);
+        assert_eq!(changed.passes, 1);
+        assert_eq!(changed.histogram_samples + changed.bloom_texels, 0);
+        assert_eq!(exposure(&gpu, &post), prior_state);
+        assert_eq!(post.pipeline_count(), 1);
+        let mut error = 0u8;
+        for (pixel, color) in brighter.chunks_exact(4).zip(&colors) {
+            for channel in 0..3 {
+                let x = f64::from(color[channel]);
+                let mapped =
+                    ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)).clamp(0., 1.);
+                let srgb = if mapped <= 0.0031308 {
+                    mapped * 12.92
+                } else {
+                    1.055 * mapped.powf(1. / 2.4) - 0.055
+                };
+                error = error.max(pixel[channel].abs_diff((srgb * 255.).round() as u8));
+            }
+        }
+        assert!(
+            error <= 1,
+            "exposure compensation differs from independent numeric tone: {error}"
+        );
+        post.set_compensation(&gpu.queue, 1., &mut budget).unwrap();
+        assert_eq!(frame(&gpu, &mut post, &out, 1).0, actual);
         let smaller = input(&gpu, 33, 17, &vec![[0.18, 0.18, 0.18, 1.0]; 33 * 17]);
         post.resize_input(
             &gpu.device,
@@ -311,6 +361,20 @@ fn histogram_exposure_adapts_slowly_and_reuses_static_measurement() {
         let state = exposure(&gpu, &post);
         assert!((state[0] - state[1]).abs() < 0.001);
         assert_eq!(measured, 768);
+        let before = frame(&gpu, &mut post, &out, 1).0;
+        let adapted = exposure(&gpu, &post);
+        post.set_compensation(&gpu.queue, 0.5, &mut budget).unwrap();
+        let (dimmed, work) = frame(&gpu, &mut post, &out, 1);
+        assert_ne!(before, dimmed);
+        assert_eq!(work.passes, 1, "cached exposure change is tone-only");
+        assert_eq!(work.histogram_samples + work.bloom_texels, 0);
+        assert_eq!(
+            exposure(&gpu, &post),
+            adapted,
+            "display compensation cannot reset adaptation history"
+        );
+        assert_eq!(post.pipeline_count(), 4);
+        post.set_compensation(&gpu.queue, 1., &mut budget).unwrap();
         let dark = input(&gpu, 64, 48, &vec![[0.01, 0.01, 0.01, 1.0]; 64 * 48]);
         post.resize_input(
             &gpu.device,
@@ -409,4 +473,178 @@ fn bloom_spreads_hdr_highlights_and_is_bitwise_stable() {
             work.bloom_texels
         );
     });
+}
+
+#[test]
+fn cached_hdr_present_keeps_histogram_bloom_and_adaptation_history_while_only_toning_fresh_surfaces()
+ {
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let hdr = input(&gpu, 64, 32, &vec![[4., 1., 0.25, 1.]; 64 * 32]);
+    let mut post = PostGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        &hdr.create_view(&Default::default()),
+        64,
+        32,
+        wgpu::TextureFormat::Rgba8Unorm,
+        OutputTransfer::ShaderSrgb,
+        PostConfig {
+            bloom: Some(BloomConfig {
+                threshold: 1.,
+                knee: 0.5,
+                intensity: 0.2,
+                levels: 2,
+            }),
+            ..Default::default()
+        },
+        &mut UploadBudget::new(10000),
+    )
+    .unwrap();
+    let target = output(&gpu, 64, 32);
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    assert!(matches!(
+        post.present_cached(
+            &mut encoder,
+            &target.create_view(&Default::default()),
+            &mut 1_000_000
+        ),
+        Err(PostError::InvalidConfig)
+    ));
+    let (original, work) = frame(&gpu, &mut post, &target, 7);
+    assert!(work.histogram_samples > 0 && work.bloom_texels > 0 && post.has_cached_source());
+    let state = exposure(&gpu, &post);
+    let pending = post.pending_work(7);
+    assert!(pending.passes > 1, "automatic adaptation remains active");
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    assert!(matches!(
+        post.present_cached(
+            &mut encoder,
+            &target.create_view(&Default::default()),
+            &mut 0
+        ),
+        Err(PostError::WorkBudget)
+    ));
+    for _ in 0..20 {
+        let (pixels, work) = frame_mode(&gpu, &mut post, &target, 7, true);
+        assert_eq!(pixels, original);
+        assert_eq!(work.passes, 1);
+        assert_eq!(work.draws, 1);
+        assert_eq!(work.histogram_samples, 0);
+        assert_eq!(work.bloom_texels, 0);
+        assert_eq!(post.frame_graph().count, 1);
+    }
+    assert_eq!(
+        exposure(&gpu, &post),
+        state,
+        "cached presentation must not advance adaptation"
+    );
+    assert_eq!(post.pending_work(7).passes, pending.passes);
+    let (_, resumed) = frame(&gpu, &mut post, &target, 7);
+    assert_eq!(resumed.histogram_samples, 0);
+    assert_eq!(resumed.bloom_texels, 0);
+    assert_ne!(
+        exposure(&gpu, &post),
+        state,
+        "ordinary encode resumes the retained adaptation"
+    );
+    post.invalidate();
+    assert!(!post.has_cached_source());
+    eprintln!(
+        "M10_CACHED_HDR_HOLD_OK frames20 BITWISE=true tone_passes1 histogram0 bloom0 exposure_history_retained=true budget_denial_atomic=true"
+    );
+}
+
+#[test]
+fn scaled_hdr_bilinear_matches_independent_f64_and_charges_the_native_output() {
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let (width, height) = (55u32, 38u32);
+    let mut colors = Vec::new();
+    for y in 0..height {
+        for x in 0..width {
+            colors.push([
+                (x % 7) as f32 / 4.,
+                (y % 5) as f32 / 3.,
+                ((x + y) % 9) as f32 / 5.,
+                1.,
+            ]);
+        }
+    }
+    let hdr = input(&gpu, width, height, &colors);
+    let mut post = PostGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        &hdr.create_view(&Default::default()),
+        width,
+        height,
+        wgpu::TextureFormat::Rgba8Unorm,
+        OutputTransfer::Attachment,
+        PostConfig {
+            exposure: Exposure::Manual(1.),
+            bloom: None,
+            histogram_stride: 4,
+        },
+        &mut UploadBudget::new(4096),
+    )
+    .unwrap();
+    assert_eq!(post.pipeline_count(), 1);
+    assert_eq!(post.set_output_extent(0, 44), Err(PostError::InvalidConfig));
+    assert_eq!(post.output_extent(), [width, height]);
+    post.set_output_extent(64, 44).unwrap();
+    assert_eq!(post.pending_work(1).tone_pixels, 64 * 44);
+    let out = output(&gpu, 64, 44);
+    let mut denied = gpu.device.create_command_encoder(&Default::default());
+    let mut allowance = 64 * 44 - 1;
+    assert_eq!(
+        post.encode(
+            &mut denied,
+            &out.create_view(&Default::default()),
+            1,
+            &mut allowance
+        )
+        .unwrap_err(),
+        PostError::WorkBudget
+    );
+    assert_eq!(allowance, 64 * 44 - 1);
+    assert!(post.needs_redraw(1));
+    let (actual, work) = frame(&gpu, &mut post, &out, 1);
+    assert_eq!((work.passes, work.draws, work.tone_pixels), (1, 1, 64 * 44));
+    assert_eq!((work.histogram_samples, work.bloom_texels), (0, 0));
+    let mut maximum = 0u8;
+    for y in 0..44 {
+        for x in 0..64 {
+            let coordinate = [
+                (f64::from(x) + 0.5) * f64::from(width) / 64. - 0.5,
+                (f64::from(y) + 0.5) * f64::from(height) / 44. - 0.5,
+            ];
+            let base = coordinate.map(|p| p.floor() as i32);
+            let weights = coordinate.map(|p| p - p.floor());
+            for c in 0..3 {
+                let mut linear = 0.;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let sx = (base[0] + dx).clamp(0, width as i32 - 1) as usize;
+                        let sy = (base[1] + dy).clamp(0, height as i32 - 1) as usize;
+                        let weight = if dx == 0 { 1. - weights[0] } else { weights[0] }
+                            * if dy == 0 { 1. - weights[1] } else { weights[1] };
+                        linear += f64::from(colors[sx + sy * width as usize][c]) * weight;
+                    }
+                }
+                let mapped = ((linear * (2.51 * linear + 0.03))
+                    / (linear * (2.43 * linear + 0.59) + 0.14))
+                    .clamp(0., 1.);
+                maximum = maximum.max(
+                    actual[((y * 64 + x) * 4 + c as u32) as usize]
+                        .abs_diff((mapped * 255.).round() as u8),
+                );
+            }
+            assert_eq!(actual[((y * 64 + x) * 4 + 3) as usize], 255);
+        }
+    }
+    assert!(maximum <= 1, "independent scaled HDR error {maximum} bytes");
+    for _ in 0..4 {
+        let (cached, work) = frame_mode(&gpu, &mut post, &out, 1, true);
+        assert_eq!(cached, actual);
+        assert_eq!(work.tone_pixels, 64 * 44);
+        assert_eq!(post.pipeline_count(), 1);
+    }
 }

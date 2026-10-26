@@ -100,6 +100,7 @@ struct Bloom {
 pub struct PostGpu {
     config: PostConfig,
     parameters: Parameters,
+    output_extent: [u32; 2],
     uniform: wgpu::Buffer,
     state: wgpu::Buffer,
     auto: Option<AutoExposure>,
@@ -354,7 +355,7 @@ impl PostGpu {
         if budget.remaining_bytes < upload {
             return Err(PostError::UploadBudget);
         }
-        let adaptation = match config.exposure {
+        let mut adaptation = match config.exposure {
             Exposure::Automatic {
                 brighten_seconds,
                 darken_seconds,
@@ -362,6 +363,7 @@ impl PostGpu {
             } => [1.0 / 60.0, brighten_seconds, darken_seconds, 0.0],
             Exposure::Manual(_) => [0.0; 4],
         };
+        adaptation[3] = 1.;
         let parameters = Parameters {
             exposure,
             adaptation,
@@ -558,6 +560,7 @@ impl PostGpu {
         Ok(Self {
             config,
             parameters,
+            output_extent: [width, height],
             uniform,
             state,
             auto,
@@ -592,6 +595,32 @@ impl PostGpu {
         self.parameters.adaptation[0] = seconds;
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&self.parameters));
         budget.remaining_bytes -= 64;
+        Ok(64)
+    }
+    /// Display compensation leaves the measured luminance and adaptation state
+    /// intact. A cached scene needs only a new tone pass after this64B update.
+    pub fn compensation(&self) -> f32 {
+        self.parameters.adaptation[3]
+    }
+    pub fn set_compensation(
+        &mut self,
+        queue: &wgpu::Queue,
+        gain: f32,
+        budget: &mut UploadBudget,
+    ) -> Result<u64, PostError> {
+        if !gain.is_finite() || !(0.25..=2.).contains(&gain) {
+            return Err(PostError::InvalidConfig);
+        }
+        if self.compensation() == gain {
+            return Ok(0);
+        }
+        if budget.remaining_bytes < 64 {
+            return Err(PostError::UploadBudget);
+        }
+        self.parameters.adaptation[3] = gain;
+        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&self.parameters));
+        budget.remaining_bytes -= 64;
+        self.output_requested = true;
         Ok(64)
     }
     pub fn needs_redraw(&self, source_revision: u64) -> bool {
@@ -664,6 +693,7 @@ impl PostGpu {
             });
         self.parameters.image[0] = width;
         self.parameters.image[1] = height;
+        self.output_extent = [width, height];
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&self.parameters));
         self.tone_bind = tone_bind(
             device,
@@ -686,6 +716,21 @@ impl PostGpu {
         budget.remaining_bytes -= upload;
         self.invalidate();
         Ok(())
+    }
+    /// The final surface can retain native resolution while HDR inputs shrink.
+    /// This changes only accounting/presentation dirtiness, never GPU resources.
+    pub fn set_output_extent(&mut self, width: u32, height: u32) -> Result<(), PostError> {
+        if width == 0 || height == 0 {
+            return Err(PostError::InvalidConfig);
+        }
+        if self.output_extent != [width, height] {
+            self.output_extent = [width, height];
+            self.output_requested = true;
+        }
+        Ok(())
+    }
+    pub fn output_extent(&self) -> [u32; 2] {
+        self.output_extent
     }
     pub fn pending_work(&self, source_revision: u64) -> PostWork {
         let changed = self.last_source != Some(source_revision);
@@ -710,7 +755,7 @@ impl PostGpu {
         PostWork {
             histogram_samples: histogram,
             bloom_texels: bloom,
-            tone_pixels: u64::from(self.parameters.image[0]) * u64::from(self.parameters.image[1]),
+            tone_pixels: u64::from(self.output_extent[0]) * u64::from(self.output_extent[1]),
             passes: 1
                 + if histogram > 0 { 2 } else { 0 }
                 + u32::from(adapting)
@@ -720,6 +765,58 @@ impl PostGpu {
                     0
                 },
             draws: 1,
+        }
+    }
+    pub fn has_cached_source(&self) -> bool {
+        self.last_source.is_some()
+    }
+    /// Present the retained HDR only. Geometry admission can pause without
+    /// advancing exposure, histogram, bloom or the retained source revision.
+    pub fn present_cached(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        output: &wgpu::TextureView,
+        remaining_pixels: &mut u64,
+    ) -> Result<PostWork, PostError> {
+        if !self.has_cached_source() {
+            return Err(PostError::InvalidConfig);
+        }
+        let pixels = u64::from(self.output_extent[0]) * u64::from(self.output_extent[1]);
+        if pixels > *remaining_pixels {
+            return Err(PostError::WorkBudget);
+        }
+        self.timer.begin();
+        self.encode_output(encoder, output);
+        self.timer.finish(encoder);
+        self.output_requested = false;
+        *remaining_pixels -= pixels;
+        Ok(PostWork {
+            tone_pixels: pixels,
+            passes: 1,
+            draws: 1,
+            ..PostWork::default()
+        })
+    }
+    fn encode_output(&self, encoder: &mut wgpu::CommandEncoder, output: &wgpu::TextureView) {
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("HDR exposure bloom tone output"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: output,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: self.timer.render(5),
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.tone);
+            pass.set_bind_group(0, &self.tone_bind, &[]);
+            pass.draw(0..3, 0..1);
         }
     }
     pub fn encode(
@@ -787,26 +884,7 @@ impl PostGpu {
                 pass.dispatch_workgroups(level.width.div_ceil(8), level.height.div_ceil(8), 1);
             }
         }
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("HDR exposure bloom tone output"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: output,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: self.timer.render(5),
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.tone);
-            pass.set_bind_group(0, &self.tone_bind, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        self.encode_output(encoder, output);
         self.timer.finish(encoder);
         debug_assert_eq!(self.timer.graph().count, work.passes);
         self.adaptation_remaining =
