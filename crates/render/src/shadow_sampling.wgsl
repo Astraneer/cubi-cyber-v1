@@ -34,6 +34,9 @@ fn cascade_shadow(world_position:vec3<f32>,world_normal:vec3<f32>)->f32 {
     let direction=normalize(shadow_sampling.sun.xyz);
     let bias=shadow_sampling.sun.w*(1.+2.*(1.-max(dot(world_normal,direction),0.)));
     for(var cascade=0u;cascade<3u;cascade++) {
+        // Uncommitted layers cannot contribute. Skip before dynamic matrix
+        // access, matching the original inactive-cascade execution path.
+        if (shadow_sampling.params.x&(1u<<cascade))==0u {continue;}
         let p=shadow_sampling.desired_matrices[cascade]*vec4(world_position,1.);
         let edge=max(abs(p.x),abs(p.y));
         if edge>=.96||p.z<0.||p.z>1. {continue;}

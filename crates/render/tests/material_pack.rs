@@ -885,10 +885,17 @@ enum ControlPack {
 // Each control owns a fresh device. Device loss in one execution path cannot
 // contaminate another result, and the original attachment-order test is intact.
 fn attachment_execution_control(pack_mode: ControlPack, gi_mode: ControlGi) {
+    attachment_execution_control_inner(pack_mode, gi_mode, false);
+}
+fn attachment_execution_control_inner(
+    pack_mode: ControlPack,
+    gi_mode: ControlGi,
+    initialize_shadows: bool,
+) {
     let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
     let diagnostics = gpu_diagnostics(&gpu);
     diagnostics.phase.store(
-        100 + pack_mode as u32 * 10 + gi_mode as u32,
+        if initialize_shadows { 200 } else { 100 } + pack_mode as u32 * 10 + gi_mode as u32,
         Ordering::Relaxed,
     );
     eprintln!("MATERIAL_CONTROL_BEGIN pack={pack_mode:?} gi={gi_mode:?} trace_dispatches=0");
@@ -908,7 +915,7 @@ fn attachment_execution_control(pack_mode: ControlPack, gi_mode: ControlGi) {
     )
     .unwrap();
     let mut renderer = terrain(&gpu, original.atlas());
-    let shadows = render::shadows::ShadowGpu::new(
+    let mut shadows = render::shadows::ShadowGpu::new(
         &gpu.device,
         &gpu.queue,
         renderer.geometry(),
@@ -957,6 +964,15 @@ fn attachment_execution_control(pack_mode: ControlPack, gi_mode: ControlGi) {
     } else {
         None
     };
+    if initialize_shadows {
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        let work = shadows.encode(&gpu.queue, &mut encoder);
+        assert!(work.draw_calls > 0);
+        gpu.queue.submit([encoder.finish()]);
+        gpu.device.poll(wgpu::PollType::Wait).unwrap();
+        assert_ne!(shadows.cache().sampling().params[0], 0);
+        eprintln!("MATERIAL_CONTROL_SHADOW_INITIALIZED trace_dispatches=0");
+    }
     if pack_mode != ControlPack::Absent {
         renderer
             .prepare_material_pack(
@@ -1021,4 +1037,13 @@ fn control_disabled_pack_attached_gi_executes_real_fragment() {
 #[test]
 fn control_enabled_pack_attached_gi_executes_one_renderer() {
     attachment_execution_control(ControlPack::Enabled, ControlGi::Attached);
+}
+
+#[test]
+fn control_initialized_shadow_attached_gi_without_pack_executes_real_fragment() {
+    attachment_execution_control_inner(ControlPack::Absent, ControlGi::Attached, true);
+}
+#[test]
+fn control_initialized_shadow_enabled_pack_without_gi_executes_real_fragment() {
+    attachment_execution_control_inner(ControlPack::Enabled, ControlGi::Absent, true);
 }
