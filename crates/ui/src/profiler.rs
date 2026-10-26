@@ -23,6 +23,7 @@ pub struct ProfilerSnapshot {
     pub interval_ns: u64,
     pub cpu_ns: Option<u64>,
     pub gpu_ns: Option<u64>,
+    pub gpu_total_complete: bool,
     pub cpu_stages_ns: [Option<u64>; 8],
     pub gpu_passes_ns: [Option<u64>; 16],
     pub work: WorkCounts,
@@ -43,6 +44,7 @@ impl Default for ProfilerSnapshot {
             interval_ns: 0,
             cpu_ns: None,
             gpu_ns: None,
+            gpu_total_complete: false,
             cpu_stages_ns: [None; 8],
             gpu_passes_ns: [None; 16],
             work: WorkCounts::ZERO,
@@ -75,6 +77,7 @@ impl ProfilerSnapshot {
             interval_ns: last.interval_ns,
             cpu_ns: last.cpu_ns,
             gpu_ns: last.gpu_ns,
+            gpu_total_complete: last.gpu_total_complete,
             cpu_stages_ns: last.cpu_stages_ns,
             gpu_passes_ns: last.gpu_passes_ns,
             work: last.work,
@@ -132,7 +135,15 @@ impl ProfilerSnapshot {
         timing(&mut text, self.measured.then_some(self.interval_ns));
         let _ = write!(text, " · CPU ");
         timing(&mut text, self.cpu_ns);
-        let _ = write!(text, " · GPU ");
+        let _ = write!(
+            text,
+            " · GPU {} ",
+            if self.gpu_total_complete {
+                "команды"
+            } else {
+                "часть"
+            }
+        );
         timing(&mut text, self.gpu_ns);
         p.text(x, y + 19.0, text.as_str(), 0xffe3e5df);
         let column = (panel.w - 16.0) / 3.0;

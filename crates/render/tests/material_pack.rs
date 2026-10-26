@@ -4,6 +4,40 @@ use render::material_pack::{
     self, LayerSource, Limits, MaterialError, MaterialPackGpu, PreparedMaterials,
 };
 use render::terrain_gpu::{AtlasImage, AtlasMip, GpuConfig, TerrainGpu};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU32, Ordering},
+};
+
+struct MaterialGpuDiagnostics {
+    phase: AtomicU32,
+    lost: Mutex<Option<String>>,
+}
+fn gpu_diagnostics(gpu: &render::Gpu) -> Arc<MaterialGpuDiagnostics> {
+    let diagnostics = Arc::new(MaterialGpuDiagnostics {
+        phase: AtomicU32::new(0),
+        lost: Mutex::new(None),
+    });
+    let lost = Arc::clone(&diagnostics);
+    gpu.device.set_device_lost_callback(move |reason, message| {
+        if reason != wgpu::DeviceLostReason::Destroyed {
+            let text = format!(
+                "phase={} reason={reason:?} message={message}",
+                lost.phase.load(Ordering::Relaxed)
+            );
+            eprintln!("MATERIAL_DEVICE_LOST {text}");
+            *lost.lost.lock().unwrap() = Some(text);
+        }
+    });
+    let error = Arc::clone(&diagnostics);
+    gpu.device.on_uncaptured_error(Box::new(move |failure| {
+        panic!(
+            "MATERIAL_GPU_ERROR phase={} {failure}",
+            error.phase.load(Ordering::Relaxed)
+        );
+    }));
+    diagnostics
+}
 
 fn base(size: u32, layers: u32) -> AtlasImage {
     AtlasImage {
@@ -409,6 +443,20 @@ fn terrain(gpu: &render::Gpu, atlas: &AtlasImage) -> TerrainGpu {
     terrain
 }
 fn image(gpu: &render::Gpu, terrain: &mut TerrainGpu) -> Vec<u8> {
+    image_with_diagnostics(gpu, terrain, None)
+}
+fn image_with_diagnostics(
+    gpu: &render::Gpu,
+    terrain: &mut TerrainGpu,
+    diagnostics: Option<&MaterialGpuDiagnostics>,
+) -> Vec<u8> {
+    let phase = diagnostics.map_or(0, |d| d.phase.load(Ordering::Relaxed));
+    if diagnostics.is_some() {
+        eprintln!(
+            "MATERIAL_FRAME_BEGIN phase={phase} adapter={:?}",
+            gpu.adapter.get_info()
+        );
+    }
     let output = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("actual optional material terrain image"),
         size: wgpu::Extent3d {
@@ -473,8 +521,30 @@ fn image(gpu: &render::Gpu, terrain: &mut TerrainGpu) -> Vec<u8> {
     buffer
         .slice(..)
         .map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
-    gpu.device.poll(wgpu::PollType::Wait).unwrap();
-    rx.recv().unwrap().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let result = loop {
+        gpu.device
+            .poll(wgpu::PollType::Poll)
+            .unwrap_or_else(|error| panic!("MATERIAL_POLL_FAILED phase={phase} {error:?}"));
+        match rx.try_recv() {
+            Ok(result) => break result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(error) => panic!("MATERIAL_MAP_CHANNEL_FAILED phase={phase} {error:?}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "MATERIAL_READBACK_TIMEOUT phase={phase} device_lost={:?}",
+            diagnostics.and_then(|d| d.lost.lock().unwrap().clone())
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    result.unwrap_or_else(|error| {
+        panic!(
+            "MATERIAL_READBACK_FAILED phase={phase} map={error:?} adapter={:?} device_lost={:?}",
+            gpu.adapter.get_info(),
+            diagnostics.and_then(|d| d.lost.lock().unwrap().clone())
+        )
+    });
     let result = buffer
         .slice(..)
         .get_mapped_range()
@@ -482,6 +552,9 @@ fn image(gpu: &render::Gpu, terrain: &mut TerrainGpu) -> Vec<u8> {
         .flat_map(|line| line[..384].iter().copied())
         .collect();
     buffer.unmap();
+    if diagnostics.is_some() {
+        eprintln!("MATERIAL_FRAME_COMPLETE phase={phase}");
+    }
     result
 }
 #[test]
@@ -617,6 +690,7 @@ fn local_materials_and_light_gi_attachments_preserve_each_other_in_either_order(
         let gpu = render::Gpu::request(&render::instance(), None, true)
             .await
             .expect("software Vulkan required");
+        let diagnostics = gpu_diagnostics(&gpu);
         let original = PreparedMaterials::prepare(&base(4, 4), &[], 0, Limits::default()).unwrap();
         let normal = png(4, 1, png::ColorType::Rgba, &[145, 155, 255, 255]);
         let spec = png(4, 1, png::ColorType::Rgba, &[64, 10, 0, 255]);
@@ -677,6 +751,7 @@ fn local_materials_and_light_gi_attachments_preserve_each_other_in_either_order(
             &mut render::terrain_gpu::UploadBudget::new(1_000_000),
         )
         .unwrap();
+        eprintln!("MATERIAL_GI_PIPELINES_READY trace_dispatches=0");
         first
             .prepare_material_pack(
                 &gpu.device,
@@ -704,8 +779,13 @@ fn local_materials_and_light_gi_attachments_preserve_each_other_in_either_order(
                 .set_material_view(&gpu.queue, [27.0, 21.0, 30.0], 0)
                 .unwrap();
         }
-        let expected = image(&gpu, &mut first);
-        assert_eq!(image(&gpu, &mut second), expected);
+        diagnostics.phase.store(1, Ordering::Relaxed);
+        let expected = image_with_diagnostics(&gpu, &mut first, Some(&diagnostics));
+        diagnostics.phase.store(2, Ordering::Relaxed);
+        assert_eq!(
+            image_with_diagnostics(&gpu, &mut second, Some(&diagnostics)),
+            expected
+        );
         let reserved_spec = png(4, 1, png::ColorType::Rgba, &[64, 244, 0, 255]);
         let reserved_prepared = PreparedMaterials::prepare(
             original.atlas(),
@@ -735,7 +815,11 @@ fn local_materials_and_light_gi_attachments_preserve_each_other_in_either_order(
                 true,
             )
             .unwrap();
-        assert_eq!(image(&gpu, &mut first), expected);
+        diagnostics.phase.store(3, Ordering::Relaxed);
+        assert_eq!(
+            image_with_diagnostics(&gpu, &mut first, Some(&diagnostics)),
+            expected
+        );
         assert_eq!(first.take_work().pipeline_compilations, 0);
     });
 }
