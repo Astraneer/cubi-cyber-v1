@@ -48,6 +48,189 @@ fn drive(owner: &mut Owner, w: &World, idx: &HeightEditIndex, tick: &mut u64) {
     }
 }
 #[test]
+fn durable_machine_emission_and_contents_do_not_revoke_or_rebuild_cold_projection() {
+    use core_types::{ChannelMask, ComponentId};
+    use server::height_authority::{Config, HeightAuthority};
+    let position = BlockPos {
+        space: SpaceId(0),
+        x: 2,
+        y: 82,
+        z: 2,
+    };
+    let mut world = World::new(rules::properties, 128);
+    let mut cells = vec![Cell::AIR; 4096];
+    cells[position.local_index().get() as usize] =
+        Cell::from_parts(rules::ids::ENERGIZED_SMELTER, 0);
+    let mut tx = Transaction::new(Tick(1), SpaceId(0));
+    tx.create_page(position.page(), cells);
+    world.commit(tx).unwrap();
+    let mut height = HeightAuthority::new(Config::default()).unwrap();
+    let mut owner = owner(Limits::default());
+    let mut tick = 1;
+    owner.interest(1, position.page(), Tick(tick)).unwrap();
+    drive(&mut owner, &world, height.index(), &mut tick);
+    let head = owner.head(position.page(), &world, height.index()).unwrap();
+    let channels = ChannelMask::SHAPE | ChannelMask::OPACITY | ChannelMask::FLUID;
+    let geometry_input = world.input_version(position.page(), channels);
+    let old_hid = height
+        .index()
+        .source(server::height_index::TileKey {
+            space: position.space,
+            level: 0,
+            x: 0,
+            z: 0,
+        })
+        .unwrap();
+    // These are the exact actual Cell transitions produced by machine phase
+    // ActiveView publication. Run their real World and durable HID paths.
+    for lit in [true, false, true, false] {
+        tick += 1;
+        let mut tx = Transaction::new(Tick(tick), SpaceId(0));
+        tx.set_cell(
+            position,
+            Cell::from_parts(
+                rules::ids::ENERGIZED_SMELTER,
+                if lit { rules::blocks::ST_LIT } else { 0 },
+            ),
+        );
+        let change = world.commit(tx).unwrap();
+        assert_eq!(change.cells.len(), 1);
+        assert_eq!(change.channels, ChannelMask::EMISSION);
+        assert_eq!(
+            world.input_version(position.page(), channels),
+            geometry_input
+        );
+        let plan = height
+            .plan_batch(std::slice::from_ref(&change))
+            .unwrap()
+            .unwrap();
+        height.apply_after_durable(plan).unwrap();
+        owner.observe(std::slice::from_ref(&change), Tick(tick));
+        assert_eq!(
+            owner.head(position.page(), &world, height.index()),
+            Some(head),
+            "an unread resident HID row cannot revoke the public column"
+        );
+        let work = owner
+            .pump(&world, height.index(), Tick(tick), 2, 2)
+            .unwrap();
+        assert_eq!(
+            (work.submitted, work.completed, work.generated_columns),
+            (0, 0, 0)
+        );
+    }
+    assert!(
+        height
+            .index()
+            .source(server::height_index::TileKey {
+                space: position.space,
+                level: 0,
+                x: 0,
+                z: 0,
+            })
+            .unwrap()
+            > old_hid,
+        "broad private Height sources really advanced"
+    );
+    tick += 1;
+    let mut tx = Transaction::new(Tick(tick), SpaceId(0));
+    tx.set_component(
+        ComponentId(1),
+        world::ComponentData {
+            anchor: position,
+            kind: 7,
+            payload: vec![3, 4, 5],
+        },
+        ChannelMask::CONTENTS,
+    );
+    let change = world.commit(tx).unwrap();
+    assert!(change.cells.is_empty());
+    assert!(
+        height
+            .plan_batch(std::slice::from_ref(&change))
+            .unwrap()
+            .is_none()
+    );
+    owner.observe(&[change], Tick(tick));
+    assert_eq!(
+        owner.head(position.page(), &world, height.index()),
+        Some(head)
+    );
+    let scope = telemetry::AllocationScope::begin().unwrap();
+    for _ in 0..1000 {
+        tick += 1;
+        let work = owner
+            .pump(&world, height.index(), Tick(tick), 2, 2)
+            .unwrap();
+        assert_eq!(
+            (work.submitted, work.completed, work.generated_columns),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            owner.head(position.page(), &world, height.index()),
+            Some(head)
+        );
+    }
+    let counts = scope.finish();
+    assert_eq!(counts.allocating_calls(), 0);
+    assert_eq!(counts.dealloc_calls, 0);
+    // A true resident geometry edit still revokes the certificate and schedules
+    // the bounded worker; there is no relaxation of source/materialization.
+    let mut tx = Transaction::new(Tick(tick + 1), SpaceId(0));
+    tx.set_cell(position, Cell::AIR);
+    let change = world.commit(tx).unwrap();
+    let plan = height
+        .plan_batch(std::slice::from_ref(&change))
+        .unwrap()
+        .unwrap();
+    height.apply_after_durable(plan).unwrap();
+    owner.observe(&[change], Tick(tick + 1));
+    assert!(
+        owner
+            .head(position.page(), &world, height.index())
+            .is_none()
+    );
+    assert!(owner.stats().queued > 0);
+    let key = ColumnKey { x: 0, z: 0 };
+    let snapshot = server::cold_projection::ColumnSnapshot::capture(
+        &world,
+        height.index(),
+        key,
+        Default::default(),
+    )
+    .unwrap();
+    let cold_edit = CellEdit {
+        position: BlockPos {
+            space: SpaceId(0),
+            x: 17,
+            y: 2,
+            z: 1,
+        },
+        cell: Cell::AIR,
+    };
+    assert!(world.page(cold_edit.position.page()).is_none());
+    let delta = HeightEditIndex::encode_delta(TxId(height.last_tx().0 + 1), &[cold_edit]).unwrap();
+    height.apply_encoded_delta(&delta).unwrap();
+    assert!(
+        !snapshot.certificate().matches(&world, height.index()),
+        "a cold page still depends on its exact saved override rows"
+    );
+    let snapshot = server::cold_projection::ColumnSnapshot::capture(
+        &world,
+        height.index(),
+        key,
+        Default::default(),
+    )
+    .unwrap();
+    let mut tx = Transaction::new(Tick(tick + 2), SpaceId(0));
+    tx.create_page(cold_edit.position.page(), vec![Cell::AIR; 4096]);
+    world.commit(tx).unwrap();
+    assert!(
+        !snapshot.certificate().matches(&world, height.index()),
+        "cold materialization must still invalidate even for equal AIR"
+    );
+}
+#[test]
 fn public_heads_and_independent_water_versions_survive_materialization_and_halo_only_edits() {
     let mut w = World::new(rules::properties, 128);
     let mut idx = index();

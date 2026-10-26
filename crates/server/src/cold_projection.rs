@@ -92,6 +92,7 @@ pub struct Certificate {
     pub column: ColumnKey,
     sources: [Source; SOURCE_PAGES],
     indices: [(TileKey, u64); 9],
+    cold_body_sources: [u64; SOURCE_PAGES],
     geometry_edits: [u64; 8],
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,16 +118,15 @@ impl Certificate {
     }
     pub fn matches(&self, world: &World, index: &HeightEditIndex) -> bool {
         index.is_ready()
-            && self
-                .indices
-                .iter()
-                .all(|&(key, version)| index.source(key) == Ok(version))
-            && self.sources.iter().all(|source| {
+            && self.sources.iter().enumerate().all(|(i, source)| {
                 let present = world.page(source.input.page).is_some();
                 present == (source.kind == Kind::Resident)
                     && world.sampled_input_version(source.input.page, CHANNELS, source.input.region)
                         == source.input.version
                     && (source.kind != Kind::Cold || world.page_version(source.input.page).0 == 0)
+                    && (source.kind != Kind::Cold
+                        || index.body_page_source(source.input.page)
+                            == Ok(self.cold_body_sources[i]))
             })
     }
     pub fn inputs(&self) -> impl Iterator<Item = SampledPageInput> + '_ {
@@ -280,6 +280,17 @@ impl ColumnSnapshot {
         }
         let edits: [TileEdits; 9] = captured.try_into().map_err(|_| Error::Encoding)?;
         let indices = std::array::from_fn(|i| (edits[i].key, edits[i].source));
+        // Only cold pages consume the indexed rows. Resident sources are
+        // immutable World snapshots guarded by the sampled geometry channels;
+        // a resident emission-only edit must not invalidate the whole column.
+        let mut cold_body_sources = [0; SOURCE_PAGES];
+        for (i, source) in sources.iter().enumerate() {
+            if source.kind == Kind::Cold {
+                cold_body_sources[i] = index
+                    .body_page_source(source.input.page)
+                    .map_err(|_| Error::IndexNotReady)?;
+            }
+        }
         let mut geometry_edits = [0; 8];
         for source in &edits[4].columns {
             if source.x.div_euclid(16) != column.x || source.z.div_euclid(16) != column.z {
@@ -298,6 +309,7 @@ impl ColumnSnapshot {
                 column,
                 sources,
                 indices,
+                cold_body_sources,
                 geometry_edits,
             },
             pages,

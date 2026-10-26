@@ -23,6 +23,66 @@ fn key(level: u8, x: i32, z: i32) -> TileKey {
     }
 }
 #[test]
+fn exact_body_page_stamps_survive_nonmax_air_reverts_and_reopen_with_existing_cell_bound() {
+    let limits = IndexLimits {
+        max_cells: 3,
+        ..IndexLimits::default()
+    };
+    let mut index = HeightEditIndex::new(limits).unwrap();
+    let a = edit(2, 1, 2, 3);
+    let b = edit(3, 2, 3, 3);
+    let c = edit(2, 18, 2, 3);
+    assert_eq!(index.body_page_source(a.position.page()), Ok(0));
+    assert_eq!(
+        index.apply_committed(TxId(0), &[a]),
+        Err(IndexError::InvalidTransaction)
+    );
+    index.apply_committed(TxId(1), &[a]).unwrap();
+    index.apply_committed(TxId(2), &[b]).unwrap();
+    index.apply_committed(TxId(3), &[c]).unwrap();
+    assert_eq!(index.body_page_source(a.position.page()), Ok(2));
+    assert_eq!(index.body_page_source(c.position.page()), Ok(3));
+    // Replace the older/non-max row with AIR. AIR is retained, not erased;
+    // the last mutation stamp must advance despite the other newer row.
+    let air = CellEdit {
+        cell: Cell::AIR,
+        ..a
+    };
+    index.apply_committed(TxId(4), &[air]).unwrap();
+    assert_eq!(index.body_page_source(a.position.page()), Ok(4));
+    assert_eq!(index.body_page_source(c.position.page()), Ok(3));
+    assert_eq!(index.get(a.position).unwrap().cell, Cell::AIR);
+    assert_eq!(index.cell_count(), 3);
+    assert_eq!(
+        index.body_page_stamp_bytes(),
+        2 * (std::mem::size_of::<core_types::PageId>() + 8)
+    );
+    let bytes = index.encode_snapshot().unwrap();
+    let restored = HeightEditIndex::decode_snapshot(&bytes, limits).unwrap();
+    assert_eq!(restored.body_page_source(a.position.page()), Ok(4));
+    assert_eq!(restored.body_page_source(c.position.page()), Ok(3));
+    assert_eq!(
+        restored.body_page_stamp_bytes(),
+        index.body_page_stamp_bytes()
+    );
+    assert_eq!(
+        restored.encode_snapshot().unwrap(),
+        bytes,
+        "no persisted schema change"
+    );
+    let mut restored = restored;
+    restored.apply_committed(TxId(5), &[]).unwrap();
+    assert_eq!(restored.body_page_source(a.position.page()), Ok(4));
+    assert_eq!(
+        restored.apply_committed(TxId(6), &[edit(2, 34, 2, 3)]),
+        Err(IndexError::Capacity)
+    );
+    assert_eq!(
+        restored.body_page_stamp_bytes(),
+        index.body_page_stamp_bytes()
+    );
+}
+#[test]
 fn air_overrides_survive_snapshot_and_deltas_touch_only_actual_ancestors() {
     let mut index = HeightEditIndex::new(IndexLimits::default()).unwrap();
     let far = key(9, 1, 0);

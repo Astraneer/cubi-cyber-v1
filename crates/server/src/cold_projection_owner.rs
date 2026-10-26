@@ -121,7 +121,6 @@ pub struct Stats {
 struct PageHead {
     head: Head,
     water_view: u64,
-    column_source: u64,
 }
 struct Column {
     registration: u64,
@@ -795,18 +794,13 @@ impl Owner {
                 next += 1;
                 id
             };
-            let column_source = body.certificate.index_sources()[4].1;
             if old.is_some_and(|old| old.head != head) {
                 self.changed_geometry.insert(page);
             }
             if old.is_some_and(|old| old.water_view != water_view) {
                 self.changed_water.insert(page);
             }
-            column.heads[i] = Some(PageHead {
-                head,
-                water_view,
-                column_source,
-            });
+            column.heads[i] = Some(PageHead { head, water_view });
             self.witnesses.insert(page, body.pages[i].witness);
         }
         column.certificate = Some(Arc::clone(&body.certificate));
@@ -855,7 +849,18 @@ impl Owner {
         let result = WaterBody {
             head,
             water_view: metadata.water_view,
-            column_source: metadata.column_source,
+            // The body is current under its selective input certificate. The
+            // private Height envelope may have advanced for a resident-only
+            // emission edit, even while all public bytes/IDs remain identical.
+            // Keep publish_projected's current-private-envelope check strict.
+            column_source: index
+                .source(crate::height_index::TileKey {
+                    space: page.space,
+                    level: 0,
+                    x: page.x,
+                    z: page.z,
+                })
+                .ok()?,
             cells: Arc::clone(&body.pages[page.y as usize].cells),
             tints: body.tints,
         };

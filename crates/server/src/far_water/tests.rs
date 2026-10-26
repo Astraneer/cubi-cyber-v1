@@ -81,6 +81,145 @@ fn build(owner: &mut Owner, world: &World, now: Tick) -> Box<net::water::WaterHa
     owner.publish(ready, now).unwrap()
 }
 #[test]
+fn projected_water_refreshes_private_height_envelope_without_rebuilding_public_body() {
+    use crate::{cold_projection_owner as projection, height_authority, height_heads};
+    use gen_authority::{PrivateSeed, ServerGenerator};
+    use net::height::{GeometryStamp, HeightKey, HeightTile, Replacement};
+    use std::sync::Arc;
+    let at = b(2, 82, 2);
+    let mut world = World::new(rules::properties, 128);
+    let mut cells = vec![Cell::AIR; 4096];
+    cells[usize::from(at.local_index().get())] = Cell::from_parts(rules::ids::ENERGIZED_SMELTER, 0);
+    let mut tx = Transaction::new(Tick(1), SpaceId(0));
+    tx.create_page(at.page(), cells);
+    world.commit(tx).unwrap();
+    let mut height = height_authority::HeightAuthority::new(Default::default()).unwrap();
+    let mut projection = projection::Owner::new(
+        Arc::new(ServerGenerator::new(
+            r#gen::TerrainSeed(1),
+            PrivateSeed::new([37; 32]),
+        )),
+        Default::default(),
+    )
+    .unwrap();
+    for y in 0..8 {
+        projection.interest(1, p(0, y, 0), Tick(1)).unwrap();
+    }
+    let mut tick = 1;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while projection.stats().queued != 0 || projection.stats().running != 0 {
+        tick += 1;
+        projection
+            .pump(&world, height.index(), Tick(tick), 2, 2)
+            .unwrap();
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_micros(100));
+    }
+    let prior = projection.water(at.page(), &world, height.index()).unwrap();
+    let mut known = [255; 37];
+    known[36] = 1;
+    let mut image = HeightTile {
+        key: HeightKey {
+            space: 0,
+            level: 0,
+            x: 0,
+            z: 0,
+        },
+        source: 1,
+        error: None,
+        heights: [8; 289],
+        known,
+        atlas: [3; 256],
+        tint: [u32::MAX; 256],
+        protected: [255; 32],
+        replacement: Replacement::Column {
+            min_y: 0,
+            max_y: 7,
+            geometry: (0..8)
+                .map(|y| {
+                    let page = p(0, y, 0);
+                    let head = projection.head(page, &world, height.index()).unwrap();
+                    GeometryStamp {
+                        page,
+                        source: head.source,
+                        view: head.view,
+                    }
+                })
+                .collect(),
+        },
+    };
+    let mut heads = height_heads::HeightHeads::new(Default::default()).unwrap();
+    let public = heads.publish(1, prior.column_source, &mut image).unwrap();
+    let request = Request {
+        page: at.page(),
+        geometry_source: prior.head.source,
+        geometry_view: prior.head.view,
+        column_source: public,
+        acknowledged: None,
+    };
+    let mut water = owner(1, 1);
+    water.begin_tick(Tick(tick));
+    water.request(1, request, Tick(tick)).unwrap();
+    let (key, request) = water.next_request().unwrap();
+    assert!(
+        water
+            .publish_projected(key, request, prior.clone(), prior.column_source)
+            .unwrap()
+            .is_some()
+    );
+    tick += 1;
+    let mut tx = Transaction::new(Tick(tick), SpaceId(0));
+    tx.set_cell(
+        at,
+        Cell::from_parts(rules::ids::ENERGIZED_SMELTER, rules::blocks::ST_LIT),
+    );
+    let change = world.commit(tx).unwrap();
+    assert_eq!(change.channels, core_types::ChannelMask::EMISSION);
+    let plan = height
+        .plan_batch(std::slice::from_ref(&change))
+        .unwrap()
+        .unwrap();
+    height.apply_after_durable(plan).unwrap();
+    projection.observe(&[change], Tick(tick));
+    let fresh = projection.water(at.page(), &world, height.index()).unwrap();
+    assert!(fresh.column_source > prior.column_source);
+    assert!(
+        Arc::ptr_eq(&fresh.cells, &prior.cells),
+        "same immutable public body reused"
+    );
+    assert_eq!(
+        (fresh.head, fresh.water_view),
+        (prior.head, prior.water_view)
+    );
+    assert_eq!(
+        heads.publish(1, fresh.column_source, &mut image).unwrap(),
+        public
+    );
+    let private = heads.private_source(1, image.key).unwrap();
+    water.begin_tick(Tick(tick));
+    water.request(1, request, Tick(tick)).unwrap();
+    let (key, request) = water.next_request().unwrap();
+    assert!(
+        matches!(
+            water.publish_projected(key, request, prior, private),
+            Err(super::capture::Error::MissingCenter)
+        ),
+        "the old private envelope still fails closed"
+    );
+    let halo = water
+        .publish_projected(key, request, fresh, private)
+        .unwrap()
+        .unwrap();
+    assert_eq!(halo.column_source, public);
+    let work = projection
+        .pump(&world, height.index(), Tick(tick), 2, 2)
+        .unwrap();
+    assert_eq!(
+        (work.submitted, work.completed, work.generated_columns),
+        (0, 0, 0)
+    );
+}
+#[test]
 fn fair_bounded_coalescing_and_per_tick_work_survive_one_busy_low_peer() {
     let mut owner = owner(4, 2);
     for connection in 1..=4 {

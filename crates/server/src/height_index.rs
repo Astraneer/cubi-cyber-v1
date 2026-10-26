@@ -111,6 +111,12 @@ pub struct HeightEditIndex {
     limits: IndexLimits,
     columns: BTreeMap<(SpaceId, u64), Column>,
     stamps: BTreeMap<TileKey, u64>,
+    // Derived exact canonical body stamps, never serialized. Every row remains
+    // retained (including AIR/reverts), so entries are bounded by max_cells.
+    // Runtime writes use globally increasing TxIds; legacy writes cannot be
+    // observed until readiness is restored. No projection certificate survives
+    // a restart, where insert_cell reconstructs these stamps from saved rows.
+    body_page_stamps: BTreeMap<PageId, u64>,
     cells: usize,
     // Equal Cell+TxId runs along Y. Maintained from changed adjacent edges only;
     // the WAL preflight must never serialize or scan the cold index.
@@ -136,6 +142,7 @@ impl HeightEditIndex {
             limits,
             columns: BTreeMap::new(),
             stamps: BTreeMap::new(),
+            body_page_stamps: BTreeMap::new(),
             cells: 0,
             runs: 0,
             last_tx: TxId(0),
@@ -190,6 +197,24 @@ impl HeightEditIndex {
             return Err(IndexError::MissingIndex);
         }
         Ok(self.stamps.get(&key).copied().unwrap_or(1))
+    }
+    /// Exact half-open canonical page body; neighbouring sample columns and
+    /// other Y pages do not change this stamp. Projection callers consult it
+    /// only for cold pages, whose actual cells come from these saved rows.
+    /// Lookup is O(log indexed pages), with no row traversal or allocation.
+    pub fn body_page_source(&self, page: PageId) -> Result<u64, IndexError> {
+        if page.space != SpaceId(0) || !(0..8).contains(&page.y) {
+            return Err(IndexError::InvalidTile);
+        }
+        if !self.ready {
+            return Err(IndexError::MissingIndex);
+        }
+        Ok(self.body_page_stamps.get(&page).copied().unwrap_or(0))
+    }
+    /// Logical key/value bytes; BTreeMap allocator/node overhead is excluded.
+    /// The number of entries never exceeds the existing indexed-cell limit.
+    pub fn body_page_stamp_bytes(&self) -> usize {
+        self.body_page_stamps.len() * (std::mem::size_of::<PageId>() + std::mem::size_of::<u64>())
     }
     pub fn get(&self, p: BlockPos) -> Option<IndexedCell> {
         let (cell, source_tx) = *self
@@ -339,6 +364,11 @@ impl HeightEditIndex {
         self.runs = self.runs + added + old_edges - new_edges;
         self.cells += added;
         column.cells.insert(p.y, value);
+        let page = p.page();
+        if page.space == SpaceId(0) && (0..8).contains(&page.y) {
+            let stamp = self.body_page_stamps.entry(page).or_default();
+            *stamp = (*stamp).max(tx.0);
+        }
     }
     /// Missing-index legacy worlds remain explicitly unavailable until every saved
     /// page was compared to canonical server baseline in a background worker.
