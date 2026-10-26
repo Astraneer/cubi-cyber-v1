@@ -47,7 +47,9 @@ impl Directory {
     fn config(&self) -> ServerConfig {
         let mut c = ServerConfig::new(&self.0);
         c.generation_enabled = false;
-        c.spawn_override = Some([2.5, 1., 8.5]);
+        // Observe both transporters from their open side. From x=2.5 the
+        // Smelter correctly occludes the first pipe under the privacy policy.
+        c.spawn_override = Some([10.5, 1., 8.5]);
         c
     }
 }
@@ -294,6 +296,15 @@ fn two_actual_udp_connections_render_durable_charged_packet_and_remove_it_after_
                 .iter()
                 .all(|b| b.connection.replica().page(p(10).page()).is_some())
         {
+            for bot in &bots {
+                for x in 10..=11 {
+                    let raw = bot.connection.replica().read(p(x));
+                    assert!(
+                        matches!(raw, net::ReplicaRead::Known(cell) if cell.id() == LOGISTICAL_TRANSPORTER),
+                        "fixture transporter {x} must be visible in the observer's actual Raw body: {raw:?}"
+                    );
+                }
+            }
             let mut m =
                 server::machines::read_machine(runtime.server().world(), ComponentId(1)).unwrap();
             m.eject = true;
