@@ -483,3 +483,41 @@ fn aimed_actions_reject_nonfinite_or_out_of_range_angles() {
         );
     }
 }
+
+#[test]
+fn unchanged_public_cells_hide_private_revisions_and_repair_the_same_header() {
+    let mut history = ViewHistory::new(1, 4);
+    let cells = Box::new([Cell::from_raw(3); PAGE_VOLUME]);
+    let first = history
+        .build(page(0), Version(9), cells.clone(), false)
+        .unwrap()
+        .unwrap();
+    let PageUpdate::Snapshot(first) = first else {
+        panic!("initial image")
+    };
+    assert!(history.acknowledge(page(0), first.version));
+    assert!(
+        history
+            .build(page(0), Version(500), cells.clone(), false)
+            .unwrap()
+            .is_none()
+    );
+    let repair = history
+        .build(page(0), Version(500), cells.clone(), true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(repair, PageUpdate::Snapshot(first.clone()));
+    assert_eq!(history.latest_page(page(0)), Some(&first));
+    let mut visible = cells;
+    visible[7] = Cell::AIR;
+    let changed = history
+        .build(page(0), Version(501), visible, false)
+        .unwrap()
+        .unwrap();
+    let PageUpdate::Delta(changed) = changed else {
+        panic!("visible delta")
+    };
+    assert_eq!(changed.base, first.version);
+    assert_eq!(changed.source_version, Version(501));
+    assert_eq!(changed.changes, [(7, Cell::AIR)]);
+}

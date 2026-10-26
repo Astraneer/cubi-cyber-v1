@@ -133,6 +133,10 @@ impl ViewHistory {
             next_version: 1,
         }
     }
+    /// Most recently admitted public image, independent of acknowledgement.
+    pub fn latest_page(&self, page: PageId) -> Option<&PageSnapshot> {
+        self.pages.get(&page)?.back()
+    }
     pub fn confirmed_page(&self, page: PageId) -> Option<&PageSnapshot> {
         let version = self.confirmed_version(page)?;
         self.pages
@@ -186,7 +190,9 @@ impl ViewHistory {
         let history = self.pages.get_mut(&page).expect("inserted");
         if history
             .back()
-            .is_none_or(|old| old.cells != cells || old.source_version != source_version)
+            // Private input revisions alone cannot create a public image or
+            // reveal hidden edits through an empty delta and its source stamp.
+            .is_none_or(|old| old.cells != cells)
         {
             let version = self.next_version;
             self.next_version = self
@@ -223,7 +229,7 @@ impl ViewHistory {
                 page,
                 base: base.version,
                 version: latest.version,
-                source_version,
+                source_version: latest.source_version,
                 changes,
             };
             let delta_bytes = encode_server(&ServerMessage::Page(PageUpdate::Delta(delta.clone())))
