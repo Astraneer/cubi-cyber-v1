@@ -14,7 +14,7 @@ class PackageTests(TestCase):
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temp:
             directory = Path(temp)
-            for name in ("client-native", "server", "examples/benchmark", "identity", "saves/world"):
+            for name in ("client-native", "server", "examples/benchmark", "examples/replay", "identity", "saves/world"):
                 path = directory / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"\x7fELF-test")

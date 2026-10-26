@@ -32,5 +32,5 @@ struct FragmentOut{@location(0)color:vec4<f32>,@builtin(frag_depth)depth:f32};
         }
         let crossing=min(next.x,min(next.y,next.z));if crossing>exit {record_trace(steps,false,false);discard;}t=crossing;var advanced=false;for(var axis=0u;axis<3u;axis++){if next[axis]<=crossing+0.000001 {cell[axis]+=stride[axis];next[axis]+=delta[axis];if !advanced {normal=vec3(0.);normal[axis]=-f32(stride[axis]);advanced=true;}}}if any(cell<vec3(0))||any(cell>=vec3(16)){record_trace(steps,false,false);discard;}
     }
-    record_trace(46u,false,true);discard;
+    record_trace(46u,false,true);discard;return FragmentOut(vec4(0.0),0.0);
 }

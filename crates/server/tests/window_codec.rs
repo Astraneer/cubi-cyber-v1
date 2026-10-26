@@ -46,6 +46,52 @@ fn binding_tail_preserves_the_exact_wnd1_prefix_and_legacy_owner_state() {
     assert_eq!(BoundWindow::decode(&plain.encode()).unwrap(), plain);
 }
 #[test]
+fn sparse_owned_payload_precedes_binding_and_survives_cursor_and_craft_moves() {
+    let mut inventory = rules::survival::Inventory::empty();
+    let tagged = rules::stack::ItemStack::new(rules::items::I_ENERGY_TABLET, 1)
+        .unwrap()
+        .with_payload(rules::item_payload::PayloadId(99))
+        .unwrap();
+    inventory.set_trusted(0, tagged).unwrap();
+    let mut state = ui::WindowState::open(3, ui::WindowKind::Inventory, &[]).unwrap();
+    for slot in [0, 100] {
+        let p = state
+            .plan_click(
+                &inventory,
+                state.guard(&inventory),
+                ui::Click {
+                    slot,
+                    right: false,
+                    shift: false,
+                },
+            )
+            .unwrap();
+        p.apply(&mut state, &mut inventory).unwrap();
+        let window = BoundWindow {
+            state: state.clone(),
+            binding: None,
+        };
+        let raw = window.encode();
+        assert_eq!(BoundWindow::decode(&raw).unwrap(), window);
+        assert_eq!(&raw[407..411], b"XRF1");
+        let (decoded, used) = ui::WindowState::decode_prefix(&raw).unwrap();
+        assert_eq!(decoded, state);
+        assert_eq!(used, 423);
+        assert_eq!(&raw[used..used + 4], b"WBD1");
+    }
+    assert_eq!(state.craft().get(0, 0).unwrap(), tagged);
+    assert!(
+        state
+            .result(&rules::crafting::RecipeBook::standard().unwrap())
+            .is_empty()
+    );
+    let close = state
+        .plan_close(&inventory, state.guard(&inventory))
+        .unwrap();
+    close.apply(&mut state, &mut inventory).unwrap();
+    assert_eq!(inventory.get(0).unwrap(), tagged);
+}
+#[test]
 fn binding_codec_rejects_truncation_tails_bad_flags_coordinates_and_cross_space() {
     let original = bound().encode();
     for end in 1..original.len() {

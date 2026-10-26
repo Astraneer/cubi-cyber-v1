@@ -1,8 +1,10 @@
 //! Thin native window/input shell; shared client owns world, budgets and camera.
 mod flight;
+mod loading;
+mod product_ui;
 mod remote_transport;
 use client::view::{ClientView, InputKey};
-use render::terrain_gpu::{AtlasImage, TerrainGpu, UploadBudget};
+use render::terrain_gpu::UploadBudget;
 use std::{
     sync::{
         Arc,
@@ -25,8 +27,9 @@ static ALLOCATOR: telemetry::CountingAllocator<std::alloc::System> =
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SceneMode {
     Sky,
-    #[default]
     Forest,
+    #[default]
+    Product,
 }
 #[derive(Clone)]
 struct ConnectOptions {
@@ -49,7 +52,7 @@ impl RemoteNative {
         })?;
         let hello = remote_transport::load_identity(&options.identity)?.unwrap_or(net::Hello {
             identity: net::PlayerId::default(),
-            name: options.name,
+            name: options.name.clone(),
             credential: None,
         });
         session
@@ -94,8 +97,8 @@ struct NativeState {
     gpu: render::Gpu,
     sky: render::SkyRenderer,
     mode: SceneMode,
-    view: Option<ClientView>,
-    loading: Option<mpsc::Receiver<Result<TerrainGpu, String>>>,
+    view: Option<Box<ClientView>>,
+    loading: Option<mpsc::Receiver<Result<Box<ClientView>, String>>>,
     loading_thread: Option<std::thread::JoinHandle<()>>,
     workers: Option<jobs::NativePool<client::SceneTask, client::SceneOutput>>,
     // The history is 43 KiB. Keeping it inline duplicates that storage across
@@ -112,15 +115,161 @@ struct NativeState {
     flight: flight::NativeFlight,
     in_flight: Arc<AtomicU32>,
     drawable: bool,
-    legacy_gpu_greedy: bool,
+    product: Option<Box<product_ui::ProductUi>>,
+    ui_loading: Option<mpsc::Receiver<Result<Box<product_ui::Prepared>, String>>>,
+    ui_loading_thread: Option<std::thread::JoinHandle<()>>,
+    ui_pending: bool,
+    last_profiler: Instant,
+    pointer: [f32; 2],
+    raster: client::view::NearRasterization,
+    quit_requested: bool,
+    ime_allowed: bool,
 }
 impl NativeState {
+    fn poll_product_loading(&mut self) -> Result<(), String> {
+        let Some(receiver) = &self.ui_loading else {
+            return Ok(());
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(_) => return Err("UI loading worker stopped".into()),
+        };
+        let mut product = product_ui::ProductUi::from_prepared(*result?);
+        if let Some(remote) = &self.remote {
+            product.layer.app.name = remote.name.clone();
+            product.connecting();
+        }
+        if let Some(view) = self.view.as_deref_mut() {
+            let applied = view.apply_settings(&product.layer.app.settings);
+            product
+                .layer
+                .app
+                .set_pending_settings(applied.pending_render);
+            product.apply_local(&self.gpu.device, &self.gpu.queue, view)?;
+        }
+        self.product = Some(product);
+        self.ui_loading = None;
+        if let Some(thread) = self.ui_loading_thread.take() {
+            thread.join().map_err(|_| "UI loading worker panicked")?;
+        }
+        Ok(())
+    }
+    fn drain_product(&mut self) -> Result<(), String> {
+        let now = self
+            .network_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        if let Some(product) = &mut self.product {
+            product.drain(
+                self.view.as_deref_mut(),
+                self.remote.as_mut().map(|r| r.session.connection_mut()),
+                now,
+            );
+        }
+        while let Some(command) = self.product.as_mut().and_then(|p| p.take_command()) {
+            match command {
+                product_ui::Command::Capture(capture) => self.capture(capture),
+                product_ui::Command::Disconnect => {
+                    self.remote = None;
+                    self.capture(false);
+                    if let Some(view) = self.view.as_deref_mut() {
+                        view.clear_keys();
+                    }
+                    if let Some(product) = &mut self.product {
+                        product.disconnected("");
+                    }
+                }
+                product_ui::Command::Connect { address, name } => {
+                    if let Err(error) = self.connect_product(address, name)
+                        && let Some(product) = &mut self.product
+                    {
+                        product.disconnected(&error);
+                    }
+                }
+                product_ui::Command::BugReport => self.export_flight()?,
+                product_ui::Command::Quit => self.quit_requested = true,
+            }
+        }
+        let ime = self.product.as_ref().is_some_and(|product| {
+            matches!(
+                product.layer.app.focus,
+                ui::app::Focus::Name
+                    | ui::app::Focus::Address
+                    | ui::app::Focus::Search
+                    | ui::app::Focus::Chat
+            )
+        });
+        if ime != self.ime_allowed {
+            self.window.set_ime_allowed(ime);
+            self.ime_allowed = ime;
+        }
+        Ok(())
+    }
+    fn connect_product(&mut self, address: String, name: String) -> Result<(), String> {
+        let address = if address.contains("://") {
+            address
+        } else {
+            format!("ws://{address}")
+        };
+        if self.loading.is_some() {
+            return Err("Дождитесь завершения загрузки мира".into());
+        }
+        self.capture(false);
+        self.remote = None;
+        self.view = None;
+        self.workers = None;
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in address.bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+        let remote = RemoteNative::new(ConnectOptions {
+            url: address,
+            identity: product_ui::data_path(&format!("identity-{hash:016x}.cubi")),
+            name,
+        })?;
+        if let Some(product) = &mut self.product {
+            product.layer.app.name = remote.name.clone();
+            product.save_preferences();
+        }
+        let preparation = loading::Preparation {
+            format: self.config.format,
+            width: self.config.width,
+            height: self.config.height,
+            scene: client::remote::RemoteSession::scene_config(),
+            raster: self.raster,
+            entities: true,
+            lighting: Some(loading::product_lighting()),
+            materials: true,
+            environment: true,
+            horizon: true,
+        };
+        let device = self.gpu.device.clone();
+        let queue = self.gpu.queue.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("cubi-remote-loading".into())
+            .spawn(move || {
+                let result = loading::prepare(&device, &queue, preparation);
+                let _ = sender.send(result);
+            })
+            .map_err(|e| e.to_string())?;
+        self.loading = Some(receiver);
+        self.loading_thread = Some(thread);
+        self.workers = Some(client::native_pool(2, 16).map_err(|e| format!("{e:?}"))?);
+        self.remote = Some(remote);
+        self.flight.begin_scene()?;
+        self.reported_ready = false;
+        Ok(())
+    }
     async fn new(
         window: Arc<Window>,
         software: bool,
         mode: SceneMode,
         connection: Option<ConnectOptions>,
         benchmark: Option<flight::BenchmarkOptions>,
+        raster: client::view::NearRasterization,
     ) -> Result<Self, String> {
         #[cfg(target_os = "windows")]
         {
@@ -131,6 +280,7 @@ impl NativeState {
                 wgpu::Backends::DX12,
                 connection.clone(),
                 benchmark.clone(),
+                raster,
             )
             .await
             {
@@ -144,6 +294,7 @@ impl NativeState {
                         wgpu::Backends::VULKAN,
                         connection,
                         benchmark,
+                        raster,
                     )
                     .await
                     .map_err(|vulkan| format!("D3D12:{dx12}; Vulkan:{vulkan}"))
@@ -158,6 +309,7 @@ impl NativeState {
             wgpu::Backends::VULKAN,
             connection,
             benchmark,
+            raster,
         )
         .await
     }
@@ -168,6 +320,7 @@ impl NativeState {
         backend: wgpu::Backends,
         connection: Option<ConnectOptions>,
         benchmark: Option<flight::BenchmarkOptions>,
+        raster: client::view::NearRasterization,
     ) -> Result<Self, String> {
         let instance = render::instance_for(backend);
         let surface = instance
@@ -179,7 +332,7 @@ impl NativeState {
         let mut config = surface
             .get_default_config(&gpu.adapter, size.width.max(1), size.height.max(1))
             .ok_or("surface has no compatible format")?;
-        config.desired_maximum_frame_latency = if mode == SceneMode::Forest {
+        config.desired_maximum_frame_latency = if mode != SceneMode::Sky {
             1
         } else {
             render::MAX_FRAMES_IN_FLIGHT
@@ -203,37 +356,58 @@ impl NativeState {
         );
         let info = gpu.adapter.get_info();
         println!("GPU adapter={} backend={:?}", info.name, info.backend);
-        let (loading, loading_thread, workers) = if mode == SceneMode::Forest {
+        let (loading, loading_thread, workers) =
+            if mode == SceneMode::Forest || (mode == SceneMode::Product && connection.is_some()) {
+                let (sender, receiver) = mpsc::sync_channel(1);
+                let device = gpu.device.clone();
+                let queue = gpu.queue.clone();
+                let format = config.format;
+                let (width, height) = (config.width, config.height);
+                let preparation = loading::Preparation {
+                    format,
+                    width,
+                    height,
+                    scene: if connection.is_some() {
+                        client::remote::RemoteSession::scene_config()
+                    } else {
+                        client::SceneConfig::forest()
+                    },
+                    raster,
+                    entities: true,
+                    lighting: (mode == SceneMode::Product).then(loading::product_lighting),
+                    materials: mode == SceneMode::Product,
+                    environment: mode == SceneMode::Product,
+                    horizon: mode == SceneMode::Product,
+                };
+                // Actual separate loading thread: async fn alone would still block frames.
+                let thread = std::thread::Builder::new()
+                    .name("cubi-pipeline-loading".into())
+                    .spawn(move || {
+                        let result = loading::prepare(&device, &queue, preparation);
+                        let _ = sender.send(result);
+                    })
+                    .map_err(|error| format!("loading worker failed:{error}"))?;
+                let workers = client::native_pool(2, 16)
+                    .map_err(|error| format!("world worker pool failed:{error:?}"))?;
+                (Some(receiver), Some(thread), Some(workers))
+            } else {
+                (None, None, None)
+            };
+        let (ui_loading, ui_loading_thread) = if mode == SceneMode::Product {
             let (sender, receiver) = mpsc::sync_channel(1);
             let device = gpu.device.clone();
             let queue = gpu.queue.clone();
             let format = config.format;
-            let (width, height) = (config.width, config.height);
-            // Actual separate loading thread: async fn alone would still block frames.
             let thread = std::thread::Builder::new()
-                .name("cubi-pipeline-loading".into())
+                .name("cubi-ui-loading".into())
                 .spawn(move || {
-                    let result = AtlasImage::donor().and_then(|atlas| {
-                        TerrainGpu::new(
-                            &device,
-                            &queue,
-                            format,
-                            width,
-                            height,
-                            render::OutputTransfer::Attachment,
-                            client::view::terrain_gpu_config(),
-                            &atlas,
-                        )
-                        .map_err(|error| error.to_string())
-                    });
+                    let result = product_ui::prepare(&device, &queue, format);
                     let _ = sender.send(result);
                 })
-                .map_err(|error| format!("loading worker failed:{error}"))?;
-            let workers = client::native_pool(2, 16)
-                .map_err(|error| format!("world worker pool failed:{error:?}"))?;
-            (Some(receiver), Some(thread), Some(workers))
+                .map_err(|error| error.to_string())?;
+            (Some(receiver), Some(thread))
         } else {
-            (None, None, None)
+            (None, None)
         };
         Ok(Self {
             window,
@@ -258,7 +432,15 @@ impl NativeState {
             flight,
             in_flight: Arc::new(AtomicU32::new(0)),
             drawable: size.width != 0 && size.height != 0,
-            legacy_gpu_greedy: false,
+            product: None,
+            ui_loading,
+            ui_loading_thread,
+            ui_pending: false,
+            last_profiler: Instant::now(),
+            pointer: [0.0; 2],
+            raster,
+            quit_requested: false,
+            ime_allowed: false,
         })
     }
     fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
@@ -270,7 +452,7 @@ impl NativeState {
         self.config.height = height;
         self.surface.configure(&self.gpu.device, &self.config);
         self.sky.resize(&self.gpu.device, width, height);
-        if let Some(view) = self.view.as_mut() {
+        if let Some(view) = self.view.as_deref_mut() {
             view.resize(&self.gpu.device, width, height)?;
         }
         Ok(())
@@ -281,22 +463,17 @@ impl NativeState {
         };
         match receiver.try_recv() {
             Ok(result) => {
-                let mut terrain = result?;
-                terrain
-                    .resize(&self.gpu.device, self.config.width, self.config.height)
-                    .map_err(|error| error.to_string())?;
-                let scene = if self.remote.is_some() {
-                    client::remote::RemoteSession::scene_config()
-                } else {
-                    client::SceneConfig::forest()
-                };
-                let raster = if self.legacy_gpu_greedy {
-                    client::view::NearRasterization::LegacyGreedy
-                } else {
-                    client::view::NearRasterization::CompactUnit
-                };
-                let mut view = ClientView::new_with_rasterization(terrain, scene, raster)?;
+                let mut view = result?;
+                view.resize(&self.gpu.device, self.config.width, self.config.height)?;
                 view.set_demo_mesh_delay_ticks(self.demo_mesh_delay_ticks);
+                if let Some(product) = &mut self.product {
+                    let applied = view.apply_settings(&product.layer.app.settings);
+                    product
+                        .layer
+                        .app
+                        .set_pending_settings(applied.pending_render);
+                    product.apply_local(&self.gpu.device, &self.gpu.queue, &mut view)?;
+                }
                 self.view = Some(view);
                 self.loading = None;
                 if let Some(thread) = self.loading_thread.take() {
@@ -316,12 +493,17 @@ impl NativeState {
             .poll(wgpu::PollType::Poll)
             .map_err(|error| error.to_string())?;
         self.flight.collect();
+        self.poll_product_loading()?;
         self.poll_loading()?;
-        if let Some(view) = self.view.as_mut() {
+        if let Some(product) = &mut self.product {
+            product.poll_import(&self.gpu.device, &self.gpu.queue, self.view.as_deref_mut());
+        }
+        self.drain_product()?;
+        if let Some(view) = self.view.as_deref_mut() {
             self.flight.prepare_route(view)?;
         }
         if self.flight.route_finished() {
-            if let Some(view) = self.view.as_ref() {
+            if let Some(view) = self.view.as_deref() {
                 let done = self.flight.finish_if_drained(
                     &self.gpu.adapter.get_info(),
                     view,
@@ -349,13 +531,21 @@ impl NativeState {
             .elapsed()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
-        if let Some(remote) = self.remote.as_mut() {
-            remote.pump_socket(now)?;
+        if let Some(remote) = self.remote.as_mut()
+            && let Err(error) = remote.pump_socket(now)
+        {
+            if self.product.is_none() {
+                return Err(error);
+            }
+            self.remote = None;
+            if let Some(product) = &mut self.product {
+                product.disconnected(&error);
+            }
         }
         if !self.drawable {
             return Ok(None);
         }
-        if let Some(view) = self.view.as_mut() {
+        if let Some(view) = self.view.as_deref_mut() {
             if let Some(command) = self.flight.route_input() {
                 let input_started = Instant::now();
                 command.apply(view);
@@ -365,7 +555,16 @@ impl NativeState {
                 remote.session.pump(view, now)?;
                 remote.pump_socket(now)?;
             }
+            if let (Some(product), Some(remote)) = (&mut self.product, &self.remote) {
+                product.sync(remote.session.connection(), view)?;
+            }
             let simulation_started = Instant::now();
+            view.set_movement_replay_time(
+                self.network_started
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64,
+            )?;
             view.advance_input(if self.flight.route_active() {
                 client::benchmark::STEP_SECONDS
             } else {
@@ -387,26 +586,57 @@ impl NativeState {
             if let Some(error) = view.scene.error() {
                 return Err(error.to_string());
             }
-            let upload_started = Instant::now();
-            view.upload_ready(&self.gpu.queue, &mut UploadBudget::new(512 * 1024))?;
-            stages[4] = Some(flight::nanos(upload_started.elapsed()));
+            if self.in_flight.load(Ordering::Acquire)
+                < if self.mode == SceneMode::Sky {
+                    render::MAX_FRAMES_IN_FLIGHT
+                } else {
+                    1
+                }
+            {
+                let upload_started = Instant::now();
+                view.upload_ready(&self.gpu.queue, &mut UploadBudget::new(2 * 1024 * 1024))?;
+                stages[4] = Some(flight::nanos(upload_started.elapsed()));
+            }
         }
         let busy = self.in_flight.load(Ordering::Acquire)
-            >= if self.mode == SceneMode::Forest {
+            >= if self.mode != SceneMode::Sky {
                 1
             } else {
                 render::MAX_FRAMES_IN_FLIGHT
             };
-        let clean = !force_present
+        if let Some(product) = &mut self.product {
+            if product.layer.app.show_debug
+                && self.last_profiler.elapsed() >= Duration::from_millis(250)
+            {
+                product
+                    .layer
+                    .app
+                    .set_profiler(ui::profiler::ProfilerSnapshot::from_recorder(
+                        self.flight.recorder(),
+                    ));
+                self.last_profiler = Instant::now();
+            }
+            if !busy
+                && product
+                    .layer
+                    .upload(&self.gpu.queue, self.config.width, self.config.height)
+                    .map_err(str::to_owned)?
+            {
+                self.ui_pending = true;
+                product.painted();
+            }
+        }
+        let clean = !self.ui_pending
+            && !force_present
             && !self.flight.route_active()
             && self
                 .view
-                .as_ref()
-                .is_some_and(|view| !view.needs_redraw(self.config.width, self.config.height));
+                .as_deref()
+                .is_none_or(|view| !view.needs_redraw(self.config.width, self.config.height));
         if clean || busy {
             let work = self
                 .view
-                .as_mut()
+                .as_deref_mut()
                 .map_or(telemetry::WorkCounts::ZERO, ClientView::take_frame_work);
             let allocations = scope.finish();
             self.record_flight(started, stages, work, allocations, false, busy)?;
@@ -426,7 +656,7 @@ impl NativeState {
         };
         let output = frame.texture.create_view(&Default::default());
         let encode_started = Instant::now();
-        let work = if let Some(view) = self.view.as_mut() {
+        let mut work = if let Some(view) = self.view.as_deref_mut() {
             let mut encoder =
                 self.gpu
                     .device
@@ -440,6 +670,9 @@ impl NativeState {
                 self.config.width,
                 self.config.height,
             )?;
+            if let Some(product) = &mut self.product {
+                product.layer.encode(&mut encoder, &output);
+            }
             let ticket = self.flight.encode(view, &mut encoder);
             self.gpu.queue.submit([encoder.finish()]);
             if let Some(ticket) = ticket {
@@ -448,13 +681,32 @@ impl NativeState {
             view.take_frame_work()
         } else {
             self.sky.render(&self.gpu.device, &self.gpu.queue, &output);
+            if let Some(product) = &mut self.product {
+                let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+                product.layer.encode(&mut encoder, &output);
+                self.gpu.queue.submit([encoder.finish()]);
+            }
             self.sky.take_work()
         };
+        if let Some(product) = &mut self.product {
+            let ui = product.layer.take_work();
+            work.upload_bytes += ui.upload_bytes;
+            work.pipeline_compilations += ui.pipeline_compilations;
+            work.quads_emitted += ui.vertex_builds / 6;
+        }
+        self.ui_pending = false;
         stages[5] = Some(flight::nanos(encode_started.elapsed()));
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         let pending = self.in_flight.clone();
+        let ui_presentation = self
+            .product
+            .as_ref()
+            .and_then(|product| product.presentation());
         self.gpu.queue.on_submitted_work_done(move || {
             pending.fetch_sub(1, Ordering::AcqRel);
+            if let Some(report) = ui_presentation {
+                report();
+            }
         });
         let present_started = Instant::now();
         self.window.pre_present_notify();
@@ -469,12 +721,18 @@ impl NativeState {
         });
         let allocations = scope.finish();
         self.record_flight(started, stages, work, allocations, true, false)?;
-        let ready =
-            self.mode == SceneMode::Sky || self.view.as_ref().is_some_and(ClientView::is_ready);
+        let ready = self.mode == SceneMode::Sky
+            || if self.mode == SceneMode::Product && self.remote.is_none() {
+                self.product.is_some()
+            } else {
+                self.view.as_deref().is_some_and(ClientView::is_ready)
+            };
         if ready && !self.reported_ready {
             self.reported_ready = true;
-            if self.mode == SceneMode::Forest {
+            if self.view.is_some() {
                 self.print_stats("NATIVE_TERRAIN_READY");
+            } else {
+                println!("NATIVE_UI_READY");
             }
         }
         Ok(Some(ready))
@@ -505,7 +763,7 @@ impl NativeState {
                     .min(u32::from(u8::MAX)) as u8,
                 ..Default::default()
             },
-            self.view.as_ref(),
+            self.view.as_deref(),
             presented,
         )
     }
@@ -515,16 +773,19 @@ impl NativeState {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|error| error.to_string())?
             .as_millis();
-        self.flight.export(
+        self.flight.export_with_movement(
             &std::path::PathBuf::from(format!(".local/artifacts/flight/native-{stamp}.json")),
             &self.gpu.adapter.get_info(),
-            self.view.as_ref(),
+            self.view.as_deref(),
             self.config.width,
             self.config.height,
+            self.remote
+                .as_ref()
+                .map(|remote| remote.session.connection().movement_replay()),
         )
     }
     fn print_stats(&self, label: &str) {
-        if let Some(view) = self.view.as_ref() {
+        if let Some(view) = self.view.as_deref() {
             let s = view.stats();
             println!(
                 "{label} frames={} resident_pages={} resident_quads={} loaded_pages={} simulation_ticks={} msaa={}",
@@ -552,7 +813,7 @@ impl NativeState {
             }
             self.window.set_cursor_visible(false);
             self.captured = true;
-            if let Some(view) = self.view.as_mut() {
+            if let Some(view) = self.view.as_deref_mut() {
                 view.activate_player();
             }
         } else {
@@ -581,11 +842,36 @@ impl NativeState {
             self.input(key, down);
         }
     }
+    fn ui_modifiers(&self) -> ui::app::Modifiers {
+        ui::app::Modifiers {
+            ctrl: self.modifiers[0] || self.modifiers[1],
+            shift: self.modifiers[2] || self.modifiers[3],
+        }
+    }
+    fn product_key(&mut self, code: KeyCode, pressed: bool, text: Option<&str>) {
+        match code {
+            KeyCode::ControlLeft => self.modifiers[0] = pressed,
+            KeyCode::ControlRight => self.modifiers[1] = pressed,
+            KeyCode::ShiftLeft => self.modifiers[2] = pressed,
+            KeyCode::ShiftRight => self.modifiers[3] = pressed,
+            _ => {}
+        }
+        let modifiers = self.ui_modifiers();
+        if let Some(product) = &mut self.product {
+            product.key(
+                self.view.as_deref_mut(),
+                &format!("{code:?}"),
+                pressed,
+                text,
+                modifiers,
+            );
+        }
+    }
     fn input(&mut self, key: InputKey, pressed: bool) {
         if self.flight.benchmark_configured() {
             return;
         }
-        if let Some(view) = self.view.as_mut() {
+        if let Some(view) = self.view.as_deref_mut() {
             view.set_key(key, pressed);
         }
     }
@@ -593,6 +879,9 @@ impl NativeState {
 impl Drop for NativeState {
     fn drop(&mut self) {
         if let Some(thread) = self.loading_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.ui_loading_thread.take() {
             let _ = thread.join();
         }
     }
@@ -641,10 +930,14 @@ impl ApplicationHandler for App {
             self.scene,
             self.connection.clone(),
             self.benchmark.clone(),
+            if self.legacy_gpu_greedy {
+                client::view::NearRasterization::LegacyGreedy
+            } else {
+                client::view::NearRasterization::CompactUnit
+            },
         )) {
             Ok(mut state) => {
                 state.demo_mesh_delay_ticks = self.mesh_delay_ticks;
-                state.legacy_gpu_greedy = self.legacy_gpu_greedy;
                 self.state = Some(Box::new(state));
             }
             Err(error) => self.fail(event_loop, error),
@@ -665,15 +958,27 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Focused(false) => {
+                if let Some(product) = &mut state.product
+                    && product.layer.app.screen == ui::app::Screen::Game
+                    && product.layer.app.focus == ui::app::Focus::None
+                {
+                    product.layer.app.open(ui::app::Screen::Pause);
+                }
                 state.capture(false);
                 state.modifiers.fill(false);
-                if let Some(view) = state.view.as_mut() {
+                if let Some(view) = state.view.as_deref_mut() {
                     view.clear_keys();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
-                if event.physical_key == PhysicalKey::Code(KeyCode::F8) && pressed && !event.repeat
+                if state.product.is_some() {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        state.product_key(code, pressed, event.text.as_deref());
+                    }
+                } else if event.physical_key == PhysicalKey::Code(KeyCode::F8)
+                    && pressed
+                    && !event.repeat
                 {
                     if let Err(error) = state.export_flight() {
                         self.fail(event_loop, error);
@@ -690,7 +995,39 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 let pressed = button_state == ElementState::Pressed;
-                if pressed && !state.captured {
+                if state.product.is_some() {
+                    let world = state.captured
+                        && state.product.as_ref().is_some_and(|p| {
+                            p.layer.app.screen == ui::app::Screen::Game
+                                && p.layer.app.focus == ui::app::Focus::None
+                        });
+                    if !state.captured
+                        && pressed
+                        && state.product.as_ref().is_some_and(|p| {
+                            p.layer.app.screen == ui::app::Screen::Game
+                                && p.layer.app.focus == ui::app::Focus::None
+                        })
+                    {
+                        state.capture(true);
+                    } else if world {
+                        match button {
+                            MouseButton::Left => state.input(InputKey::Attack, pressed),
+                            MouseButton::Right => state.input(InputKey::Place, pressed),
+                            _ => {}
+                        }
+                    } else if pressed {
+                        let modifiers = state.ui_modifiers();
+                        if let Some(product) = &mut state.product {
+                            product.layer.app.click(
+                                state.pointer[0],
+                                state.pointer[1],
+                                button == MouseButton::Right,
+                                modifiers,
+                            );
+                            product.click_sound();
+                        }
+                    }
+                } else if pressed && !state.captured {
                     state.capture(true);
                 } else {
                     match button {
@@ -700,7 +1037,44 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                state.pointer = [position.x as f32, position.y as f32];
+                if let Some(product) = &mut state.product {
+                    product
+                        .layer
+                        .app
+                        .pointer(state.pointer[0], state.pointer[1]);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Some(product) = &mut state.product {
+                    let y = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                        winit::event::MouseScrollDelta::PixelDelta(position) => {
+                            position.y as f32 / 40.0
+                        }
+                    };
+                    product.layer.app.wheel(y.signum() as i32);
+                }
+            }
+            WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
+                if let Some(product) = &mut state.product
+                    && matches!(
+                        product.layer.app.focus,
+                        ui::app::Focus::Name
+                            | ui::app::Focus::Address
+                            | ui::app::Focus::Search
+                            | ui::app::Focus::Chat
+                    )
+                {
+                    product.layer.app.text(&text);
+                }
+            }
             WindowEvent::RedrawRequested => {
+                if state.quit_requested {
+                    event_loop.exit();
+                    return;
+                }
                 if self.benchmark.is_some() && self.started.elapsed().as_secs() > 600 {
                     self.fail(event_loop, "native benchmark timeout".into());
                     return;
@@ -739,6 +1113,12 @@ impl ApplicationHandler for App {
                                     work.synchronous_generations,
                                     work.upload_bytes
                                 );
+                            } else if self.scene == SceneMode::Product && state.view.is_none() {
+                                println!(
+                                    "NATIVE_UI_OK frames={} screen={:?}",
+                                    self.frames,
+                                    state.product.as_ref().map(|p| p.layer.app.screen)
+                                );
                             } else {
                                 state.print_stats("NATIVE_TERRAIN_OK");
                             }
@@ -756,9 +1136,23 @@ impl ApplicationHandler for App {
         if let DeviceEvent::MouseMotion { delta } = event
             && let Some(state) = self.state.as_mut()
             && state.captured
-            && let Some(view) = state.view.as_mut()
+            && let Some(view) = state.view.as_deref_mut()
         {
-            view.mouse_delta(delta.0, delta.1);
+            if let Some(product) = &state.product {
+                if product.layer.app.screen == ui::app::Screen::Game
+                    && product.layer.app.focus == ui::app::Focus::None
+                    && let Some([dx, dy]) = client::ui_bridge::mouse_delta(
+                        &product.layer.app.settings,
+                        delta.0,
+                        delta.1,
+                    )
+                {
+                    view.mouse_delta(dx, dy);
+                    product.trace_motion([dx, dy], view.player().yaw, view.player().pitch);
+                }
+            } else {
+                view.mouse_delta(delta.0, delta.1);
+            }
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -790,7 +1184,7 @@ fn input_key(code: KeyCode) -> Option<InputKey> {
 fn main() -> Result<(), String> {
     let mut app = App {
         state: None,
-        scene: SceneMode::Forest,
+        scene: SceneMode::Product,
         smoke_frames: None,
         frames: 0,
         failure: None,
@@ -807,6 +1201,7 @@ fn main() -> Result<(), String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--benchmark" => {
+                app.scene = SceneMode::Forest;
                 app.benchmark = Some(flight::BenchmarkOptions {
                     output: args
                         .next()

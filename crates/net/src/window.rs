@@ -1,21 +1,26 @@
 //! Owner-only public window DTO. Persistence uses its own codec; this payload
 //! contains no secret token, world seed or imported resource bytes.
 use core_types::{BlockPos, Cell, SpaceId};
-pub const MAX_WINDOW_BYTES: usize = 1024;
+pub const MAX_WINDOW_BYTES: usize = 4096;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stack {
     pub item: u16,
     pub count: u16,
     pub damage: u16,
+    pub payload: u64,
 }
 impl Stack {
     pub const EMPTY: Self = Self {
         item: 0,
         count: 0,
         damage: 0,
+        payload: 0,
     };
     fn valid(self) -> bool {
-        self == Self::EMPTY || (self.item != 0 && (1..=64).contains(&self.count))
+        self == Self::EMPTY
+            || (self.item != 0
+                && (1..=64).contains(&self.count)
+                && (self.payload == 0 || self.count == 1))
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,6 +283,23 @@ pub fn encode_snapshot(state: &WindowSnapshot) -> Result<Vec<u8>, WindowCodecErr
     out.extend_from_slice(&state.fuel.to_le_bytes());
     out.extend_from_slice(&state.energy.to_le_bytes());
     out.extend_from_slice(&state.sides);
+    let stacks = || {
+        std::iter::once(state.cursor)
+            .chain(state.craft)
+            .chain(std::iter::once(state.craft_result))
+            .chain(state.container.iter().copied())
+    };
+    let refs = stacks().filter(|s| s.payload != 0).count();
+    if refs != 0 {
+        out.extend_from_slice(b"XRF1");
+        out.extend_from_slice(&(refs as u16).to_le_bytes());
+        for (index, stack) in stacks().enumerate() {
+            if stack.payload != 0 {
+                out.extend_from_slice(&(index as u16).to_le_bytes());
+                out.extend_from_slice(&stack.payload.to_le_bytes());
+            }
+        }
+    }
     Ok(out)
 }
 pub fn decode_snapshot(bytes: &[u8]) -> Result<WindowSnapshot, WindowCodecError> {
@@ -297,12 +319,12 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<WindowSnapshot, WindowCodecError>
     } else {
         None
     };
-    let cursor = read.stack()?;
+    let mut cursor = read.stack()?;
     let mut craft = [Stack::EMPTY; 9];
     for cell in &mut craft {
         *cell = read.stack()?;
     }
-    let craft_result = read.stack()?;
+    let mut craft_result = read.stack()?;
     let length = kind.container_len().ok_or(WindowCodecError::Value)?;
     let mut container = Vec::with_capacity(length);
     for _ in 0..length {
@@ -312,6 +334,31 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<WindowSnapshot, WindowCodecError>
     let fuel = read.u16()?;
     let energy = read.u64()?;
     let sides = read.take()?;
+    if read.at < read.bytes.len() {
+        if read.take::<4>()? != *b"XRF1" {
+            return Err(WindowCodecError::Format);
+        }
+        let count = usize::from(read.u16()?);
+        let maximum = 11 + container.len();
+        if count == 0 || count > maximum {
+            return Err(WindowCodecError::Limit);
+        }
+        let mut previous = None;
+        for _ in 0..count {
+            let index = usize::from(read.u16()?);
+            let payload = read.u64()?;
+            if index >= maximum || payload == 0 || previous.is_some_and(|old| old >= index) {
+                return Err(WindowCodecError::Value);
+            }
+            previous = Some(index);
+            match index {
+                0 => cursor.payload = payload,
+                1..=9 => craft[index - 1].payload = payload,
+                10 => craft_result.payload = payload,
+                _ => container[index - 11].payload = payload,
+            }
+        }
+    }
     read.finish()?;
     let state = WindowSnapshot {
         guard,
@@ -404,6 +451,7 @@ impl<'a> Reader<'a> {
             item: self.u16()?,
             count: self.u16()?,
             damage: self.u16()?,
+            payload: 0,
         })
     }
     fn finish(&self) -> Result<(), WindowCodecError> {

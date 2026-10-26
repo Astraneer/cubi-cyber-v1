@@ -27,6 +27,8 @@ pub mod kind {
     pub const TRANSPORTER: u32 = 16;
 }
 pub const ACTIVE: u32 = 1;
+/// Reserved stable slots remain allocated but publish no primary or shadow draw.
+pub const HIDDEN: u32 = 2;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct BlockInstance {
@@ -43,6 +45,14 @@ pub struct BlockInstance {
     /// Generic cube faces: Down|Up<<16, North|South<<16, West|East<<16.
     pub reserved: [u32; 4],
 }
+impl BlockInstance {
+    pub fn hidden() -> Self {
+        Self {
+            flags: HIDDEN,
+            ..Self::default()
+        }
+    }
+}
 impl Default for BlockInstance {
     fn default() -> Self {
         Self {
@@ -51,7 +61,7 @@ impl Default for BlockInstance {
             kind: 0,
             flags: 0,
             connections: 0,
-            light: 15 << 12,
+            light: 15,
             phase: 0.,
             amount: 1.,
             tint: u32::MAX,
@@ -221,6 +231,7 @@ pub struct BlockModelsGpu {
     cull: wgpu::ComputePipeline,
     previous: Vec<BlockInstance>,
     active: u32,
+    kind_counts: [u32; MODEL_KINDS],
     revision: u64,
     shadow_revision: u64,
     last: Option<(Camera, u64)>,
@@ -234,6 +245,27 @@ impl BlockModelsGpu {
         geometry: TerrainGeometry<'_>,
         config: BlockConfig,
         shadows: Option<&ShadowGpu>,
+    ) -> Result<Self, BlockError> {
+        Self::new_prepared(device, queue, geometry, config, shadows, None)
+    }
+    /// Prepare shared atmospheric lighting once during loading.
+    pub fn new_with_atmosphere(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        geometry: TerrainGeometry<'_>,
+        config: BlockConfig,
+        shadows: Option<&ShadowGpu>,
+        atmosphere: &crate::atmosphere::AtmosphereGpu,
+    ) -> Result<Self, BlockError> {
+        Self::new_prepared(device, queue, geometry, config, shadows, Some(atmosphere))
+    }
+    fn new_prepared(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        geometry: TerrainGeometry<'_>,
+        config: BlockConfig,
+        shadows: Option<&ShadowGpu>,
+        atmosphere: Option<&crate::atmosphere::AtmosphereGpu>,
     ) -> Result<Self, BlockError> {
         if config.max_instances == 0
             || config.atlas_layers < 185
@@ -257,7 +289,7 @@ impl BlockModelsGpu {
         let instances = buffer(
             "64B block model records",
             u64::from(config.max_instances) * 64,
-            storage,
+            storage | wgpu::BufferUsages::COPY_SRC,
         );
         let vertices = buffer(
             "immutable block model vertices",
@@ -317,6 +349,9 @@ impl BlockModelsGpu {
                 },
             ]);
         }
+        if atmosphere.is_some() {
+            entries.push(buffer_layout(20, f, false, true));
+        }
         let render_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("static block atlas layout"),
             entries: &entries,
@@ -362,6 +397,9 @@ impl BlockModelsGpu {
                     },
                 ]);
             }
+            if lighting && let Some(atmosphere) = atmosphere {
+                entries.push(buffer_binding(20, atmosphere.lighting_buffer()));
+            }
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("static block draw tables"),
                 layout,
@@ -383,7 +421,17 @@ impl BlockModelsGpu {
         };
         let bind = make_bind(&render_layout, &camera, &visible, true);
         let cull_bind = make_cull(&camera, &visible, &indirect);
-        let source=include_str!("block_models.wgsl").replace("// SHADOWS",if shadows.is_some(){include_str!("shadow_sampling.wgsl")}else{"fn cascade_shadow(p:vec3<f32>,n:vec3<f32>)->f32{return 1.;}"}).replace("// ILLUMINATION",if shadows.is_some(){"return light.rgb+vec3(light.a*(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.)));"}else{"return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.));"});
+        let source = crate::atmosphere::surface_shader(
+            include_str!("block_models.wgsl"),
+            shadows.is_some(),
+            atmosphere.is_some(),
+            true,
+            if shadows.is_some() {
+                "return light.rgb+vec3(light.a*(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.)));"
+            } else {
+                "return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.));"
+            },
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("GPU static block poses"),
             source: wgpu::ShaderSource::Wgsl(source.clone().into()),
@@ -461,6 +509,7 @@ impl BlockModelsGpu {
             cull,
             previous: Vec::with_capacity(config.max_instances as usize),
             active: 0,
+            kind_counts: [0; MODEL_KINDS],
             revision: 0,
             shadow_revision: 0,
             last: None,
@@ -481,16 +530,48 @@ impl BlockModelsGpu {
             .chain([i.yaw, i.phase, i.amount].iter())
             .all(|x| x.is_finite())
             && i.kind < MODEL_KINDS as u32
-            && i.flags & !ACTIVE == 0
+            && i.flags & !(ACTIVE | HIDDEN) == 0
             && i.connections & !0xfff == 0
             && i.layer < self.config.atlas_layers
             && (0.0..=1.0).contains(&i.amount)
-            && i.light & !0xfffff == 0
             && (i.kind != kind::CHEST || (0.0..=1.0).contains(&i.phase))
             && (i.kind != kind::CUBE_MACHINE
                 || i.reserved[..3].iter().all(|p| {
                     p & 0xffff < self.config.atlas_layers && p >> 16 < self.config.atlas_layers
                 }))
+    }
+    /// Loading-only fixed slot reservation. Subsequent additions/removals use
+    /// one update() record and HIDDEN, without moving other live instance slots.
+    pub fn reserve_slots(
+        &mut self,
+        queue: &wgpu::Queue,
+        count: u32,
+        budget: &mut UploadBudget,
+    ) -> Result<BlockWork, BlockError> {
+        if !self.previous.is_empty() || count == 0 || count > self.config.max_instances {
+            return Err(BlockError::InvalidIndex);
+        }
+        let bytes = u64::from(count) * 64;
+        if budget.remaining_bytes < bytes {
+            return Err(BlockError::UploadBudget);
+        }
+        self.previous
+            .resize(count as usize, BlockInstance::hidden());
+        queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.previous));
+        budget.remaining_bytes -= bytes;
+        self.revision = self.revision.wrapping_add(1);
+        self.work.upload_bytes += bytes;
+        Ok(BlockWork {
+            upload_bytes: bytes,
+            instances: count,
+            ..BlockWork::default()
+        })
+    }
+    pub fn active_instances(&self) -> u32 {
+        self.kind_counts.iter().sum()
+    }
+    pub fn reserved_slots(&self) -> usize {
+        self.previous.len()
     }
     pub fn upload(
         &mut self,
@@ -511,11 +592,9 @@ impl BlockModelsGpu {
             return Err(BlockError::UploadBudget);
         }
         let visibility_changed = self.previous.len() != instances.len()
-            || self
-                .previous
-                .iter()
-                .zip(instances)
-                .any(|(a, b)| a.position != b.position || a.kind != b.kind);
+            || self.previous.iter().zip(instances).any(|(a, b)| {
+                a.position != b.position || a.kind != b.kind || (a.flags ^ b.flags) & HIDDEN != 0
+            });
         let shadow_changed = self.previous.len() != instances.len()
             || self
                 .previous
@@ -570,8 +649,12 @@ impl BlockModelsGpu {
             bytemuck::bytes_of(&value),
         );
         self.previous[index as usize] = value;
-        self.refresh_active();
-        if old.position != value.position || old.kind != value.kind {
+        self.count_instance(old, false);
+        self.count_instance(value, true);
+        if old.position != value.position
+            || old.kind != value.kind
+            || (old.flags ^ value.flags) & HIDDEN != 0
+        {
             self.revision = self.revision.wrapping_add(1);
         }
         if !same_geometry(&old, &value) {
@@ -586,7 +669,27 @@ impl BlockModelsGpu {
         })
     }
     fn refresh_active(&mut self) {
-        self.active = self.previous.iter().fold(0, |mask, i| mask | (1 << i.kind));
+        self.kind_counts.fill(0);
+        self.active = 0;
+        for index in 0..self.previous.len() {
+            self.count_instance(self.previous[index], true);
+        }
+    }
+    fn count_instance(&mut self, instance: BlockInstance, add: bool) {
+        if instance.flags & HIDDEN != 0 {
+            return;
+        }
+        let count = &mut self.kind_counts[instance.kind as usize];
+        if add {
+            *count += 1;
+        } else {
+            *count -= 1;
+        }
+        if *count == 0 {
+            self.active &= !(1 << instance.kind);
+        } else {
+            self.active |= 1 << instance.kind;
+        }
     }
     pub fn prepare_frame(
         &mut self,
@@ -659,6 +762,10 @@ impl BlockModelsGpu {
     pub fn model_vertex_buffer(&self) -> &wgpu::Buffer {
         &self.vertices
     }
+    /// Read-only GPU capture source; each reserved stable slot is exactly 64 bytes.
+    pub fn instance_buffer(&self) -> &wgpu::Buffer {
+        &self.instances
+    }
     pub fn take_work(&mut self) -> BlockWork {
         std::mem::take(&mut self.work)
     }
@@ -672,6 +779,7 @@ fn same_geometry(a: &BlockInstance, b: &BlockInstance) -> bool {
         && a.amount == b.amount
         && a.layer == b.layer
         && a.reserved == b.reserved
+        && (a.flags ^ b.flags) & HIDDEN == 0
 }
 impl DynamicShadowCaster for BlockModelsGpu {
     fn available(&self) -> bool {

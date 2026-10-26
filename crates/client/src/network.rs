@@ -12,7 +12,7 @@ use net::{
     ReplicaError, ReplicaRead, SecretToken, ServerMessage, Welcome,
 };
 use sim::{Keys, Player, prediction::PredictionState};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use world::CellRead;
 
 const MAX_INPUTS: usize = 256;
@@ -79,6 +79,14 @@ pub struct NetworkCounters {
     pub peak_actions: usize,
     pub peak_outbox: usize,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueueDepths {
+    pub cells: usize,
+    pub light: usize,
+    pub geometry: usize,
+    pub height: usize,
+    pub outgoing: usize,
+}
 #[derive(Clone, Copy)]
 struct PredictedTick {
     state: PredictionState,
@@ -105,6 +113,8 @@ pub struct Connection {
     replica: Replica,
     overlay: PredictionOverlay,
     player: Option<Player>,
+    movement_replay: Box<sim::replay::Recorder>,
+    replay_time_ns: u64,
     input_history: InputHistory,
     inputs: BTreeMap<u64, InputFrame>,
     next_input: u64,
@@ -135,9 +145,14 @@ pub struct Connection {
     page_updates: VecDeque<PageUpdate>,
     page_removals: VecDeque<PageId>,
     geometry_interest: BTreeMap<PageId, PageInterest>,
+    height_geometry_interest: BTreeSet<PageId>,
     geometries: BTreeMap<PageId, net::PublicGeometry>,
     geometry_updates: VecDeque<net::PublicGeometry>,
     geometry_removals: VecDeque<PageId>,
+    height_interest: BTreeMap<net::height::HeightKey, (Option<u64>, u64, bool)>,
+    height_updates: VecDeque<Box<net::height::HeightTile>>,
+    lights: net::light::Replica,
+    light_updates: VecDeque<net::light::Update>,
     counters: NetworkCounters,
 }
 
@@ -165,6 +180,11 @@ impl Connection {
             replica: Replica::new(config.maximum_pages),
             overlay: PredictionOverlay::new(MAX_ACTIONS),
             player: None,
+            movement_replay: Box::new(
+                sim::replay::Recorder::new(sim::replay::DEFAULT_STEPS)
+                    .map_err(NetworkError::Simulation)?,
+            ),
+            replay_time_ns: 0,
             input_history: InputHistory::new(MAX_INPUTS),
             inputs: BTreeMap::new(),
             next_input: 1,
@@ -196,9 +216,15 @@ impl Connection {
             page_updates: VecDeque::new(),
             page_removals: VecDeque::new(),
             geometry_interest: BTreeMap::new(),
+            height_geometry_interest: BTreeSet::new(),
             geometries: BTreeMap::new(),
             geometry_updates: VecDeque::new(),
             geometry_removals: VecDeque::new(),
+            height_interest: BTreeMap::new(),
+            height_updates: VecDeque::new(),
+            lights: net::light::Replica::new(config.maximum_pages)
+                .map_err(|_| NetworkError::Capacity)?,
+            light_updates: VecDeque::new(),
             counters: NetworkCounters::default(),
         })
     }
@@ -224,6 +250,24 @@ impl Connection {
     }
     pub fn credential(&self) -> Option<SecretToken> {
         self.credential
+    }
+    pub fn queue_depths(&self) -> QueueDepths {
+        QueueDepths {
+            cells: self.page_updates.len(),
+            light: self.light_updates.len(),
+            geometry: self.geometry_updates.len(),
+            height: self.height_updates.len(),
+            outgoing: self.outbox.len(),
+        }
+    }
+    pub fn movement_replay(&self) -> &sim::replay::Recorder {
+        &self.movement_replay
+    }
+    fn note_replay_time(&mut self, now_ms: u64) {
+        self.replay_time_ns = self.replay_time_ns.max(now_ms.saturating_mul(1_000_000));
+        self.movement_replay
+            .set_time(self.replay_time_ns)
+            .expect("clamped replay wall clock");
     }
     pub fn player(&self) -> Option<&Player> {
         self.player.as_ref()
@@ -257,6 +301,9 @@ impl Connection {
     }
     pub fn summary(&self, page: PageId) -> Option<&FarSummary> {
         self.summaries.get(&page)
+    }
+    pub fn remote_players_tick(&self) -> Tick {
+        self.remote_tick
     }
     pub fn remote_players(&self) -> impl Iterator<Item = &PlayerState> {
         self.remote_players.values()
@@ -319,9 +366,10 @@ impl Connection {
         self.geometry_removals.pop_front()
     }
     pub fn request_geometry(&mut self, page: PageId, now_ms: u64) -> Result<(), NetworkError> {
-        if !self.geometry_interest.contains_key(&page) && self.geometry_interest.len() >= 16 {
+        if !self.geometry_interest.contains_key(&page) && self.geometry_interest.len() >= 128 {
             return Err(NetworkError::Capacity);
         }
+        self.height_geometry_interest.remove(&page);
         let known = self.geometries.get(&page).map(|g| g.source_version);
         self.queue(ClientMessage::RequestGeometry { page, known })?;
         self.geometry_interest.insert(
@@ -339,10 +387,141 @@ impl Connection {
         }
         self.queue(ClientMessage::ForgetGeometry(page))?;
         self.geometry_interest.remove(&page);
+        self.height_geometry_interest.remove(&page);
+        self.geometry_updates.retain(|g| g.page != page);
         if self.geometries.remove(&page).is_some() {
             self.geometry_removals.push_back(page);
         }
         Ok(())
+    }
+    pub fn request_height(
+        &mut self,
+        key: net::height::HeightKey,
+        now_ms: u64,
+    ) -> Result<(), NetworkError> {
+        key.validate().map_err(|_| NetworkError::Protocol)?;
+        if !self.height_interest.contains_key(&key) && self.height_interest.len() >= 512 {
+            return Err(NetworkError::Capacity);
+        }
+        let known = self.height_interest.get(&key).and_then(|i| i.0);
+        self.queue(ClientMessage::RequestHeight { key, known })?;
+        self.height_interest.insert(key, (known, now_ms, false));
+        Ok(())
+    }
+    pub fn release_height(&mut self, key: net::height::HeightKey) -> Result<(), NetworkError> {
+        let pages: Vec<_> = self
+            .height_geometry_interest
+            .iter()
+            .filter(|p| key.level == 0 && p.space.0 == key.space && p.x == key.x && p.z == key.z)
+            .copied()
+            .collect();
+        if self.outbox.len() + pages.len() + 1 > MAX_OUTBOX
+            || self.geometry_removals.len() + pages.len() > 32
+        {
+            return Err(NetworkError::Capacity);
+        }
+        self.queue(ClientMessage::ForgetHeight(key))?;
+        for page in pages {
+            self.release_geometry(page)?;
+        }
+        self.height_interest.remove(&key);
+        self.height_updates.retain(|t| t.key != key);
+        Ok(())
+    }
+    pub fn take_height_update(&mut self) -> Option<Box<net::height::HeightTile>> {
+        self.height_updates.pop_front()
+    }
+    fn queue_light_update(&mut self, update: net::light::Update) -> Result<(), NetworkError> {
+        let page = update.header().page;
+        if let Some(old) = self
+            .light_updates
+            .iter_mut()
+            .find(|u| u.header().page == page)
+        {
+            match (old, &update) {
+                (net::light::Update::Snapshot(a), net::light::Update::Delta(b))
+                    if a.header.version == b.base =>
+                {
+                    for &(index, value) in &b.changes {
+                        a.values[usize::from(index)] = value;
+                    }
+                    a.header = b.header;
+                }
+                (net::light::Update::Delta(a), net::light::Update::Delta(b))
+                    if a.header.version == b.base =>
+                {
+                    let mut changes: BTreeMap<_, _> = a.changes.iter().copied().collect();
+                    changes.extend(b.changes.iter().copied());
+                    a.changes = changes.into_iter().collect();
+                    a.header = b.header;
+                }
+                (old, _) => *old = update,
+            }
+            return Ok(());
+        }
+        if self.light_updates.len() >= self.config.maximum_pages {
+            return Err(NetworkError::Capacity);
+        }
+        self.light_updates.push_back(update);
+        Ok(())
+    }
+    fn queue_page_update(&mut self, update: PageUpdate) -> Result<(), NetworkError> {
+        let page = match &update {
+            PageUpdate::Snapshot(p) => p.page,
+            PageUpdate::Delta(p) => p.page,
+        };
+        if let Some(old) = self.page_updates.iter_mut().find(|u| match u {
+            PageUpdate::Snapshot(p) => p.page == page,
+            PageUpdate::Delta(p) => p.page == page,
+        }) {
+            match (old, &update) {
+                (PageUpdate::Snapshot(a), PageUpdate::Delta(b)) if a.version == b.base => {
+                    for &(index, value) in &b.changes {
+                        a.cells[usize::from(index)] = value;
+                    }
+                    a.version = b.version;
+                    a.source_version = b.source_version;
+                }
+                (PageUpdate::Delta(a), PageUpdate::Delta(b)) if a.version == b.base => {
+                    let mut changes: BTreeMap<_, _> = a.changes.iter().copied().collect();
+                    changes.extend(b.changes.iter().copied());
+                    a.changes = changes.into_iter().collect();
+                    a.version = b.version;
+                    a.source_version = b.source_version;
+                }
+                (old, _) => *old = update,
+            }
+            return Ok(());
+        }
+        if self.page_updates.len() >= self.config.maximum_pages {
+            return Err(NetworkError::Capacity);
+        }
+        self.page_updates.push_back(update);
+        Ok(())
+    }
+    pub fn request_light_snapshot(&mut self, page: PageId) -> Result<(), NetworkError> {
+        let cell_view = self
+            .replica
+            .page(page)
+            .ok_or(NetworkError::Protocol)?
+            .version;
+        if self.outbox.len() >= MAX_OUTBOX {
+            return Err(NetworkError::Capacity);
+        }
+        self.queue(ClientMessage::RequestLight(net::light::Request {
+            page,
+            cell_view,
+            acknowledged: None,
+        }))?;
+        self.lights.remove(page);
+        self.light_updates.retain(|u| u.header().page != page);
+        Ok(())
+    }
+    pub fn light_replica(&self) -> &net::light::Replica {
+        &self.lights
+    }
+    pub fn take_light_update(&mut self) -> Option<net::light::Update> {
+        self.light_updates.pop_front()
     }
     pub fn take_reply(&mut self) -> Option<ActionReply> {
         self.replies.pop_front()
@@ -369,6 +548,36 @@ impl Connection {
             .collect()
     }
     fn queue(&mut self, message: ClientMessage) -> Result<(), NetworkError> {
+        // ACKs describe retained public state, so a newer ACK supersedes an
+        // unsent older one. A slow render/loading frame never builds an ACK log.
+        let same = |old: &ClientMessage| match (old, &message) {
+            (ClientMessage::AckPage { page: a, .. }, ClientMessage::AckPage { page: b, .. }) => {
+                a == b
+            }
+            (ClientMessage::RequestLight(a), ClientMessage::RequestLight(b)) => a.page == b.page,
+            (
+                ClientMessage::RequestPage { page: a, .. },
+                ClientMessage::RequestPage { page: b, .. },
+            ) => a == b,
+            (ClientMessage::Entities(_), ClientMessage::Entities(_)) => true,
+            _ => false,
+        };
+        if let Some(old) = self.outbox.iter_mut().find(|old| same(old)) {
+            let replace = match (&*old, &message) {
+                (
+                    ClientMessage::AckPage { version: a, .. },
+                    ClientMessage::AckPage { version: b, .. },
+                ) => b >= a,
+                (ClientMessage::RequestLight(a), ClientMessage::RequestLight(b)) => {
+                    b.cell_view >= a.cell_view
+                }
+                _ => true,
+            };
+            if replace {
+                *old = message;
+            }
+            return Ok(());
+        }
         if self.outbox.len() >= MAX_OUTBOX {
             return Err(NetworkError::Capacity);
         }
@@ -415,6 +624,7 @@ impl Connection {
     }
 
     pub fn receive(&mut self, message: ServerMessage, now_ms: u64) -> Result<(), NetworkError> {
+        self.note_replay_time(now_ms);
         match message {
             ServerMessage::Inventory { data } => {
                 let inventory = rules::survival::Inventory::decode(&data)
@@ -495,13 +705,28 @@ impl Connection {
                 self.counters.authoritative_states += 1;
             }
             ServerMessage::Page(update) => {
-                if self.page_updates.len() >= MAX_PAGE_UPDATES || self.outbox.len() >= MAX_OUTBOX {
+                if self.page_updates.len() >= MAX_PAGE_UPDATES || self.outbox.len() + 2 > MAX_OUTBOX
+                {
                     return Err(NetworkError::Capacity);
                 }
                 let (page, cells) = match &update {
                     PageUpdate::Snapshot(s) => (s.page, core_types::PAGE_VOLUME),
                     PageUpdate::Delta(d) => (d.page, d.changes.len()),
                 };
+                let needed = usize::from(
+                    !self
+                        .outbox
+                        .iter()
+                        .any(|m| matches!(m,ClientMessage::AckPage{page:p,..} if *p==page)),
+                ) + usize::from(
+                    !self
+                        .outbox
+                        .iter()
+                        .any(|m| matches!(m,ClientMessage::RequestLight(r) if r.page==page)),
+                );
+                if self.outbox.len() + needed > MAX_OUTBOX {
+                    return Err(NetworkError::Capacity);
+                }
                 // A delayed packet for an evicted AOI must not repopulate the cache.
                 if !self.interest.contains_key(&page) {
                     return Ok(());
@@ -510,6 +735,12 @@ impl Connection {
                     Ok(net::ApplyResult::Applied) => {
                         let version = self.replica.page(page).expect("applied page").version;
                         self.queue(ClientMessage::AckPage { page, version })?;
+                        let acknowledged = self.lights.page(page).map(|s| s.header.version);
+                        self.queue(ClientMessage::RequestLight(net::light::Request {
+                            page,
+                            cell_view: version,
+                            acknowledged,
+                        }))?;
                         self.interest
                             .get_mut(&page)
                             .expect("interest checked")
@@ -519,7 +750,7 @@ impl Connection {
                             PageUpdate::Snapshot(_) => self.counters.full_snapshots += 1,
                             PageUpdate::Delta(_) => self.counters.deltas += 1,
                         }
-                        self.page_updates.push_back(update);
+                        self.queue_page_update(update)?;
                         self.overlay.retire_applied(&self.replica);
                         self.world_changed = true;
                     }
@@ -608,16 +839,49 @@ impl Connection {
             ServerMessage::Geometry(geometry) => {
                 let geometry = *geometry;
                 if !self.geometry_interest.contains_key(&geometry.page) {
-                    return Ok(());
+                    let page = geometry.page;
+                    let height_column = (0..32).contains(&page.y)
+                        && self.height_interest.keys().any(|key| {
+                            key.level == 0
+                                && key.space == page.space.0
+                                && key.x == page.x
+                                && key.z == page.z
+                        });
+                    if !height_column {
+                        return Ok(());
+                    }
+                    if self.geometry_interest.len() >= 128 {
+                        return Err(NetworkError::Capacity);
+                    }
+                    self.geometry_interest.insert(
+                        page,
+                        PageInterest {
+                            received: false,
+                            last_request: now_ms,
+                        },
+                    );
+                    self.height_geometry_interest.insert(page);
                 }
                 geometry.validate().map_err(|_| NetworkError::Protocol)?;
-                if self.geometries.get(&geometry.page).is_some_and(|old| {
-                    old.view_version >= geometry.view_version
+                if let Some(old) = self.geometries.get(&geometry.page) {
+                    if old.view_version == geometry.view_version {
+                        if *old != geometry {
+                            return Err(NetworkError::Protocol);
+                        }
+                        return Ok(());
+                    }
+                    if old.view_version > geometry.view_version
                         || old.source_version > geometry.source_version
-                }) {
-                    return Ok(());
+                    {
+                        return Ok(());
+                    }
                 }
-                if self.geometry_updates.len() >= 32 {
+                if self.geometry_updates.len() >= 128
+                    && !self
+                        .geometry_updates
+                        .iter()
+                        .any(|g| g.page == geometry.page)
+                {
                     return Err(NetworkError::Capacity);
                 }
                 self.geometry_interest
@@ -625,7 +889,15 @@ impl Connection {
                     .expect("interest checked")
                     .received = true;
                 self.geometries.insert(geometry.page, geometry.clone());
-                self.geometry_updates.push_back(geometry);
+                if let Some(old) = self
+                    .geometry_updates
+                    .iter_mut()
+                    .find(|g| g.page == geometry.page)
+                {
+                    *old = geometry;
+                } else {
+                    self.geometry_updates.push_back(geometry);
+                }
             }
             ServerMessage::GeometryUnavailable(page) => {
                 if let Some(interest) = self.geometry_interest.get_mut(&page) {
@@ -678,6 +950,77 @@ impl Connection {
                     .map_err(|_| NetworkError::Protocol)?
                 {
                     self.queue(ClientMessage::Presence(reply))?;
+                }
+            }
+            ServerMessage::Light(update) => {
+                let header = update.header();
+                if self.outbox.len() >= MAX_OUTBOX
+                    && !self
+                        .outbox
+                        .iter()
+                        .any(|m| matches!(m,ClientMessage::RequestLight(r) if r.page==header.page))
+                {
+                    return Err(NetworkError::Capacity);
+                }
+                let cell_view = self.replica.page(header.page).map(|p| p.version);
+                match self.lights.apply((*update).clone(), cell_view) {
+                    Ok(result) => {
+                        if let Some(image) = self.lights.page(header.page) {
+                            self.queue(ClientMessage::RequestLight(net::light::Request {
+                                page: header.page,
+                                cell_view: image.header.cell_view,
+                                acknowledged: Some(image.header.version),
+                            }))?;
+                        }
+                        if result == net::light::Apply::Applied {
+                            self.queue_light_update(*update)?;
+                        }
+                    }
+                    Err(net::light::Error::MissingBase { .. }) => {
+                        if let Some(cell_view) = cell_view {
+                            self.queue(ClientMessage::RequestLight(net::light::Request {
+                                page: header.page,
+                                cell_view,
+                                acknowledged: None,
+                            }))?;
+                        }
+                    }
+                    Err(net::light::Error::MissingCells { .. }) => {
+                        self.queue(ClientMessage::RequestPage {
+                            page: header.page,
+                            acknowledged: None,
+                        })?;
+                    }
+                    Err(net::light::Error::Capacity) => return Err(NetworkError::Capacity),
+                    Err(_) => return Err(NetworkError::Protocol),
+                }
+            }
+            ServerMessage::LightUnavailable(page) => {
+                self.lights.remove(page);
+                self.light_updates.retain(|u| u.header().page != page);
+            }
+            ServerMessage::Height(tile) => {
+                tile.validate().map_err(|_| NetworkError::Protocol)?;
+                if let Some(interest) = self.height_interest.get_mut(&tile.key)
+                    && interest.0.is_none_or(|old| tile.source >= old)
+                {
+                    if self.height_updates.len() >= 512
+                        && !self.height_updates.iter().any(|t| t.key == tile.key)
+                    {
+                        return Err(NetworkError::Capacity);
+                    }
+                    *interest = (Some(tile.source), now_ms, true);
+                    if let Some(old) = self.height_updates.iter_mut().find(|t| t.key == tile.key) {
+                        *old = tile;
+                    } else {
+                        self.height_updates.push_back(tile);
+                    }
+                }
+            }
+            ServerMessage::HeightUnavailable(key) => {
+                if let Some(interest) = self.height_interest.get_mut(&key) {
+                    interest.1 = now_ms;
+                    interest.2 = false;
                 }
             }
             ServerMessage::Window(state) => {
@@ -779,11 +1122,13 @@ impl Connection {
             self.world_changed = false;
         }
         if let Some((tick, sequence, state)) = self.pending_authority.take() {
-            let mut player = Player::new([0.0; 3]);
-            state
-                .apply_authoritative(&mut player)
-                .map_err(NetworkError::Simulation)?;
-            self.player = Some(player);
+            if let Some(player) = self.player.as_mut() {
+                state
+                    .apply_authoritative(player)
+                    .map_err(NetworkError::Simulation)?;
+            } else {
+                self.player = Some(state.to_player().map_err(NetworkError::Simulation)?);
+            }
             self.predicted_tick = tick;
             self.predicted_input = sequence;
             self.predicted.retain(|old, _| *old <= tick.0);
@@ -831,7 +1176,12 @@ impl Connection {
                 ReplicaRead::Unknown => CellRead::Unknown,
                 ReplicaRead::Known(cell) => CellRead::Known(cell),
             };
-            let outcome = player.tick(&query, key_state(frame.map_or(0, |f| f.keys)));
+            let outcome = self.movement_replay.tick(
+                player,
+                &query,
+                key_state(frame.map_or(0, |f| f.keys)),
+                false,
+            );
             if outcome.waiting_for_world {
                 self.counters.unknown_steps += 1;
             } else if let Some(frame) = frame {
@@ -914,6 +1264,7 @@ impl Connection {
                     item: held.item(),
                     count: held.count(),
                     damage: held.damage(),
+                    payload: held.payload().map_or(0, |id| id.0),
                 },
             };
         }
@@ -961,6 +1312,7 @@ impl Connection {
         Ok(id)
     }
     pub fn poll(&mut self, now_ms: u64) -> Result<(), NetworkError> {
+        self.note_replay_time(now_ms);
         if let Some(hello) = &self.handshake
             && now_ms.saturating_sub(self.last_hello) >= 250
         {
@@ -999,6 +1351,16 @@ impl Connection {
             .collect();
         for page in geometry {
             self.request_geometry(page, now_ms)?;
+        }
+        let heights: Vec<_> = self
+            .height_interest
+            .iter()
+            .filter(|(_, i)| !i.2 && now_ms.saturating_sub(i.1) >= 1000)
+            .take(2)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in heights {
+            self.request_height(key, now_ms)?;
         }
         let pages: Vec<_> = self
             .interest

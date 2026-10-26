@@ -76,6 +76,15 @@ fn settle(gpu: &render::Gpu, lighting: &mut ClientLighting, world: &mut World) -
     unreachable!()
 }
 fn read_sample(gpu: &render::Gpu, lighting: &ClientLighting, index: usize) -> u32 {
+    read_word(
+        gpu,
+        lighting,
+        index / render::light_volume::LIGHT_SAMPLES * render::light_volume::LIGHT_PAGE_WORDS
+            + 1
+            + index % render::light_volume::LIGHT_SAMPLES,
+    )
+}
+fn read_word(gpu: &render::Gpu, lighting: &ClientLighting, index: usize) -> u32 {
     let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("CPU to GPU light owner oracle"),
         size: 4,
@@ -171,8 +180,8 @@ fn owner_runs_cpu_solver_dirty_uploads_and_shadow_cache_without_geometry_rebuild
         let light = world.page(page()).unwrap().light(torch.local_index());
         assert!(light.block >= 14 && light.rgb.iter().all(|v| *v >= 14));
         let sample = read_sample(&gpu, &lighting, light_index([8, 8, 8]).unwrap());
-        assert_eq!((sample >> 16) & 15, u32::from(light.block));
-        assert_eq!(sample & 15, u32::from(light.rgb[0]));
+        assert_eq!((sample >> 4) & 15, u32::from(light.block));
+        assert_eq!((sample >> 8) & 255, u32::from(light.rgb[0]));
         assert_eq!(
             terrain.take_work().upload_bytes,
             0,
@@ -210,22 +219,22 @@ fn owner_runs_cpu_solver_dirty_uploads_and_shadow_cache_without_geometry_rebuild
             .unwrap();
         settle(&gpu, &mut lighting, &mut world);
         assert_eq!(
-            read_sample(
+            read_word(
                 &gpu,
                 &lighting,
-                overlay.slot as usize * render::light_volume::LIGHT_SAMPLES
+                overlay.slot as usize * render::light_volume::LIGHT_PAGE_WORDS
             ),
             0x80000000 | handle.slot,
             "overlay must follow its base, never replace it"
         );
         assert_ne!(
-            read_sample(
+            read_word(
                 &gpu,
                 &lighting,
-                model.slot as usize * render::light_volume::LIGHT_SAMPLES
+                model.slot as usize * render::light_volume::LIGHT_PAGE_WORDS
             ) & 0x40000000,
             0,
-            "model should use four-byte uniform lighting"
+            "model should use explicit uniform header lighting"
         );
 
         let mut tx = Transaction::new(Tick(world.tick().0 + 1), SpaceId(0));
@@ -237,7 +246,7 @@ fn owner_runs_cpu_solver_dirty_uploads_and_shadow_cache_without_geometry_rebuild
         assert_eq!(light.block, 0);
         assert_eq!(light.rgb, [0; 3]);
         assert_eq!(
-            read_sample(&gpu, &lighting, light_index([8, 8, 8]).unwrap()) & 0xfff,
+            read_sample(&gpu, &lighting, light_index([8, 8, 8]).unwrap()) >> 8,
             0
         );
         assert_eq!(
@@ -245,15 +254,15 @@ fn owner_runs_cpu_solver_dirty_uploads_and_shadow_cache_without_geometry_rebuild
                 &gpu,
                 &lighting,
                 model.slot as usize * render::light_volume::LIGHT_SAMPLES
-            ) & 0xfff,
+            ) >> 8,
             0,
             "instance light must follow lamp removal"
         );
         assert_eq!(
-            read_sample(
+            read_word(
                 &gpu,
                 &lighting,
-                overlay.slot as usize * render::light_volume::LIGHT_SAMPLES
+                overlay.slot as usize * render::light_volume::LIGHT_PAGE_WORDS
             ),
             0x80000000 | handle.slot,
             "RGB updates must preserve live overlay alias"
@@ -373,5 +382,270 @@ fn bootstrap_larger_than_seed_queue_makes_bounded_progress() {
         .unwrap();
         let (_, cells) = settle(&gpu, &mut lighting, &mut world);
         assert!(cells >= 3 * 4096);
+    });
+}
+
+#[test]
+fn authoritative_replica_keeps_server_light_and_never_runs_local_sky_or_solver() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut terrain = setup(&gpu);
+        let mut world = World::new(rules::properties, 256);
+        let p = BlockPos {
+            space: SpaceId(0),
+            x: 8,
+            y: 8,
+            z: 8,
+        };
+        let mut tx = Transaction::new(Tick(1), SpaceId(0));
+        tx.create_page(page(), vec![Cell::AIR; 4096]);
+        tx.set_light(
+            p,
+            world::LightSample {
+                sky: 15,
+                block: 3,
+                rgb: [15, 0, 0],
+            },
+        );
+        world.commit(tx).unwrap();
+        let handle = terrain
+            .upload_page(
+                &gpu.queue,
+                None,
+                1,
+                translation([0.; 3]),
+                &PageMesh::default(),
+                &mut UploadBudget::new(1000000),
+            )
+            .unwrap();
+        // GeneratedProfile is deliberately present before selecting replica mode;
+        // with_authoritative_source must replace it with UnknownIsDark.
+        let mut lighting = ClientLighting::prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut terrain,
+            &mut world,
+            config().with_authoritative_source(),
+            [8., 0., 8.],
+            [0.3, 0.8, 0.2],
+        )
+        .unwrap();
+        lighting
+            .register_page(page(), handle, WorldBounds::new([0.; 3], [16.; 3]).unwrap())
+            .unwrap();
+        let boundary = world.journal_next();
+        let (bytes, cells) = settle(&gpu, &mut lighting, &mut world);
+        assert_eq!(cells, 0);
+        assert_eq!(bytes, LIGHT_PAGE_BYTES);
+        assert_eq!(world.journal_next(), boundary);
+        assert_eq!(world.page(page()).unwrap().light(p.local_index()).sky, 15);
+        let index = light_index([8, 8, 8]).unwrap();
+        let sample = read_sample(&gpu, &lighting, index);
+        assert_eq!((sample >> 8) & 255, 15);
+        assert_eq!(sample & 15, 15);
+        assert_eq!((sample >> 4) & 15, 3);
+        assert_eq!(
+            read_sample(&gpu, &lighting, light_index([-1, 8, 8]).unwrap()),
+            0,
+            "Unknown halo certified as sky"
+        );
+        let mut tx = Transaction::new(Tick(2), SpaceId(0));
+        tx.set_light(
+            p,
+            world::LightSample {
+                sky: 0,
+                block: 9,
+                rgb: [0, 0, 15],
+            },
+        );
+        world.commit(tx).unwrap();
+        let boundary = world.journal_next();
+        let (bytes, cells) = settle(&gpu, &mut lighting, &mut world);
+        assert_eq!(bytes, 4);
+        assert_eq!(cells, 0);
+        assert_eq!(world.journal_next(), boundary);
+        let sample = read_sample(&gpu, &lighting, index);
+        assert_eq!((sample >> 24) & 255, 15);
+        assert_eq!(sample & 15, 0);
+        assert_eq!((sample >> 4) & 15, 9);
+        for _ in 0..100 {
+            let work = lighting
+                .pump(&gpu.queue, &mut world, Tick(100), &mut UploadBudget::new(0))
+                .unwrap();
+            assert_eq!(work.cpu_cells, 0);
+            assert_eq!(work.cpu_neighbors, 0);
+            assert_eq!(work.light_updates, 0);
+            assert_eq!(work.pending_seed_pages, 0);
+            assert_eq!(work.upload_bytes, 0);
+            assert!(work.ready);
+        }
+        lighting.detach(&mut world);
+        println!(
+            "M4 authoritative LIGHT initial23332B delta4B,0CPUsolver/sky/derivedTx,UnknownhaloDark,idle1000writes"
+        );
+    });
+}
+
+#[test]
+fn scene_source_certificate_gates_zero_snapshot_and_revokes_high_rgb_on_cell_view_change() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut terrain = setup(&gpu);
+        let point = BlockPos {
+            space: SpaceId(0),
+            x: 8,
+            y: 8,
+            z: 8,
+        };
+        let mut scene = client::ClientScene::new(client::SceneConfig {
+            center: point,
+            horizontal_radius: 0,
+            vertical_radius: 0,
+            max_loaded_pages: 27,
+            authoritative_remote: true,
+            ..client::SceneConfig::forest()
+        })
+        .unwrap();
+        let image = |view| {
+            net::PageUpdate::Snapshot(net::PageSnapshot {
+                page: page(),
+                version: view,
+                source_version: core_types::Version(500 + view),
+                cells: Box::new([Cell::AIR; 4096]),
+            })
+        };
+        scene
+            .import_authoritative_page(&image(10), Tick(1))
+            .unwrap();
+        let handle = terrain
+            .upload_page(
+                &gpu.queue,
+                None,
+                1,
+                translation([0.; 3]),
+                &PageMesh::default(),
+                &mut UploadBudget::new(1000000),
+            )
+            .unwrap();
+        let mut lighting = ClientLighting::prepare_scene(
+            &gpu.device,
+            &gpu.queue,
+            &mut terrain,
+            &mut scene,
+            config().with_authoritative_source(),
+            [8., 0., 8.],
+            [0.3, 0.8, 0.2],
+        )
+        .unwrap();
+        lighting
+            .register_page(page(), handle, WorldBounds::new([0.; 3], [16.; 3]).unwrap())
+            .unwrap();
+        let unknown = lighting
+            .pump_scene(
+                &gpu.queue,
+                &mut scene,
+                Tick(2),
+                &mut UploadBudget::new(1000000),
+            )
+            .unwrap();
+        assert!(!unknown.ready);
+        assert_eq!(unknown.unknown_source_pages, 1);
+        assert_eq!(unknown.cpu_cells, 0);
+        let packet = |version, light| {
+            net::light::Update::Snapshot(net::light::Snapshot {
+                header: net::light::Header {
+                    page: page(),
+                    cell_view: 10,
+                    version,
+                    source: core_types::Version(1000 + version),
+                },
+                values: Box::new([light; 4096]),
+            })
+        };
+        let imported = scene
+            .import_authoritative_light(&packet(1, 0), Tick(3))
+            .unwrap();
+        assert!(imported.applied);
+        assert!(imported.change.is_none());
+        let known = lighting
+            .pump_scene(
+                &gpu.queue,
+                &mut scene,
+                Tick(3),
+                &mut UploadBudget::new(1000000),
+            )
+            .unwrap();
+        assert!(known.ready);
+        assert_eq!(known.confirmed_source_pages, 1);
+        assert_eq!(known.upload_bytes, LIGHT_PAGE_BYTES);
+        let hdr = net::light::pack(15, 7, [231, 17, 255]).unwrap();
+        scene
+            .import_authoritative_light(&packet(2, hdr), Tick(4))
+            .unwrap();
+        let before = lighting.ready_diagnostics(&scene);
+        assert!(before.authoritative && before.journal_lag_records > 0);
+        lighting.take_upload_bytes();
+        let cpu = lighting.ingest_scene_cpu(&mut scene).unwrap();
+        assert_eq!(cpu.coalesced_light_changes, 4096);
+        assert_eq!(cpu.journal_entries, 1);
+        assert_eq!(
+            (cpu.upload_bytes, cpu.cpu_cells, cpu.sample_reads),
+            (0, 0, 0)
+        );
+        assert_eq!(lighting.take_upload_bytes(), 0);
+        assert_eq!(
+            read_sample(&gpu, &lighting, light_index([8, 8, 8]).unwrap()),
+            0,
+            "CPU phase wrote into an in-flight GPU resource"
+        );
+        let after = lighting.ready_diagnostics(&scene);
+        assert_eq!(after.journal_lag_records, 0);
+        assert!(!after.partial_record);
+        assert_eq!((after.dirty_residents, after.unknown_source_pages), (1, 0));
+        let known = loop {
+            let work = lighting
+                .pump_scene(
+                    &gpu.queue,
+                    &mut scene,
+                    Tick(4),
+                    &mut UploadBudget::new(1000000),
+                )
+                .unwrap();
+            if work.ready {
+                break work;
+            }
+        };
+        assert!(known.ready);
+        assert_eq!(
+            read_sample(&gpu, &lighting, light_index([8, 8, 8]).unwrap()),
+            hdr,
+            "legal RGB8 was truncated or tagged as alias"
+        );
+        scene
+            .import_authoritative_page(&image(11), Tick(5))
+            .unwrap();
+        assert!(scene.authoritative_light_version(page()).is_none());
+        let revoked = lighting
+            .pump_scene(
+                &gpu.queue,
+                &mut scene,
+                Tick(5),
+                &mut UploadBudget::new(1000000),
+            )
+            .unwrap();
+        assert!(!revoked.ready);
+        assert_eq!(revoked.unknown_source_pages, 1);
+        assert_eq!(
+            read_sample(&gpu, &lighting, light_index([8, 8, 8]).unwrap()),
+            0
+        );
+        assert_eq!(revoked.cpu_cells, 0);
+        println!(
+            "M4 Scene LIGHT defaultzeroUnknown,zeroSnapshotcertifieswithoutWorldTx,RGB[231,17,255]GPUexact,cellView11revokesGPUtoDark"
+        );
     });
 }

@@ -1,7 +1,8 @@
 //! Versioned bounded state for an owner-side block-entity component.
 use super::*;
 
-pub const MACHINE_BYTES: usize = 3211;
+const LEGACY_MACHINE_BYTES: usize = 3211;
+pub const MACHINE_BYTES: usize = LEGACY_MACHINE_BYTES + 6 + 5 * 10;
 pub const MACHINE_HEADER_BYTES: usize = 139;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MachineDecodeError {
@@ -126,6 +127,21 @@ impl Machine {
             w.at,
             MACHINE_HEADER_BYTES + usize::from(self.pump_node_count) * 12
         );
+        let count = self
+            .slots
+            .iter()
+            .filter(|s| s.stack.payload().is_some())
+            .count();
+        if count > 0 {
+            w.raw(b"XRF1");
+            w.u16(count as u16);
+            for (i, slot) in self.slots.iter().enumerate() {
+                if let Some(id) = slot.stack.payload() {
+                    w.u16(i as u16);
+                    w.u64(id.0);
+                }
+            }
+        }
         w.at
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, MachineDecodeError> {
@@ -224,15 +240,28 @@ impl Machine {
             return Err(Value);
         }
         let used = MACHINE_HEADER_BYTES + count * 12;
-        if bytes.len() != used
-            && (bytes.len() != MACHINE_BYTES || bytes[used..].iter().any(|&b| b != 0))
-        {
+        if bytes.len() < used {
             return Err(Length);
         }
         for p in &mut m.pump_nodes[..count] {
             for c in p {
                 *c = r.u32() as i32;
             }
+        }
+        let (refs, ref_bytes) =
+            crate::item_payload::refs::read(&bytes[used..], 5).map_err(|_| Stack)?;
+        let total = used + ref_bytes;
+        if bytes.len() != total
+            && (!matches!(bytes.len(), LEGACY_MACHINE_BYTES | MACHINE_BYTES)
+                || bytes[total..].iter().any(|&b| b != 0))
+        {
+            return Err(Length);
+        }
+        for (i, id) in refs {
+            if m.slots[i].charge != 0 {
+                return Err(Value);
+            }
+            m.slots[i].stack = m.slots[i].stack.with_payload(id).map_err(|_| Stack)?;
         }
         if m.upgrades.iter().any(|&u| u > 8)
             || m.upgrade_delay > 20

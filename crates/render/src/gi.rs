@@ -5,6 +5,7 @@ use bytemuck::{Pod, Zeroable};
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct GiVoxel(u32);
+pub const MAX_REFLECTED_RADIANCE: f32 = 32.0;
 impl GiVoxel {
     pub const UNKNOWN: Self = Self(0);
     pub const EMPTY: Self = Self(0x8000_0000);
@@ -13,16 +14,16 @@ impl GiVoxel {
     pub fn opaque_reflected(radiance: [f32; 3]) -> Option<Self> {
         if radiance
             .iter()
-            .any(|v| !v.is_finite() || !(0.0..=8.0).contains(v))
+            .any(|v| !v.is_finite() || !(0.0..=MAX_REFLECTED_RADIANCE).contains(v))
         {
             return None;
         }
-        let rgb = radiance.map(|v| (v * (1023.0 / 8.0)).round() as u32);
+        let rgb = radiance.map(|v| (v * (1023.0 / MAX_REFLECTED_RADIANCE)).round() as u32);
         Some(Self(0xc000_0000 | rgb[0] | (rgb[1] << 10) | (rgb[2] << 20)))
     }
     pub fn reflected(self) -> [f32; 3] {
         [self.0 & 1023, (self.0 >> 10) & 1023, (self.0 >> 20) & 1023]
-            .map(|v| v as f32 * (8.0 / 1023.0))
+            .map(|v| v as f32 * (MAX_REFLECTED_RADIANCE / 1023.0))
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -633,6 +634,9 @@ impl GiGpu {
     }
     pub fn pending(&self) -> u32 {
         self.dirty
+    }
+    pub fn config(&self) -> GiConfig {
+        self.config
     }
     pub fn source_revision(&self) -> u32 {
         self.parameters.stamps[0]

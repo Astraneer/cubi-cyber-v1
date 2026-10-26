@@ -90,6 +90,96 @@ fn integer_origin_is_applied_before_light_lookup_without_losing_fraction() {
     assert_eq!(frame.lights()[0].rgb(), [15, 2, 0]);
     assert_eq!(frame.lights()[0].sky(), 7);
 }
+
+#[test]
+fn public_actor_light_is_dark_between_cell_view_invalidation_and_confirmed_rebind() {
+    let point = BlockPos {
+        space: SpaceId(0),
+        x: 8,
+        y: 8,
+        z: 8,
+    };
+    let mut scene = client::ClientScene::new(client::SceneConfig {
+        center: point,
+        horizontal_radius: 0,
+        vertical_radius: 0,
+        authoritative_remote: true,
+        ..client::SceneConfig::forest()
+    })
+    .unwrap();
+    let cells = |view| {
+        net::PageUpdate::Snapshot(net::PageSnapshot {
+            page: point.page(),
+            version: view,
+            source_version: core_types::Version(10),
+            cells: Box::new([Cell::AIR; 4096]),
+        })
+    };
+    scene.import_authoritative_page(&cells(1), Tick(0)).unwrap();
+    let light = |cell_view, version| {
+        net::light::Update::Snapshot(net::light::Snapshot {
+            header: net::light::Header {
+                page: point.page(),
+                cell_view,
+                version,
+                source: core_types::Version(20),
+            },
+            values: Box::new([net::light::pack(15, 2, [231, 17, 255]).unwrap(); 4096]),
+        })
+    };
+    scene
+        .import_authoritative_light(&light(1, 1), Tick(0))
+        .unwrap();
+    let mut actor = instance();
+    actor.position = [8., 8., 8.];
+    let mut frame = EntityFrame::new(1);
+    let icons = RegistryItemVisuals {
+        icon_layer: &|_| None,
+    };
+    frame
+        .prepare_sampled(&[actor], SpaceId(0), [0; 3], &icons, |position| {
+            scene.read_authoritative_light(position)
+        })
+        .unwrap();
+    let packed = render::light_volume::PackedLight::new(15, 2, [231, 17, 255]).unwrap();
+    assert_eq!(frame.lights(), &[packed]);
+    scene.import_authoritative_page(&cells(2), Tick(1)).unwrap();
+    assert_eq!(
+        scene
+            .world()
+            .page(point.page())
+            .unwrap()
+            .light(point.local_index())
+            .rgb,
+        [231, 17, 255],
+        "binding invalidation costs no4096-cell light clearing transaction"
+    );
+    let revision = scene.world().version();
+    let unknown = frame
+        .prepare_sampled(&[actor], SpaceId(0), [0; 3], &icons, |position| {
+            scene.read_authoritative_light(position)
+        })
+        .unwrap();
+    assert_eq!(unknown.unknown_light_reads, 1);
+    assert_eq!(
+        frame.lights(),
+        &[render::light_volume::PackedLight::default()]
+    );
+    assert_eq!(
+        scene.world().version(),
+        revision,
+        "sampling never mutates authority fields"
+    );
+    scene
+        .import_authoritative_light(&light(2, 2), Tick(1))
+        .unwrap();
+    frame
+        .prepare_sampled(&[actor], SpaceId(0), [0; 3], &icons, |position| {
+            scene.read_authoritative_light(position)
+        })
+        .unwrap();
+    assert_eq!(frame.lights(), &[packed]);
+}
 #[test]
 fn missing_item_icon_keeps_previous_complete_frame_and_block_items_reuse_atlas() {
     let world = World::new(rules::properties, 8);
@@ -169,4 +259,37 @@ fn local_human_keeps_first_person_shadow_and_rebases_before_f32() {
     assert!(
         local_player_instance(&player, 0.5, sim::CameraMode::RightShoulder, [0; 3], 1).is_none()
     );
+}
+
+#[test]
+fn registry_block_drops_keep_grass_log_and_machine_face_materials() {
+    let world = World::new(rules::properties, 8);
+    let mut frame = EntityFrame::new(1);
+    let visuals = RegistryItemVisuals {
+        icon_layer: &|_| None,
+    };
+    for block in [
+        rules::ids::GRASS,
+        rules::ids::LOG,
+        rules::ids::ENERGIZED_SMELTER,
+    ] {
+        let mut item = instance();
+        item.kind = 6;
+        item.flags = 32;
+        item.color = u32::from(block);
+        frame
+            .prepare(&[item], &world, SpaceId(0), [0; 3], &visuals)
+            .unwrap();
+        let expected = std::array::from_fn(|face| {
+            rules::blocks::layer_cell(block, 0, rules::blocks::mesh_face(face as u8)).0 as u16
+        });
+        assert_eq!(frame.instances()[0].block_layers(), Some(expected));
+        assert_ne!(
+            expected[0..2],
+            expected[2..4],
+            "fixture must distinguish end and side textures"
+        );
+        assert_eq!(frame.instances()[0].limb_phase, item.limb_phase);
+        assert_eq!(frame.instances()[0].reserved, item.reserved);
+    }
 }

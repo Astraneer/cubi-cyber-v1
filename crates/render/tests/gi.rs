@@ -30,6 +30,38 @@ fn probes(gpu: &render::Gpu, gi: &GiGpu) -> Vec<ProbeSample> {
         .map(bytemuck::pod_read_unaligned)
         .collect()
 }
+// Independent f64 projected-solid-angle quadrature over the finite 16x16 wall.
+// This oracle uses neither algorithm's angular samples nor SH coefficients.
+fn wall_irradiance(position: [f32; 4], radiance: f32) -> f64 {
+    let distance = 12.0 - f64::from(position[0]);
+    let step = 16.0 / 128.0;
+    let mut integral = 0.0;
+    for y in 0..128 {
+        for z in 0..128 {
+            let dy = (f64::from(y) + 0.5) * step - f64::from(position[1]);
+            let dz = (f64::from(z) + 0.5) * step - f64::from(position[2]);
+            let radius_squared = distance * distance + dy * dy + dz * dz;
+            // Both paths have the same 24-block ray limit.
+            if radius_squared < 24.0 * 24.0 {
+                integral += distance * distance / (radius_squared * radius_squared) * step * step;
+            }
+        }
+    }
+    f64::from(radiance) * integral
+}
+fn rms_error(actual: &[ProbeSample], expected: &[f64]) -> f64 {
+    (actual
+        .iter()
+        .zip(expected)
+        .map(|(p, expected)| {
+            let error = f64::from(p.irradiance([1., 0., 0.])[0]) - expected;
+            error * error
+        })
+        .sum::<f64>()
+        / actual.len() as f64)
+        .sqrt()
+}
+
 fn statistics(gpu: &render::Gpu, gi: &GiGpu) -> [u32; 4] {
     let bytes = read(gpu, gi.statistics_buffer());
     std::array::from_fn(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()))
@@ -270,6 +302,16 @@ fn edited_visible_gpu_probes_reach_h6_within_six_ticks_and_fifo_fails() {
         tick(&gpu, &mut priority, 8, 64 * 38, &mut budget);
         assert_eq!(priority.pending(), 0);
         let lit = probes(&gpu, &priority);
+        let physical_reference = lit
+            .iter()
+            .map(|p| wall_irradiance(p.position, reflected[0]))
+            .collect::<Vec<_>>();
+        let physical_rms = rms_error(&lit, &physical_reference);
+        assert!(
+            physical_rms < 0.32,
+            "finite-wall independent f64 lighting regression: {physical_rms}"
+        );
+        println!("GI_FINITE_WALL_F64_OK receivers=64 RMS={physical_rms} quadrature=128x128");
         priority
             .upload_cells(
                 &gpu.queue,
@@ -435,7 +477,7 @@ fn unknown_and_obsolete_source_jobs_cannot_publish_light() {
         let deferred = gi.trace_tick(&gpu.queue, &mut encoder, 4, &mut budget, &mut 0);
         assert_eq!(deferred.updated_probes, 0);
         assert_eq!(gi.pending(), 64);
-        assert!(GiVoxel::opaque_reflected([9.0, 0.0, 0.0]).is_none());
+        assert!(GiVoxel::opaque_reflected([33.0, 0.0, 0.0]).is_none());
         assert!(GiVoxel::opaque_reflected([f32::NAN, 0.0, 0.0]).is_none());
         println!(
             "GI_STALE_GPU_OK unknown_light_leaks=0 obsolete_published=0 fresh_source_revision={} deferred_pending=64",
@@ -457,7 +499,7 @@ fn probe_receiver_conserves_lambert_energy_in_a_uniform_room() {
             ..config(Priority::EditedVisible)
         };
         let mut gi = GiGpu::new(&gpu.device, &gpu.queue, config, &mut budget).unwrap();
-        let surface = GiVoxel::opaque_reflected([1.0, 0.5, 0.25]).unwrap();
+        let surface = GiVoxel::opaque_reflected([17.0, 17.0 / 15.0, 231.0 / 15.0]).unwrap();
         let mut room = [GiVoxel::EMPTY; 4096];
         for y in 0..16 {
             for z in 0..16 {
@@ -647,7 +689,7 @@ struct Vertex{@builtin(position)position:vec4<f32>,@location(0)uv:vec2<f32>};
             "probe convolution or Lambert normalization created/lost reflected energy: {error}"
         );
         println!(
-            "GI_RECEIVER_GPU_OK hdr_pixels=2048 max_energy_error={error:.8} escaped_sky=excluded direct_emission=excluded"
+            "GI_RECEIVER_GPU_OK hdr_pixels=2048 legal_RGB8_HDR=true max_energy_error={error:.8} escaped_sky=excluded direct_emission=excluded"
         );
     });
 }

@@ -43,6 +43,7 @@ impl SurfaceCell {
         }
     }
 }
+#[derive(Clone)]
 pub struct WaterHalo {
     cells: Box<[SurfaceCell; HALO_VOLUME]>,
 }
@@ -240,6 +241,7 @@ pub struct WaterTask {
     pub version: Version,
     pub inputs: [SampledPageInput; 27],
     pages: [Option<Arc<Page>>; 27],
+    halo: Option<WaterHalo>,
     tints: Box<[u32; 256]>,
 }
 pub struct CompletedWater {
@@ -302,17 +304,17 @@ impl WaterTask {
                 .try_into()
                 .unwrap_or_else(|_| unreachable!("fixed27snapshots")),
             tints,
+            halo: None,
         })
     }
-    pub fn execute(
-        self,
-        max_quads: usize,
-        cancel: impl Fn() -> bool,
-    ) -> Result<CompletedWater, WaterMeshError> {
-        if cancel() {
-            return Err(WaterMeshError::Cancelled);
+    pub fn tints(&self) -> &[u32; 256] {
+        &self.tints
+    }
+    pub fn snapshot_halo(&self) -> WaterHalo {
+        if let Some(halo) = &self.halo {
+            return halo.clone();
         }
-        let halo = WaterHalo::from_fn(|x, y, z| {
+        WaterHalo::from_fn(|x, y, z| {
             let dx = x.div_euclid(16);
             let dy = y.div_euclid(16);
             let dz = z.div_euclid(16);
@@ -323,9 +325,64 @@ impl WaterTask {
             self.pages[p].as_ref().map_or(SurfaceCell::Unknown, |page| {
                 SurfaceCell::from_cell(page.cell(LocalIdx::new(i).expect("16cube index")))
             })
-        });
+        })
+    }
+    pub fn from_halo(
+        page: PageId,
+        inputs: [SampledPageInput; 27],
+        tints: Box<[u32; 256]>,
+        halo: WaterHalo,
+    ) -> Result<Self, WaterMeshError> {
+        for dy in -1i32..=1 {
+            for dz in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let i = ((dx + 1) + 3 * (dz + 1) + 9 * (dy + 1)) as usize;
+                    let p = PageId {
+                        space: page.space,
+                        x: page
+                            .x
+                            .checked_add(dx)
+                            .ok_or(WaterMeshError::CoordinateOverflow)?,
+                        y: page
+                            .y
+                            .checked_add(dy)
+                            .ok_or(WaterMeshError::CoordinateOverflow)?,
+                        z: page
+                            .z
+                            .checked_add(dz)
+                            .ok_or(WaterMeshError::CoordinateOverflow)?,
+                    };
+                    if inputs[i].page != p
+                        || inputs[i].channels != CHANNELS
+                        || inputs[i].region
+                            != PageRegion::new([-dx as i8, -dy as i8, -dz as i8])
+                                .expect("halo region")
+                    {
+                        return Err(WaterMeshError::CoordinateOverflow);
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            page,
+            version: inputs[13].version,
+            inputs,
+            pages: std::array::from_fn(|_| None),
+            tints,
+            halo: Some(halo),
+        })
+    }
+    pub fn execute(
+        self,
+        max_quads: usize,
+        cancel: impl Fn() -> bool,
+    ) -> Result<CompletedWater, WaterMeshError> {
+        if cancel() {
+            return Err(WaterMeshError::Cancelled);
+        }
+        let halo = self.snapshot_halo();
         let mut mesh = mesh_water(&halo, &self.tints, max_quads, cancel)?;
-        mesh.work.snapshot_lookups = 27;
+        mesh.work.snapshot_lookups = if self.halo.is_some() { 0 } else { 27 };
         Ok(CompletedWater {
             page: self.page,
             version: self.version,

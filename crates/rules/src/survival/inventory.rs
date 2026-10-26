@@ -7,6 +7,7 @@ use core_types::Cell;
 
 pub const OFFHAND: usize = 40;
 pub const INVENTORY_BYTES: usize = 4 + 1 + 1 + 8 + 41 * 6;
+pub const INVENTORY_MAX_BYTES: usize = INVENTORY_BYTES + 6 + 41 * 10;
 
 /// Flat indices preserve the donor contract: main 0..36, boots..helmet 36..40,
 /// offhand 40. New players own no items; grants are explicit server operations.
@@ -327,7 +328,7 @@ impl Inventory {
         }
         Ok(plan)
     }
-    pub fn encode(&self) -> [u8; INVENTORY_BYTES] {
+    pub fn encode(&self) -> crate::item_payload::Encoded<INVENTORY_MAX_BYTES> {
         let mut out = [0u8; INVENTORY_BYTES];
         out[..4].copy_from_slice(b"INV1");
         out[4] = self.selected;
@@ -337,10 +338,14 @@ impl Inventory {
             bytes[2..4].copy_from_slice(&stack.count().to_le_bytes());
             bytes[4..].copy_from_slice(&stack.damage().to_le_bytes());
         }
-        out
+        let mut encoded = crate::item_payload::Encoded::from_prefix(&out);
+        encoded
+            .append_refs(self.slots.iter().enumerate().map(|(i, s)| (i, s.payload())))
+            .expect("validated inventory references");
+        encoded
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, SurvivalError> {
-        if bytes.len() != INVENTORY_BYTES
+        if !(INVENTORY_BYTES..=INVENTORY_MAX_BYTES).contains(&bytes.len())
             || &bytes[..4] != b"INV1"
             || bytes[4] >= 9
             || bytes[5] != 0
@@ -354,7 +359,7 @@ impl Inventory {
                 .try_into()
                 .map_err(|_| SurvivalError::InvalidEncoding)?,
         );
-        for (slot, raw) in bytes[14..].chunks_exact(6).enumerate() {
+        for (slot, raw) in bytes[14..INVENTORY_BYTES].chunks_exact(6).enumerate() {
             let read = |index| u16::from_le_bytes([raw[index], raw[index + 1]]);
             let stack = ItemStack::from_parts(read(0), read(2), read(4))
                 .map_err(|_| SurvivalError::InvalidStack)?;
@@ -365,6 +370,16 @@ impl Inventory {
                 return Err(SurvivalError::InvalidArmorSlot);
             }
             out.slots[slot] = stack;
+        }
+        let (refs, used) = crate::item_payload::refs::read(&bytes[INVENTORY_BYTES..], 41)
+            .map_err(|_| SurvivalError::InvalidEncoding)?;
+        if INVENTORY_BYTES + used != bytes.len() {
+            return Err(SurvivalError::InvalidEncoding);
+        }
+        for (slot, id) in refs {
+            out.slots[slot] = out.slots[slot]
+                .with_payload(id)
+                .map_err(|_| SurvivalError::InvalidStack)?;
         }
         Ok(out)
     }

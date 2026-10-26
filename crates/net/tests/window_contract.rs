@@ -90,6 +90,7 @@ fn all_window_kinds_have_bounded_snapshots_with_strict_shapes_and_values() {
                 item: 1,
                 count: 64,
                 damage: 0,
+                payload: 0,
             },
             craft: [Stack::EMPTY; 9],
             craft_result: Stack::EMPTY,

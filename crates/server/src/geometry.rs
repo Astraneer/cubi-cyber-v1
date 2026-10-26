@@ -157,9 +157,16 @@ impl Server {
                 }
                 continue;
             }
-            peer.geometry_view = peer.geometry_view.saturating_add(1);
-            geometry.view_version = peer.geometry_view;
+            if peer.geometry_subscriptions.get(&page) == Some(&version)
+                && let Some(view) = peer.geometry_views.get(&page)
+            {
+                geometry.view_version = *view;
+            } else {
+                peer.geometry_view = peer.geometry_view.saturating_add(1);
+                geometry.view_version = peer.geometry_view;
+            }
             peer.geometry_subscriptions.insert(page, version);
+            peer.geometry_views.insert(page, geometry.view_version);
             output.push(Outgoing::reliable(
                 connection,
                 ServerMessage::Geometry(Box::new(geometry)),

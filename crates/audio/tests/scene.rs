@@ -32,6 +32,11 @@ fn loading_prepares_every_event_and_fixed_tick_requests_allocate_nothing() {
         let cue = events.steps(tick, body, EmitterId(1), [0.0; 3]).unwrap();
         footsteps += cue.iter().flatten().count();
         assert!(
+            cue.iter()
+                .flatten()
+                .all(|request| request.category == audio::Category::Players)
+        );
+        assert!(
             events
                 .steps(tick, body, EmitterId(1), [0.0; 3])
                 .unwrap()

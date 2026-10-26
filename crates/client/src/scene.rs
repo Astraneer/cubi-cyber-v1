@@ -14,6 +14,9 @@ use world::{CursorId, PageRegion, SampledPageInput as PageInput, Transaction, Wo
 #[path = "remote_scene.rs"]
 mod remote;
 pub use remote::*;
+#[path = "remote_light.rs"]
+mod remote_light;
+pub use remote_light::*;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SceneConfig {
@@ -91,6 +94,7 @@ pub enum SceneError {
         expected: u64,
     },
     PredictionConflict,
+    Light(net::light::Error),
 }
 impl std::fmt::Display for SceneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -215,6 +219,7 @@ pub struct ClientScene {
     pending_evictions: VecDeque<PageId>,
     rebases: crate::rebase::RebaseTracker,
     confirmed_versions: BTreeMap<PageId, ConfirmedPageVersion>,
+    confirmed_lights: BTreeMap<PageId, ConfirmedLightVersion>,
     remote_biomes: Option<terrain_gen::Generator>,
 }
 impl ClientScene {
@@ -322,6 +327,7 @@ impl ClientScene {
             pending_evictions: VecDeque::with_capacity(config.max_loaded_pages),
             rebases: crate::rebase::RebaseTracker::default(),
             confirmed_versions: BTreeMap::new(),
+            confirmed_lights: BTreeMap::new(),
             remote_biomes: config
                 .authoritative_remote
                 .then(|| terrain_gen::Generator::new(config.seed)),
@@ -600,6 +606,7 @@ impl ClientScene {
             for page in &change.pages {
                 if page.removed {
                     self.confirmed_versions.remove(&page.page);
+                    self.confirmed_lights.remove(&page.page);
                 }
             }
         }

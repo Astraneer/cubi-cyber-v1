@@ -171,11 +171,34 @@ impl SelfBody {
         self.previous_body = yaw;
     }
     pub(crate) fn tick(&mut self, player: &Motion) {
-        let dx = (player.pos[0] - player.prev[0]) as f32;
-        let dz = (player.pos[2] - player.prev[2]) as f32;
+        self.tick_pose(player.prev, player.pos, player.yaw, player.swinging);
+    }
+    /// Advance the same cosmetic pose from a confirmed remote motion sample.
+    /// This performs no physics, world query, permission change or allocation.
+    pub fn advance_motion(
+        &mut self,
+        previous: [f64; 3],
+        position: [f64; 3],
+        yaw: f32,
+        swinging: bool,
+    ) -> Result<(), &'static str> {
+        if !yaw.is_finite()
+            || previous
+                .iter()
+                .chain(position.iter())
+                .any(|value| !value.is_finite())
+        {
+            return Err("invalid body motion sample");
+        }
+        self.tick_pose(previous, position, yaw, swinging);
+        Ok(())
+    }
+    fn tick_pose(&mut self, previous: [f64; 3], position: [f64; 3], yaw: f32, swinging: bool) {
+        let dx = (position[0] - previous[0]) as f32;
+        let dz = (position[2] - previous[2]) as f32;
         self.age = self.age.wrapping_add(1);
         self.previous_body = self.body;
-        self.body = turn_body(self.body, player.yaw, dx, dz, player.swinging);
+        self.body = turn_body(self.body, yaw, dx, dz, swinging);
         self.previous_limb = self.limb;
         self.previous_amount = self.amount;
         self.amount += (((dx * dx + dz * dz).sqrt() * 4.0).min(1.0) - self.amount) * 0.4;

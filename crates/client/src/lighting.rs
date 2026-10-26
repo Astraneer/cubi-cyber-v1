@@ -170,11 +170,20 @@ impl LightDirtyTracker {
         page: PageId,
         scratch: &'a mut LightUploadScratch,
     ) -> Option<PreparedLight<'a>> {
+        self.prepare_filtered(world, page, scratch, |_| true)
+    }
+    pub fn prepare_filtered<'a>(
+        &self,
+        world: &World,
+        page: PageId,
+        scratch: &'a mut LightUploadScratch,
+        known: impl Fn(PageId) -> bool,
+    ) -> Option<PreparedLight<'a>> {
         let dirty = self.pages.get(&page)?;
         let mut work = LightSampleWork::default();
         if dirty.full {
             for (index, value) in scratch.samples.iter_mut().enumerate() {
-                *value = sample(world, page, index, &mut work);
+                *value = sample(world, page, index, &mut work, &known);
             }
             Some(PreparedLight::Full {
                 page,
@@ -192,7 +201,7 @@ impl LightDirtyTracker {
                     if index < LIGHT_SAMPLES {
                         scratch.updates.push(LightUpdate {
                             index: index as u16,
-                            value: sample(world, page, index, &mut work),
+                            value: sample(world, page, index, &mut work, &known),
                         });
                     }
                     bits &= bits - 1;
@@ -266,7 +275,13 @@ fn light_receivers(page: PageId, index: LocalIdx, output: &mut [(PageId, usize);
     }
     count
 }
-fn sample(world: &World, page: PageId, index: usize, work: &mut LightSampleWork) -> PackedLight {
+fn sample(
+    world: &World,
+    page: PageId,
+    index: usize,
+    work: &mut LightSampleWork,
+    known: &impl Fn(PageId) -> bool,
+) -> PackedLight {
     work.samples += 1;
     let local = [
         (index % 18) as i64 - 1,
@@ -292,7 +307,9 @@ fn sample(world: &World, page: PageId, index: usize, work: &mut LightSampleWork)
         y,
         z,
     };
-    if let Some(page) = world.page(position.page()) {
+    if known(position.page())
+        && let Some(page) = world.page(position.page())
+    {
         work.known_reads += 1;
         let light = page.light(position.local_index());
         PackedLight::new(light.sky, light.block, light.rgb).expect("world light validates 0..15")
@@ -331,8 +348,14 @@ pub enum SkyPolicy {
         top_y: i32,
     },
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LightSource {
+    LocalDerived,
+    Authoritative,
+}
 #[derive(Clone, Copy, Debug)]
 pub struct ClientLightingConfig {
+    pub source: LightSource,
     pub shadows: ShadowConfig,
     pub sky: SkyPolicy,
     pub cpu_limits: LightingLimits,
@@ -347,6 +370,7 @@ pub struct ClientLightingConfig {
 impl Default for ClientLightingConfig {
     fn default() -> Self {
         Self {
+            source: LightSource::LocalDerived,
             shadows: ShadowConfig::default(),
             sky: SkyPolicy::UnknownIsDark,
             cpu_limits: LightingLimits::default(),
@@ -361,6 +385,12 @@ impl Default for ClientLightingConfig {
     }
 }
 impl ClientLightingConfig {
+    /// Replica mode never creates or runs a CPU solver and never certifies sky.
+    pub fn with_authoritative_source(mut self) -> Self {
+        self.source = LightSource::Authoritative;
+        self.sky = SkyPolicy::UnknownIsDark;
+        self
+    }
     pub fn standalone() -> Self {
         Self {
             sky: SkyPolicy::GeneratedProfile {
@@ -481,6 +511,8 @@ impl SkyAccess for SkyProof {
 struct ResidentLight {
     handle: PageHandle,
     bounds: WorldBounds,
+    upload_revision: u64,
+    bindings: [Option<u64>; 27],
 }
 struct OverlayLight {
     page: PageId,
@@ -503,6 +535,7 @@ struct PendingRecord {
     cell: usize,
     light: usize,
     page_started: bool,
+    full_lights: bool,
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ClientLightingWork {
@@ -520,10 +553,33 @@ pub struct ClientLightingWork {
     pub ready: bool,
     pub oldest_light_age_ticks: u64,
     pub light_overdue: bool,
+    pub confirmed_source_pages: usize,
+    pub unknown_source_pages: usize,
+    pub provenance_page_reads: u64,
+    pub coalesced_light_changes: u64,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LightingReadyDiagnostics {
+    pub authoritative: bool,
+    pub bootstrap_pages: usize,
+    pub pending_solver_cells: usize,
+    pub journal_next: u64,
+    pub journal_consumed: u64,
+    pub journal_lag_records: u64,
+    pub partial_record: bool,
+    pub partial_light_remaining: usize,
+    pub pending_gpu_pages: usize,
+    pub dirty_residents: usize,
+    pub resident_pages: usize,
+    pub unknown_source_pages: usize,
+    pub unbound_overlays: usize,
+    pub dirty_instances: usize,
+    pub sky_columns: usize,
+    pub pending_shadow_cascades: u32,
 }
 pub struct ClientLighting {
     config: ClientLightingConfig,
-    engine: LightingEngine,
+    engine: Option<LightingEngine>,
     sky: SkyProof,
     lights: LightVolumeGpu,
     shadows: ShadowGpu,
@@ -556,8 +612,9 @@ impl ClientLighting {
         if config.max_journal_entries == 0
             || config.max_gpu_pages_per_pump == 0
             || config.max_pending_light_pages < 27
-            || config.max_bootstrap_pages < world.loaded_pages()
-            || config.max_sky_blockers == 0
+            || (config.source == LightSource::LocalDerived
+                && (config.max_bootstrap_pages < world.loaded_pages()
+                    || config.max_sky_blockers == 0))
         {
             return Err(ClientLightingError::InvalidConfig);
         }
@@ -566,22 +623,37 @@ impl ClientLighting {
         let lights = LightVolumeGpu::new(device, max_pages)?;
         let shadows = ShadowGpu::new(device, queue, geometry, config.shadows, center, sun)?;
         terrain.attach_lighting(device, &shadows, &lights)?;
-        let engine = LightingEngine::attach(world, config.cpu_limits)?;
+        let derived = config.source == LightSource::LocalDerived;
+        let engine = if derived {
+            Some(LightingEngine::attach(world, config.cpu_limits)?)
+        } else {
+            None
+        };
         let next_sequence = world.journal_next();
         let cursor = world.register_cursor();
-        let bootstrap = world.pages().map(|(page, _)| (page, 0)).collect();
+        let bootstrap = if derived {
+            world.pages().map(|(page, _)| (page, 0)).collect()
+        } else {
+            VecDeque::new()
+        };
         let mut known_columns: BTreeMap<(SpaceId, i32, i32), BTreeSet<i32>> = BTreeMap::new();
-        for (page, _) in world.pages() {
-            known_columns
-                .entry((page.space, page.x, page.z))
-                .or_default()
-                .insert(page.y);
+        if derived {
+            for (page, _) in world.pages() {
+                known_columns
+                    .entry((page.space, page.x, page.z))
+                    .or_default()
+                    .insert(page.y);
+            }
         }
         Ok(Self {
             config,
             engine,
             sky: SkyProof {
-                policy: config.sky,
+                policy: if derived {
+                    config.sky
+                } else {
+                    SkyPolicy::UnknownIsDark
+                },
                 blockers: BTreeMap::new(),
                 count: 0,
                 max_blockers: config.max_sky_blockers,
@@ -592,7 +664,7 @@ impl ClientLighting {
             next_sequence,
             record: None,
             bootstrap,
-            bootstrap_sky_complete: false,
+            bootstrap_sky_complete: !derived,
             dirty: LightDirtyTracker::new(config.max_pending_light_pages),
             scratch: LightUploadScratch::default(),
             residents: BTreeMap::new(),
@@ -640,10 +712,15 @@ impl ClientLighting {
             return Ok(());
         }
         self.dirty.mark_full(page, Version(0))?;
-        if let Some(old) = self
-            .residents
-            .insert(page, ResidentLight { handle, bounds })
-        {
+        if let Some(old) = self.residents.insert(
+            page,
+            ResidentLight {
+                handle,
+                bounds,
+                upload_revision: 0,
+                bindings: [None; 27],
+            },
+        ) {
             self.shadows.invalidate_bounds(old.bounds);
         }
         self.shadows.invalidate_bounds(bounds);
@@ -797,7 +874,7 @@ impl ClientLighting {
     }
     pub fn needs_work(&self, world: &World) -> bool {
         !self.bootstrap.is_empty()
-            || !self.engine.is_idle()
+            || self.engine.as_ref().is_some_and(|engine| !engine.is_idle())
             || self.next_sequence != world.journal_next()
             || self.record.is_some()
             || self.dirty.pending_pages() != 0
@@ -808,6 +885,62 @@ impl ClientLighting {
             || self.instances.values().any(|instance| instance.dirty)
             || !self.sky_dirty.is_empty()
             || self.shadows.cache().pending() != 0
+    }
+    /// Bounded CPU journal work can run while an older GPU frame is in flight.
+    /// No queue, GPU resource, uniform update or solver is reachable here.
+    pub fn ingest_scene_cpu(
+        &mut self,
+        scene: &mut crate::ClientScene,
+    ) -> Result<ClientLightingWork, ClientLightingError> {
+        if self.config.source != LightSource::Authoritative {
+            return Err(ClientLightingError::InvalidConfig);
+        }
+        let mut work = ClientLightingWork::default();
+        self.ingest(scene.derived_world_mut(), &mut work)?;
+        work.pending_gpu_pages = self.dirty.pending_pages();
+        Ok(work)
+    }
+    pub fn ready_diagnostics(&self, scene: &crate::ClientScene) -> LightingReadyDiagnostics {
+        let journal_next = scene.world().journal_next();
+        LightingReadyDiagnostics {
+            authoritative: self.config.source == LightSource::Authoritative,
+            bootstrap_pages: self.bootstrap.len(),
+            pending_solver_cells: self
+                .engine
+                .as_ref()
+                .map_or(0, LightingEngine::pending_cells),
+            journal_next,
+            journal_consumed: self.next_sequence,
+            journal_lag_records: journal_next.saturating_sub(self.next_sequence),
+            partial_record: self.record.is_some(),
+            partial_light_remaining: self.record.as_ref().map_or(0, |record| {
+                record.change.lights.len().saturating_sub(record.light)
+            }),
+            pending_gpu_pages: self.dirty.pending_pages(),
+            dirty_residents: self
+                .residents
+                .keys()
+                .filter(|page| self.dirty.pending_version(**page).is_some())
+                .count(),
+            resident_pages: self.residents.len(),
+            unknown_source_pages: self
+                .residents
+                .keys()
+                .filter(|page| scene.authoritative_light_version(**page).is_none())
+                .count(),
+            unbound_overlays: self
+                .overlays
+                .values()
+                .filter(|overlay| overlay.bound_source.is_none())
+                .count(),
+            dirty_instances: self
+                .instances
+                .values()
+                .filter(|instance| instance.dirty)
+                .count(),
+            sky_columns: self.sky_dirty.len(),
+            pending_shadow_cascades: self.shadows.cache().pending(),
+        }
     }
     pub fn set_cpu_budget(&mut self, budget: LightBudget) -> Result<(), ClientLightingError> {
         if budget.max_cells == 0
@@ -836,7 +969,96 @@ impl ClientLighting {
         tick: Tick,
         budget: &mut UploadBudget,
     ) -> Result<ClientLightingWork, ClientLightingError> {
-        self.pump(queue, scene.derived_world_mut(), tick, budget)
+        if self.config.source == LightSource::LocalDerived {
+            return self.pump(queue, scene.derived_world_mut(), tick, budget);
+        }
+        let mut work = ClientLightingWork::default();
+        self.ingest(scene.derived_world_mut(), &mut work)?;
+        for (&page, resident) in &mut self.residents {
+            let mut bindings = [None; 27];
+            let mut i = 0;
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for dx in -1..=1 {
+                        if let (Some(x), Some(y), Some(z)) = (
+                            page.x.checked_add(dx),
+                            page.y.checked_add(dy),
+                            page.z.checked_add(dz),
+                        ) {
+                            work.provenance_page_reads += 1;
+                            bindings[i] = scene
+                                .authoritative_light_version(PageId {
+                                    space: page.space,
+                                    x,
+                                    y,
+                                    z,
+                                })
+                                .map(|stamp| stamp.cell_view);
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            if bindings != resident.bindings {
+                if self
+                    .dirty
+                    .mark_full(page, scene.world().page_version(page))
+                    .is_err()
+                {
+                    work.backpressure = true;
+                    continue;
+                }
+                let revoked = resident
+                    .bindings
+                    .iter()
+                    .zip(bindings)
+                    .any(|(old, new)| old.is_some() && old != &new);
+                if revoked {
+                    if budget.remaining_bytes < 8 {
+                        work.backpressure = true;
+                        continue;
+                    }
+                    let version = resident
+                        .upload_revision
+                        .checked_add(1)
+                        .ok_or(ClientLightingError::CoordinateOverflow)?;
+                    work.upload_bytes += self.lights.upload_uniform(
+                        queue,
+                        resident.handle,
+                        version,
+                        PackedLight::default(),
+                        budget,
+                    )?;
+                    resident.upload_revision = version;
+                }
+                resident.bindings = bindings;
+            }
+        }
+        self.upload_filtered(queue, scene.world(), budget, &mut work, |page| {
+            scene.authoritative_light_version(page).is_some()
+        })?;
+        self.upload_instances_filtered(queue, scene.world(), budget, &mut work, |page| {
+            scene.authoritative_light_version(page).is_some()
+        })?;
+        for page in self.residents.keys() {
+            if scene.authoritative_light_version(*page).is_some() {
+                work.confirmed_source_pages += 1;
+            } else {
+                work.unknown_source_pages += 1;
+            }
+        }
+        work.pending_gpu_pages = self.dirty.pending_pages();
+        work.ready = work.unknown_source_pages == 0
+            && !work.backpressure
+            && work.pending_gpu_pages == 0
+            && self
+                .overlays
+                .values()
+                .all(|overlay| overlay.bound_source.is_some())
+            && self.instances.values().all(|instance| !instance.dirty)
+            && self.next_sequence == scene.world().journal_next()
+            && self.record.is_none();
+        Ok(work)
     }
     pub fn pump(
         &mut self,
@@ -849,32 +1071,47 @@ impl ClientLighting {
         let mut work = ClientLightingWork::default();
         self.pump_bootstrap(world, tick, &mut work)?;
         self.ingest(world, &mut work)?;
-        self.pump_sky_seeds(tick, &mut work)?;
-        let progress = self.engine.ingest(world, tick, self.config.ingest_budget)?;
-        work.backpressure |= progress.backpressure;
-        work.oldest_light_age_ticks = progress.oldest_age_ticks;
-        work.light_overdue = progress.overdue;
-        // Sky proof must include all pending authority edits before the solver
-        // can use it. A bounded cursor lag delays light rather than leaking sky.
-        if self.bootstrap_sky_complete
-            && self.next_sequence == world.journal_next()
-            && self.record.is_none()
-        {
-            let progress = self
-                .engine
-                .step(world, tick, self.config.cpu_budget, &self.sky)?;
-            work.cpu_cells = progress.work.cells_examined;
-            work.cpu_neighbors = progress.work.neighbor_reads;
-            work.light_updates = progress.work.light_updates;
+        if self.engine.is_some() {
+            self.pump_sky_seeds(tick, &mut work)?;
+            let progress = self.engine.as_mut().expect("derived owner").ingest(
+                world,
+                tick,
+                self.config.ingest_budget,
+            )?;
+            work.backpressure |= progress.backpressure;
             work.oldest_light_age_ticks = progress.oldest_age_ticks;
             work.light_overdue = progress.overdue;
-            work.backpressure |= progress.backpressure;
-            self.ingest(world, &mut work)?;
+            // Sky proof must include all pending authority edits before the solver
+            // can use it. A bounded cursor lag delays light rather than leaking sky.
+            if self.bootstrap_sky_complete
+                && self.next_sequence == world.journal_next()
+                && self.record.is_none()
+            {
+                let progress = self.engine.as_mut().expect("derived owner").step(
+                    world,
+                    tick,
+                    self.config.cpu_budget,
+                    &self.sky,
+                )?;
+                work.cpu_cells = progress.work.cells_examined;
+                work.cpu_neighbors = progress.work.neighbor_reads;
+                work.light_updates = progress.work.light_updates;
+                work.oldest_light_age_ticks = progress.oldest_age_ticks;
+                work.light_overdue = progress.overdue;
+                work.backpressure |= progress.backpressure;
+                self.ingest(world, &mut work)?;
+            }
         }
         self.upload(queue, world, budget, &mut work)?;
         self.upload_instances(queue, world, budget, &mut work)?;
-        work.pending_light_cells = self.engine.pending_cells();
-        work.pending_seed_pages = self.engine.pending_seed_pages();
+        work.pending_light_cells = self
+            .engine
+            .as_ref()
+            .map_or(0, LightingEngine::pending_cells);
+        work.pending_seed_pages = self
+            .engine
+            .as_ref()
+            .map_or(0, LightingEngine::pending_seed_pages);
         work.pending_gpu_pages = self.dirty.pending_pages();
         work.ready = self
             .overlays
@@ -883,7 +1120,7 @@ impl ClientLighting {
             && self.instances.values().all(|instance| !instance.dirty)
             && self.sky_dirty.is_empty()
             && self.bootstrap.is_empty()
-            && self.engine.is_idle()
+            && self.engine.as_ref().is_none_or(LightingEngine::is_idle)
             && work.pending_gpu_pages == 0
             && self.next_sequence == world.journal_next()
             && self.record.is_none();
@@ -925,7 +1162,9 @@ impl ClientLighting {
     }
     pub fn detach(self, world: &mut World) {
         world.remove_cursor(self.cursor);
-        self.engine.detach(world);
+        if let Some(engine) = self.engine {
+            engine.detach(world);
+        }
     }
     fn observe_sky(&mut self, position: BlockPos, opacity: u8) -> Result<(), ClientLightingError> {
         observe_sky(&mut self.sky, &mut self.sky_dirty, position, opacity)
@@ -966,6 +1205,8 @@ impl ClientLighting {
             };
             if self
                 .engine
+                .as_mut()
+                .expect("derived sky seed")
                 .queue_cell(position, tick, LightPriority::Interactive)
                 .is_err()
             {
@@ -1023,6 +1264,8 @@ impl ClientLighting {
                 };
                 if self
                     .engine
+                    .as_mut()
+                    .expect("derived bootstrap")
                     .queue_page(*page, tick, LightPriority::Background)
                     .is_err()
                 {
@@ -1052,6 +1295,7 @@ impl ClientLighting {
                     break;
                 };
                 PendingRecord {
+                    full_lights: self.engine.is_none() && change.lights.len() > 1024,
                     change,
                     next: batch.next,
                     page: 0,
@@ -1082,7 +1326,9 @@ impl ClientLighting {
                 if work.journal_entries >= self.config.max_journal_entries {
                     return Ok(false);
                 }
-                if (change.created || change.removed)
+                if (change.created
+                    || change.removed
+                    || (record.full_lights && change.channels.intersects(ChannelMask::LIGHTING)))
                     && self
                         .dirty
                         .mark_page_boundary(change.page, change.after)
@@ -1100,13 +1346,13 @@ impl ClientLighting {
                 {
                     self.shadows.invalidate_bounds(resident.bounds);
                 }
-                if change.created {
+                if self.engine.is_some() && change.created {
                     self.known_columns
                         .entry((change.page.space, change.page.x, change.page.z))
                         .or_default()
                         .insert(change.page.y);
                 }
-                if change.removed {
+                if self.engine.is_some() && change.removed {
                     let key = (change.page.space, change.page.x, change.page.z);
                     if let Some(ys) = self.known_columns.get_mut(&key) {
                         ys.remove(&change.page.y);
@@ -1140,6 +1386,9 @@ impl ClientLighting {
             record.initial_index = 0;
             record.page_started = false;
         }
+        if self.engine.is_none() {
+            record.cell = record.change.cells.len();
+        }
         while record.cell < record.change.cells.len() {
             if work.journal_entries >= self.config.max_journal_entries {
                 return Ok(false);
@@ -1151,6 +1400,12 @@ impl ClientLighting {
             )?;
             record.cell += 1;
             work.journal_entries += 1;
+        }
+        if record.full_lights {
+            // Page metadata already covered every changed light and its halo.
+            // GPU publication samples the current complete World volume later.
+            work.coalesced_light_changes += (record.change.lights.len() - record.light) as u64;
+            record.light = record.change.lights.len();
         }
         while record.light < record.change.lights.len() {
             if work.journal_entries >= self.config.max_journal_entries {
@@ -1183,6 +1438,16 @@ impl ClientLighting {
         budget: &mut UploadBudget,
         work: &mut ClientLightingWork,
     ) -> Result<(), ClientLightingError> {
+        self.upload_instances_filtered(queue, world, budget, work, |_| true)
+    }
+    fn upload_instances_filtered(
+        &mut self,
+        queue: &wgpu::Queue,
+        world: &World,
+        budget: &mut UploadBudget,
+        work: &mut ClientLightingWork,
+        known: impl Fn(PageId) -> bool,
+    ) -> Result<(), ClientLightingError> {
         for overlay in self.overlays.values_mut() {
             let Some(base) = self
                 .residents
@@ -1207,7 +1472,9 @@ impl ClientLighting {
         }
         for instance in self.instances.values_mut() {
             work.sample_reads += 1;
-            let value = if let Some(page) = world.page(instance.position.page()) {
+            let value = if known(instance.position.page())
+                && let Some(page) = world.page(instance.position.page())
+            {
                 let light = page.light(instance.position.local_index());
                 PackedLight::new(light.sky, light.block, light.rgb).expect("valid world light")
             } else {
@@ -1248,20 +1515,33 @@ impl ClientLighting {
         budget: &mut UploadBudget,
         work: &mut ClientLightingWork,
     ) -> Result<(), ClientLightingError> {
+        self.upload_filtered(queue, world, budget, work, |_| true)
+    }
+    fn upload_filtered(
+        &mut self,
+        queue: &wgpu::Queue,
+        world: &World,
+        budget: &mut UploadBudget,
+        work: &mut ClientLightingWork,
+        known: impl Fn(PageId) -> bool,
+    ) -> Result<(), ClientLightingError> {
         let mut considered = 0;
-        while considered < self.config.max_gpu_pages_per_pump {
+        let mut inspected = 0;
+        let metadata_limit = self.config.max_gpu_pages_per_pump.saturating_mul(27);
+        while considered < self.config.max_gpu_pages_per_pump && inspected < metadata_limit {
             let Some(page) = self.dirty.first_page() else {
                 break;
             };
-            considered += 1;
+            inspected += 1;
             if !self.residents.contains_key(&page) {
                 let version = self.dirty.pending_version(page).expect("dirty page");
                 self.dirty.acknowledge(page, version);
                 continue;
             }
+            considered += 1;
             let prepared = self
                 .dirty
-                .prepare(world, page, &mut self.scratch)
+                .prepare_filtered(world, page, &mut self.scratch, &known)
                 .expect("dirty page");
             let version = match prepared {
                 PreparedLight::Full { version, .. } | PreparedLight::Patch { version, .. } => {
@@ -1272,6 +1552,10 @@ impl ClientLighting {
                 self.dirty.acknowledge(page, version);
                 continue;
             };
+            let gpu_version = resident
+                .upload_revision
+                .checked_add(1)
+                .ok_or(ClientLightingError::CoordinateOverflow)?;
             let uploaded = match prepared {
                 PreparedLight::Full {
                     samples,
@@ -1280,7 +1564,7 @@ impl ClientLighting {
                 } => {
                     work.sample_reads += sample_work.samples;
                     self.lights
-                        .upload_page(queue, resident.handle, version.0, samples, budget)
+                        .upload_page(queue, resident.handle, gpu_version, samples, budget)
                 }
                 PreparedLight::Patch {
                     updates,
@@ -1289,11 +1573,17 @@ impl ClientLighting {
                 } => {
                     work.sample_reads += sample_work.samples;
                     self.lights
-                        .upload_patch(queue, resident.handle, version.0, updates, budget)
+                        .upload_patch(queue, resident.handle, gpu_version, updates, budget)
                 }
             };
             match uploaded {
                 Ok(bytes) => {
+                    if bytes > 0 {
+                        self.residents
+                            .get_mut(&page)
+                            .expect("resident upload")
+                            .upload_revision = gpu_version;
+                    }
                     work.upload_bytes += bytes;
                     work.gpu_pages += usize::from(bytes > 0);
                     self.dirty.acknowledge(page, version);

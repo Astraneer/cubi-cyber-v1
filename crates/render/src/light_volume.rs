@@ -8,38 +8,39 @@ use crate::terrain_gpu::{PageHandle, UploadBudget};
 
 pub const LIGHT_EDGE: usize = 18;
 pub const LIGHT_SAMPLES: usize = LIGHT_EDGE * LIGHT_EDGE * LIGHT_EDGE;
-pub const LIGHT_PAGE_BYTES: u64 = LIGHT_SAMPLES as u64 * 4;
+pub const LIGHT_PAGE_WORDS: usize = LIGHT_SAMPLES + 1;
+pub const LIGHT_PAGE_BYTES: u64 = LIGHT_PAGE_WORDS as u64 * 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct PackedLight(u32);
 impl PackedLight {
     pub fn new(sky: u8, block: u8, rgb: [u8; 3]) -> Option<Self> {
-        if sky > 15 || block > 15 || rgb.iter().any(|v| *v > 15) {
+        if sky > 15 || block > 15 {
             return None;
         }
         Some(Self(
-            u32::from(rgb[0])
-                | (u32::from(rgb[1]) << 4)
-                | (u32::from(rgb[2]) << 8)
-                | (u32::from(sky) << 12)
-                | (u32::from(block) << 16),
+            u32::from(sky)
+                | (u32::from(block) << 4)
+                | (u32::from(rgb[0]) << 8)
+                | (u32::from(rgb[1]) << 16)
+                | (u32::from(rgb[2]) << 24),
         ))
     }
     pub const fn raw(self) -> u32 {
         self.0
     }
     pub const fn sky(self) -> u8 {
-        ((self.0 >> 12) & 15) as u8
+        (self.0 & 15) as u8
     }
     pub const fn block(self) -> u8 {
-        ((self.0 >> 16) & 15) as u8
+        ((self.0 >> 4) & 15) as u8
     }
     pub const fn rgb(self) -> [u8; 3] {
         [
-            (self.0 & 15) as u8,
-            ((self.0 >> 4) & 15) as u8,
-            ((self.0 >> 8) & 15) as u8,
+            (self.0 >> 8) as u8,
+            (self.0 >> 16) as u8,
+            (self.0 >> 24) as u8,
         ]
     }
 }
@@ -81,7 +82,7 @@ struct Slot {
 pub struct LightVolumeGpu {
     buffer: wgpu::Buffer,
     slots: Vec<Slot>,
-    staging: Box<[u32; LIGHT_SAMPLES]>,
+    staging: Box<[u32; LIGHT_PAGE_WORDS]>,
     upload_bytes: u64,
 }
 impl LightVolumeGpu {
@@ -103,7 +104,7 @@ impl LightVolumeGpu {
                 mapped_at_creation: false,
             }),
             slots: vec![Slot::default(); max_pages as usize],
-            staging: Box::new([0; LIGHT_SAMPLES]),
+            staging: Box::new([0; LIGHT_PAGE_WORDS]),
             upload_bytes: 0,
         })
     }
@@ -193,14 +194,27 @@ impl LightVolumeGpu {
         {
             return Ok(0);
         }
-        if budget.remaining_bytes < 4 {
+        let header_bytes =
+            if slot.initialized && slot.generation == handle.generation && slot.uniform {
+                0
+            } else {
+                4
+            };
+        let bytes = 4 + header_bytes;
+        if budget.remaining_bytes < bytes {
             return Err(LightUploadError::UploadBudget);
         }
-        let header = 0x4000_0000 | value.raw();
+        if header_bytes > 0 {
+            queue.write_buffer(
+                &self.buffer,
+                u64::from(handle.slot) * LIGHT_PAGE_BYTES,
+                bytemuck::bytes_of(&0x40000000u32),
+            );
+        }
         queue.write_buffer(
             &self.buffer,
-            u64::from(handle.slot) * LIGHT_PAGE_BYTES,
-            bytemuck::bytes_of(&header),
+            u64::from(handle.slot) * LIGHT_PAGE_BYTES + 4,
+            bytemuck::bytes_of(&value.raw()),
         );
         *slot = Slot {
             generation: handle.generation,
@@ -209,9 +223,9 @@ impl LightVolumeGpu {
             alias: None,
             uniform: true,
         };
-        budget.remaining_bytes -= 4;
-        self.upload_bytes += 4;
-        Ok(4)
+        budget.remaining_bytes -= bytes;
+        self.upload_bytes += bytes;
+        Ok(bytes)
     }
     /// Full snapshots are accepted only for a new slot generation or a newer
     /// version. A reused terrain slot cannot inherit a previous page's light.
@@ -239,7 +253,8 @@ impl LightVolumeGpu {
         if budget.remaining_bytes < LIGHT_PAGE_BYTES {
             return Err(LightUploadError::UploadBudget);
         }
-        for (output, sample) in self.staging.iter_mut().zip(samples) {
+        self.staging[0] = 0;
+        for (output, sample) in self.staging[1..].iter_mut().zip(samples) {
             *output = sample.raw();
         }
         queue.write_buffer(
@@ -296,7 +311,7 @@ impl LightVolumeGpu {
             return Err(LightUploadError::UploadBudget);
         }
         for update in updates {
-            self.staging[usize::from(update.index)] = update.value.raw();
+            self.staging[1 + usize::from(update.index)] = update.value.raw();
         }
         let mut start = 0;
         while start < updates.len() {
@@ -308,8 +323,8 @@ impl LightVolumeGpu {
             let last = usize::from(updates[end - 1].index) + 1;
             queue.write_buffer(
                 &self.buffer,
-                u64::from(handle.slot) * LIGHT_PAGE_BYTES + first as u64 * 4,
-                bytemuck::cast_slice(&self.staging[first..last]),
+                u64::from(handle.slot) * LIGHT_PAGE_BYTES + (first as u64 + 1) * 4,
+                bytemuck::cast_slice(&self.staging[1 + first..1 + last]),
             );
             start = end;
         }
@@ -333,7 +348,10 @@ mod tests {
         }
         assert!(PackedLight::new(16, 0, [0; 3]).is_none());
         assert!(PackedLight::new(0, 16, [0; 3]).is_none());
-        assert!(PackedLight::new(0, 0, [0, 16, 0]).is_none());
+        assert_eq!(
+            PackedLight::new(15, 9, [231, 17, 255]).unwrap().rgb(),
+            [231, 17, 255]
+        );
     }
     #[test]
     fn halo_indices_match_cell_yzx_layout() {

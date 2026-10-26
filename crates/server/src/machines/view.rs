@@ -11,6 +11,7 @@ pub(super) struct Stage<'a> {
     pub(super) work: &'a mut Work,
     pub(super) budget: Budget,
     pub(super) error: Option<MachineError>,
+    pub(super) spawn_exhausted: bool,
     pub(super) wake_machines: BTreeSet<ComponentId>,
     pub(super) wake_networks: BTreeSet<NetworkKey>,
 }
@@ -35,6 +36,7 @@ impl<'a> Stage<'a> {
             work,
             budget,
             error: None,
+            spawn_exhausted: false,
             wake_machines: BTreeSet::new(),
             wake_networks: BTreeSet::new(),
         }
@@ -62,7 +64,10 @@ impl<'a> Stage<'a> {
             CellRead::Unknown => Err(MachineError::Unknown),
         }
     }
-    fn component_at(&mut self, p: BlockPos) -> Result<Option<ComponentId>, MachineError> {
+    pub(super) fn component_at(
+        &mut self,
+        p: BlockPos,
+    ) -> Result<Option<ComponentId>, MachineError> {
         self.cell(p)?;
         Ok(self
             .world
@@ -116,7 +121,7 @@ impl<'a> Stage<'a> {
             .after
             .clone())
     }
-    fn machine_mut(&mut self, id: ComponentId) -> Result<&mut Machine, MachineError> {
+    pub(super) fn machine_mut(&mut self, id: ComponentId) -> Result<&mut Machine, MachineError> {
         self.ensure_machine(id)?;
         Ok(&mut self
             .local
@@ -125,19 +130,19 @@ impl<'a> Stage<'a> {
             .expect("ensured machine")
             .after)
     }
-    fn ensure_chest(&mut self, id: ComponentId) -> Result<(), MachineError> {
+    pub(super) fn ensure_chest(&mut self, id: ComponentId) -> Result<(), MachineError> {
         if self.local.chests.contains_key(&id) {
             return Ok(());
         }
         if self
             .work
             .bytes
-            .saturating_add(2 * machines::MACHINE_BYTES as u64)
+            .saturating_add(2 * rules::survival::furnace::CHEST_MAX_BYTES as u64)
             > self.budget.bytes
         {
             return Err(MachineError::Bounds);
         }
-        self.work.bytes += 2 * rules::survival::furnace::CHEST_BYTES as u64;
+        self.work.bytes += 2 * rules::survival::furnace::CHEST_MAX_BYTES as u64;
         let change = if let Some(change) = self.parent.chests.get(&id) {
             *change
         } else {
@@ -221,6 +226,9 @@ impl<'a> Stage<'a> {
                     .network_at([q.x, q.y, q.z])
                     .ok_or(MachineError::Missing)?,
             };
+            if self.owner.network_dirty(key) {
+                return Ok(0);
+            }
             let mut state = self.reservoir(key)?;
             let accepted = amount.min(
                 grid.network(key.network)?
@@ -245,7 +253,7 @@ impl<'a> Stage<'a> {
         {
             return Ok(0);
         }
-        if !self.owner.machines.get(&id).is_some_and(|m| m.active) {
+        if !self.owner.machine_active(id) {
             return Ok(0);
         }
         let accepted = self.machine_mut(id)?.insert_energy(amount);
@@ -254,7 +262,7 @@ impl<'a> Stage<'a> {
         }
         Ok(accepted)
     }
-    fn push_items_result(
+    pub(super) fn push_items_result(
         &mut self,
         p: BlockPos,
         face: Face,
@@ -265,6 +273,14 @@ impl<'a> Stage<'a> {
         }
         let q = offset(p, face)?;
         let cell = self.cell(q)?;
+        if cell.id() == LOGISTICAL_TRANSPORTER {
+            let incoming = arms::arm(arms::arms_of(cell.state()), face.opposite() as u8);
+            return if matches!(incoming, 1 | 3) {
+                self.spawn_packet(q, p, stack)
+            } else {
+                Ok(0)
+            };
+        }
         let Some(id) = self.component_at(q)? else {
             return Ok(0);
         };
@@ -275,16 +291,14 @@ impl<'a> Stage<'a> {
             .data
             .kind;
         if kind == MACHINE_COMPONENT {
-            if !self.owner.machines.get(&id).is_some_and(|m| m.active) {
+            if !self.owner.machine_active(id) {
                 return Ok(0);
             }
             let facing = Face::ALL[blocks::facing_of(cell.raw()) as usize];
-            let accepted = self.machine_mut(id)?.insert_item(
-                facing,
-                face.opposite(),
-                machines::Slot::new(stack),
-                false,
-            );
+            let slot = self.transport_slot(stack)?;
+            let accepted = self
+                .machine_mut(id)?
+                .insert_item(facing, face.opposite(), slot, false);
             if accepted > 0 {
                 self.wake_machines.insert(id);
             }
@@ -321,6 +335,19 @@ impl<'a> Stage<'a> {
             }
             return Ok(stack.count() - left);
         }
+        if kind == crate::survival::FURNACE_COMPONENT {
+            self.ensure_furnace(id)?;
+            return transport::put_furnace(
+                &mut self
+                    .local
+                    .furnaces
+                    .get_mut(&id)
+                    .expect("loaded furnace")
+                    .after,
+                face.opposite(),
+                stack,
+            );
+        }
         Ok(0)
     }
     fn push_substance_result(
@@ -350,6 +377,9 @@ impl<'a> Stage<'a> {
                     .ok_or(MachineError::Missing)?,
             };
             let network = grid.network(key.network)?;
+            if self.owner.network_dirty(key) {
+                return Ok(0);
+            }
             let mut state = self.reservoir(key)?;
             let valid = match network.resource {
                 Resource::Fluid => [3, 6].contains(&substance),
@@ -378,7 +408,7 @@ impl<'a> Stage<'a> {
         {
             return Ok(0);
         }
-        if !self.owner.machines.get(&id).is_some_and(|m| m.active) {
+        if !self.owner.machine_active(id) {
             return Ok(0);
         }
         let accepted = self
@@ -483,6 +513,49 @@ impl MachineWorld for Stage<'_> {
         let result = self.push_items_result(p, face, stack);
         self.callback(result)
     }
+    fn push_slot(&mut self, p: [i32; 3], face: Face, slot: machines::Slot) -> u16 {
+        let result = (|| {
+            let (stack, payload) = slot.to_item().map_err(|_| MachineError::Encoding)?;
+            let mut temporary = None;
+            if let Some(payload) = payload {
+                let id = payload.id();
+                match self.local.payloads.entry(id) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(payload);
+                        temporary = Some(id);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry) => {
+                        if entry.get() != &payload {
+                            return Err(MachineError::Encoding);
+                        }
+                    }
+                }
+            }
+            let position = BlockPos {
+                space: self.current_space(),
+                x: p[0],
+                y: p[1],
+                z: p[2],
+            };
+            let accepted = self.push_items_result(position, face, stack)?;
+            let normalized = offset(position, face)
+                .ok()
+                .and_then(|p| {
+                    self.world
+                        .page(p.page())
+                        .and_then(|page| page.component(p.local_index()))
+                })
+                .and_then(|id| self.world.component(id))
+                .is_some_and(|r| r.data.kind == MACHINE_COMPONENT);
+            if (accepted == 0 || normalized)
+                && let Some(id) = temporary
+            {
+                self.local.payloads.remove(&id);
+            }
+            Ok(accepted)
+        })();
+        self.callback(result)
+    }
     fn push_substance(&mut self, p: [i32; 3], face: Face, substance: u8, amount: u32) -> u32 {
         let p = BlockPos {
             space: self.current_space(),
@@ -497,16 +570,12 @@ impl MachineWorld for Stage<'_> {
 
 impl machines::grid::GridWorld for Stage<'_> {
     fn active(&self, endpoint: machines::grid::Endpoint) -> bool {
-        self.owner
-            .machines
-            .get(&ComponentId(endpoint.owner))
-            .is_some_and(|m| {
-                m.active
-                    && self
-                        .world
-                        .component(m.id)
-                        .is_some_and(|r| r.data.kind == MACHINE_COMPONENT)
-            })
+        let id = ComponentId(endpoint.owner);
+        self.owner.machine_active(id)
+            && self
+                .world
+                .component(id)
+                .is_some_and(|r| r.data.kind == MACHINE_COMPONENT)
     }
     fn room(
         &mut self,
@@ -612,6 +681,40 @@ impl Overlay {
                 self.chests.insert(id, change);
             }
         }
+        for (id, change) in local.furnaces {
+            if let Some(old) = self.furnaces.get_mut(&id) {
+                old.after = change.after;
+            } else {
+                self.furnaces.insert(id, change);
+            }
+        }
+        for (id, patch) in local.packets {
+            self.packets
+                .entry(id)
+                .and_modify(|old| old.after = patch.after.clone())
+                .or_insert(patch);
+        }
+        for (p, patch) in local.pulls {
+            self.pulls
+                .entry(p)
+                .and_modify(|old| old.after = patch.after)
+                .or_insert(patch);
+        }
+        self.next_packet = local.next_packet.or(self.next_packet);
+        self.packet_count_delta += local.packet_count_delta;
+        self.packet_bytes_delta += local.packet_bytes_delta;
+        self.clock_bytes_delta += local.clock_bytes_delta;
+        for (page, count) in local.page_counts {
+            *self.page_counts.entry(page).or_default() += count;
+        }
+        for (page, patch) in local.clocks {
+            self.clocks
+                .entry(page)
+                .and_modify(|old| old.after = patch.after)
+                .or_insert(patch);
+        }
+        self.payloads.extend(local.payloads);
+        self.item_spawns.extend(local.item_spawns);
         for (position, (before, after)) in local.cells {
             self.cells
                 .entry(position)

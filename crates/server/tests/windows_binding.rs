@@ -54,6 +54,7 @@ fn context<'a>(player: &'a sim::Player, inventory: &'a Inventory) -> Context<'a>
         inventory,
         space: SpaceId(0),
         permitted: true,
+        payloads: None,
     }
 }
 fn guard(window: &BoundWindow, inventory: &Inventory) -> WindowGuard {
@@ -383,4 +384,146 @@ fn hidden_blocks_do_not_leak_expected_ids_and_close_returns_owned_cursor_out_of_
             .unwrap()
             .closed
     );
+}
+#[test]
+fn charged_tablet_cache_does_not_allocate_records_until_a_guarded_owned_transfer() {
+    let book = RecipeBook::standard().unwrap();
+    let p = player();
+    let mut inv = Inventory::empty();
+    let mut window = BoundWindow::inventory(1).unwrap();
+    let mut machine = Machine::new(MekKind::Cube);
+    machine.slots[0] = Slot::tablet(4000);
+    let mut bytes = [0; rules::machines::MACHINE_BYTES];
+    let n = machine.encode(&mut bytes);
+    let mut world = fixture(
+        ENERGY_CUBE,
+        Some(world::ComponentData {
+            anchor: target(),
+            kind: 0x8201,
+            payload: bytes[..n].to_vec(),
+        }),
+    );
+    let mut ledger =
+        rules::item_payload::Ledger::new(rules::item_payload::Config::default()).unwrap();
+    let make = |window: &BoundWindow, inv: &Inventory, intent| {
+        windows::plan(
+            &world,
+            &Context {
+                player: &p,
+                space: SpaceId(0),
+                inventory: inv,
+                permitted: true,
+                payloads: Some(&ledger),
+            },
+            window,
+            intent,
+            window.state.id() + 1,
+            Tick(2),
+            &book,
+        )
+    };
+    let opened = make(
+        &window,
+        &inv,
+        WindowIntent::OpenBlock {
+            position: target(),
+            expected: cell(ENERGY_CUBE),
+        },
+    )
+    .unwrap();
+    assert!(opened.payloads().is_empty());
+    apply(&mut world, &mut window, &mut inv, opened);
+    assert_eq!(ledger.len(), 0);
+    let old_revision = window.state.revision();
+    // Continuous charging refreshes a display reference without interning every
+    // intermediate joule value or permanently invalidating delayed click guards.
+    machine.slots[0] = Slot::tablet(4020);
+    let n = machine.encode(&mut bytes);
+    let mut tx = Transaction::new(Tick(3), SpaceId(0));
+    tx.set_component(
+        ComponentId(500),
+        world::ComponentData {
+            anchor: target(),
+            kind: 0x8201,
+            payload: bytes[..n].to_vec(),
+        },
+        ChannelMask::CONTENTS,
+    );
+    world.commit(tx).unwrap();
+    assert!(window.refresh(&world).unwrap());
+    assert_eq!(window.state.revision(), old_revision);
+    assert_eq!(ledger.len(), 0);
+    let intent = WindowIntent::Click {
+        guard: guard(&window, &inv),
+        slot: 41,
+        right: false,
+        shift: false,
+    };
+    let mut plan = windows::plan(
+        &world,
+        &Context {
+            player: &p,
+            space: SpaceId(0),
+            inventory: &inv,
+            permitted: true,
+            payloads: Some(&ledger),
+        },
+        &window,
+        intent,
+        0,
+        Tick(4),
+        &book,
+    )
+    .unwrap();
+    assert_eq!(plan.payloads().len(), 1);
+    assert!(plan.window_after().state.cursor().payload().is_some());
+    let delta = ledger
+        .extend(ledger.plan().unwrap(), plan.take_payloads(), [])
+        .unwrap();
+    ledger.acknowledge(delta).unwrap();
+    apply(&mut world, &mut window, &mut inv, plan);
+    let held = window.state.cursor();
+    assert_eq!(
+        ledger
+            .resolve(held.payload().unwrap(), held.item())
+            .unwrap()
+            .joules(held.item())
+            .unwrap(),
+        4020
+    );
+    let machine_after =
+        Machine::decode(&world.component(ComponentId(500)).unwrap().data.payload).unwrap();
+    assert!(machine_after.slots[0].stack.is_empty());
+    assert_eq!(machine_after.slots[0].charge, 0);
+    // Inserting that same owned reference resolves back to numeric charge and
+    // does not create another record or duplicate its energy.
+    let intent = WindowIntent::Click {
+        guard: guard(&window, &inv),
+        slot: 41,
+        right: false,
+        shift: false,
+    };
+    let plan = windows::plan(
+        &world,
+        &Context {
+            player: &p,
+            space: SpaceId(0),
+            inventory: &inv,
+            permitted: true,
+            payloads: Some(&ledger),
+        },
+        &window,
+        intent,
+        0,
+        Tick(5),
+        &book,
+    )
+    .unwrap();
+    assert!(plan.payloads().is_empty());
+    apply(&mut world, &mut window, &mut inv, plan);
+    let after = Machine::decode(&world.component(ComponentId(500)).unwrap().data.payload).unwrap();
+    assert_eq!(after.slots[0].charge, 4020);
+    assert!(after.slots[0].stack.payload().is_none());
+    assert!(window.state.cursor().is_empty());
+    assert_eq!(ledger.len(), 1);
 }

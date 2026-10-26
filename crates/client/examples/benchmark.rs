@@ -97,6 +97,7 @@ async fn run(options: Options) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     let mut view = ClientView::new(renderer, client::SceneConfig::forest())?;
+    let replay_started = Instant::now();
     let pool = client::native_pool(2, 16).map_err(|e| format!("world workers: {e:?}"))?;
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("benchmark actual terrain output"),
@@ -116,6 +117,7 @@ async fn run(options: Options) -> Result<(), String> {
     let warm_started = Instant::now();
     let mut stable = 0;
     loop {
+        view.set_movement_replay_time(ns(replay_started.elapsed()))?;
         view.advance_input(benchmark::STEP_SECONDS)?;
         let tick = view.tick();
         view.scene
@@ -170,6 +172,7 @@ async fn run(options: Options) -> Result<(), String> {
         command.apply(&mut view);
         let input_ns = ns(input_started.elapsed());
         let sim_started = Instant::now();
+        view.set_movement_replay_time(ns(replay_started.elapsed()))?;
         view.advance_input(benchmark::STEP_SECONDS)?;
         let simulation_ns = ns(sim_started.elapsed());
         let jobs_started = Instant::now();
@@ -263,6 +266,9 @@ async fn run(options: Options) -> Result<(), String> {
     );
     json.pop();
     write!(json, ",\"benchmark\":{{\"route\":\"{}\",\"width\":{},\"height\":{},\"presentationIncluded\":false,\"framesRequested\":{},\"routeFrames\":{},\"routeComplete\":{},\"renderedFrames\":{},\"fixedStepHz\":60,\"blockingReadback\":true,\"scene\":\"generated-forest-fixture\",\"colorPassIncludesSky\":true,\"workerAllocationsMeasured\":false,\"oldestJobAgeMeasured\":false}}}}", benchmark::ROUTE, options.width, options.height, options.frames, benchmark::FRAMES, options.frames == benchmark::FRAMES, completed).map_err(|e| e.to_string())?;
+    view.movement_replay()
+        .append_json(&mut json)
+        .map_err(str::to_owned)?;
     if let Some(parent) = options.out.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }

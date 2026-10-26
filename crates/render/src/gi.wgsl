@@ -40,7 +40,7 @@ fn trace_ray(origin:vec3<f32>,direction:vec3<f32>)->Ray {
         let packed=voxel(cell);
         if (packed&0x80000000u)==0u{return Ray(vec3(0.0),distance,steps,0u,1u);}
         if (packed&0x40000000u)!=0u {
-            let color=vec3<f32>(f32(packed&1023u),f32((packed>>10u)&1023u),f32((packed>>20u)&1023u))*(8.0/1023.0);
+            let color=vec3<f32>(f32(packed&1023u),f32((packed>>10u)&1023u),f32((packed>>20u)&1023u))*(32.0/1023.0);
             return Ray(color,distance,steps,1u,0u);
         }
         distance=min(next.x,min(next.y,next.z));

@@ -511,3 +511,176 @@ fn block_and_entity_shadow_pair_preserves_both_exact_version_counters() {
         );
     });
 }
+
+#[test]
+fn stable_reserved_slots_hide_and_reuse_one_record_without_changing_neighbors() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut terrain = terrain(&gpu);
+        let mut models = BlockModelsGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            terrain.geometry(),
+            render::block_models::BlockConfig {
+                max_instances: 8,
+                atlas_layers: 186,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            models
+                .reserve_slots(&gpu.queue, 8, &mut UploadBudget::new(511))
+                .is_err()
+        );
+        assert_eq!(models.reserved_slots(), 0);
+        assert_eq!(
+            models
+                .reserve_slots(&gpu.queue, 8, &mut UploadBudget::new(512))
+                .unwrap()
+                .upload_bytes,
+            512
+        );
+        assert_eq!(models.active_instances(), 0);
+        let mut a = prop(kind::CHEST);
+        a.position = [0., 0., 0.];
+        let mut b = prop(kind::WIND_GENERATOR);
+        b.position = [3., 0., 0.];
+        models
+            .update(&gpu.queue, 2, a, &mut UploadBudget::new(64))
+            .unwrap();
+        models
+            .update(&gpu.queue, 7, b, &mut UploadBudget::new(64))
+            .unwrap();
+        let before = frame(&gpu, &mut terrain, Some(&mut models), camera());
+        assert_eq!(before.1[kind::CHEST as usize], 1);
+        assert_eq!(before.1[kind::WIND_GENERATOR as usize], 1);
+        models.take_work();
+        assert!(
+            models
+                .update(
+                    &gpu.queue,
+                    2,
+                    BlockInstance::hidden(),
+                    &mut UploadBudget::new(63)
+                )
+                .is_err()
+        );
+        assert_eq!(models.active_instances(), 2);
+        models
+            .update(
+                &gpu.queue,
+                2,
+                BlockInstance::hidden(),
+                &mut UploadBudget::new(64),
+            )
+            .unwrap();
+        assert_eq!(models.active_instances(), 1);
+        let after = frame(&gpu, &mut terrain, Some(&mut models), camera());
+        assert_eq!(after.1[kind::CHEST as usize], 0);
+        assert_eq!(after.1[kind::WIND_GENERATOR as usize], 1);
+        assert_ne!(before.0, after.0);
+        models
+            .update(&gpu.queue, 2, a, &mut UploadBudget::new(64))
+            .unwrap();
+        let restored = frame(&gpu, &mut terrain, Some(&mut models), camera());
+        assert_eq!(restored.0, before.0);
+        assert_eq!(models.take_work().upload_bytes, 128);
+        let scope = telemetry::AllocationScope::begin().unwrap();
+        for _ in 0..100 {
+            assert_eq!(
+                models
+                    .update(&gpu.queue, 7, b, &mut UploadBudget::new(0))
+                    .unwrap()
+                    .upload_bytes,
+                0
+            );
+        }
+        assert_eq!(scope.finish().allocating_calls(), 0);
+    });
+}
+
+#[test]
+fn optional_atmosphere_lighting_tracks_day_and_dark_night_without_recompilation() {
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let mut terrain = terrain(&gpu);
+    let mut budget = UploadBudget::new(1_000_000);
+    let mut atmosphere = render::atmosphere::AtmosphereGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        render::atmosphere::AtmosphereConfig {
+            transmittance_size: [32, 8],
+            sky_size: [16, 8],
+            transmittance_steps: 32,
+            sky_steps: 16,
+        },
+        render::atmosphere::AtmosphereState {
+            sun_direction: [0., -1., 0.],
+            altitude_km: 0.072,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    atmosphere
+        .encode_update(&mut encoder, &mut 1_000_000)
+        .unwrap();
+    gpu.queue.submit([encoder.finish()]);
+    let mut consumer = BlockModelsGpu::new_with_atmosphere(
+        &gpu.device,
+        &gpu.queue,
+        terrain.geometry(),
+        BlockConfig {
+            max_instances: 8,
+            atlas_layers: 186,
+        },
+        None,
+        &atmosphere,
+    )
+    .unwrap();
+    let mut chest = prop(kind::CHEST);
+    chest.position = [0.; 3];
+    consumer.upload(&gpu.queue, &[chest], &mut budget).unwrap();
+    consumer.take_work();
+    let dark = frame(&gpu, &mut terrain, Some(&mut consumer), camera()).0;
+    let dark_pixels = dark
+        .chunks_exact(4)
+        .filter(|p| p[3] == 255 && p[..3] == [0, 0, 0])
+        .count();
+    assert!(
+        dark_pixels > 50,
+        "night receiver must be dark: {dark_pixels}"
+    );
+    atmosphere
+        .set_state(
+            &gpu.queue,
+            render::atmosphere::AtmosphereState::default(),
+            &mut budget,
+        )
+        .unwrap();
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    atmosphere
+        .encode_update(&mut encoder, &mut 1_000_000)
+        .unwrap();
+    gpu.queue.submit([encoder.finish()]);
+    let day = frame(&gpu, &mut terrain, Some(&mut consumer), camera()).0;
+    let lit_pixels = day
+        .chunks_exact(4)
+        .zip(dark.chunks_exact(4))
+        .filter(|(a, b)| b[3] == 255 && b[..3] == [0, 0, 0] && a[..3].iter().any(|v| *v > 3))
+        .count();
+    assert!(
+        lit_pixels > 50,
+        "day receivers must react to shared atmosphere: {lit_pixels}"
+    );
+    assert_eq!(
+        consumer.take_work().pipeline_compilations,
+        0,
+        "day change must reuse pipelines"
+    );
+    println!(
+        "M10_block_models_ATMOSPHERE_GPU_OK consumer=block_models night_black={dark_pixels} day_lit={lit_pixels} runtime_pipeline_compilations=0"
+    );
+}

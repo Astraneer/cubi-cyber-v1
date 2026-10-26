@@ -3,7 +3,7 @@
 //! Morton-ordered columns make a dyadic tile capture a bounded contiguous range.
 use core_types::{BlockPos, Cell, PageId, SpaceId, TxId};
 use std::collections::{BTreeMap, BTreeSet};
-pub const SCHEMA: u16 = 1;
+pub const SCHEMA: u16 = 2;
 pub const MAX_LEVEL: u8 = 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TileKey {
@@ -112,6 +112,9 @@ pub struct HeightEditIndex {
     columns: BTreeMap<(SpaceId, u64), Column>,
     stamps: BTreeMap<TileKey, u64>,
     cells: usize,
+    // Equal Cell+TxId runs along Y. Maintained from changed adjacent edges only;
+    // the WAL preflight must never serialize or scan the cold index.
+    runs: usize,
     last_tx: TxId,
     ready: bool,
     rebuild_tx: TxId,
@@ -123,6 +126,9 @@ impl HeightEditIndex {
             || limits.max_cells == 0
             || limits.max_stamps == 0
             || limits.max_snapshot_bytes < 36
+            || limits.max_columns > u32::MAX as usize
+            || limits.max_cells > u32::MAX as usize
+            || limits.max_stamps > u32::MAX as usize
         {
             return Err(IndexError::InvalidLimits);
         }
@@ -131,6 +137,7 @@ impl HeightEditIndex {
             columns: BTreeMap::new(),
             stamps: BTreeMap::new(),
             cells: 0,
+            runs: 0,
             last_tx: TxId(0),
             ready: true,
             rebuild_tx: TxId(0),
@@ -143,6 +150,25 @@ impl HeightEditIndex {
     pub fn last_tx(&self) -> TxId {
         self.last_tx
     }
+    /// Startup/checkpoint-worker traversal; never call this from a frame/tick.
+    pub fn iter_cells(&self) -> impl Iterator<Item = (CellEdit, TxId)> + '_ {
+        self.columns.iter().flat_map(|((space, _), column)| {
+            column.cells.iter().map(move |(y, (cell, tx))| {
+                (
+                    CellEdit {
+                        position: BlockPos {
+                            space: *space,
+                            x: column.x,
+                            y: *y,
+                            z: column.z,
+                        },
+                        cell: *cell,
+                    },
+                    *tx,
+                )
+            })
+        })
+    }
     pub fn cell_count(&self) -> usize {
         self.cells
     }
@@ -154,6 +180,9 @@ impl HeightEditIndex {
     }
     pub fn pending_legacy_pages(&self) -> usize {
         self.pending.len()
+    }
+    pub fn pending_legacy_keys(&self) -> impl ExactSizeIterator<Item = PageId> + '_ {
+        self.pending.iter().copied()
     }
     pub fn source(&self, key: TileKey) -> Result<u64, IndexError> {
         key.bounds().ok_or(IndexError::InvalidTile)?;
@@ -180,16 +209,32 @@ impl HeightEditIndex {
         if tx.0 == 0 || tx.0 == u64::MAX || tx <= self.last_tx {
             return Err(IndexError::InvalidTransaction);
         }
-        self.preflight_edits(edits)
+        self.preflight_edits(tx, edits, false, self.pending.len())
     }
-    fn preflight_edits(&self, edits: &[CellEdit]) -> Result<(), IndexError> {
+    fn preflight_edits(
+        &self,
+        tx: TxId,
+        edits: &[CellEdit],
+        legacy: bool,
+        pending: usize,
+    ) -> Result<(), IndexError> {
         let mut positions = BTreeSet::new();
+        let mut overlay = BTreeMap::new();
+        let mut edges = BTreeSet::new();
         let mut columns = BTreeSet::new();
         let mut stamps = BTreeSet::new();
         let mut cells = 0;
         for e in edits {
             if !positions.insert(e.position) {
                 return Err(IndexError::DuplicateEdit);
+            }
+            if legacy && self.get(e.position).is_some_and(|old| old.source_tx > tx) {
+                continue;
+            }
+            overlay.insert(e.position, (e.cell, tx));
+            edges.insert(e.position);
+            if let Some(y) = e.position.y.checked_sub(1) {
+                edges.insert(BlockPos { y, ..e.position });
             }
             let c = (e.position.space, morton(e.position.x, e.position.z));
             if !self.columns.contains_key(&c) {
@@ -209,6 +254,27 @@ impl HeightEditIndex {
             || self.stamps.len() + stamps.len() > self.limits.max_stamps
         {
             return Err(IndexError::Capacity);
+        }
+        let old_value = |p| self.get(p).map(|v| (v.cell, v.source_tx));
+        let new_value = |p| overlay.get(&p).copied().or_else(|| old_value(p));
+        let mut runs = (self.runs + cells) as i128;
+        for left in edges {
+            let Some(y) = left.y.checked_add(1) else {
+                continue;
+            };
+            let right = BlockPos { y, ..left };
+            let joined = |a: Option<(Cell, TxId)>, b: Option<(Cell, TxId)>| a.is_some() && a == b;
+            runs += i128::from(joined(old_value(left), old_value(right)));
+            runs -= i128::from(joined(new_value(left), new_value(right)));
+        }
+        let runs = u128::try_from(runs).map_err(|_| IndexError::Malformed)?;
+        let bytes = 36u128
+            + (self.columns.len() + columns.len()) as u128 * 16
+            + runs * 20
+            + (self.stamps.len() + stamps.len()) as u128 * 21
+            + pending as u128 * 16;
+        if bytes > self.limits.max_snapshot_bytes as u128 {
+            return Err(IndexError::SnapshotTooLarge);
         }
         Ok(())
     }
@@ -235,14 +301,7 @@ impl HeightEditIndex {
             if !self.columns.contains_key(&key) {
                 work.columns_added += 1;
             }
-            let column = self.columns.entry(key).or_insert_with(|| Column {
-                x: e.position.x,
-                z: e.position.z,
-                cells: BTreeMap::new(),
-            });
-            if column.cells.insert(e.position.y, (e.cell, tx)).is_none() {
-                self.cells += 1;
-            }
+            self.insert_cell(*e, tx);
             work.cells_written += 1;
             touched.extend(affected(e.position));
         }
@@ -252,6 +311,34 @@ impl HeightEditIndex {
             work.ancestors_touched += 1;
         }
         work
+    }
+    fn insert_cell(&mut self, edit: CellEdit, tx: TxId) {
+        let p = edit.position;
+        let column = self
+            .columns
+            .entry((p.space, morton(p.x, p.z)))
+            .or_insert_with(|| Column {
+                x: p.x,
+                z: p.z,
+                cells: BTreeMap::new(),
+            });
+        let old = column.cells.get(&p.y).copied();
+        let value = (edit.cell, tx);
+        let mut old_edges = 0;
+        let mut new_edges = 0;
+        for y in [p.y.checked_sub(1), p.y.checked_add(1)]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(neighbor) = column.cells.get(&y).copied() {
+                old_edges += usize::from(old == Some(neighbor));
+                new_edges += usize::from(value == neighbor);
+            }
+        }
+        let added = usize::from(old.is_none());
+        self.runs = self.runs + added + old_edges - new_edges;
+        self.cells += added;
+        column.cells.insert(p.y, value);
     }
     /// Missing-index legacy worlds remain explicitly unavailable until every saved
     /// page was compared to canonical server baseline in a background worker.
@@ -268,6 +355,9 @@ impl HeightEditIndex {
             pending.insert(page);
             if pending.len() > self.limits.max_columns {
                 return Err(IndexError::Capacity);
+            }
+            if 36u128 + pending.len() as u128 * 16 > self.limits.max_snapshot_bytes as u128 {
+                return Err(IndexError::SnapshotTooLarge);
             }
         }
         self.ready = false;
@@ -287,7 +377,7 @@ impl HeightEditIndex {
         {
             return Err(IndexError::WrongLegacyPage);
         }
-        self.preflight_edits(differences)?;
+        self.preflight_edits(self.rebuild_tx, differences, true, self.pending.len() - 1)?;
         let work = self.insert(self.rebuild_tx, differences, true);
         self.pending.remove(&page);
         Ok(work)
@@ -368,35 +458,49 @@ impl HeightEditIndex {
     /// Snapshot serialization belongs to a checkpoint worker. WAL records use the
     /// bounded delta codec below; serializing the whole index per edit is forbidden.
     pub fn encode_snapshot(&self) -> Result<Vec<u8>, IndexError> {
-        let size = 36 + self.cells * 28 + self.stamps.len() * 21 + self.pending.len() * 16;
+        let size = 36
+            + self.columns.len() * 16
+            + self.runs * 20
+            + self.stamps.len() * 21
+            + self.pending.len() * 16;
         if size > self.limits.max_snapshot_bytes {
             return Err(IndexError::SnapshotTooLarge);
         }
         let mut b = Vec::with_capacity(size);
-        b.extend_from_slice(b"HIX1");
+        b.extend_from_slice(b"HIX2");
         u16w(&mut b, SCHEMA);
         u16w(&mut b, u16::from(self.ready));
         u64w(&mut b, self.last_tx.0);
         u64w(&mut b, self.rebuild_tx.0);
-        u32w(&mut b, self.cells as u32);
+        u32w(&mut b, self.columns.len() as u32);
         u32w(&mut b, self.stamps.len() as u32);
         u32w(&mut b, self.pending.len() as u32);
         for ((space, _), c) in &self.columns {
-            for (y, (cell, tx)) in &c.cells {
-                edit_write(
-                    &mut b,
-                    CellEdit {
-                        position: BlockPos {
-                            space: *space,
-                            x: c.x,
-                            y: *y,
-                            z: c.z,
-                        },
-                        cell: *cell,
-                    },
-                );
+            u32w(&mut b, space.0);
+            i32w(&mut b, c.x);
+            i32w(&mut b, c.z);
+            let count_at = b.len();
+            u32w(&mut b, 0);
+            let mut count = 0u32;
+            let mut cells = c.cells.iter().peekable();
+            while let Some((&y, &(cell, tx))) = cells.next() {
+                let mut end = y;
+                let mut len = 1u32;
+                while let Some(&(&next, &value)) = cells.peek() {
+                    if end.checked_add(1) != Some(next) || value != (cell, tx) {
+                        break;
+                    }
+                    cells.next();
+                    end = next;
+                    len += 1;
+                }
+                i32w(&mut b, y);
+                u32w(&mut b, len);
+                u32w(&mut b, cell.raw());
                 u64w(&mut b, tx.0);
+                count += 1;
             }
+            b[count_at..count_at + 4].copy_from_slice(&count.to_le_bytes());
         }
         for (key, stamp) in &self.stamps {
             u32w(&mut b, key.space.0);
@@ -411,6 +515,7 @@ impl HeightEditIndex {
             i32w(&mut b, p.y);
             i32w(&mut b, p.z);
         }
+        debug_assert_eq!(b.len(), size);
         Ok(b)
     }
     pub fn decode_snapshot(bytes: &[u8], limits: IndexLimits) -> Result<Self, IndexError> {
@@ -418,7 +523,10 @@ impl HeightEditIndex {
             return Err(IndexError::SnapshotTooLarge);
         }
         let mut r = Reader { bytes, at: 0 };
-        if r.take::<4>()? != *b"HIX1" || r.u16()? != SCHEMA {
+        let magic = r.take::<4>()?;
+        let schema = r.u16()?;
+        let legacy = magic == *b"HIX1" && schema == 1;
+        if !(legacy || magic == *b"HIX2" && schema == SCHEMA) {
             return Err(IndexError::Malformed);
         }
         let ready = match r.u16()? {
@@ -431,12 +539,22 @@ impl HeightEditIndex {
         let count = r.u32()? as usize;
         let stamps = r.u32()? as usize;
         let pending = r.u32()? as usize;
-        if count > limits.max_cells
+        if count
+            > if legacy {
+                limits.max_cells
+            } else {
+                limits.max_columns
+            }
             || stamps > limits.max_stamps
             || pending > limits.max_columns
             || last_tx.0 == u64::MAX
             || rebuild_tx > last_tx
-            || 36 + count * 28 + stamps * 21 + pending * 16 != bytes.len()
+            || (legacy
+                && 36u128 + count as u128 * 28 + stamps as u128 * 21 + pending as u128 * 16
+                    != bytes.len() as u128)
+            || (!legacy
+                && 36u128 + count as u128 * 36 + stamps as u128 * 21 + pending as u128 * 16
+                    > bytes.len() as u128)
         {
             return Err(IndexError::Malformed);
         }
@@ -444,22 +562,65 @@ impl HeightEditIndex {
         index.ready = ready;
         index.last_tx = last_tx;
         index.rebuild_tx = rebuild_tx;
-        for _ in 0..count {
-            let e = r.edit()?;
-            let tx = TxId(r.u64()?);
-            if tx > last_tx || index.get(e.position).is_some() {
-                return Err(IndexError::Malformed);
+        if legacy {
+            for _ in 0..count {
+                let e = r.edit()?;
+                let tx = TxId(r.u64()?);
+                if tx > last_tx || index.get(e.position).is_some() {
+                    return Err(IndexError::Malformed);
+                }
+                index.insert_cell(e, tx);
             }
-            let column = index
-                .columns
-                .entry((e.position.space, morton(e.position.x, e.position.z)))
-                .or_insert_with(|| Column {
-                    x: e.position.x,
-                    z: e.position.z,
-                    cells: BTreeMap::new(),
-                });
-            column.cells.insert(e.position.y, (e.cell, tx));
-            index.cells += 1;
+        } else {
+            let mut previous_column = None;
+            for _ in 0..count {
+                let space = SpaceId(r.u32()?);
+                let x = r.i32()?;
+                let z = r.i32()?;
+                let key = (space, morton(x, z));
+                let runs = r.u32()? as usize;
+                if previous_column.is_some_and(|old| old >= key)
+                    || runs == 0
+                    || runs > limits.max_cells - index.cells
+                {
+                    return Err(IndexError::Malformed);
+                }
+                previous_column = Some(key);
+                let mut previous_run = None;
+                for _ in 0..runs {
+                    let y = r.i32()?;
+                    let len = r.u32()? as usize;
+                    let cell = Cell::from_raw(r.u32()?);
+                    let tx = TxId(r.u64()?);
+                    let end = i64::from(y) + len as i64 - 1;
+                    if len == 0
+                        || len > limits.max_cells - index.cells
+                        || end > i64::from(i32::MAX)
+                        || tx > last_tx
+                        || previous_run.is_some_and(|(old_end, old_value)| {
+                            i64::from(y) <= old_end
+                                || (i64::from(y) == old_end + 1 && old_value == (cell, tx))
+                        })
+                    {
+                        return Err(IndexError::Malformed);
+                    }
+                    for offset in 0..len {
+                        index.insert_cell(
+                            CellEdit {
+                                position: BlockPos {
+                                    space,
+                                    x,
+                                    y: (i64::from(y) + offset as i64) as i32,
+                                    z,
+                                },
+                                cell,
+                            },
+                            tx,
+                        );
+                    }
+                    previous_run = Some((end, (cell, tx)));
+                }
+            }
         }
         if index.columns.len() > limits.max_columns {
             return Err(IndexError::Capacity);
@@ -491,8 +652,16 @@ impl HeightEditIndex {
                 return Err(IndexError::Malformed);
             }
         }
-        if ready && !index.pending.is_empty() {
+        if (ready && !index.pending.is_empty()) || r.at != bytes.len() {
             return Err(IndexError::Malformed);
+        }
+        let encoded_size = 36u128
+            + index.columns.len() as u128 * 16
+            + index.runs as u128 * 20
+            + index.stamps.len() as u128 * 21
+            + index.pending.len() as u128 * 16;
+        if encoded_size > limits.max_snapshot_bytes as u128 {
+            return Err(IndexError::SnapshotTooLarge);
         }
         Ok(index)
     }

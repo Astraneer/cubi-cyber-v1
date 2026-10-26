@@ -25,15 +25,16 @@ impl BoundWindow {
         if bytes.len() < PREFIX_BYTES || bytes.len() > MAX_BYTES {
             return Err(Error::Encoding);
         }
-        let state = ui::WindowState::decode(&bytes[..PREFIX_BYTES]).map_err(|_| Error::Encoding)?;
-        if bytes.len() == PREFIX_BYTES {
+        let (state, prefix_len) =
+            ui::WindowState::decode_prefix(bytes).map_err(|_| Error::Encoding)?;
+        if bytes.len() == prefix_len {
             return Ok(Self {
                 state,
                 binding: None,
             });
         }
         let mut read = Reader {
-            bytes: &bytes[PREFIX_BYTES..],
+            bytes: &bytes[prefix_len..],
             at: 0,
         };
         if &read.take::<4>()? != b"WBD1" {

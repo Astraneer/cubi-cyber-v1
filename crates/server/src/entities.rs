@@ -3,6 +3,7 @@
 //! WAL batch, acknowledges this delta, then sends public poses.
 pub mod interactions;
 pub mod items;
+pub mod owner;
 pub mod path_jobs;
 pub mod replication;
 use core_types::{BlockPos, Cell, ChannelMask, PageId, SpaceId, Tick, Version};

@@ -2,7 +2,9 @@
 //! Registration follows successful GPU publication, including both H1 handles.
 use crate::{
     ClientScene,
-    lighting::{ClientLighting, ClientLightingConfig, ClientLightingError, ClientLightingWork},
+    lighting::{
+        ClientLighting, ClientLightingConfig, ClientLightingError, ClientLightingWork, LightSource,
+    },
 };
 use core_types::{BlockPos, PageId, Tick};
 use render::{
@@ -13,6 +15,8 @@ use world::lighting::LightBudget;
 pub const SUN: [f32; 3] = [0.35, 0.8, 0.2];
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LightingStats {
+    pub journal_entries: u64,
+    pub coalesced_light_changes: u64,
     pub cpu_cells: u64,
     pub neighbors: u64,
     pub upload_bytes: u64,
@@ -28,6 +32,8 @@ pub struct LightingStats {
     pub oldest_age_ticks: u64,
     pub overdue: bool,
     pub ready: bool,
+    pub authoritative_source: bool,
+    pub pending_source_pages: usize,
 }
 pub struct ViewLighting {
     pub owner: ClientLighting,
@@ -48,7 +54,10 @@ impl ViewLighting {
             owner: ClientLighting::prepare_scene(
                 device, queue, terrain, scene, config, center, SUN,
             )?,
-            stats: LightingStats::default(),
+            stats: LightingStats {
+                authoritative_source: config.source == LightSource::Authoritative,
+                ..LightingStats::default()
+            },
         })
     }
     pub fn register_base(
@@ -107,6 +116,8 @@ impl ViewLighting {
             max_updates: cells,
         })?;
         let work = self.owner.pump_scene(queue, scene, tick, budget)?;
+        self.stats.journal_entries += work.journal_entries as u64;
+        self.stats.coalesced_light_changes += work.coalesced_light_changes;
         if work.upload_bytes > 0 {
             terrain.invalidate()
         }
@@ -117,8 +128,66 @@ impl ViewLighting {
         self.stats.pending_pages = work.pending_gpu_pages;
         self.stats.oldest_age_ticks = work.oldest_light_age_ticks;
         self.stats.overdue = work.light_overdue;
-        self.stats.ready = work.ready;
+        self.stats.pending_source_pages = self.source_pending_pages(scene);
+        self.stats.ready = work.ready && self.stats.pending_source_pages == 0;
         Ok(work)
+    }
+    /// Drains bounded authoritative metadata while the previous GPU image is
+    /// still in flight. Queue writes remain confined to the upload phase.
+    pub fn advance_cpu(&mut self, scene: &mut ClientScene) -> Result<(), ClientLightingError> {
+        if !self.stats.authoritative_source {
+            return Ok(());
+        }
+        let work = self.owner.ingest_scene_cpu(scene)?;
+        self.stats.journal_entries += work.journal_entries as u64;
+        self.stats.coalesced_light_changes += work.coalesced_light_changes;
+        self.stats.pending_pages = work.pending_gpu_pages;
+        Ok(())
+    }
+    pub fn snapshot(&self, scene: &ClientScene) -> LightingStats {
+        let mut stats = self.stats;
+        stats.pending_source_pages = self.source_pending_pages(scene);
+        stats.pending_shadow_cascades = self.owner.shadows().cache().pending();
+        stats.ready = self.is_ready(scene);
+        stats
+    }
+    pub fn is_ready(&self, scene: &ClientScene) -> bool {
+        self.stats.ready
+            && self.source_pending_pages(scene) == 0
+            && !self.owner.needs_work(scene.world())
+    }
+    fn source_pending_pages(&self, scene: &ClientScene) -> usize {
+        if self.stats.authoritative_source {
+            // Visible pages form the configured box. Its one-page expansion is
+            // exactly the union of sampled volume halos, with no duplicates.
+            let config = scene.config();
+            let page = config.center.page();
+            let horizontal = i32::from(config.horizontal_radius) + 1;
+            let vertical = i32::from(config.vertical_radius) + 1;
+            let mut missing = 0;
+            for dy in -vertical..=vertical {
+                for dz in -horizontal..=horizontal {
+                    for dx in -horizontal..=horizontal {
+                        let (Some(x), Some(y), Some(z)) = (
+                            page.x.checked_add(dx),
+                            page.y.checked_add(dy),
+                            page.z.checked_add(dz),
+                        ) else {
+                            continue;
+                        };
+                        let source = PageId { x, y, z, ..page };
+                        if scene.world().page(source).is_some()
+                            && scene.authoritative_light_version(source).is_none()
+                        {
+                            missing += 1;
+                        }
+                    }
+                }
+            }
+            missing
+        } else {
+            0
+        }
     }
     pub fn encode(
         &mut self,

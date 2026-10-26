@@ -4,12 +4,24 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$root/tools/env.sh"
 cd "$root"
 
+profile=debug
+build_args=()
+if [[ "${1:-}" == --release ]]; then
+  profile=release
+  build_args+=(--release)
+  shift
+fi
+if [[ $# -ne 0 ]]; then
+  printf '%s\n' 'Usage: bash tools/build_web.sh [--release]' >&2
+  exit 2
+fi
+
 binding_version=0.2.104
 if ! command -v wasm-bindgen >/dev/null 2>&1 || [[ "$(wasm-bindgen --version)" != "wasm-bindgen $binding_version" ]]; then
   CARGO_TARGET_DIR="$root/.local/tool-targets/wasm-bindgen" \
     cargo install wasm-bindgen-cli --version "=$binding_version" --locked --root "$CARGO_HOME"
 fi
-cargo build --locked --target wasm32-unknown-unknown -p client-web
+cargo build --locked --target wasm32-unknown-unknown -p client-web "${build_args[@]}"
 dist="$root/.local/web-dist"
 mkdir -p "$dist/pkg"
 cp "$root/web/index.html" "$dist/index.html"
@@ -17,5 +29,5 @@ if [[ -d "$root/web/workers" ]]; then
   mkdir -p "$dist/workers"
   cp "$root"/web/workers/*.js "$dist/workers/"
 fi
-wasm-bindgen --target web --out-dir "$dist/pkg" --out-name client_web "$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/client_web.wasm"
-printf '%s\n' "Web build ready in $dist"
+wasm-bindgen --target web --out-dir "$dist/pkg" --out-name client_web "$CARGO_TARGET_DIR/wasm32-unknown-unknown/$profile/client_web.wasm"
+printf '%s\n' "Web $profile build ready in $dist"

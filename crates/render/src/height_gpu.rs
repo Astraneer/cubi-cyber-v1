@@ -115,6 +115,25 @@ impl HeightGpu {
         config: HeightGpuConfig,
         shadows: Option<&ShadowGpu>,
     ) -> Result<Self, HeightGpuError> {
+        Self::new_prepared(device, geometry, config, shadows, None)
+    }
+    /// Prepare shared atmospheric lighting once during loading.
+    pub fn new_with_atmosphere(
+        device: &wgpu::Device,
+        geometry: TerrainGeometry<'_>,
+        config: HeightGpuConfig,
+        shadows: Option<&ShadowGpu>,
+        atmosphere: &crate::atmosphere::AtmosphereGpu,
+    ) -> Result<Self, HeightGpuError> {
+        Self::new_prepared(device, geometry, config, shadows, Some(atmosphere))
+    }
+    fn new_prepared(
+        device: &wgpu::Device,
+        geometry: TerrainGeometry<'_>,
+        config: HeightGpuConfig,
+        shadows: Option<&ShadowGpu>,
+        atmosphere: Option<&crate::atmosphere::AtmosphereGpu>,
+    ) -> Result<Self, HeightGpuError> {
         if config.max_tiles == 0
             || config.atlas_layers == 0
             || u64::from(config.max_tiles) * TILE_BYTES
@@ -186,6 +205,9 @@ impl HeightGpu {
                 },
             ]);
         }
+        if atmosphere.is_some() {
+            entries.push(buffer_layout(20, f, false, true));
+        }
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("public height grid draw layout"),
             entries: &entries,
@@ -226,6 +248,9 @@ impl HeightGpu {
                 },
             ]);
         }
+        if let Some(atmosphere) = atmosphere {
+            entries.push(buffer_binding(20, atmosphere.lighting_buffer()));
+        }
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("public height grid sources"),
             layout: &layout,
@@ -241,7 +266,17 @@ impl HeightGpu {
                 buffer_binding(3, &indirect),
             ],
         });
-        let source=include_str!("height_grid.wgsl").replace("// SHADOWS",if shadows.is_some(){include_str!("shadow_sampling.wgsl")}else{"fn cascade_shadow(p:vec3<f32>,n:vec3<f32>)->f32{return 1.;}"}).replace("// ILLUMINATION",if shadows.is_some(){"return vec3(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.));"}else{"return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.));"});
+        let source = crate::atmosphere::surface_shader(
+            include_str!("height_grid.wgsl"),
+            shadows.is_some(),
+            atmosphere.is_some(),
+            false,
+            if shadows.is_some() {
+                "return vec3(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.));"
+            } else {
+                "return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.));"
+            },
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("implicit stitched height grid"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -344,6 +379,50 @@ impl HeightGpu {
         enabled: bool,
         budget: &mut UploadBudget,
     ) -> Result<HeightHandle, HeightGpuError> {
+        self.upload_inner(queue, handle, tile, seams, origin, enabled, false, budget)
+    }
+    /// A disabled replacement may coexist with the active copy of the same
+    /// tile. Its writes cannot alter the current front; publish all affected
+    /// handles together only after source/seam/protected-geometry validation.
+    pub fn upload_staged(
+        &mut self,
+        queue: &wgpu::Queue,
+        tile: &HeightTile,
+        seams: u32,
+        origin: [i64; 3],
+        budget: &mut UploadBudget,
+    ) -> Result<HeightHandle, HeightGpuError> {
+        let hash = tile.canonical_hash();
+        let mut copies = 0;
+        for old in &self.slots {
+            if old.key != Some(tile.key) {
+                continue;
+            }
+            copies += 1;
+            if tile.source < old.source {
+                return Err(HeightGpuError::StaleSource);
+            }
+            if tile.source == old.source && hash != old.hash {
+                return Err(HeightGpuError::ConflictingSource);
+            }
+        }
+        if copies >= 2 {
+            return Err(HeightGpuError::Capacity);
+        }
+        self.upload_inner(queue, None, tile, seams, origin, false, true, budget)
+    }
+    #[allow(clippy::too_many_arguments)] // Internal preflight shared by active updates and disabled staging.
+    fn upload_inner(
+        &mut self,
+        queue: &wgpu::Queue,
+        handle: Option<HeightHandle>,
+        tile: &HeightTile,
+        seams: u32,
+        origin: [i64; 3],
+        enabled: bool,
+        duplicate_staging: bool,
+        budget: &mut UploadBudget,
+    ) -> Result<HeightHandle, HeightGpuError> {
         tile.validate(self.config.atlas_layers)
             .map_err(|_| HeightGpuError::InvalidTile)?;
         if seams & !15 != 0
@@ -367,7 +446,7 @@ impl HeightGpu {
             }
             (h.slot, old)
         } else {
-            if self.slots.iter().any(|s| s.key == Some(tile.key)) {
+            if !duplicate_staging && self.slots.iter().any(|s| s.key == Some(tile.key)) {
                 return Err(HeightGpuError::InvalidTile);
             }
             let slot = *self.free.last().ok_or(HeightGpuError::Capacity)?;
@@ -396,6 +475,14 @@ impl HeightGpu {
         if budget.remaining_bytes < bytes {
             return Err(HeightGpuError::UploadBudget);
         }
+        // Generation exhaustion must fail before any queue write.
+        let generation = if old.key.is_some() {
+            old.generation
+        } else {
+            old.generation
+                .checked_add(1)
+                .ok_or(HeightGpuError::Capacity)?
+        };
         if payload_changed {
             self.staging.fill(0);
             for (out, h) in self.staging[..289].iter_mut().zip(tile.heights) {
@@ -425,14 +512,9 @@ impl HeightGpu {
             );
             self.revision = self.revision.wrapping_add(1)
         }
-        let generation = if old.key.is_some() {
-            old.generation
-        } else {
+        if old.key.is_none() {
             self.free.pop();
-            old.generation
-                .checked_add(1)
-                .ok_or(HeightGpuError::Capacity)?
-        };
+        }
         self.slots[slot as usize] = Slot {
             generation,
             key: Some(tile.key),

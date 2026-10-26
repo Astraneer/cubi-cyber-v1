@@ -83,6 +83,19 @@ fn actual_movement_replays_flight_liquids_unknown_and_authority_checkpoints() {
     recorder.append_json(&mut json).unwrap();
     let via_json = Archive::from_report(&json).unwrap().replay().unwrap();
     assert_eq!(result, via_json);
+    let spaced = json.replace(":", " : \n").replace(",", ",\n  ");
+    assert_eq!(
+        Archive::from_report(&spaced).unwrap().replay().unwrap(),
+        result
+    );
+    let quoted = format!(
+        "{{\"quoted\":\"\\\"movementReplay\\\":{{}}\",{}",
+        &spaced[1..]
+    );
+    assert_eq!(
+        Archive::from_report(&quoted).unwrap().replay().unwrap(),
+        result
+    );
     assert!(json.ends_with("\"}}"));
 }
 #[test]

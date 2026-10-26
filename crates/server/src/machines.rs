@@ -4,6 +4,8 @@
 mod codec;
 #[path = "machines/fixture.rs"]
 mod fixture;
+#[path = "machines/machine_activity.rs"]
+mod machine_activity;
 #[path = "machines/owner.rs"]
 mod owner;
 #[path = "machines/phase.rs"]
@@ -12,8 +14,17 @@ mod phase;
 mod planner;
 #[path = "machines/registration.rs"]
 mod registration;
+#[path = "machines/render_hint.rs"]
+mod render_hint;
+#[path = "machines/replication.rs"]
+pub mod replication;
+pub use render_hint::RenderHint;
 #[path = "machines/topology.rs"]
 mod topology;
+#[path = "machines/topology_pending.rs"]
+mod topology_pending;
+#[path = "machines/transport.rs"]
+pub mod transport;
 #[path = "machines/view.rs"]
 mod view;
 
@@ -31,7 +42,7 @@ use rules::{
         sides,
     },
     stack::ItemStack,
-    survival::furnace::Chest,
+    survival::furnace::{Chest, Furnace},
 };
 use std::collections::{BTreeMap, BTreeSet};
 use world::{CellRead, ComponentData, Transaction, World};
@@ -72,6 +83,7 @@ pub struct Budget {
     pub bytes: u64,
     pub endpoints: usize,
     pub route_nodes: usize,
+    pub item_spawns: usize,
 }
 impl Default for Budget {
     fn default() -> Self {
@@ -81,6 +93,7 @@ impl Default for Budget {
             bytes: 32 * 1024 * 1024,
             endpoints: 16_384,
             route_nodes: 4096,
+            item_spawns: 2048,
         }
     }
 }
@@ -98,6 +111,10 @@ pub struct Work {
     pub oldest_age: u64,
     pub recipe_ticks: u64,
     pub analytic_transitions: u64,
+    pub routes: u64,
+    pub route_nodes: u64,
+    pub packets: u64,
+    pub pulls: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MachineError {
@@ -209,6 +226,8 @@ pub struct RuntimeDelta {
     pub networks: Vec<NetworkPatch>,
     pub endpoints: Vec<EndpointPatch>,
     pub configs: Vec<ConfigPatch>,
+    pub transport: Option<transport::TransportDelta>,
+    pub topology_queue: Option<crate::topology_queue::Delta>,
 }
 #[must_use = "Commit transactions and RuntimeDelta in the same WAL batch before publishing"]
 pub struct PhasePlan {
@@ -216,7 +235,14 @@ pub struct PhasePlan {
     pub delta: RuntimeDelta,
     pub inputs: Vec<jobs::InputVersion>,
     pub fluid_wakes: Vec<BlockPos>,
+    pub payloads: Vec<rules::item_payload::Payload>,
+    pub item_spawns: Vec<rules::entities::item::ItemEntity>,
     pub work: Work,
+}
+pub struct PhaseContext<'a> {
+    pub payloads: Option<&'a dyn rules::item_payload::Resolver>,
+    pub active: Option<&'a dyn Fn(BlockPos) -> bool>,
+    pub activity: &'a [(PageId, bool)],
 }
 pub struct MachineRuntime {
     config: Config,
@@ -224,6 +250,7 @@ pub struct MachineRuntime {
     next_order: u64,
     machines: BTreeMap<ComponentId, MachineMeta>,
     positions: BTreeMap<BlockPos, ComponentId>,
+    machine_pages: BTreeMap<PageId, BTreeSet<ComponentId>>,
     events: BTreeMap<(Tick, u8, u64), Pending>,
     keys: BTreeMap<Event, (Tick, u8, u64)>,
     grids: BTreeMap<SpaceId, Grid>,
@@ -231,6 +258,10 @@ pub struct MachineRuntime {
     producers: BTreeMap<NetworkKey, Vec<ComponentId>>,
     configs: BTreeMap<BlockPos, TransmitterConfig>,
     phase_scratch: PhaseScratch,
+    transport: transport::TransportOwner,
+    topology_queue: crate::topology_queue::Queue,
+    dirty_networks: BTreeMap<NetworkKey, BTreeSet<BlockPos>>,
+    dirty_positions: BTreeMap<BlockPos, BTreeSet<NetworkKey>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeSnapshot {
@@ -242,12 +273,35 @@ pub struct RuntimeSnapshot {
     pub network_orders: Vec<(NetworkKey, u64)>,
     pub producers: Vec<(NetworkKey, Vec<ComponentId>)>,
     pub configs: Vec<TransmitterConfig>,
+    pub transport: transport::TransportSnapshot,
+    pub topology_queue: crate::topology_queue::Snapshot,
 }
 #[derive(Clone, Copy)]
 struct ReadOwner<'a> {
+    dirty_networks: &'a BTreeMap<NetworkKey, BTreeSet<BlockPos>>,
+    new_dirty: &'a BTreeSet<NetworkKey>,
+    active: Option<&'a dyn Fn(BlockPos) -> bool>,
+    now: Tick,
+    packet_limit: usize,
+    transport: &'a transport::TransportOwner,
+    configs: &'a BTreeMap<BlockPos, TransmitterConfig>,
+    payloads: Option<&'a dyn rules::item_payload::Resolver>,
     machines: &'a BTreeMap<ComponentId, MachineMeta>,
+    activity_meta: &'a BTreeMap<ComponentId, Option<MachineMeta>>,
     positions: &'a BTreeMap<BlockPos, ComponentId>,
     grids: &'a BTreeMap<SpaceId, Grid>,
+}
+impl ReadOwner<'_> {
+    fn machine_meta(self, id: ComponentId) -> Option<MachineMeta> {
+        self.activity_meta
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| self.machines.get(&id).copied())
+    }
+    fn machine_active(self, id: ComponentId) -> bool {
+        self.machine_meta(id)
+            .is_some_and(|m| m.active && self.active.is_none_or(|active| active(m.anchor)))
+    }
 }
 #[derive(Clone)]
 struct MachineChange {
@@ -262,13 +316,31 @@ struct ChestChange {
     after: Chest,
     anchor: BlockPos,
 }
+#[derive(Clone, Copy)]
+struct FurnaceChange {
+    version: Version,
+    before: Furnace,
+    after: Furnace,
+    anchor: BlockPos,
+}
 #[derive(Default)]
 struct Overlay {
     machines: BTreeMap<ComponentId, MachineChange>,
     chests: BTreeMap<ComponentId, ChestChange>,
+    furnaces: BTreeMap<ComponentId, FurnaceChange>,
     cells: BTreeMap<BlockPos, (Cell, Cell)>,
     reservoirs: BTreeMap<NetworkKey, (Reservoir, Reservoir)>,
     inputs: BTreeMap<PageId, Option<Version>>,
+    packets: BTreeMap<u64, transport::PacketPatch>,
+    pulls: BTreeMap<BlockPos, transport::PullPatch>,
+    next_packet: Option<u64>,
+    packet_count_delta: i64,
+    packet_bytes_delta: i64,
+    payloads: BTreeMap<rules::item_payload::PayloadId, rules::item_payload::Payload>,
+    item_spawns: Vec<rules::entities::item::ItemEntity>,
+    clocks: BTreeMap<PageId, transport::ClockPatch>,
+    page_counts: BTreeMap<PageId, i64>,
+    clock_bytes_delta: i64,
 }
 pub fn machine_component(anchor: BlockPos, machine: &Machine) -> ComponentData {
     let mut bytes = [0; machines::MACHINE_BYTES];

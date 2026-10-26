@@ -1,8 +1,4 @@
-// The module remains unexported until the coordinated stack codec checkpoint.
-pub use rules::{ItemId, blocks, items, machines};
-#[path = "../src/item_payload.rs"]
-mod item_payload;
-use item_payload::*;
+use rules::item_payload::*;
 use rules::{
     blocks::MekKind,
     items::*,
@@ -14,7 +10,8 @@ use telemetry::{AllocationCounts, AllocationScope, CountingAllocator};
 static ALLOCATOR: CountingAllocator = CountingAllocator::new(std::alloc::System);
 #[test]
 fn entire_machine_is_one_immutable_record_and_exactly_resolves_after_restart() {
-    // Approved game/mek_tests.rs275..286 preserves the complete block entity.
+    // Immutable codec helper preserves every supplied field. Actual block-item
+    // creation separately applies the approved world/mek/items.rs projection.
     let mut machine = Machine::new(MekKind::Purifier);
     machine.energy = 19_920;
     machine.progress = 17;
@@ -213,6 +210,171 @@ fn inline_encoded_values_have_exact_legacy_length_and_zero_allocations() {
         let before = bytes.len();
         assert!(bytes.append_refs([(0, Some(PayloadId(8)))]).is_err());
         assert_eq!(bytes.len(), before);
+    }
+    assert_eq!(scope.finish(), AllocationCounts::default());
+}
+
+#[test]
+fn stack_and_all_small_container_codecs_keep_payload_and_legacy_bytes() {
+    use rules::survival::{
+        Inventory,
+        furnace::{Chest, Furnace},
+    };
+    let payload = Payload::machine(&Machine::new(MekKind::Cube)).unwrap();
+    let raw = ItemStack::new(payload.item(), 1).unwrap();
+    let tagged = raw.with_payload(payload.id()).unwrap();
+    assert_eq!(tagged.payload(), Some(payload.id()));
+    assert_eq!(tagged.maximum(), 1);
+    assert!(!raw.same_kind(tagged));
+    assert_eq!(tagged.with_count(1).unwrap(), tagged);
+    assert_eq!(tagged.with_count(0).unwrap(), ItemStack::EMPTY);
+    assert!(tagged.with_count(2).is_err());
+    assert!(raw.with_payload(PayloadId(0)).is_err());
+    assert!(ItemStack::EMPTY.with_payload(payload.id()).is_err());
+    assert_eq!(std::mem::size_of::<ItemStack>(), 16);
+    let mut inventory = Inventory::empty();
+    inventory.set_trusted(0, tagged).unwrap();
+    let bytes = inventory.encode();
+    assert_eq!(bytes.len(), 276);
+    assert_eq!(&bytes[260..266], b"XRF1\x01\x00");
+    assert_eq!(Inventory::decode(&bytes), Ok(inventory));
+    let mut ordinary = Inventory::empty();
+    ordinary.set_trusted(0, raw).unwrap();
+    let ordinary = ordinary.encode();
+    assert_eq!(ordinary.len(), 260);
+    assert_eq!(ordinary[..260], bytes[..260]);
+    let mut chest = Chest::default();
+    chest.set_trusted(26, tagged).unwrap();
+    let bytes = chest.encode();
+    assert_eq!(bytes.len(), 190);
+    assert_eq!(Chest::decode(&bytes), Ok(chest));
+    assert_eq!(Chest::default().encode().len(), 174);
+    let mut furnace = Furnace::default();
+    furnace.set_trusted(0, tagged).unwrap();
+    let bytes = furnace.encode();
+    assert_eq!(bytes.len(), 46);
+    assert_eq!(Furnace::decode(&bytes), Ok(furnace));
+    assert_eq!(Furnace::default().encode().len(), 30);
+    let mut malformed = inventory.encode().to_vec();
+    malformed[264..266].copy_from_slice(&0u16.to_le_bytes());
+    assert!(Inventory::decode(&malformed).is_err());
+    let scope = AllocationScope::begin().unwrap();
+    for _ in 0..10_000 {
+        std::hint::black_box(inventory.encode());
+        std::hint::black_box(chest.encode());
+        std::hint::black_box(furnace.encode());
+    }
+    assert_eq!(scope.finish(), AllocationCounts::default());
+}
+#[test]
+fn tablet_roundtrip_through_ledger_inventory_chest_and_slot_preserves_joules() {
+    use rules::survival::{Inventory, furnace::Chest};
+    let slot = Slot::tablet(180_000);
+    let (stack, payload) = slot.to_item().unwrap();
+    let payload = payload.unwrap();
+    assert_eq!(stack.damage(), 0);
+    assert_eq!(stack.payload(), Some(payload.id()));
+    let mut ledger = Ledger::new(Config::default()).unwrap();
+    ledger
+        .acknowledge(
+            ledger
+                .extend(ledger.plan().unwrap(), [payload], [])
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(Slot::from_item(stack, &ledger).unwrap(), slot);
+    let mut inv = Inventory::empty();
+    inv.plan_pickup(stack).unwrap().apply(&mut inv).unwrap();
+    let mut chest = Chest::default();
+    chest
+        .plan_transfer(&inv, 0, 0, 1, true)
+        .unwrap()
+        .apply(&mut inv, &mut chest)
+        .unwrap();
+    assert!(inv.hand().is_empty());
+    let chest = Chest::decode(&chest.encode()).unwrap();
+    assert_eq!(
+        Slot::from_item(chest.slots()[0], &ledger).unwrap().charge,
+        180_000
+    );
+    let mut parent = Machine::new(MekKind::Cube);
+    parent.slots[0] = Slot::new(stack);
+    let mut bytes = [0; rules::machines::MACHINE_BYTES];
+    let used = parent.encode(&mut bytes);
+    assert_eq!(used, 155);
+    assert_eq!(Machine::decode(&bytes[..used]).unwrap(), parent);
+    let payload = Payload::machine(&parent).unwrap();
+    let empty = Ledger::new(Config::default()).unwrap();
+    assert!(
+        empty
+            .extend(empty.plan().unwrap(), [payload.clone()], [])
+            .is_err()
+    );
+    ledger
+        .acknowledge(
+            ledger
+                .extend(ledger.plan().unwrap(), [payload.clone()], [])
+                .unwrap(),
+        )
+        .unwrap();
+    let restored = Ledger::restore(Config::default(), &ledger.snapshot()).unwrap();
+    assert_eq!(
+        restored
+            .resolve(payload.id(), payload.item())
+            .unwrap()
+            .resolve_machine(payload.item())
+            .unwrap(),
+        parent
+    );
+}
+#[test]
+fn physical_item_codec_preserves_reference_without_changing_ordinary_160_byte_image() {
+    use core_types::SpaceId;
+    use rules::entities::{EntityId, item::ItemEntity};
+    let payload = Payload::charge(20).unwrap();
+    let ordinary = ItemStack::new(I_ENERGY_TABLET, 1).unwrap();
+    let plain = ItemEntity::new(EntityId(1), SpaceId(0), ordinary, [1.0, 2.0, 3.0], 7, 10).unwrap();
+    let mut tagged = plain;
+    tagged.stack = ordinary.with_payload(payload.id()).unwrap();
+    let bytes = tagged.encode().unwrap();
+    assert_eq!(ItemEntity::decode(&bytes).unwrap(), tagged);
+    let original = plain.encode().unwrap();
+    assert_eq!(&bytes[..121], &original[..121]);
+    assert_eq!(&bytes[129..], &original[129..]);
+    assert_eq!(&bytes[121..129], &payload.id().0.to_le_bytes());
+    assert!(original[121..].iter().all(|&b| b == 0));
+}
+#[test]
+fn ordinary_recipe_cannot_silently_destroy_immutable_item_state() {
+    let raw = ItemStack::new(I_ENERGY_TABLET, 1).unwrap();
+    let typed = raw.with_payload(Payload::charge(20).unwrap().id()).unwrap();
+    let ingredient = rules::crafting::Ingredient::Item(I_ENERGY_TABLET);
+    assert!(ingredient.accepts(raw));
+    assert!(!ingredient.accepts(typed));
+}
+#[test]
+fn pending_ledger_view_resolves_same_batch_charge_without_publishing_or_cloning() {
+    let ledger = Ledger::new(Config::default()).unwrap();
+    let payload = Payload::charge(200_000).unwrap();
+    let item = ItemStack::new(I_ENERGY_TABLET, 1)
+        .unwrap()
+        .with_payload(payload.id())
+        .unwrap();
+    let delta = ledger
+        .extend(ledger.plan().unwrap(), [payload.clone()], [])
+        .unwrap();
+    let view = ledger.view(&delta).unwrap();
+    assert!(ledger.get(payload.id()).is_none());
+    assert_eq!(Slot::from_item(item, &view).unwrap().charge, 200_000);
+    assert!(Slot::from_item(item, &ledger).is_err());
+    let scope = AllocationScope::begin().unwrap();
+    for _ in 0..10_000 {
+        assert_eq!(
+            view.resolve(payload.id(), item.item())
+                .unwrap()
+                .joules(item.item()),
+            Ok(200_000)
+        );
     }
     assert_eq!(scope.finish(), AllocationCounts::default());
 }

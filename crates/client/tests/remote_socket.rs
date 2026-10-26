@@ -135,7 +135,15 @@ fn native_websocket_pump_imports_real_authority_without_client_generation() {
             0,
             "remote never publishes locally generated pages"
         );
-        assert!(!runtime.server().is_failed());
+        assert!(
+            !runtime.server().is_failed(),
+            "heightready={} indexedcells={} columns={} loaded={} counters={:?}",
+            runtime.server().height_ready_for_publication(),
+            runtime.server().height_authority().index().cell_count(),
+            runtime.server().height_authority().index().column_count(),
+            runtime.server().world().loaded_pages(),
+            runtime.server().counters()
+        );
         if !persisted && let Some(welcome) = remote.connection().welcome() {
             let hello = Hello {
                 identity: welcome.identity,

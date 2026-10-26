@@ -119,6 +119,110 @@ impl ProxyPayload {
             palette_len: palette.len() as u32,
         })
     }
+    /// Bounded browser-worker result. The decoder checks every rank/index before
+    /// constructing storage accepted by the GPU; no meshing runs on the owner.
+    pub fn encode_public(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(24 + self.words.len() * 4);
+        bytes.extend_from_slice(b"PXP1");
+        for value in [
+            self.words.len() as u32,
+            self.palette_offset,
+            self.index_bits,
+            self.occupied,
+            self.palette_len,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for word in &self.words {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+    pub fn decode_public(bytes: &[u8], atlas_layers: u32) -> Result<Self, ProxyError> {
+        if bytes.len() < 24
+            || bytes.len() > 24 + 10000 * 4
+            || &bytes[..4] != b"PXP1"
+            || atlas_layers == 0
+            || atlas_layers > 256
+        {
+            return Err(ProxyError::InvalidMaterial);
+        }
+        let read =
+            |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("bounded header"));
+        let count = read(4) as usize;
+        let palette_offset = read(8);
+        let bits = read(12);
+        let occupied = read(16);
+        let palette_len = read(20);
+        if count > 10000
+            || occupied > 4096
+            || palette_len > occupied
+            || bits > 12
+            || bits
+                != if palette_len <= 1 {
+                    0
+                } else {
+                    32 - (palette_len - 1).leading_zeros()
+                }
+            || bytes.len() != 24 + count * 4
+        {
+            return Err(ProxyError::InvalidMaterial);
+        }
+        let index_words = (occupied as usize * bits as usize).div_ceil(32);
+        if palette_offset as usize != INDEX_OFFSET + index_words
+            || count != INDEX_OFFSET + index_words + palette_len as usize * 2
+        {
+            return Err(ProxyError::InvalidMaterial);
+        }
+        let word = |index: usize| read(24 + index * 4);
+        let mut rank = 0u32;
+        for index in 0..=64 {
+            if ((word(128 + index / 2) >> ((index % 2) * 16)) & 65535) != rank {
+                return Err(ProxyError::InvalidMaterial);
+            }
+            if index < 64 {
+                rank += word(index * 2).count_ones() + word(index * 2 + 1).count_ones();
+            }
+        }
+        if rank != occupied || word(160) >> 16 != 0 || ((occupied == 0) != (palette_len == 0)) {
+            return Err(ProxyError::InvalidMaterial);
+        }
+        for index in 0..palette_len as usize {
+            let info = word(palette_offset as usize + index * 2);
+            if info & 65535 >= atlas_layers || info >> 16 > 1 {
+                return Err(ProxyError::InvalidMaterial);
+            }
+        }
+        if bits > 0 {
+            let mask = (1u32 << bits) - 1;
+            for index in 0..occupied as usize {
+                let bit = index * bits as usize;
+                let mut value = word(INDEX_OFFSET + bit / 32) >> (bit % 32);
+                if bit % 32 + bits as usize > 32 {
+                    value |= word(INDEX_OFFSET + bit / 32 + 1) << (32 - bit % 32);
+                }
+                if value & mask >= palette_len {
+                    return Err(ProxyError::InvalidMaterial);
+                }
+            }
+            let used = occupied as usize * bits as usize % 32;
+            if used > 0 && word(palette_offset as usize - 1) >> used != 0 {
+                return Err(ProxyError::InvalidMaterial);
+            }
+        }
+        Ok(Self {
+            words: (0..count).map(word).collect(),
+            palette_offset,
+            index_bits: bits,
+            occupied,
+            palette_len,
+        })
+    }
+    pub fn materials_within(&self, atlas_layers: u32) -> bool {
+        (0..self.palette_len as usize).all(|index| {
+            self.words[self.palette_offset as usize + index * 2] & 65535 < atlas_layers
+        })
+    }
     pub fn upload_bytes(&self) -> u64 {
         self.words.len() as u64 * 4 + OBJECT_BYTES
     }
@@ -245,6 +349,7 @@ pub struct ProxyWork {
 }
 pub struct LodProxyGpu {
     config: ProxyConfig,
+    model_staging: Vec<(u32, ObjectGpu)>,
     objects: wgpu::Buffer,
     payload: wgpu::Buffer,
     visible: wgpu::Buffer,
@@ -270,6 +375,27 @@ impl LodProxyGpu {
         geometry: TerrainGeometry<'_>,
         config: ProxyConfig,
         shadows: Option<&ShadowGpu>,
+    ) -> Result<Self, ProxyError> {
+        Self::new_prepared(device, queue, geometry, config, shadows, None)
+    }
+    /// Prepare the same atmospheric energy as near terrain at loading.
+    pub fn new_with_atmosphere(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        geometry: TerrainGeometry<'_>,
+        config: ProxyConfig,
+        shadows: Option<&ShadowGpu>,
+        atmosphere: &crate::atmosphere::AtmosphereGpu,
+    ) -> Result<Self, ProxyError> {
+        Self::new_prepared(device, queue, geometry, config, shadows, Some(atmosphere))
+    }
+    fn new_prepared(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        geometry: TerrainGeometry<'_>,
+        config: ProxyConfig,
+        shadows: Option<&ShadowGpu>,
+        atmosphere: Option<&crate::atmosphere::AtmosphereGpu>,
     ) -> Result<Self, ProxyError> {
         let limits = device.limits();
         if config.max_objects == 0
@@ -359,6 +485,9 @@ impl LodProxyGpu {
                 },
             ]);
         }
+        if atmosphere.is_some() {
+            render_entries.push(buffer_layout(20, f, false, true));
+        }
         let render_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("LOD masked proxy render layout"),
             entries: &render_entries,
@@ -407,6 +536,9 @@ impl LodProxyGpu {
                 },
             ]);
         }
+        if let Some(atmosphere) = atmosphere {
+            entries.push(buffer_binding(20, atmosphere.lighting_buffer()));
+        }
         let render_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("LOD public data and materials"),
             layout: &render_layout,
@@ -422,7 +554,32 @@ impl LodProxyGpu {
                 buffer_binding(3, &indirect),
             ],
         });
-        let source=include_str!("lod_proxy.wgsl").replace("// INSTRUMENTATION",if config.instrument{COUNTERS}else{NO_COUNTERS}).replace("// LIGHTING",if shadows.is_some(){include_str!("shadow_sampling.wgsl")}else{"fn cascade_shadow(p:vec3<f32>,n:vec3<f32>)->f32{return 1.0;}"}).replace("// ILLUMINATION",if shadows.is_some(){"return object.light.rgb+vec3(object.light.a*(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.0)));"}else{"return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.0));"});
+        let source = include_str!("lod_proxy.wgsl")
+            .replace(
+                "// INSTRUMENTATION",
+                if config.instrument {
+                    COUNTERS
+                } else {
+                    NO_COUNTERS
+                },
+            )
+            .replace("// LIGHTING", "// SHADOWS");
+        let source = if atmosphere.is_some() {
+            source.replace("// ILLUMINATION", "let light=object.light;// ILLUMINATION")
+        } else {
+            source
+        };
+        let source = crate::atmosphere::surface_shader(
+            &source,
+            shadows.is_some(),
+            atmosphere.is_some(),
+            true,
+            if shadows.is_some() {
+                "return object.light.rgb+vec3(object.light.a*(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.0)));"
+            } else {
+                "return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.0));"
+            },
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("bounded masked LOD traversal"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -507,6 +664,7 @@ impl LodProxyGpu {
         );
         Ok(Self {
             config,
+            model_staging: Vec::with_capacity(config.max_objects as usize),
             objects,
             payload,
             visible,
@@ -698,6 +856,55 @@ impl LodProxyGpu {
                     bytemuck::bytes_of(&flags),
                 );
             }
+        }
+        budget.remaining_bytes -= bytes;
+        self.work.upload_bytes += bytes;
+        if bytes > 0 {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        Ok(bytes)
+    }
+    /// Atomically updates transforms without uploading any occupancy/palette
+    /// payload. Sorted unique handles and the full byte budget precede writes.
+    pub fn set_models_batch(
+        &mut self,
+        queue: &wgpu::Queue,
+        changes: &[(ProxyHandle, [[f32; 4]; 4])],
+        budget: &mut UploadBudget,
+    ) -> Result<u64, ProxyError> {
+        if changes.windows(2).any(|p| p[0].0.slot >= p[1].0.slot) {
+            return Err(ProxyError::StaleHandle);
+        }
+        self.model_staging.clear();
+        for &(handle, model) in changes {
+            let slot = self
+                .slots
+                .get(handle.slot as usize)
+                .filter(|s| s.generation == handle.generation && s.span.is_some())
+                .ok_or(ProxyError::StaleHandle)?;
+            let inv = inverse(model)?;
+            if slot.object.model == model {
+                continue;
+            }
+            let mut object = slot.object;
+            object.model = model;
+            object.inverse = inv;
+            let (min, max) = bounds(model);
+            object.bounds_min = [min[0], min[1], min[2], 0.];
+            object.bounds_max = [max[0], max[1], max[2], 0.];
+            self.model_staging.push((handle.slot, object));
+        }
+        let bytes = self.model_staging.len() as u64 * OBJECT_BYTES;
+        if budget.remaining_bytes < bytes {
+            return Err(ProxyError::UploadBudget);
+        }
+        for &(slot, object) in &self.model_staging {
+            queue.write_buffer(
+                &self.objects,
+                u64::from(slot) * OBJECT_BYTES,
+                bytemuck::bytes_of(&object),
+            );
+            self.slots[slot as usize].object = object;
         }
         budget.remaining_bytes -= bytes;
         self.work.upload_bytes += bytes;

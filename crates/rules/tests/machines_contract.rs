@@ -69,6 +69,21 @@ impl MachineWorld for World {
 fn stack(id: u16, n: u16) -> Slot {
     Slot::new(ItemStack::new(id, n).unwrap())
 }
+
+#[test]
+fn item_only_ejection_adapter_keeps_charged_output_instead_of_erasing_energy() {
+    let mut machine = Machine::new(MekKind::Smelter);
+    machine.eject = true;
+    machine.sides = [SideMode::Output; 6];
+    machine.slots[1] = Slot::tablet(180_000);
+    let mut world = World {
+        sink: true,
+        ..World::default()
+    };
+    machine.tick([0; 3], Face::South, &mut world);
+    assert_eq!(machine.slots[1], Slot::tablet(180_000));
+    assert!(world.item_ticks.is_empty());
+}
 fn tick(m: &mut Machine, w: &mut World) -> Step {
     w.tick += 1;
     m.tick([0, 64, 0], Face::South, w)

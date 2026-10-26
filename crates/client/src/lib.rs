@@ -9,13 +9,17 @@ pub mod demo_interaction;
 pub mod edit_shell;
 pub mod entities;
 pub mod gi_source;
+pub mod height_cache;
 pub mod lighting;
+pub mod local_materials;
 pub mod lodcache;
 pub mod network;
 mod overrides;
 pub mod presentation;
+pub mod props_source;
 mod rebase;
 pub mod remote;
+pub mod remote_humans;
 mod scene;
 pub mod self_model;
 mod task;
@@ -23,8 +27,10 @@ pub mod ui_bridge;
 pub mod ui_window;
 pub mod view;
 pub mod water;
+pub mod water_source;
 pub use overrides::{OverrideLimits, OverrideStats};
 pub use scene::*;
+pub use sim::replay;
 #[cfg(not(target_arch = "wasm32"))]
 pub use task::native_pool;
 pub use task::{

@@ -32,7 +32,8 @@ impl Reader<'_> {
     }
     fn records(&mut self, maximum: usize) -> Result<Vec<Record>, Error> {
         let n = u32::from_le_bytes(self.take()?) as usize;
-        if n > maximum || n > self.bytes.len().saturating_sub(self.at) / 17 {
+        // Smallest record: 8-byte id, 2-byte size, 4-byte configurator data.
+        if n > maximum || n > self.bytes.len().saturating_sub(self.at) / 14 {
             return Err(Error::Bounds);
         }
         let mut out = Vec::with_capacity(n);

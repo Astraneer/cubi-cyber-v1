@@ -255,6 +255,19 @@ impl Mixer {
         self.rate = rate;
         Ok(())
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn inherit_control(&mut self, previous: &mut Self) -> Result<(), AudioError> {
+        if self.active_voices() != 0 || self.echo.is_some() {
+            return Err(AudioError::Invalid);
+        }
+        self.next_generation = previous.next_generation;
+        self.listener = previous.listener;
+        self.master = previous.master;
+        self.volumes = previous.volumes;
+        self.echo = previous.echo.take();
+        self.work = std::mem::take(&mut previous.work);
+        Ok(())
+    }
     pub fn add_clip(&mut self, pcm: Pcm) -> Result<ClipId, AudioError> {
         if self.clips.len() == MAX_CLIPS
             || pcm.bytes() > self.memory_limit.saturating_sub(self.clip_bytes)
@@ -487,5 +500,51 @@ impl Mixer {
     }
     pub fn take_work(&mut self) -> MixWork {
         std::mem::take(&mut self.work)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod replacement_tests {
+    use super::*;
+    #[test]
+    fn resource_bank_replacement_keeps_settings_echo_and_rejects_old_voice_handles() {
+        let mut old = Mixer::new(48000, 4, 1024 * 1024).unwrap();
+        let clip = old
+            .add_clip(Pcm::mono(vec![1.0; 512], 48000).unwrap())
+            .unwrap();
+        old.volume(None, 0.25).unwrap();
+        old.volume(Some(Category::Ui), 0.5).unwrap();
+        old.listener(Listener {
+            position: [12.0, 80.0, -3.0],
+            right: [0.0, 0.0, 1.0],
+        })
+        .unwrap();
+        old.cavity(crate::echo::Cavity {
+            wall_distances: [Some(2.0); 6],
+            absorption: 0.3,
+        })
+        .unwrap();
+        let previous = old
+            .play(VoiceRequest::local(clip, EmitterId(1), Category::Ui))
+            .unwrap();
+        old.mix_stereo(&mut [0.0; 128]);
+        let mut replacement = Mixer::new(48000, 4, 1024 * 1024).unwrap();
+        let clip = replacement
+            .add_clip(Pcm::mono(vec![0.5; 512], 48000).unwrap())
+            .unwrap();
+        replacement.inherit_control(&mut old).unwrap();
+        assert_eq!(replacement.master, 0.25);
+        assert_eq!(replacement.volumes[Category::Ui as usize], 0.5);
+        assert_eq!(replacement.listener.position, [12.0, 80.0, -3.0]);
+        assert!(replacement.echo.is_some());
+        assert!(old.echo.is_none());
+        assert!(replacement.take_work().voice_samples > 0);
+        let current = replacement
+            .play(VoiceRequest::local(clip, EmitterId(2), Category::Ui))
+            .unwrap();
+        assert_ne!(current.generation, previous.generation);
+        assert!(!replacement.stop(previous));
+        assert_eq!(replacement.active_voices(), 1);
+        assert!(replacement.stop(current));
     }
 }

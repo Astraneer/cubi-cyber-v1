@@ -1,10 +1,16 @@
 //! Read-only fixed-tick audio inputs. Queries never generate/load world cells.
+mod actions;
+mod entities;
+mod machines;
+pub use actions::{BlockCue, ConfirmedBlockSounds};
 use audio::{
     Listener,
     echo::Cavity,
     events::{StepBody, Surface},
 };
 use core_types::Cell;
+pub use entities::EntitySounds;
+pub use machines::{MachineCommand, MachineSoundWork, MachineSounds};
 use rules::blocks::Snd;
 use sim::{Player, QueryWorld};
 use world::CellRead;

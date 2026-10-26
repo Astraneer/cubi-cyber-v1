@@ -16,6 +16,8 @@ pub struct RemoteCounters {
     pub imported_pages: u64,
     pub imported_cells: u64,
     pub prediction_changes: u64,
+    pub imported_light_pages: u64,
+    pub imported_light_samples: u64,
 }
 pub struct RemoteSession {
     connection: Connection,
@@ -28,6 +30,11 @@ pub struct RemoteSession {
     next_place_ms: u64,
     counters: RemoteCounters,
     entity_instances: Vec<rules::entities::mob::Instance>,
+    wanted_pages: Vec<core_types::PageId>,
+    page_capacity: usize,
+    wanted_heights: Vec<net::height::HeightKey>,
+    height_interest: BTreeSet<net::height::HeightKey>,
+    humans: crate::remote_humans::RemoteHumans,
 }
 impl RemoteSession {
     pub fn new(config: NetworkConfig) -> Result<Self, String> {
@@ -43,8 +50,14 @@ impl RemoteSession {
             counters: RemoteCounters::default(),
             entity_instances: vec![
                 rules::entities::mob::Instance::default();
-                net::entities::MAX_ENTITIES
+                net::entities::MAX_ENTITIES + 64
             ],
+            wanted_pages: Vec::with_capacity(config.maximum_pages),
+            page_capacity: config.maximum_pages,
+            wanted_heights: Vec::with_capacity(512),
+            height_interest: BTreeSet::new(),
+            humans: crate::remote_humans::RemoteHumans::new(64)
+                .map_err(|e| format!("public human capacity: {e:?}"))?,
         })
     }
     pub fn scene_config() -> SceneConfig {
@@ -64,7 +77,20 @@ impl RemoteSession {
     }
     pub fn receive_frame(&mut self, bytes: &[u8], now_ms: u64) -> Result<(), String> {
         let message = net::decode_server(bytes).map_err(|e| e.to_string())?;
-        self.connection.receive(message, now_ms).map_err(error)
+        let kind = match &message {
+            net::ServerMessage::Page(_) => "cells",
+            net::ServerMessage::Light(_) => "light",
+            net::ServerMessage::Geometry(_) => "geometry",
+            net::ServerMessage::Height(_) => "height",
+            net::ServerMessage::Prediction { .. } => "prediction",
+            _ => "control",
+        };
+        self.connection.receive(message, now_ms).map_err(|e| {
+            format!(
+                "network authority: {e:?} receiving {kind}, queues {:?}",
+                self.connection.queue_depths()
+            )
+        })
     }
     pub fn take_outgoing(&mut self) -> Option<Vec<u8>> {
         self.connection
@@ -107,7 +133,84 @@ impl RemoteSession {
                 .entity_replica()
                 .instances(space, time, [0; 3], &mut self.entity_instances)
                 .map_err(|e| format!("public entity interpolation: {e:?}"))?;
-            view.set_remote_entities(&self.entity_instances[..count], space, [0; 3])?;
+            let humans = self
+                .humans
+                .write(
+                    self.connection.remote_players_tick(),
+                    time,
+                    self.connection.remote_players(),
+                    welcome.identity,
+                    space,
+                    [0; 3],
+                    &mut self.entity_instances[count..],
+                )
+                .map_err(|e| format!("public human interpolation: {e:?}"))?;
+            view.set_remote_entities(&self.entity_instances[..count + humans], space, [0; 3])?;
+        }
+        if self.configured && self.connection.player().is_some() {
+            self.pump_horizon(view, now_ms)?;
+        }
+        Ok(())
+    }
+    fn pump_horizon(&mut self, view: &mut ClientView, now_ms: u64) -> Result<(), String> {
+        self.wanted_heights.clear();
+        for key in view.horizon_wanted_height() {
+            if self.wanted_heights.len() == 512 {
+                return Err("public horizon request capacity".into());
+            }
+            self.wanted_heights.push(key);
+        }
+        self.wanted_heights.sort_unstable();
+        if !self.wanted_heights.is_empty() {
+            for _ in 0..4 {
+                let Some(page) = self.connection.take_geometry_removal() else {
+                    break;
+                };
+                view.remove_remote_geometry(page)?;
+            }
+            for geometry in self.connection.take_geometry_updates(4) {
+                view.ingest_remote_geometry(&geometry)?;
+            }
+            for _ in 0..4 {
+                let Some(tile) = self.connection.take_height_update() else {
+                    break;
+                };
+                view.ingest_remote_height(tile)?;
+            }
+        }
+        let mut retired = [None; 4];
+        for (slot, key) in retired.iter_mut().zip(
+            self.height_interest
+                .iter()
+                .filter(|key| self.wanted_heights.binary_search(key).is_err()),
+        ) {
+            *slot = Some(*key);
+        }
+        for key in retired.into_iter().flatten() {
+            match self.connection.release_height(key) {
+                Ok(()) => {
+                    self.height_interest.remove(&key);
+                }
+                Err(NetworkError::Capacity) => break,
+                Err(e) => return Err(error(e)),
+            }
+        }
+        let mut added = 0;
+        for key in self.wanted_heights.iter().copied() {
+            if added >= 4 {
+                break;
+            }
+            if self.height_interest.contains(&key) {
+                continue;
+            }
+            match self.connection.request_height(key, now_ms) {
+                Ok(()) => {
+                    self.height_interest.insert(key);
+                    added += 1;
+                }
+                Err(NetworkError::Capacity) => break,
+                Err(e) => return Err(error(e)),
+            }
         }
         Ok(())
     }
@@ -170,13 +273,19 @@ impl RemoteSession {
                 }
             }
         }
-        let wanted: BTreeSet<_> = scene.requested_pages().collect();
+        self.wanted_pages.clear();
+        for page in scene.requested_pages() {
+            if self.wanted_pages.len() == self.page_capacity {
+                return Err("remote scene exceeds confirmed page capacity".into());
+            }
+            self.wanted_pages.push(page);
+        }
         for update in self.connection.take_page_updates(4) {
             let page = match &update {
                 PageUpdate::Snapshot(p) => p.page,
                 PageUpdate::Delta(p) => p.page,
             };
-            if !wanted.contains(&page) {
+            if !self.wanted_pages.contains(&page) {
                 continue;
             }
             match scene.import_authoritative_page(&update, self.connection.acknowledged_tick()) {
@@ -195,7 +304,7 @@ impl RemoteSession {
         // wire event. Rehydrate only missing/stale scene images from that exact
         // confirmed cache, with a separate bounded fallback budget.
         let mut restored = 0;
-        for page in wanted {
+        for page in self.wanted_pages.iter().copied() {
             let Some(image) = self.connection.replica().page(page) else {
                 continue;
             };
@@ -216,6 +325,59 @@ impl RemoteSession {
             self.counters.imported_cells += import.cells_scanned as u64;
             if let Some(change) = import.change {
                 changes.push(change)
+            }
+        }
+        // LIGHT has its own confirmed base and binds to the exact public cell
+        // view. Packet reordering repairs from the retained public light image.
+        for _ in 0..4 {
+            let Some(update) = self.connection.take_light_update() else {
+                break;
+            };
+            if !self.wanted_pages.contains(&update.header().page) {
+                continue;
+            }
+            match scene.import_authoritative_light(&update, self.connection.acknowledged_tick()) {
+                Ok(import) => {
+                    self.counters.imported_light_pages += u64::from(import.applied);
+                    self.counters.imported_light_samples += import.samples_scanned as u64;
+                    if let Some(change) = import.change {
+                        changes.push(change);
+                    }
+                }
+                Err(SceneError::Light(
+                    net::light::Error::MissingBase { .. } | net::light::Error::MissingCells { .. },
+                )) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        let mut restored_lights = 0;
+        for page in self.wanted_pages.iter().copied() {
+            let Some(image) = self.connection.light_replica().page(page) else {
+                continue;
+            };
+            if scene
+                .authoritative_version(page)
+                .is_none_or(|v| v.view != image.header.cell_view)
+            {
+                continue;
+            }
+            if scene
+                .authoritative_light_version(page)
+                .is_some_and(|v| v.view >= image.header.version)
+            {
+                continue;
+            }
+            if restored_lights == 4 {
+                break;
+            }
+            let import = scene
+                .import_replica_light(image, self.connection.acknowledged_tick())
+                .map_err(|e| e.to_string())?;
+            restored_lights += 1;
+            self.counters.imported_light_pages += u64::from(import.applied);
+            self.counters.imported_light_samples += import.samples_scanned as u64;
+            if let Some(change) = import.change {
+                changes.push(change);
             }
         }
         let positions: BTreeSet<_> = self.connection.predicted_positions().collect();
@@ -289,6 +451,15 @@ impl RemoteSession {
             .is_some_and(|(_, _, id)| !self.connection.action_pending(id))
         {
             self.mining = None;
+        }
+        let attacking = input.keys & net::InputFrame::ATTACK != 0;
+        if !attacking && !input.placing {
+            if self.mining.take().is_some() {
+                self.connection
+                    .aimed_action(Action::StopMining, false, now_ms, input.yaw, input.pitch)
+                    .map_err(error)?;
+            }
+            return Ok(());
         }
         let player = self.connection.player().expect("sampled player");
         let mut pose = sim::prediction::PredictionState::capture(player)

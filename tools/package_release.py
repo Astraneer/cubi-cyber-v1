@@ -87,13 +87,16 @@ def payload(kind, directory, platform):
     names = ("client-native" + extension, "server" + extension)
     files = {name: file_bytes(directory / name) for name in names}
     files["benchmark" + extension] = file_bytes(directory / "examples" / ("benchmark" + extension))
+    files["movement-replay" + extension] = file_bytes(directory / "examples" / ("replay" + extension))
     signature = b"MZ" if platform == "windows" else b"\x7fELF"
     if any(not value.startswith(signature) for value in files.values()):
         raise ValueError("Формат программы не соответствует выбранной платформе")
     files["bench_report.py"] = file_bytes(ROOT / "tools/bench_report.py")
-    files["ЗАПУСК.txt"] = (f"Сервер: server{extension} --data saves/world\n"
-                            f"Клиент: client-native{extension} --connect ws://127.0.0.1:25565\n"
-                            f"Маршрут без окна: benchmark{extension} --out measurements/run.json\n"
+    prefix = ".\\" if platform == "windows" else "./"
+    files["ЗАПУСК.txt"] = (f"Сервер: {prefix}server{extension} --data saves/world\n"
+                            f"Клиент: {prefix}client-native{extension} --connect ws://127.0.0.1:25565\n"
+                            f"Маршрут без окна: {prefix}benchmark{extension} --out measurements/run.json\n"
+                            f"Повтор движения из F8: {prefix}movement-replay{extension} F8.json\n"
                             "HTML: python bench_report.py report measurements/run.json --out measurements/report.html\n"
                             "Ограничения текущей сборки и критерии приёмки: docs/STATUS.md.\n").encode()
     return files
@@ -112,7 +115,7 @@ def archive(out, files, provenance):
         for name, data in sorted(files.items()):
             info = zipfile.ZipInfo(name, date_time=FIXED_TIME)
             info.compress_type = zipfile.ZIP_DEFLATED
-            mode = 0o755 if name in ("client-native", "server", "benchmark") else 0o644
+            mode = 0o755 if name in ("client-native", "server", "benchmark", "movement-replay") else 0o644
             info.external_attr = (0o100000 | mode) << 16
             bundle.writestr(info, data)
     checksum = hashlib.sha256(out.read_bytes()).hexdigest()

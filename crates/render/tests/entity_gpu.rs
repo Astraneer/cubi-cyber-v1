@@ -684,3 +684,289 @@ fn nonblock_sprites_use_separate_item_array_with_real_cutout_alpha() {
         );
     });
 }
+
+#[test]
+fn block_drops_preserve_all_six_face_layers_in_one_64_byte_instance() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let colors = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 0, 255],
+            [255, 0, 255, 255],
+            [0, 255, 255, 255],
+        ];
+        let rgba = colors
+            .into_iter()
+            .flat_map(|color| std::iter::repeat_n(color, 256).flatten())
+            .collect::<Vec<_>>();
+        let atlas = render::entity_models::item_atlas(&rgba, 6).unwrap();
+        let mut terrain = TerrainGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            256,
+            192,
+            OutputTransfer::Attachment,
+            GpuConfig {
+                max_pages: 8,
+                max_quads: 8192,
+                occlusion: false,
+            },
+            &atlas,
+        )
+        .unwrap();
+        let mut entities = EntityGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            terrain.geometry(),
+            EntityConfig {
+                max_entities: 1,
+                atlas_layers: 6,
+            },
+            None,
+        )
+        .unwrap();
+        let mut cube = instance(6);
+        cube.position = [0.; 3];
+        cube.scale = 1.;
+        cube.color = 0;
+        cube.set_block_layers([0, 1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(std::mem::size_of_val(&cube), 64);
+        assert_eq!(cube.block_layers(), Some([0, 1, 2, 3, 4, 5]));
+        entities
+            .upload(&gpu.queue, &[cube], &[], &mut UploadBudget::new(68))
+            .unwrap();
+        let normals = [
+            [0., -1., 0.],
+            [0., 1., 0.],
+            [0., 0., -1.],
+            [0., 0., 1.],
+            [-1., 0., 0.],
+            [1., 0., 0.],
+        ];
+        for (face, normal) in normals.into_iter().enumerate() {
+            let eye = [normal[0] * 4., 0.6 + normal[1] * 4., normal[2] * 4.];
+            let up = if normal[1] != 0. {
+                [0., 0., 1.]
+            } else {
+                [0., 1., 0.]
+            };
+            let camera = Camera::perspective(eye, [0., 0.6, 0.], up, 1., 256. / 192., 0.1, 100.);
+            let pixels = frame(&gpu, &mut terrain, Some(&mut entities), camera).0;
+            let p = &pixels[(128 + 96 * 256) * 4..][..4];
+            for channel in 0..3 {
+                if colors[face][channel] == 0 {
+                    assert_eq!(p[channel], 0, "wrong layer on face {face}: {p:?}");
+                } else {
+                    assert!(p[channel] > 80, "missing face {face}: {p:?}");
+                }
+            }
+        }
+        let before = entities.take_work();
+        assert_eq!(before.instance_records, 1);
+        assert_eq!(before.cpu_vertices, 0);
+        assert_eq!(
+            cube.set_block_layers([0, 1, 2, 3, 4, 256]),
+            Err(EntityError::InvalidInstance)
+        );
+        let mut bad = cube;
+        bad.pitch = f32::from_bits(0x3f800000 | 6);
+        assert_eq!(
+            entities.upload(&gpu.queue, &[bad], &[], &mut UploadBudget::new(68)),
+            Err(EntityError::InvalidInstance)
+        );
+        println!("M7 blockdrop6independentfaceviewsPASS,one64Brecord,0CPUvertices,finitepacking");
+    });
+}
+
+#[test]
+fn optional_atmosphere_lighting_tracks_day_and_dark_night_without_recompilation() {
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let mut terrain = terrain(&gpu);
+    let mut budget = UploadBudget::new(1_000_000);
+    let mut atmosphere = render::atmosphere::AtmosphereGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        render::atmosphere::AtmosphereConfig {
+            transmittance_size: [32, 8],
+            sky_size: [16, 8],
+            transmittance_steps: 32,
+            sky_steps: 16,
+        },
+        render::atmosphere::AtmosphereState {
+            sun_direction: [0., -1., 0.],
+            altitude_km: 0.072,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    atmosphere
+        .encode_update(&mut encoder, &mut 1_000_000)
+        .unwrap();
+    gpu.queue.submit([encoder.finish()]);
+    let mut consumer = EntityGpu::new_with_environment(
+        &gpu.device,
+        &gpu.queue,
+        terrain.geometry(),
+        EntityConfig {
+            max_entities: 8,
+            atlas_layers: 186,
+        },
+        None,
+        None,
+        &atmosphere,
+    )
+    .unwrap();
+    let mut pig = instance(0);
+    pig.position = [0.; 3];
+    consumer
+        .upload(
+            &gpu.queue,
+            &[pig],
+            &[PackedLight::new(15, 15, [0; 3]).unwrap()],
+            &mut budget,
+        )
+        .unwrap();
+    consumer.take_work();
+    let dark = frame(&gpu, &mut terrain, Some(&mut consumer), camera()).0;
+    let dark_pixels = dark
+        .chunks_exact(4)
+        .filter(|p| p[3] == 255 && p[..3] == [0, 0, 0])
+        .count();
+    assert!(
+        dark_pixels > 50,
+        "night receiver must be dark: {dark_pixels}"
+    );
+    atmosphere
+        .set_state(
+            &gpu.queue,
+            render::atmosphere::AtmosphereState::default(),
+            &mut budget,
+        )
+        .unwrap();
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    atmosphere
+        .encode_update(&mut encoder, &mut 1_000_000)
+        .unwrap();
+    gpu.queue.submit([encoder.finish()]);
+    let day = frame(&gpu, &mut terrain, Some(&mut consumer), camera()).0;
+    let lit_pixels = day
+        .chunks_exact(4)
+        .zip(dark.chunks_exact(4))
+        .filter(|(a, b)| b[3] == 255 && b[..3] == [0, 0, 0] && a[..3].iter().any(|v| *v > 3))
+        .count();
+    assert!(
+        lit_pixels > 50,
+        "day receivers must react to shared atmosphere: {lit_pixels}"
+    );
+    assert_eq!(
+        consumer.take_work().pipeline_compilations,
+        0,
+        "day change must reuse pipelines"
+    );
+    println!(
+        "M10_entity_gpu_ATMOSPHERE_GPU_OK consumer=entity_gpu night_black={dark_pixels} day_lit={lit_pixels} runtime_pipeline_compilations=0"
+    );
+}
+
+#[test]
+fn public_pipe_packets_keep_center_without_drop_bob_or_spin() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut terrain = terrain(&gpu);
+        let items = render::entity_models::item_atlas(&vec![255; 16 * 16 * 4], 1).unwrap();
+        let mut entities = EntityGpu::new_with_items(
+            &gpu.device,
+            &gpu.queue,
+            terrain.geometry(),
+            EntityConfig {
+                max_entities: 2,
+                atlas_layers: 186,
+            },
+            None,
+            &items,
+        )
+        .unwrap();
+        let vertices = read_model(&gpu, &entities);
+        let mut rows = [instance(6), instance(7)];
+        for (i, row) in rows.iter_mut().enumerate() {
+            row.position = [if i == 0 { -0.45 } else { 0.45 }, 1., 0.];
+            row.color = 0;
+            row.flags = 32 | render::entity_gpu::PIPE;
+            row.scale = if i == 0 { 0.2 } else { 0.4 };
+        }
+        let c = Camera::perspective(
+            [0., 1., 3.],
+            [0., 1., 0.],
+            [0., 1., 0.],
+            1.,
+            256. / 192.,
+            0.1,
+            100.,
+        );
+        let sky = frame(&gpu, &mut terrain, None, c).0;
+        entities
+            .upload(&gpu.queue, &rows, &[], &mut UploadBudget::new(136))
+            .unwrap();
+        let (first, counts) = frame(&gpu, &mut terrain, Some(&mut entities), c);
+        assert_eq!((counts[6], counts[7]), (1, 1));
+        let mask = first
+            .chunks_exact(4)
+            .zip(sky.chunks_exact(4))
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        assert!(mask.len() > 100, "pipe records were hidden or absent");
+        let mean_y = mask.iter().map(|i| (i / 256) as f64 + 0.5).sum::<f64>() / mask.len() as f64;
+        assert!(
+            (mean_y - 96.).abs() < 1.5,
+            "pipe center moved from canonical point: y{mean_y}"
+        );
+        for row in &mut rows {
+            row.limb_phase = 73.;
+            row.reserved = 2.75;
+        }
+        entities
+            .upload(&gpu.queue, &rows, &[], &mut UploadBudget::new(128))
+            .unwrap();
+        let fixed = frame(&gpu, &mut terrain, Some(&mut entities), c).0;
+        assert_eq!(fixed, first, "pipe inherited age-dependent drop bob/spin");
+        for row in &mut rows {
+            row.flags &= !render::entity_gpu::PIPE;
+            row.limb_phase = 0.;
+            row.reserved = 0.;
+        }
+        entities
+            .upload(&gpu.queue, &rows, &[], &mut UploadBudget::new(128))
+            .unwrap();
+        let drop_a = frame(&gpu, &mut terrain, Some(&mut entities), c).0;
+        for row in &mut rows {
+            row.limb_phase = 40.;
+        }
+        entities
+            .upload(&gpu.queue, &rows, &[], &mut UploadBudget::new(128))
+            .unwrap();
+        let drop_b = frame(&gpu, &mut terrain, Some(&mut entities), c).0;
+        assert_ne!(drop_a, drop_b, "ordinary drops lost their animation");
+        let mut invalid = instance(0);
+        invalid.flags = 32 | render::entity_gpu::PIPE;
+        assert_eq!(
+            entities.upload(&gpu.queue, &[invalid], &[], &mut UploadBudget::new(1000)),
+            Err(EntityError::InvalidInstance)
+        );
+        assert_eq!(read_model(&gpu, &entities), vertices);
+        assert_eq!(entities.take_work().cpu_vertices, 0);
+        println!(
+            "M9 pipe GPU cube/icon {}px centerY{mean_y:.4},age73 bitwise unchanged,drop animated,CPUvertices0",
+            mask.len()
+        );
+    });
+}

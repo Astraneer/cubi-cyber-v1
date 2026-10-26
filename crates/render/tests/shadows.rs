@@ -309,7 +309,8 @@ fn light_volume_dirty_patches_do_not_touch_geometry_and_reject_stale_slots() {
         gpu.queue.submit([encoder.finish()]);
         let bytes = read_buffer(&gpu, &buffer);
         for i in 0..LIGHT_SAMPLES {
-            let actual = u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+            let actual =
+                u32::from_le_bytes(bytes[(i + 1) * 4..(i + 1) * 4 + 4].try_into().unwrap());
             let expected = updates
                 .iter()
                 .find(|u| usize::from(u.index) == i)
@@ -543,130 +544,150 @@ fn ray_hits_box(origin: [f32; 3], direction: [f32; 3]) -> bool {
 }
 #[test]
 fn walking_grid_and_stepped_sun_match_independent_ray_visibility() {
-    pollster::block_on(async {
-        let gpu = render::Gpu::request(&render::instance(), None, true)
-            .await
-            .unwrap();
-        let mut terrain = TerrainGpu::new(
-            &gpu.device,
+    pollster::block_on(h5_walking(128, false));
+}
+#[test]
+fn product_2048_cached_cascades_pass_h5_with_96mib_selected_profile() {
+    pollster::block_on(h5_walking(2048, true));
+}
+async fn h5_walking(resolution: u32, dynamic_casters: bool) {
+    let gpu = render::Gpu::request(&render::instance(), None, true)
+        .await
+        .unwrap();
+    let mut terrain = TerrainGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        64,
+        64,
+        OutputTransfer::Attachment,
+        GpuConfig {
+            max_pages: 4,
+            max_quads: 512,
+            occlusion: false,
+        },
+        &AtlasImage::donor().unwrap(),
+    )
+    .unwrap();
+    terrain
+        .upload_page(
             &gpu.queue,
-            wgpu::TextureFormat::Rgba8Unorm,
-            64,
-            64,
-            OutputTransfer::Attachment,
-            GpuConfig {
-                max_pages: 4,
-                max_quads: 512,
-                occlusion: false,
-            },
-            &AtlasImage::donor().unwrap(),
+            None,
+            1,
+            translation([0.; 3]),
+            &box_mesh(),
+            &mut UploadBudget::new(10000),
         )
         .unwrap();
-        terrain
-            .upload_page(
-                &gpu.queue,
-                None,
-                1,
-                translation([0.; 3]),
-                &box_mesh(),
-                &mut UploadBudget::new(10000),
-            )
-            .unwrap();
-        let config = ShadowConfig {
-            resolution: 128,
-            half_widths: [16., 32., 64.],
-            depth_half_extent: 32.,
-            ..ShadowConfig::default()
-        };
-        let sun = [0.3, 0.8, 0.2];
-        let mut shadow = ShadowGpu::new(
-            &gpu.device,
-            &gpu.queue,
-            terrain.geometry(),
-            config,
-            [8., 0., 8.],
-            sun,
-        )
-        .unwrap();
-        for _ in 0..3 {
-            render_shadow(&gpu, &mut shadow);
-        }
-        let probe = ReceiverProbe::new(&gpu, &shadow);
-        let baseline = probe.capture(&gpu);
-        let sampling = shadow.cache().sampling();
-        let direction = [sampling.sun[0], sampling.sun[1], sampling.sun[2]];
-        let mut dark = 0;
-        let mut lit = 0;
-        for y in 0..128 {
-            for x in 0..128 {
-                let p = [
-                    -4. + (x as f32 + 0.5) * 0.1875,
-                    0.,
-                    -4. + (y as f32 + 0.5) * 0.1875,
-                ];
-                let witnesses =
-                    [[-0.4, -0.4], [-0.4, 0.4], [0.4, -0.4], [0.4, 0.4], [0., 0.]].map(|offset| {
-                        ray_hits_box([p[0] + offset[0], 0., p[2] + offset[1]], direction)
-                    });
-                let value = baseline[(x + y * 128) * 4];
-                if witnesses.iter().all(|v| *v) {
-                    assert!(
-                        value <= 64,
-                        "shadow ray oracle expects occlusion at {p:?}, got{value}"
-                    );
-                    dark += 1;
-                } else if witnesses.iter().all(|v| !*v) {
-                    assert!(
-                        value >= 191,
-                        "ray oracle expects sky visibility at {p:?}, got{value}"
-                    );
-                    lit += 1;
-                }
+    let config = ShadowConfig {
+        resolution,
+        dynamic_casters,
+        half_widths: [16., 32., 64.],
+        depth_half_extent: 32.,
+        ..ShadowConfig::default()
+    };
+    let sun = [0.3, 0.8, 0.2];
+    let mut shadow = ShadowGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        terrain.geometry(),
+        config,
+        [8., 0., 8.],
+        sun,
+    )
+    .unwrap();
+    let mut texels = 0u64;
+    let mut copy_bytes = 0u64;
+    for _ in 0..3 {
+        let work = render_shadow(&gpu, &mut shadow);
+        texels += work.clear_pixels;
+        copy_bytes += work.dynamic_copy_bytes;
+    }
+    let probe = ReceiverProbe::new(&gpu, &shadow);
+    let baseline = probe.capture(&gpu);
+    let sampling = shadow.cache().sampling();
+    let direction = [sampling.sun[0], sampling.sun[1], sampling.sun[2]];
+    let mut dark = 0;
+    let mut lit = 0;
+    for y in 0..128 {
+        for x in 0..128 {
+            let p = [
+                -4. + (x as f32 + 0.5) * 0.1875,
+                0.,
+                -4. + (y as f32 + 0.5) * 0.1875,
+            ];
+            let witnesses = [[-0.4, -0.4], [-0.4, 0.4], [0.4, -0.4], [0.4, 0.4], [0., 0.]]
+                .map(|offset| ray_hits_box([p[0] + offset[0], 0., p[2] + offset[1]], direction));
+            let value = baseline[(x + y * 128) * 4];
+            if witnesses.iter().all(|v| *v) {
+                assert!(
+                    value <= 64,
+                    "shadow ray oracle expects occlusion at {p:?}, got{value}"
+                );
+                dark += 1;
+            } else if witnesses.iter().all(|v| !*v) {
+                assert!(
+                    value >= 191,
+                    "ray oracle expects sky visibility at {p:?}, got{value}"
+                );
+                lit += 1;
             }
         }
-        assert!(
-            dark > 100 && lit > 10000,
-            "constant image must fail independent visibility oracle {dark}/{lit}"
-        );
-        let mut maximum_flicker = 0_f64;
-        let mut actual_updates = 0;
-        for step in 1..=32 {
-            shadow
-                .update_view([8. + step as f32 * 0.1, 0., 8. + step as f32 * 0.07], sun)
-                .unwrap();
-            actual_updates += render_shadow(&gpu, &mut shadow).cascade_updates;
-            let image = probe.capture(&gpu);
-            let difference: u64 = image
-                .chunks_exact(4)
-                .zip(baseline.chunks_exact(4))
-                .map(|(a, b)| u64::from(a[0].abs_diff(b[0])))
-                .sum();
-            let permille = difference as f64 / (128. * 128. * 255.) * 1000.;
-            maximum_flicker = maximum_flicker.max(permille);
-        }
-        assert!(
-            actual_updates > 10,
-            "walking fixture did not cross texel snap boundaries"
-        );
-        assert!(
-            maximum_flicker <= 0.02,
-            "world-fixed shadow mask flicker {maximum_flicker}‰ exceeds H5 0.02‰"
-        );
-        // A real sun step must alter the projected shadow, then become stable again.
+    }
+    assert!(
+        dark > 100 && lit > 10000,
+        "constant image must fail independent visibility oracle {dark}/{lit}"
+    );
+    let mut maximum_flicker = 0_f64;
+    let mut actual_updates = 0;
+    for step in 1..=32 {
         shadow
-            .update_view([11.2, 0., 10.24], [0.6, 0.8, -0.2])
+            .update_view([8. + step as f32 * 0.1, 0., 8. + step as f32 * 0.07], sun)
             .unwrap();
-        for _ in 0..3 {
-            render_shadow(&gpu, &mut shadow);
-        }
-        let changed = probe.capture(&gpu);
-        assert_ne!(changed, baseline, "sun step did not rotate actual shadow");
-        assert_eq!(render_shadow(&gpu, &mut shadow).cascade_updates, 0);
-        assert_eq!(probe.capture(&gpu), changed);
-        println!(
-            "H5 walking32frames updates={actual_updates},worldReceiverFlickerPermille={maximum_flicker},rayCertifiedShadow={dark},rayCertifiedSky={lit}; sunStepChanged=true"
-        );
-    });
+        let work = render_shadow(&gpu, &mut shadow);
+        actual_updates += work.cascade_updates;
+        texels += work.clear_pixels;
+        copy_bytes += work.dynamic_copy_bytes;
+        let image = probe.capture(&gpu);
+        let difference: u64 = image
+            .chunks_exact(4)
+            .zip(baseline.chunks_exact(4))
+            .map(|(a, b)| u64::from(a[0].abs_diff(b[0])))
+            .sum();
+        let permille = difference as f64 / (128. * 128. * 255.) * 1000.;
+        maximum_flicker = maximum_flicker.max(permille);
+    }
+    assert!(
+        actual_updates > 10,
+        "walking fixture did not cross texel snap boundaries"
+    );
+    assert!(
+        maximum_flicker <= 0.02,
+        "world-fixed shadow mask flicker {maximum_flicker}‰ exceeds H5 0.02‰"
+    );
+    // A real sun step must alter the projected shadow, then become stable again.
+    shadow
+        .update_view([11.2, 0., 10.24], [0.6, 0.8, -0.2])
+        .unwrap();
+    for _ in 0..3 {
+        let work = render_shadow(&gpu, &mut shadow);
+        texels += work.clear_pixels;
+        copy_bytes += work.dynamic_copy_bytes;
+    }
+    let changed = probe.capture(&gpu);
+    assert_ne!(changed, baseline, "sun step did not rotate actual shadow");
+    assert_eq!(render_shadow(&gpu, &mut shadow).cascade_updates, 0);
+    assert_eq!(probe.capture(&gpu), changed);
+    println!(
+        "H5 walking32frames updates={actual_updates},worldReceiverFlickerPermille={maximum_flicker},rayCertifiedShadow={dark},rayCertifiedSky={lit}; sunStepChanged=true"
+    );
+    let depth_bytes = u64::from(resolution).pow(2) * 3 * 4 * (1 + u64::from(dynamic_casters));
+    if resolution == 2048 && dynamic_casters {
+        assert_eq!(depth_bytes, 96 * 1024 * 1024);
+    }
+    println!(
+        "H5 selectedresolution{resolution} dynamic{dynamic_casters} depthBytes{depth_bytes} actualTexels{texels} GPUcopyBytes{copy_bytes}"
+    );
 }
 
 #[test]
@@ -705,7 +726,7 @@ fn overlay_alias_and_model_uniform_headers_sample_actual_gpu_light() {
             lights
                 .upload_uniform(&gpu.queue, model, 1, blue, &mut budget)
                 .unwrap(),
-            4
+            8
         );
         assert_eq!(
             lights.alias_page(
@@ -871,7 +892,7 @@ fn overlay_alias_and_model_uniform_headers_sample_actual_gpu_light() {
                 .unwrap(),
             0
         );
-        assert_eq!(lights.take_upload_bytes(), 2 * LIGHT_PAGE_BYTES + 8);
+        assert_eq!(lights.take_upload_bytes(), 2 * LIGHT_PAGE_BYTES + 12);
     });
 }
 
@@ -1005,6 +1026,267 @@ fn fixed_edit_shell_casts_the_same_shadow_as_final_greedy_geometry() {
         assert_eq!(
             fast, final_depth,
             "fixed H1 shadow shell must match final full geometry"
+        );
+    });
+}
+
+#[test]
+fn shadow_queries_measure_actual_static_passes_and_static_cache_has_zero_queries() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut terrain = TerrainGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            64,
+            64,
+            OutputTransfer::Attachment,
+            GpuConfig {
+                max_pages: 8,
+                max_quads: 512,
+                occlusion: false,
+            },
+            &AtlasImage::donor().unwrap(),
+        )
+        .unwrap();
+        terrain
+            .upload_page(
+                &gpu.queue,
+                None,
+                1,
+                translation([0.; 3]),
+                &box_mesh(),
+                &mut UploadBudget::new(1000000),
+            )
+            .unwrap();
+        let mut shadow = ShadowGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            terrain.geometry(),
+            ShadowConfig {
+                resolution: 128,
+                half_widths: [16., 32., 64.],
+                depth_half_extent: 64.,
+                max_updates_per_frame: 3,
+                ..ShadowConfig::default()
+            },
+            [8., 0., 8.],
+            [0.3, 0.8, 0.2],
+        )
+        .unwrap();
+        let read = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("actual shadow timestamp oracle"),
+            size: 9 * 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        let work = shadow.encode(&gpu.queue, &mut encoder);
+        let graph = shadow.graph();
+        assert_eq!(work.cascade_updates, 3);
+        assert_eq!(graph.count, 6);
+        assert_eq!(&graph.kinds[..6], &[1, 2, 1, 2, 1, 2]);
+        assert!(graph.has_timestamps);
+        shadow.copy_timestamps_into(&mut encoder, &read, 0);
+        gpu.queue.submit([encoder.finish()]);
+        let bytes = read_buffer(&gpu, &read);
+        let mut ns = 0u64;
+        for pair in bytes[..6 * 16].chunks_exact(16) {
+            let a = u64::from_le_bytes(pair[..8].try_into().unwrap());
+            let b = u64::from_le_bytes(pair[8..].try_into().unwrap());
+            assert!(b > a);
+            ns += b - a;
+        }
+        assert!(ns > 0);
+        assert_eq!(shadow.timing_source().unwrap().count, 6);
+        assert_eq!(render_shadow(&gpu, &mut shadow).draw_calls, 0);
+        assert_eq!(shadow.graph().count, 0);
+        assert!(shadow.timing_source().is_none());
+        println!(
+            "M4 actualshadowquerypasses6 elapsed{ns}ticks staticcache0queries/0draws;copies+castercomputeexcluded"
+        );
+    });
+}
+
+#[test]
+fn rgb8_hdr_dense_corner_alias_and_uniform_preserve_all_channels_on_gpu() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut lights = LightVolumeGpu::new(&gpu.device, 3).unwrap();
+        let handle = |slot| PageHandle {
+            slot,
+            generation: 1,
+        };
+        let hdr = PackedLight::new(15, 7, [231, 17, 255]).unwrap();
+        let mut budget = UploadBudget::new(1000000);
+        lights
+            .upload_page(&gpu.queue, handle(0), 1, &[hdr; LIGHT_SAMPLES], &mut budget)
+            .unwrap();
+        assert_eq!(
+            lights
+                .alias_page(&gpu.queue, handle(1), handle(0), &mut budget)
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            lights.upload_uniform(&gpu.queue, handle(2), 1, hdr, &mut UploadBudget::new(7)),
+            Err(LightUploadError::UploadBudget)
+        );
+        assert_eq!(
+            lights
+                .upload_uniform(&gpu.queue, handle(2), 1, hdr, &mut UploadBudget::new(8))
+                .unwrap(),
+            8
+        );
+        let layout = gpu
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("HDR8lightoracle"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("HDR8actualvolumes"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 12,
+                resource: lights.buffer().as_entire_binding(),
+            }],
+        });
+        let source = format!(
+            "{}\n{}",
+            include_str!("../src/light_volume.wgsl"),
+            r#"@vertex fn vertex(@builtin(vertex_index)i:u32)->@builtin(position)vec4<f32>{let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));return vec4(p[i],0.,1.);}@fragment fn fragment(@builtin(position)p:vec4<f32>)->@location(0)vec4<f32>{return sample_page_light(u32(p.x),vec3(-1.),vec3(0.));}"#
+        );
+        let shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("realHDRRGB8 decode"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        let pl = gpu
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&layout],
+                push_constant_ranges: &[],
+            });
+        let pipeline = gpu
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("HDR8densealiasuniform"),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vertex"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fragment"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba32Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+                cache: None,
+            });
+        let output = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("HDR8floatlinearoracle"),
+            size: wgpu::Extent3d {
+                width: 3,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = output.create_view(&Default::default());
+        let read = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("HDR8linearreadback"),
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &output,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &read,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 3,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let bytes = read_buffer(&gpu, &read);
+        for pixel in bytes[..48].chunks_exact(16) {
+            for (channel, expected) in [231. / 15., 17. / 15., 17., 1.].into_iter().enumerate() {
+                let actual =
+                    f32::from_le_bytes(pixel[channel * 4..channel * 4 + 4].try_into().unwrap());
+                assert!(
+                    (actual - expected).abs() < 0.00001,
+                    "channel{channel} got{actual} expected{expected}"
+                );
+            }
+        }
+        println!(
+            "M4 GPU RGB8[231,17,255] HDR[15.4,1.1333,17] densehaloCorner+alias+uniform exact,headercollision0"
         );
     });
 }

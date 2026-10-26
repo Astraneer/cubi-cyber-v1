@@ -135,9 +135,12 @@ struct Bot {
     scheduled_predictions: BTreeMap<u64, (u64, [f64; 3], [f64; 3])>,
     scheduled_checked: usize,
     scheduled_corrections: usize,
+    inject_wrong_prediction: bool,
+    injected_prediction: bool,
+    positive_control_checks: usize,
 }
 impl Bot {
-    fn new(address: SocketAddr, id: u64, flying: bool) -> Self {
+    fn new(address: SocketAddr, id: u64, flying: bool, inject_wrong_prediction: bool) -> Self {
         let socket = UdpSocket::bind(local()).unwrap();
         socket.connect(address).unwrap();
         socket.set_nonblocking(true).unwrap();
@@ -182,6 +185,9 @@ impl Bot {
             scheduled_predictions: BTreeMap::new(),
             scheduled_checked: 0,
             scheduled_corrections: 0,
+            inject_wrong_prediction,
+            injected_prediction: false,
+            positive_control_checks: 0,
         }
     }
     fn queue(&mut self, packets: Vec<Vec<u8>>, now: u64) {
@@ -268,8 +274,11 @@ impl Bot {
                         "scheduled input consumed at its server tick"
                     );
                     self.scheduled_checked += 1;
-                    self.scheduled_corrections +=
-                        usize::from(player.position != position || player.velocity != velocity);
+                    let disagrees = player.position != position || player.velocity != velocity;
+                    self.scheduled_corrections += usize::from(disagrees);
+                    if self.inject_wrong_prediction && sequence >= 24 && disagrees {
+                        self.positive_control_checks += 1;
+                    }
                 }
                 if self.state.is_some_and(|(previous, _)| previous > tick) {
                     self.reordered_states += 1;
@@ -343,7 +352,16 @@ impl Bot {
                 self.prediction_tick += 1;
             }
         }
-        predicted.tick(&flat_query, keys(frame.keys));
+        // A deliberate client-only input error supplies an exact-tick positive
+        // control. The transmitted input and authoritative simulation stay FORWARD.
+        let prediction_bits = if self.inject_wrong_prediction && sequence == 24 {
+            assert!(target > 0);
+            self.injected_prediction = true;
+            (frame.keys & !InputFrame::FORWARD) | InputFrame::BACK
+        } else {
+            frame.keys
+        };
+        predicted.tick(&flat_query, keys(prediction_bits));
         self.prediction_tick = if target > 0 {
             target
         } else {
@@ -425,22 +443,36 @@ fn packet_reordered(packet: &[u8], previous: &mut u64) -> bool {
 
 #[test]
 fn walk_and_flight_authority_consume_each_input_once_through_real_delayed_udp() {
-    run_movement(false, false);
+    run_movement(false, false, false);
 }
 #[test]
 fn scheduled_inputs_match_shared_simulation_at_authoritative_ticks() {
     // Repeat the exact tick oracle under different host scheduling. Network
     // jitter/loss and authority tick durations remain unchanged in both runs.
-    run_movement(true, false);
-    run_movement(true, true);
+    run_movement(true, false, false);
+    run_movement(true, true, false);
 }
-fn run_movement(scheduled: bool, host_delays: bool) {
+#[test]
+fn wrong_local_input_has_real_corrections_at_exact_authority_ticks() {
+    run_movement(true, false, true);
+}
+fn run_movement(scheduled: bool, host_delays: bool, inject_wrong_prediction: bool) {
     let directory = Directory::new();
     let server = Server::open_with_world(directory.config(), flat()).unwrap();
     let mut runtime = Runtime::bind(server, local(), local()).unwrap();
     let mut bots = [
-        Bot::new(runtime.udp_address().unwrap(), 1, false),
-        Bot::new(runtime.udp_address().unwrap(), 2, true),
+        Bot::new(
+            runtime.udp_address().unwrap(),
+            1,
+            false,
+            inject_wrong_prediction,
+        ),
+        Bot::new(
+            runtime.udp_address().unwrap(),
+            2,
+            true,
+            inject_wrong_prediction,
+        ),
     ];
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut next_input = None;
@@ -484,9 +516,9 @@ fn run_movement(scheduled: bool, host_delays: bool) {
                     now,
                 );
             }
-            // A client scheduling hiccup creates neutral authority ticks in
-            // legacy mode. It makes the old sequence/pose oracle's ambiguity
-            // deterministic while retaining the exact network profile.
+            // A legacy client hiccup may create neutral authority ticks, but
+            // actual fsync backpressure can absorb the gap. Report its observed
+            // corrections; the explicit wrong-input run is the positive control.
             next_input = Some(now + if !scheduled && sent == 24 { 250 } else { 50 });
         }
         // Continue the redundant tail until both ACKs arrive; the final input
@@ -556,13 +588,23 @@ fn run_movement(scheduled: bool, host_delays: bool) {
             bot.terminal_checks >= 5,
             "independent idle convergence checks"
         );
-        if !scheduled {
+        if inject_wrong_prediction {
+            assert!(
+                bot.injected_prediction,
+                "client-only BACK input was simulated"
+            );
             assert!(
                 bot.corrections > 0,
-                "legacy client hiccup exercises correction reporting"
+                "wrong input exercises correction reporting"
             );
+            assert!(bot.maximum_prediction_error > 0.0);
+            assert!(
+                bot.positive_control_checks > 10,
+                "independent exact authority ticks expose the wrong local input"
+            );
+            assert!(bot.scheduled_corrections > 10);
         }
-        if scheduled {
+        if scheduled && !inject_wrong_prediction {
             assert_eq!(
                 bot.corrections, 0,
                 "scheduled input pose is compared only at its exact authority tick"
@@ -580,7 +622,7 @@ fn run_movement(scheduled: bool, host_delays: bool) {
     let reordered: u64 = bots.iter().map(|bot| bot.reordered_packets).sum();
     assert!(reordered > 0, "jitter actually reordered datagrams");
     eprintln!(
-        "movement UDP scheduled={scheduled} host_delays={host_delays} bots=2 inputs_per_bot={INPUTS} virtual_ms={now} profile=75+/-20ms/2%loss lost={lost} reordered={reordered} input_steps={} owner_ticks={} traffic_in={} traffic_out={} queue_overflows={} seq_prediction_corrections=[{},{}] max_prediction_error=[{:.6},{:.6}] scheduled_tick_checks=[{},{}] scheduled_tick_corrections=[{},{}]",
+        "movement UDP scheduled={scheduled} wrong_input={inject_wrong_prediction} host_delays={host_delays} bots=2 inputs_per_bot={INPUTS} virtual_ms={now} profile=75+/-20ms/2%loss lost={lost} reordered={reordered} input_steps={} owner_ticks={} traffic_in={} traffic_out={} queue_overflows={} seq_prediction_corrections=[{},{}] max_prediction_error=[{:.6},{:.6}] scheduled_tick_checks=[{},{}] scheduled_tick_corrections=[{},{}]",
         counters.input_steps,
         counters.ticks,
         transport.received_bytes,

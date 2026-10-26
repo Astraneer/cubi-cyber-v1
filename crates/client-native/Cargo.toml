@@ -16,6 +16,9 @@ wgpu.workspace = true
 winit.workspace = true
 pollster.workspace = true
 telemetry.workspace = true
+ui = { path = "../ui" }
+audio = { path = "../audio" }
+core-types.workspace = true
 
 [lints]
 workspace = true

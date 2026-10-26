@@ -395,7 +395,10 @@ pub fn encode_client(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
                     if inventory.selected >= 9 {
                         return Err(CodecError::InvalidBounds);
                     }
-                    out.byte(7);
+                    if inventory.payload != 0 && inventory.count != 1 {
+                        return Err(CodecError::InvalidBounds);
+                    }
+                    out.byte(if inventory.payload == 0 { 7 } else { 18 });
                     out.position(*position);
                     out.u32(expected.raw());
                     out.u32(cell.raw());
@@ -404,6 +407,9 @@ pub fn encode_client(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
                     out.u16(inventory.item);
                     out.u16(inventory.count);
                     out.u16(inventory.damage);
+                    if inventory.payload != 0 {
+                        out.u64(inventory.payload);
+                    }
                 }
                 Action::Chat(text) => {
                     if !presence::valid_chat(text) {
@@ -463,6 +469,32 @@ pub fn encode_client(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
                 &mut out,
                 &entities::encode_request(*request).map_err(|_| CodecError::InvalidBounds)?,
             );
+        }
+        ClientMessage::RequestHeight { key, known } => {
+            out.byte(12);
+            write_height_key(&mut out, *key)?;
+            out.bool(known.is_some());
+            if let Some(source) = known {
+                if *source == 0 {
+                    return Err(CodecError::InvalidBounds);
+                }
+                out.u64(*source);
+            }
+        }
+        ClientMessage::RequestLight(request) => {
+            out.byte(14);
+            write_blob(
+                &mut out,
+                &light::encode_request(*request).map_err(|_| CodecError::InvalidBounds)?,
+            );
+        }
+        ClientMessage::ForgetLight(page) => {
+            out.byte(15);
+            out.page(*page);
+        }
+        ClientMessage::ForgetHeight(key) => {
+            out.byte(13);
+            write_height_key(&mut out, *key)?;
         }
         ClientMessage::ForgetGeometry(page) => {
             out.byte(8);
@@ -563,7 +595,7 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
                     }
                     Action::SelectSlot(slot)
                 }
-                7 => {
+                tag @ (7 | 18) => {
                     let position = input.position()?;
                     let expected = Cell::from_raw(input.u32()?);
                     let cell = Cell::from_raw(input.u32()?);
@@ -573,8 +605,11 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
                         item: input.u16()?,
                         count: input.u16()?,
                         damage: input.u16()?,
+                        payload: if tag == 18 { input.u64()? } else { 0 },
                     };
-                    if inventory.selected >= 9 {
+                    if inventory.selected >= 9
+                        || (tag == 18 && (inventory.payload == 0 || inventory.count != 1))
+                    {
                         return Err(CodecError::InvalidBounds);
                     }
                     Action::PlaceOwned {
@@ -635,6 +670,25 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
             ClientMessage::RequestGeometry { page, known }
         }
         8 => ClientMessage::ForgetGeometry(input.page()?),
+        12 => {
+            let key = read_height_key(&mut input)?;
+            let known = if input.bool()? {
+                let n = input.u64()?;
+                if n == 0 {
+                    return Err(CodecError::InvalidBounds);
+                }
+                Some(n)
+            } else {
+                None
+            };
+            ClientMessage::RequestHeight { key, known }
+        }
+        13 => ClientMessage::ForgetHeight(read_height_key(&mut input)?),
+        14 => ClientMessage::RequestLight(
+            light::decode_request(read_blob(&mut input, light::MAX_REQUEST_BYTES)?)
+                .map_err(|_| CodecError::InvalidBounds)?,
+        ),
+        15 => ClientMessage::ForgetLight(input.page()?),
         10 => ClientMessage::Presence(
             presence::decode_client(read_blob(&mut input, 64)?)
                 .map_err(|_| CodecError::InvalidBounds)?,
@@ -752,7 +806,7 @@ pub fn encode_server(message: &ServerMessage) -> Result<Vec<u8>, CodecError> {
             out.player(*player);
         }
         ServerMessage::Inventory { data } => {
-            if !(14..=512).contains(&data.len()) {
+            if !(14..=1024).contains(&data.len()) {
                 return Err(CodecError::InvalidBounds);
             }
             out.byte(12);
@@ -783,6 +837,28 @@ pub fn encode_server(message: &ServerMessage) -> Result<Vec<u8>, CodecError> {
                 &mut out,
                 &window::encode_snapshot(state).map_err(|_| CodecError::InvalidBounds)?,
             );
+        }
+        ServerMessage::Height(tile) => {
+            out.byte(18);
+            write_blob(
+                &mut out,
+                &height::encode(tile).map_err(|_| CodecError::InvalidBounds)?,
+            );
+        }
+        ServerMessage::Light(update) => {
+            out.byte(20);
+            write_blob(
+                &mut out,
+                &light::encode(update).map_err(|_| CodecError::InvalidBounds)?,
+            );
+        }
+        ServerMessage::LightUnavailable(page) => {
+            out.byte(21);
+            out.page(*page);
+        }
+        ServerMessage::HeightUnavailable(key) => {
+            out.byte(19);
+            write_height_key(&mut out, *key)?;
         }
         ServerMessage::GeometryUnavailable(page) => {
             out.byte(14);
@@ -1073,7 +1149,7 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, CodecError> {
         }
         12 => {
             let len = usize::from(input.u16()?);
-            if !(14..=512).contains(&len) {
+            if !(14..=1024).contains(&len) {
                 return Err(CodecError::InvalidBounds);
             }
             ServerMessage::Inventory {
@@ -1094,10 +1170,39 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, CodecError> {
             window::decode_snapshot(read_blob(&mut input, window::MAX_WINDOW_BYTES)?)
                 .map_err(|_| CodecError::InvalidBounds)?,
         )),
+        18 => ServerMessage::Height(Box::new(
+            height::decode(read_blob(&mut input, height::MAX_HEIGHT_BYTES)?)
+                .map_err(|_| CodecError::InvalidBounds)?,
+        )),
+        19 => ServerMessage::HeightUnavailable(read_height_key(&mut input)?),
+        20 => ServerMessage::Light(Box::new(
+            light::decode(read_blob(&mut input, light::MAX_BYTES)?)
+                .map_err(|_| CodecError::InvalidBounds)?,
+        )),
+        21 => ServerMessage::LightUnavailable(input.page()?),
         _ => return Err(CodecError::InvalidEnum),
     };
     finish(input)?;
     Ok(message)
+}
+
+fn write_height_key(out: &mut Writer, key: height::HeightKey) -> Result<(), CodecError> {
+    key.validate().map_err(|_| CodecError::InvalidBounds)?;
+    out.u32(key.space);
+    out.byte(key.level);
+    out.i32(key.x);
+    out.i32(key.z);
+    Ok(())
+}
+fn read_height_key(input: &mut Reader<'_>) -> Result<height::HeightKey, CodecError> {
+    let key = height::HeightKey {
+        space: input.u32()?,
+        level: input.byte()?,
+        x: input.i32()?,
+        z: input.i32()?,
+    };
+    key.validate().map_err(|_| CodecError::InvalidBounds)?;
+    Ok(key)
 }
 
 fn write_geometry(out: &mut Writer, geometry: &PublicGeometry) -> Result<(), CodecError> {

@@ -99,6 +99,27 @@ pub struct BuiltProxy {
     pub payload: Arc<ProxyPayload>,
 }
 impl LodBuildTask {
+    /// Immutable already-public source for bounded browser transport.
+    pub fn public_snapshot(&self) -> PublicPage {
+        self.source.page()
+    }
+    pub fn from_public_snapshot(
+        key: LodKey,
+        revision: u64,
+        page: PublicPage,
+        atlas_layers: u32,
+    ) -> Result<Self, LodCacheError> {
+        if key.level!=0||revision==0||atlas_layers==0||atlas_layers>256||page.cells().iter().any(|voxel|matches!(voxel,PublicVoxel::Solid{material,..} if u32::from(*material)>=atlas_layers)){return Err(LodCacheError::MalformedGeometry);}
+        Ok(Self {
+            key,
+            revision,
+            source: SourceData::Protected(Arc::new(page)),
+            atlas_layers,
+        })
+    }
+    pub fn atlas_layers(&self) -> u32 {
+        self.atlas_layers
+    }
     pub fn execute(self) -> Result<BuiltProxy, ProxyError> {
         let page = self.source.page();
         let proxy = render::lod::MaskedRayProxy::from_public_page(

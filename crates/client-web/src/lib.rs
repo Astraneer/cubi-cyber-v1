@@ -1,5 +1,6 @@
 //! Thin browser surface/input/worker transport. World and camera are shared Rust.
 #![cfg(target_arch = "wasm32")]
+mod browser_horizon;
 mod browser_network;
 mod generation_worker;
 mod product_ui;
@@ -29,6 +30,7 @@ struct BrowserState {
     view: ClientView,
     workers: BrowserWorkerPool,
     running: BTreeMap<JobId, CancellationToken>,
+    horizon_workers: Option<browser_horizon::BrowserHorizon>,
     last_ms: f64,
     resolve: Option<js_sys::Function>,
     reject: Option<js_sys::Function>,
@@ -50,6 +52,10 @@ struct BrowserState {
     last_profiler_ms: f64,
     ui_pending: bool,
     connection_epoch: u64,
+    local_materials_revision: u64,
+    local_materials_resolution: u32,
+    local_materials_layers: usize,
+    local_materials_upload_bytes: u64,
 }
 impl BrowserState {
     fn observe_presentations(&mut self) {
@@ -61,6 +67,14 @@ impl BrowserState {
     }
     fn stats(&self) -> JsValue {
         let value = stats_object(&self.view);
+        let light_pages = self.socket.as_ref().map_or(0, |socket| {
+            socket.session().connection().light_replica().len()
+        });
+        let _ = js_sys::Reflect::set(
+            &value,
+            &"authoritativeLightPages".into(),
+            &(light_pages as f64).into(),
+        );
         if let Some(product) = &self.product {
             for (name, item) in [
                 ("uiScreen", format!("{:?}", product.layer.app.screen)),
@@ -83,6 +97,24 @@ impl BrowserState {
             );
             let _ = js_sys::Reflect::set(
                 &value,
+                &"uiNeedsUpload".into(),
+                &product
+                    .layer
+                    .needs_redraw(self.config.width, self.config.height)
+                    .into(),
+            );
+            let _ = js_sys::Reflect::set(&value, &"uiFramePending".into(), &self.ui_pending.into());
+            for (name, revision) in [
+                ("uiRevision", product.layer.app.revision()),
+                (
+                    "uiUploadedRevision",
+                    product.layer.uploaded_revision().unwrap_or(0),
+                ),
+            ] {
+                let _ = js_sys::Reflect::set(&value, &name.into(), &(revision as f64).into());
+            }
+            let _ = js_sys::Reflect::set(
+                &value,
                 &"interactionMode".into(),
                 &"authoritative-remote".into(),
             );
@@ -101,6 +133,20 @@ impl BrowserState {
             ("renderedUploadBytes", self.view.rendered_upload_bytes()),
             ("worldVersion", self.view.scene.world().version().0),
             ("renderedWorldVersion", self.view.rendered_world_version().0),
+        ] {
+            let _ = js_sys::Reflect::set(&value, &name.into(), &(number as f64).into());
+        }
+        for (name, number) in [
+            ("localMaterialsRevision", self.local_materials_revision),
+            (
+                "localMaterialsResolution",
+                u64::from(self.local_materials_resolution),
+            ),
+            ("localMaterialsLayers", self.local_materials_layers as u64),
+            (
+                "localMaterialsUploadBytes",
+                self.local_materials_upload_bytes,
+            ),
         ] {
             let _ = js_sys::Reflect::set(&value, &name.into(), &(number as f64).into());
         }
@@ -220,6 +266,9 @@ impl BrowserState {
         if let Some(error) = self.view.scene.error() {
             return Err(js_error(error));
         }
+        if let Some(horizon) = &mut self.horizon_workers {
+            horizon.pump(&mut self.view)?;
+        }
         Ok(())
     }
     fn draw(&mut self) -> Result<bool, JsValue> {
@@ -241,6 +290,9 @@ impl BrowserState {
                 .as_ref()
                 .is_some_and(|socket| socket.session().connection().welcome().is_some())
         {
+            self.view
+                .set_movement_replay_time((now.max(0.0) * 1_000_000.0).min(u64::MAX as f64) as u64)
+                .map_err(js_error)?;
             self.view.advance_input(elapsed).map_err(js_error)?;
         }
         if !self.resetting
@@ -263,9 +315,12 @@ impl BrowserState {
             self.pump()?;
         }
         let jobs_end = clock_ms();
-        self.view
-            .upload_ready(&self.gpu.queue, &mut UploadBudget::new(512 * 1024))
-            .map_err(js_error)?;
+        let can_upload = self.in_flight.load(Ordering::Acquire) < 1;
+        if can_upload {
+            self.view
+                .upload_ready(&self.gpu.queue, &mut UploadBudget::new(2 * 1024 * 1024))
+                .map_err(js_error)?;
+        }
         let mut ui_changed = false;
         if let Some(product) = &mut self.product {
             product.poll_imports();
@@ -285,10 +340,11 @@ impl BrowserState {
                 }
                 self.last_profiler_ms = now;
             }
-            ui_changed = product
-                .layer
-                .upload(&self.gpu.queue, self.config.width, self.config.height)
-                .map_err(js_error)?;
+            ui_changed = can_upload
+                && product
+                    .layer
+                    .upload(&self.gpu.queue, self.config.width, self.config.height)
+                    .map_err(js_error)?;
         }
         self.ui_pending |= ui_changed;
         let upload_end = clock_ms();
@@ -349,11 +405,8 @@ impl BrowserState {
                 )
                 .map_err(js_error)?;
             self.gpu_capture.as_mut().and_then(|capture| {
-                capture.encode(
-                    self.view.renderer_mut(),
-                    &mut encoder,
-                    u64::from(self.submitted) + 1,
-                )
+                self.view
+                    .encode_gpu_capture(capture, &mut encoder, u64::from(self.submitted) + 1)
             })
         } else {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -561,9 +614,17 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                         &atlas,
                     )
                     .map_err(js_error)?;
-                    let view =
+                    let mut view =
                         ClientView::new(renderer, client::remote::RemoteSession::scene_config())
                             .map_err(js_error)?;
+                    animation_frame().await?;
+                    prepare_product_world(&mut view, &device, &queue, width, height, &atlas)?;
+                    prepare_material_variant(&mut view, &device, &queue, &atlas)?;
+                    let materials = audio::browser::with_local_resources(|local| {
+                        client::local_materials::prepare(local, Default::default())
+                    });
+                    let material_revision =
+                        audio::browser::with_local_resources(|local| local.revision());
                     let href = web_sys::window().ok_or("window")?.location().href()?;
                     let worker = web_sys::Url::new_with_base("workers/jobs.js", &href)?.href();
                     let module = web_sys::Url::new_with_base("pkg/client_web.js", &href)?.href();
@@ -574,12 +635,26 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                         2,
                         32 * 1024 * 1024,
                     )?;
+                    let horizon_workers = browser_horizon::BrowserHorizon::new(&worker, &module)?;
                     let mut borrowed = state.borrow_mut();
                     if borrowed.connection_epoch != epoch {
                         return Ok::<_, JsValue>(());
                     }
                     borrowed.view = view;
+                    if let Some(recorder) = &mut borrowed.recorder {
+                        recorder
+                            .begin_input_epoch()
+                            .map_err(|error| js_error(format!("new world recorder: {error:?}")))?;
+                    }
+                    borrowed.local_materials_revision = 0;
+                    borrowed.local_materials_resolution = 0;
+                    borrowed.local_materials_layers = 0;
+                    borrowed.local_materials_upload_bytes = 0;
+                    if let Ok(materials) = materials {
+                        let _ = apply_local_materials(&mut borrowed, materials, material_revision);
+                    }
                     borrowed.workers = workers;
+                    borrowed.horizon_workers = Some(horizon_workers);
                     borrowed.running.clear();
                     borrowed.resetting = false;
                     drop(borrowed);
@@ -624,18 +699,35 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                 let _ = animation_frame().await;
                 let revision = audio::browser::with_local_resources(|local| local.revision());
                 let prepared = audio::browser::prepare_current_sound_bank().await;
+                let _ = animation_frame().await;
+                let materials = audio::browser::with_local_resources(|local| {
+                    client::local_materials::prepare(local, Default::default())
+                });
                 if audio::browser::with_local_resources(|local| local.revision()) != revision {
                     return;
                 }
-                if let Some(state) = weak.upgrade()
-                    && let Some(product) = &mut state.borrow_mut().product
-                {
+                if let Some(state) = weak.upgrade() {
+                    let mut state = state.borrow_mut();
+                    let colors_ok = match materials {
+                        Ok(materials) => {
+                            apply_local_materials(&mut state, materials, revision).is_ok()
+                        }
+                        Err(_) => false,
+                    };
+                    let Some(product) = &mut state.product else {
+                        return;
+                    };
                     let result = prepared.and_then(|prepared| product.audio.replace_bank(prepared));
-                    product.layer.app.set_status(if result.is_ok() {
-                        "Локальные звуки подготовлены"
-                    } else {
-                        "Звуки набора отклонены; прежний звук сохранён"
-                    });
+                    product
+                        .layer
+                        .app
+                        .set_status(if result.is_ok() && colors_ok {
+                            "Локальные звуки и материалы набора применены"
+                        } else if result.is_ok() {
+                            "Звуки подготовлены; изображения отклонены, прежние цвета сохранены"
+                        } else {
+                            "Звуки набора отклонены; прежний звук сохранён"
+                        });
                     let _ = product.apply_sound();
                 }
             });
@@ -648,13 +740,130 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                     .as_ref()
                     .and_then(|socket| socket.session().connection().welcome())
                     .map_or(0, |welcome| u64::from(welcome.public_seed));
-                let mut report = recorder.export_json("webgpu", seed, 0, state.view.tick().0);
+                let mut report = recorder.export_json("webgpu", seed, 0, 0);
+                let movement = state.socket.as_ref().map_or_else(
+                    || state.view.movement_replay(),
+                    |socket| socket.session().connection().movement_replay(),
+                );
+                let movement_result = movement.append_json(&mut report);
+                report.pop();
+                use std::fmt::Write;
+                let _ = write!(
+                    report,
+                    ",\"movementReplayAvailable\":{},\"initialPublicWorldHashKnown\":false,\"currentPublicWorldHash\":\"{:016x}\"",
+                    movement_result.is_ok(),
+                    state.view.scene.world().canonical_hash()
+                );
+                if let Err(reason) = movement_result {
+                    let _ = write!(report, ",\"movementReplayUnavailableReason\":{reason:?}");
+                }
+                report.push('}');
                 report.insert_str(1,"\"replayAvailable\":false,\"replayUnavailableReason\":\"initial public world snapshot not captured\",");
                 let _ =
                     product_ui::download("cubi-flight-recorder.json", &report, "application/json");
             }
         }
     }
+}
+fn apply_local_materials(
+    state: &mut BrowserState,
+    materials: Option<render::material_pack::PreparedMaterials>,
+    revision: u64,
+) -> Result<(), render::material_pack::MaterialError> {
+    let layers = materials.as_ref().map_or(0, |value| value.imported_layers);
+    let materials = if materials.is_none() && state.local_materials_layers > 0 {
+        let base = AtlasImage::donor().map_err(|_| render::material_pack::MaterialError::Atlas)?;
+        Some(render::material_pack::PreparedMaterials::prepare(
+            &base,
+            &[],
+            revision,
+            Default::default(),
+        )?)
+    } else {
+        materials
+    };
+    let (resolution, uploaded) = if let Some(materials) = materials {
+        let gpu = render::material_pack::MaterialPackGpu::upload(
+            &state.gpu.device,
+            &state.gpu.queue,
+            &materials,
+        )?;
+        if gpu.reserved_metals {
+            return Err(render::material_pack::MaterialError::UnsupportedMetal);
+        }
+        let actual_resolution = gpu.resolution;
+        let geometry = state.view.renderer_mut().geometry();
+        let (_, proxy_bytes) =
+            render::material_pack::apply_albedo_in_place(&state.gpu.queue, geometry, &materials)?;
+        let uploaded = gpu.upload_bytes + proxy_bytes;
+        state
+            .view
+            .renderer_mut()
+            .replace_material_pack(&state.gpu.device, &state.gpu.queue, gpu, layers > 0)
+            .map_err(|_| render::material_pack::MaterialError::Target)?;
+        (actual_resolution, uploaded)
+    } else {
+        (0, 0)
+    };
+    state.local_materials_revision = revision;
+    state.local_materials_resolution = resolution;
+    state.local_materials_layers = layers;
+    state.local_materials_upload_bytes = uploaded;
+    state.view.invalidate();
+    Ok(())
+}
+fn prepare_product_world(
+    view: &mut ClientView,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    width: u32,
+    height: u32,
+    atlas: &AtlasImage,
+) -> Result<(), JsValue> {
+    view.prepare_lighting(
+        device,
+        queue,
+        client::lighting::ClientLightingConfig {
+            source: client::lighting::LightSource::Authoritative,
+            shadows: render::shadows::ShadowConfig {
+                resolution: 2048,
+                dynamic_casters: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .map_err(js_error)?;
+    view.prepare_environment(
+        device,
+        queue,
+        width,
+        height,
+        render::OutputTransfer::ShaderSrgb,
+        client::view::EnvironmentProfile::default(),
+        atlas,
+    )
+    .map_err(js_error)?;
+    view.prepare_entities(device, queue).map_err(js_error)?;
+    view.prepare_horizon(device, queue, client::view::horizon::Config::default())
+        .map_err(js_error)?;
+    Ok(())
+}
+
+fn prepare_material_variant(
+    view: &mut ClientView,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    atlas: &AtlasImage,
+) -> Result<(), JsValue> {
+    let prepared =
+        render::material_pack::PreparedMaterials::prepare(atlas, &[], 0, Default::default())
+            .map_err(|error| js_error(format!("material defaults: {error:?}")))?;
+    let gpu = render::material_pack::MaterialPackGpu::upload(device, queue, &prepared)
+        .map_err(|error| js_error(format!("material defaults GPU: {error:?}")))?;
+    view.renderer_mut()
+        .prepare_material_pack(device, queue, gpu, false)
+        .map_err(js_error)
 }
 fn connect_socket(state: &Rc<RefCell<BrowserState>>, address: String, name: String) {
     let mut state = state.borrow_mut();
@@ -676,6 +885,64 @@ fn connect_socket(state: &Rc<RefCell<BrowserState>>, address: String, name: Stri
 fn stats_object(view: &ClientView) -> JsValue {
     let stats = view.stats();
     let value = js_sys::Object::new();
+    let position = stats.player_pos;
+    let eye_light = view.scene.read_authoritative_light(core_types::BlockPos {
+        space: view.scene.config().center.space,
+        x: position[0].floor() as i32,
+        y: position[1].floor() as i32 + 2,
+        z: position[2].floor() as i32,
+    });
+    for (name, number) in [
+        (
+            "horizonHeightFront",
+            view.horizon_stats().map_or(0, |s| s.height_front) as f64,
+        ),
+        (
+            "horizonProxyFront",
+            view.horizon_stats().map_or(0, |s| s.proxy_front) as f64,
+        ),
+        (
+            "pendingLightSourcePages",
+            view.lighting_stats().map_or(0, |s| s.pending_source_pages) as f64,
+        ),
+        (
+            "lightPendingGpuPages",
+            view.lighting_stats().map_or(0, |s| s.pending_pages) as f64,
+        ),
+        (
+            "lightPendingCells",
+            view.lighting_stats().map_or(0, |s| s.pending_cells) as f64,
+        ),
+        (
+            "lightPendingShadows",
+            view.lighting_stats()
+                .map_or(0, |s| s.pending_shadow_cascades) as f64,
+        ),
+        (
+            "lightOldestTicks",
+            view.lighting_stats().map_or(0, |s| s.oldest_age_ticks) as f64,
+        ),
+    ] {
+        let _ = js_sys::Reflect::set(&value, &name.into(), &number.into());
+    }
+    let _ = js_sys::Reflect::set(
+        &value,
+        &"publicEyeSky".into(),
+        &eye_light.map_or(JsValue::NULL, |s| s.sky.into()),
+    );
+    for (name, flag) in [
+        (
+            "authoritativeLighting",
+            view.lighting_stats()
+                .is_some_and(|s| s.authoritative_source),
+        ),
+        ("environmentPrepared", view.environment_stats().is_some()),
+        ("horizonPrepared", view.horizon_stats().is_some()),
+        ("publicEyeLightKnown", eye_light.is_some()),
+        ("lightReady", view.lighting_stats().is_some_and(|s| s.ready)),
+    ] {
+        let _ = js_sys::Reflect::set(&value, &name.into(), &flag.into());
+    }
     for (name, number) in [
         ("residentPages", stats.resident_pages as f64),
         ("residentQuads", stats.resident_quads as f64),
@@ -1174,6 +1441,9 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
         )?)
     };
     if let Some(product) = &mut product {
+        animation_frame().await?;
+        prepare_product_world(&mut view, &gpu.device, &gpu.queue, width, height, &atlas)?;
+        prepare_material_variant(&mut view, &gpu.device, &gpu.queue, &atlas)?;
         let applied = view.apply_settings(&product.layer.app.settings);
         product
             .layer
@@ -1222,6 +1492,14 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
         2,
         32 * 1024 * 1024,
     )?;
+    let horizon_workers = if diagnostic {
+        None
+    } else {
+        Some(browser_horizon::BrowserHorizon::new(
+            &worker_url,
+            &module_url,
+        )?)
+    };
     let mut resolve_fn = None;
     let mut reject_fn = None;
     let ready = js_sys::Promise::new(&mut |resolve, reject| {
@@ -1236,6 +1514,7 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
         view,
         workers,
         running: BTreeMap::new(),
+        horizon_workers,
         last_ms: window.performance().map_or(0.0, |p| p.now()),
         resolve: resolve_fn,
         reject: reject_fn,
@@ -1253,6 +1532,10 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
         gpu_capture,
         last_present_ms: clock_ms(),
         last_profiler_ms: 0.0,
+        local_materials_revision: 0,
+        local_materials_resolution: 0,
+        local_materials_layers: 0,
+        local_materials_upload_bytes: 0,
         ui_pending: false,
         connection_epoch: 0,
         presentation_probe: client::presentation::PresentationProbe::new(0),

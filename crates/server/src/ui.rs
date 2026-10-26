@@ -162,13 +162,40 @@ impl WindowState {
     /// Refresh a cache from authoritative block contents. Cursor and crafting
     /// remain owned by the player; a changed cache invalidates old click guards.
     pub fn refresh_container_trusted(&mut self, slots: &[ItemStack]) -> Result<bool, WindowError> {
+        self.refresh_container_impl(slots, false)
+    }
+    /// Charge changes update the cache without invalidating a slot click.
+    pub fn refresh_machine_container_trusted(
+        &mut self,
+        slots: &[ItemStack],
+    ) -> Result<bool, WindowError> {
+        self.refresh_container_impl(slots, true)
+    }
+    fn refresh_container_impl(
+        &mut self,
+        slots: &[ItemStack],
+        charge_only: bool,
+    ) -> Result<bool, WindowError> {
         if slots.len() != self.container().len() {
             return Err(WindowError::Slot);
         }
         if slots == self.container() {
             return Ok(false);
         }
-        let revision = self.revision.checked_add(1).ok_or(WindowError::Overflow)?;
+        let changes_items = !charge_only
+            || slots.iter().zip(self.container()).any(|(new, old)| {
+                *new != *old
+                    && !(new.item() == rules::items::I_ENERGY_TABLET
+                        && old.item() == new.item()
+                        && new.count() == 1
+                        && old.count() == 1
+                        && old.damage() == new.damage())
+            });
+        let revision = if changes_items {
+            self.revision.checked_add(1).ok_or(WindowError::Overflow)?
+        } else {
+            self.revision
+        };
         self.container[..slots.len()].copy_from_slice(slots);
         self.revision = revision;
         Ok(true)
@@ -485,10 +512,31 @@ impl WindowState {
             bytes.extend_from_slice(&stack.count().to_le_bytes());
             bytes.extend_from_slice(&stack.damage().to_le_bytes());
         }
+        rules::item_payload::refs::append(
+            &mut bytes,
+            std::iter::once(self.cursor)
+                .chain((0..9).map(|index| {
+                    self.craft
+                        .get(index % 3, index / 3)
+                        .unwrap_or(ItemStack::EMPTY)
+                }))
+                .chain(self.container)
+                .enumerate()
+                .map(|(index, stack)| (index, stack.payload())),
+        )
+        .expect("validated window stack references");
         bytes
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, WindowError> {
-        if bytes.len() != 407 || bytes.get(..4) != Some(b"WND1") {
+        let (state, used) = Self::decode_prefix(bytes)?;
+        if used != bytes.len() {
+            return Err(WindowError::Encoding);
+        }
+        Ok(state)
+    }
+    /// A bounded sparse XRF1 tail precedes the outer WBD1 binding section.
+    pub fn decode_prefix(bytes: &[u8]) -> Result<(Self, usize), WindowError> {
+        if bytes.len() < 407 || bytes.get(..4) != Some(b"WND1") {
             return Err(WindowError::Encoding);
         }
         let id = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
@@ -509,12 +557,12 @@ impl WindowState {
         let mut state = if kind == WindowKind::Inventory {
             Self::inventory()
         } else {
-            Self::open(id, kind, &vec![ItemStack::EMPTY; container_len(kind)])?
+            Self::open(id, kind, &[ItemStack::EMPTY; 54][..container_len(kind)])?
         };
         state.revision = revision;
         state.id = id;
         state.closed = bytes[22] != 0;
-        for (index, raw) in bytes[23..].chunks_exact(6).enumerate() {
+        for (index, raw) in bytes[23..407].chunks_exact(6).enumerate() {
             let read = |at| u16::from_le_bytes([raw[at], raw[at + 1]]);
             let stack = ItemStack::from_parts(read(0), read(2), read(4))
                 .map_err(|_| WindowError::Encoding)?;
@@ -540,6 +588,43 @@ impl WindowState {
                 }
             }
         }
+        let (refs, used) = rules::item_payload::refs::read(&bytes[407..], 64)
+            .map_err(|_| WindowError::Encoding)?;
+        for (index, payload) in refs {
+            match index {
+                0 => {
+                    state.cursor = state
+                        .cursor
+                        .with_payload(payload)
+                        .map_err(|_| WindowError::Encoding)?
+                }
+                1..=9 => {
+                    let at = index - 1;
+                    let old = state
+                        .craft
+                        .get(at % 3, at / 3)
+                        .ok_or(WindowError::Encoding)?;
+                    state
+                        .craft
+                        .set(
+                            at % 3,
+                            at / 3,
+                            old.with_payload(payload)
+                                .map_err(|_| WindowError::Encoding)?,
+                        )
+                        .map_err(|_| WindowError::Encoding)?;
+                }
+                _ => {
+                    let slot = index - 10;
+                    if slot >= container_len(kind) {
+                        return Err(WindowError::Encoding);
+                    }
+                    state.container[slot] = state.container[slot]
+                        .with_payload(payload)
+                        .map_err(|_| WindowError::Encoding)?;
+                }
+            }
+        }
         if !matches!(state.kind, WindowKind::Inventory | WindowKind::Workbench)
             && state.craft.cells().iter().any(|value| !value.is_empty())
         {
@@ -550,7 +635,7 @@ impl WindowState {
         {
             return Err(WindowError::Encoding);
         }
-        Ok(state)
+        Ok((state, 407 + used))
     }
 }
 #[derive(Clone, Copy)]

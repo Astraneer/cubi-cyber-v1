@@ -670,6 +670,45 @@ fn environment_graph_preflights_budgets_reuses_static_scene_and_keeps_all_timing
             &mut upload,
         )
         .unwrap();
+    environment
+        .prepare_multiple_scattering(
+            &gpu.device,
+            &gpu.queue,
+            render::multiple_scattering::MultipleScatteringConfig {
+                size: [8, 8],
+                directions: 32,
+                steps: 32,
+                ..Default::default()
+            },
+            &mut upload,
+        )
+        .unwrap();
+    environment
+        .prepare_celestials(
+            &gpu.device,
+            &gpu.queue,
+            render::celestial::CelestialConfig {
+                stars: 0,
+                ..Default::default()
+            },
+            &mut upload,
+        )
+        .unwrap();
+    environment
+        .prepare_aerial(
+            &gpu.device,
+            &gpu.queue,
+            &terrain,
+            W,
+            H,
+            render::aerial_gpu::AerialConfig {
+                grid: [8, 8, 16],
+                steps: 8,
+                ..Default::default()
+            },
+            &mut upload,
+        )
+        .unwrap();
     let water = environment.water_mut().unwrap();
     let water_object = water
         .upload_object(&gpu.queue, None, translation([0., 0.5, 0.]), &mut upload)
@@ -709,6 +748,8 @@ fn environment_graph_preflights_budgets_reuses_static_scene_and_keeps_all_timing
     let output = output(&gpu);
     let view = output.create_view(&Default::default());
     let fresh_budget = || EnvironmentBudget {
+        aerial_steps: 1_000_000,
+        aerial_samples: 1_000_000,
         upload_bytes: 1_000_000,
         atmosphere_steps: 1_000_000,
         water_reflection_steps: 0,
@@ -769,7 +810,22 @@ fn environment_graph_preflights_budgets_reuses_static_scene_and_keeps_all_timing
             |_| 0,
         )
         .unwrap();
-    assert_eq!(first.atmosphere.passes, 2);
+    assert_eq!(first.atmosphere.passes, 3);
+    assert_eq!(first.celestial.draws, 1);
+    assert_eq!(first.celestial.vertices, 8);
+    assert_eq!(first.aerial.passes, 2);
+    assert_eq!(first.aerial.integration_steps, 8192);
+    assert!(matches!(
+        environment.prepare_celestials(
+            &gpu.device,
+            &gpu.queue,
+            render::celestial::CelestialConfig::default(),
+            &mut upload
+        ),
+        Err(EnvironmentError::Terrain(
+            render::terrain_gpu::TerrainError::LatePreparation
+        ))
+    ));
     assert!(
         first.terrain.passes > 0
             && first.water.passes > 0
@@ -846,6 +902,45 @@ fn environment_graph_preflights_budgets_reuses_static_scene_and_keeps_all_timing
             .iter()
             .all(Option::is_none)
     );
+    environment.request_present();
+    assert!(!environment.scene_needed(&terrain, &camera, CullingMode::FrustumAndHiZ, state));
+    assert!(environment.needs_redraw(&terrain, &camera, CullingMode::FrustumAndHiZ, state));
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    let mut budget = fresh_budget();
+    let presented = environment
+        .encode(
+            &gpu.queue,
+            &mut encoder,
+            &mut terrain,
+            &view,
+            &camera,
+            CullingMode::FrustumAndHiZ,
+            state,
+            &mut budget,
+            |_| panic!("output-only redraw must retain the cached scene"),
+        )
+        .unwrap();
+    assert_eq!(presented.passes, 1);
+    assert_eq!(presented.upload_bytes, 0);
+    assert_eq!(presented.post.histogram_samples, 0);
+    assert_eq!(
+        (presented.celestial.draws, presented.celestial.vertices),
+        (0, 0)
+    );
+    assert_eq!(presented.post.bloom_texels, 0);
+    assert_eq!(presented.post.tone_pixels, u64::from(W) * u64::from(H));
+    assert_eq!(
+        environment
+            .timing_sources(&terrain)
+            .iter()
+            .flatten()
+            .count(),
+        1
+    );
+    let repeated = capture(&gpu, &mut encoder, &output);
+    gpu.queue.submit([encoder.finish()]);
+    assert_eq!(read(&gpu, &repeated), read(&gpu, &pixels));
+    assert!(!environment.needs_redraw(&terrain, &camera, CullingMode::FrustumAndHiZ, state));
     terrain.take_work();
     environment.water_mut().unwrap().take_work();
     environment
@@ -964,6 +1059,8 @@ fn exposure_only_environment_frames_reuse_hdr_without_geometry_or_histogram_work
     let output = output(&gpu);
     let view = output.create_view(&Default::default());
     let mut budget = EnvironmentBudget {
+        aerial_steps: 1_000_000,
+        aerial_samples: 1_000_000,
         upload_bytes: 10000,
         atmosphere_steps: 100000,
         water_reflection_steps: 0,
@@ -991,6 +1088,8 @@ fn exposure_only_environment_frames_reuse_hdr_without_geometry_or_histogram_work
     assert!(environment.needs_redraw(&terrain, &camera, CullingMode::FrustumAndHiZ, state));
     terrain.take_work();
     let mut budget = EnvironmentBudget {
+        aerial_steps: 1_000_000,
+        aerial_samples: 1_000_000,
         upload_bytes: 0,
         atmosphere_steps: 0,
         water_reflection_steps: 0,
@@ -1040,5 +1139,335 @@ fn exposure_only_environment_frames_reuse_hdr_without_geometry_or_histogram_work
     println!(
         "M10_POST_ONLY_GPU_OK first_histogram_samples={} cached_scene_passes=0 cached_histogram_samples=0 cached_upload_bytes=0 exposure_tone_passes=2 timing_sources=1 stale_terrain_timestamps=0",
         first.post.histogram_samples
+    );
+}
+
+#[test]
+fn physical_atmosphere_shares_surface_energy_and_removes_white_skylight_at_night() {
+    use render::{
+        atmosphere::{AtmosphereConfig, SOLAR_IRRADIANCE, reference_transmittance},
+        environment_gpu::{EnvironmentBudget, EnvironmentConfig, EnvironmentGpu, EnvironmentState},
+        light_volume::{LightVolumeGpu, PackedLight},
+        material_pack::{Limits, MaterialPackGpu, PreparedMaterials},
+        shadows::{ShadowConfig, ShadowGpu},
+    };
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let atlas = AtlasImage {
+        tile_size: 1,
+        layers: 1,
+        mips: vec![AtlasMip {
+            size: 1,
+            rgba: vec![255; 4],
+            tint_mask: vec![255],
+        }],
+    };
+    let make = || {
+        TerrainGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            W,
+            H,
+            OutputTransfer::ShaderSrgb,
+            GpuConfig {
+                max_pages: 4,
+                max_quads: 65536,
+                occlusion: true,
+            },
+            &atlas,
+        )
+        .unwrap()
+    };
+    let mut terrain = make();
+    let mut legacy = make();
+    let mut upload = UploadBudget::new(2_000_000);
+    let base = terrain
+        .upload_page(
+            &gpu.queue,
+            None,
+            1,
+            translation([0.; 3]),
+            &cube(false),
+            &mut upload,
+        )
+        .unwrap();
+    legacy
+        .upload_page(
+            &gpu.queue,
+            None,
+            1,
+            translation([0.; 3]),
+            &cube(false),
+            &mut upload,
+        )
+        .unwrap();
+    let prepared = PreparedMaterials::prepare(&atlas, &[], 1, Limits::default()).unwrap();
+    let pack = MaterialPackGpu::upload(&gpu.device, &gpu.queue, &prepared).unwrap();
+    terrain
+        .prepare_material_pack(&gpu.device, &gpu.queue, pack, true)
+        .unwrap();
+    let mut lights = LightVolumeGpu::new(&gpu.device, 4).unwrap();
+    lights
+        .upload_uniform(
+            &gpu.queue,
+            base,
+            1,
+            PackedLight::new(15, 0, [0; 3]).unwrap(),
+            &mut upload,
+        )
+        .unwrap();
+    let mut shadows = ShadowGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        terrain.geometry(),
+        ShadowConfig {
+            resolution: 32,
+            max_updates_per_frame: 3,
+            ..ShadowConfig::default()
+        },
+        [8.; 3],
+        [0., 1., 0.],
+    )
+    .unwrap();
+    legacy
+        .attach_lighting(&gpu.device, &shadows, &lights)
+        .unwrap();
+    let state = EnvironmentState {
+        eye: [26., 31., 29.],
+        sun: [0., 1., 0.],
+        sun_intensity: 1.,
+        altitude_km: 0.072,
+        time_seconds: 0.,
+        delta_seconds: 1. / 60.,
+        tick: 0,
+        underwater: false,
+    };
+    terrain.set_material_view(&gpu.queue, state.eye, 0).unwrap();
+    let config = EnvironmentConfig {
+        atmosphere: AtmosphereConfig {
+            transmittance_size: [64, 32],
+            sky_size: [48, 32],
+            transmittance_steps: 64,
+            sky_steps: 48,
+        },
+        post: PostConfig {
+            exposure: Exposure::Manual(0.15),
+            bloom: None,
+            ..PostConfig::default()
+        },
+        ..EnvironmentConfig::default()
+    };
+    let mut environment = EnvironmentGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        &mut terrain,
+        W,
+        H,
+        OutputTransfer::ShaderSrgb,
+        config,
+        state,
+        Some((&shadows, &lights)),
+        &mut upload,
+    )
+    .unwrap();
+    let camera = Camera::perspective(
+        state.eye,
+        [8.; 3],
+        [0., 1., 0.],
+        1.,
+        W as f32 / H as f32,
+        0.1,
+        200.,
+    );
+    let output = output(&gpu);
+    let view = output.create_view(&Default::default());
+    let budget = || EnvironmentBudget {
+        aerial_steps: 1_000_000,
+        aerial_samples: 1_000_000,
+        upload_bytes: 100000,
+        atmosphere_steps: 1_000_000,
+        water_reflection_steps: 0,
+        cloud_density_samples: 0,
+        gi_rays: 0,
+        post_pixels: 100000,
+    };
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    shadows.encode(&gpu.queue, &mut encoder);
+    environment
+        .encode(
+            &gpu.queue,
+            &mut encoder,
+            &mut terrain,
+            &view,
+            &camera,
+            CullingMode::FrustumAndHiZ,
+            state,
+            &mut budget(),
+            |_| 0,
+        )
+        .unwrap();
+    let day = capture(&gpu, &mut encoder, &output);
+    let hdr = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("independent actual terrain coverage"),
+        size: u64::from(W * H * 8),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: terrain.resolved_hdr_texture(),
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &hdr,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(W * 8),
+                rows_per_image: Some(H),
+            },
+        },
+        wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
+    );
+    let illumination = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("independent atmosphere shared-light oracle"),
+        size: 80,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_buffer_to_buffer(
+        environment.atmosphere_lighting_buffer(),
+        0,
+        &illumination,
+        0,
+        80,
+    );
+    gpu.queue.submit([encoder.finish()]);
+    let rgba = |buffer: &wgpu::Buffer| {
+        read(&gpu, buffer)
+            .chunks_exact(((W * 4).div_ceil(256) * 256) as usize)
+            .flat_map(|row| row[..(W * 4) as usize].iter().copied())
+            .collect::<Vec<_>>()
+    };
+    let day = rgba(&day);
+    let coverage = read(&gpu, &hdr);
+    let raw = read(&gpu, &illumination);
+    let values: Vec<_> = raw
+        .chunks_exact(4)
+        .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+        .collect();
+    let expected = reference_transmittance(0.072, 1., 4096);
+    let mut max_sun_error = 0f64;
+    for channel in 0..3 {
+        max_sun_error = max_sun_error.max(
+            (f64::from(values[12 + channel]) - expected[channel] * f64::from(SOLAR_IRRADIANCE))
+                .abs(),
+        );
+    }
+    assert!(
+        max_sun_error < 0.04,
+        "solar irradiance mismatch={max_sun_error}, actual={:?}, reference={expected:?}",
+        &values[12..15]
+    );
+    let red = (values[0] * 0.2820948 + values[1] * 0.48860252).max(0.);
+    let blue = (values[8] * 0.2820948 + values[9] * 0.48860252).max(0.);
+    assert!(
+        blue > red && red > 0.,
+        "surface ambient must come from the same colored sky integral"
+    );
+    let receivers: Vec<_> = coverage
+        .chunks_exact(8)
+        .enumerate()
+        .filter(|(index, p)| {
+            let _ = index;
+            u16::from_le_bytes([p[6], p[7]]) == 0x3c00
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        receivers.len() > 1000,
+        "fixture must cover a substantial receiver area: {}",
+        receivers.len()
+    );
+    assert!(
+        receivers
+            .iter()
+            .any(|&i| day[i * 4..i * 4 + 3].iter().any(|&c| c > 80)),
+        "daylight must actually illuminate receivers"
+    );
+    let night = EnvironmentState {
+        sun: [0., -1., 0.],
+        tick: 1,
+        ..state
+    };
+    shadows.update_view([8.; 3], night.sun).unwrap();
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    shadows.encode(&gpu.queue, &mut encoder);
+    environment
+        .encode(
+            &gpu.queue,
+            &mut encoder,
+            &mut terrain,
+            &view,
+            &camera,
+            CullingMode::FrustumAndHiZ,
+            night,
+            &mut budget(),
+            |_| 0,
+        )
+        .unwrap();
+    let dark = capture(&gpu, &mut encoder, &output);
+    encoder.copy_buffer_to_buffer(
+        environment.atmosphere_lighting_buffer(),
+        0,
+        &illumination,
+        0,
+        80,
+    );
+    legacy
+        .encode_frame(
+            &gpu.queue,
+            &mut encoder,
+            &view,
+            &camera,
+            CullingMode::FrustumAndHiZ,
+        )
+        .unwrap();
+    let control = capture(&gpu, &mut encoder, &output);
+    gpu.queue.submit([encoder.finish()]);
+    let dark = rgba(&dark);
+    let control = rgba(&control);
+    let mut leaks = 0;
+    let mut old_glow = 0;
+    for &i in &receivers {
+        leaks += usize::from(dark[i * 4..i * 4 + 3].iter().any(|&c| c != 0));
+        old_glow += usize::from(control[i * 4..i * 4 + 3].iter().any(|&c| c > 20));
+    }
+    assert_eq!(
+        leaks, 0,
+        "skyVisibility15 alone must not illuminate a night-side material"
+    );
+    assert!(
+        old_glow > 1000,
+        "old white-skylight negative control must fail the same black-receiver criterion"
+    );
+    let raw = read(&gpu, &illumination);
+    for i in (0..12).chain(12..15) {
+        assert_eq!(
+            f32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap()),
+            0.
+        );
+    }
+    println!(
+        "M10_SHARED_ATMOSPHERE_GPU_OK receivers={} diffuse_sky_blue_gt_red=true max_solar_irradiance_error={:.8} solar_irradiance={} night_surface_leaks=0 old_white_skylight_negative_pixels={} PBR=true",
+        receivers.len(),
+        max_sun_error,
+        SOLAR_IRRADIANCE,
+        old_glow
     );
 }

@@ -110,6 +110,7 @@ pub struct PostGpu {
     tone_bind: wgpu::BindGroup,
     tone: wgpu::RenderPipeline,
     last_source: Option<u64>,
+    output_requested: bool,
     adaptation_remaining: f32,
     timer: crate::gpu_time::GpuPassTimer<12>,
 }
@@ -567,6 +568,7 @@ impl PostGpu {
             tone_bind,
             tone,
             last_source: None,
+            output_requested: false,
             adaptation_remaining: 0.0,
             timer: crate::gpu_time::GpuPassTimer::new(device, queue, "HDR post pass timings"),
         })
@@ -593,7 +595,13 @@ impl PostGpu {
         Ok(64)
     }
     pub fn needs_redraw(&self, source_revision: u64) -> bool {
-        self.last_source != Some(source_revision) || self.adaptation_remaining > 0.0
+        self.output_requested
+            || self.last_source != Some(source_revision)
+            || self.adaptation_remaining > 0.0
+    }
+    /// Present cached HDR to a newly acquired output without invalidating it.
+    pub fn request_present(&mut self) {
+        self.output_requested = true;
     }
     pub fn invalidate(&mut self) {
         self.last_source = None;
@@ -618,6 +626,12 @@ impl PostGpu {
     pub fn pipeline_count(&self) -> u32 {
         1 + if self.auto.is_some() { 3 } else { 0 } + u32::from(self.bloom.is_some())
     }
+    pub(crate) fn resize_upload_bytes(&self, width: u32, height: u32) -> u64 {
+        64 + self
+            .config
+            .bloom
+            .map_or(0, |b| u64::from(levels(width, height, b)) * 16)
+    }
 
     /// Input rebinding on resize reuses every prepared pipeline.
     #[allow(clippy::too_many_arguments)]
@@ -637,11 +651,7 @@ impl PostGpu {
         {
             return Err(PostError::InvalidConfig);
         }
-        let upload = 64
-            + self
-                .config
-                .bloom
-                .map_or(0, |b| u64::from(levels(width, height, b)) * 16);
+        let upload = self.resize_upload_bytes(width, height);
         if budget.remaining_bytes < upload {
             return Err(PostError::UploadBudget);
         }
@@ -802,6 +812,7 @@ impl PostGpu {
         self.adaptation_remaining =
             (self.adaptation_remaining - self.parameters.adaptation[0]).max(0.0);
         self.last_source = Some(source_revision);
+        self.output_requested = false;
         *remaining_pixels -= work.pixels();
         Ok(work)
     }

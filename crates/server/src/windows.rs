@@ -6,6 +6,7 @@ use net::window::{WindowIntent, WindowSnapshot};
 use rules::{
     blocks::{BeKind, MekKind},
     crafting::{RecipeBook, RecipeId},
+    item_payload::{Payload, Resolver},
     machines::{self, Machine, SideMode},
     stack::ItemStack,
     survival::{
@@ -45,9 +46,13 @@ impl BoundWindow {
             return Ok(false);
         };
         let block = read_bound(world, binding)?;
-        self.state
-            .refresh_container_trusted(&block.stack_values())
-            .map_err(Error::Window)
+        let slots = block.stack_values()?;
+        if matches!(block, Block::Machine(_)) {
+            self.state.refresh_machine_container_trusted(&slots)
+        } else {
+            self.state.refresh_container_trusted(&slots)
+        }
+        .map_err(Error::Window)
     }
 }
 pub struct Context<'a> {
@@ -55,6 +60,7 @@ pub struct Context<'a> {
     pub space: SpaceId,
     pub inventory: &'a Inventory,
     pub permitted: bool,
+    pub payloads: Option<&'a dyn Resolver>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -81,6 +87,7 @@ pub struct WindowPlan {
     transaction: Option<Transaction>,
     pages: Vec<(PageId, Version)>,
     components: Vec<(ComponentId, Option<Version>)>,
+    payloads: Vec<Payload>,
 }
 impl WindowPlan {
     pub fn window_after(&self) -> &BoundWindow {
@@ -91,6 +98,12 @@ impl WindowPlan {
     }
     pub fn drops(&self) -> &[ItemStack] {
         &self.drops
+    }
+    pub fn payloads(&self) -> &[Payload] {
+        &self.payloads
+    }
+    pub fn take_payloads(&mut self) -> Vec<Payload> {
+        std::mem::take(&mut self.payloads)
     }
     pub fn transaction(&self) -> Option<&Transaction> {
         self.transaction.as_ref()
@@ -131,7 +144,7 @@ impl WindowPlan {
 }
 enum Block {
     Workbench,
-    Chest(Chest),
+    Chest(Box<Chest>),
     Furnace(Furnace),
     Machine(Box<Machine>),
 }
@@ -152,14 +165,18 @@ impl Block {
             Self::Machine(_) => unreachable!("machine slots use stack projection"),
         }
     }
-    fn stack_values(&self) -> Vec<ItemStack> {
-        match self {
+    fn stack_values(&self) -> Result<Vec<ItemStack>, Error> {
+        Ok(match self {
             Self::Machine(m) => m.slots[..machines::roles(m.kind).len()]
                 .iter()
-                .map(|s| s.stack)
-                .collect(),
+                .map(|s| {
+                    s.to_item()
+                        .map(|(stack, _)| stack)
+                        .map_err(|_| Error::Encoding)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
             _ => self.slots().to_vec(),
-        }
+        })
     }
     fn data(&self, anchor: BlockPos) -> Option<ComponentData> {
         Some(match self {
@@ -177,7 +194,11 @@ impl Block {
             }
         })
     }
-    fn set_slots(&mut self, slots: &[ItemStack]) -> Result<(), Error> {
+    fn set_slots(
+        &mut self,
+        slots: &[ItemStack],
+        payloads: Option<&dyn Resolver>,
+    ) -> Result<(), Error> {
         match self {
             Self::Workbench => {
                 if !slots.is_empty() {
@@ -198,11 +219,16 @@ impl Block {
             }
             Self::Machine(m) => {
                 for (i, &s) in slots.iter().enumerate() {
-                    if m.slots[i].stack != s {
-                        if m.slots[i].charge != 0 {
-                            return Err(Error::UnsupportedTypedItem);
-                        }
-                        m.slots[i] = machines::Slot::new(s);
+                    if m.slots[i].to_item().map_err(|_| Error::Encoding)?.0 != s {
+                        m.slots[i] = if s.payload().is_some() {
+                            machines::Slot::from_item(
+                                s,
+                                payloads.ok_or(Error::UnsupportedTypedItem)?,
+                            )
+                            .map_err(|_| Error::Encoding)?
+                        } else {
+                            machines::Slot::new(s)
+                        };
                     }
                 }
             }
@@ -340,11 +366,11 @@ fn block(
         None
     };
     Ok(match definition.be.unwrap() {
-        BeKind::Chest => Block::Chest(if let Some(b) = bytes {
+        BeKind::Chest => Block::Chest(Box::new(if let Some(b) = bytes {
             Chest::decode(b).map_err(|_| Error::Encoding)?
         } else {
             Chest::default()
-        }),
+        })),
         BeKind::Furnace => Block::Furnace(if let Some(b) = bytes {
             Furnace::decode(b).map_err(|_| Error::Encoding)?
         } else {
@@ -404,6 +430,7 @@ pub fn plan(
         transaction: None,
         pages: Vec::with_capacity(10),
         components: Vec::with_capacity(1),
+        payloads: Vec::new(),
     };
     if matches!(
         intent,
@@ -472,7 +499,7 @@ pub fn plan(
         }
         out.after = if let Some((binding, value)) = opened {
             BoundWindow {
-                state: ui::WindowState::open(fresh_id, value.kind(), &value.stack_values())
+                state: ui::WindowState::open(fresh_id, value.kind(), &value.stack_values()?)
                     .map_err(Error::Window)?,
                 binding: Some(binding),
             }
@@ -486,7 +513,7 @@ pub fn plan(
                 access(world, context, binding.target, &mut out.pages)?;
                 guard_page(world, binding.anchor.page(), &mut out.pages);
                 let value = read_bound(world, binding)?;
-                if value.stack_values() != current.state.container() {
+                if value.stack_values()? != current.state.container() {
                     return Err(Error::Stale);
                 }
                 if let Some(id) = binding.component {
@@ -570,16 +597,37 @@ pub fn plan(
             _ => return Err(Error::Encoding),
         }
         .map_err(Error::Window)?;
-        let changed =
-            ui_plan.container_changed() || matches!(intent, WindowIntent::MachineSide { .. });
+        let owned_transfer = ui_plan.container_changed();
+        let changed = owned_transfer || matches!(intent, WindowIntent::MachineSide { .. });
         out.drops.extend_from_slice(ui_plan.drops());
         ui_plan
             .apply(&mut out.after.state, &mut out.after_inventory)
             .map_err(Error::Window)?;
+        if owned_transfer && let Some(Block::Machine(machine)) = bound.as_ref() {
+            for slot in machine
+                .slots
+                .iter()
+                .take(machines::roles(machine.kind).len())
+            {
+                if let Some(payload) = slot.to_item().map_err(|_| Error::Encoding)?.1 {
+                    let id = Some(payload.id());
+                    if std::iter::once(out.after.state.cursor())
+                        .chain(out.after.state.craft().cells().iter().copied())
+                        .chain(out.after_inventory.slots().iter().copied())
+                        .any(|stack| stack.payload() == id)
+                    {
+                        if context.payloads.is_none() {
+                            return Err(Error::UnsupportedTypedItem);
+                        }
+                        out.payloads.push(payload);
+                    }
+                }
+            }
+        }
         if changed {
             let binding = current.binding.ok_or(Error::Component)?;
             let value = bound.as_mut().ok_or(Error::Component)?;
-            value.set_slots(out.after.state.container())?;
+            value.set_slots(out.after.state.container(), context.payloads)?;
             if let Some(data) = value.data(binding.anchor) {
                 let id = binding.component.ok_or(Error::Component)?;
                 let mut tx = Transaction::new(now, binding.anchor.space);
@@ -651,7 +699,7 @@ pub fn snapshot(
         && let Some(binding) = bound.binding
     {
         let value = read_bound(world, binding)?;
-        if value.stack_values() != bound.state.container() {
+        if value.stack_values()? != bound.state.container() {
             return Err(Error::Stale);
         }
         match value {
@@ -678,6 +726,7 @@ fn stack(s: ItemStack) -> net::window::Stack {
         item: s.item(),
         count: s.count(),
         damage: s.damage(),
+        payload: s.payload().map_or(0, |id| id.0),
     }
 }
 fn mek_code(kind: MekKind) -> u8 {

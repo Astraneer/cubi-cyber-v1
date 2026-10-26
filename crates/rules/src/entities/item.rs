@@ -137,12 +137,13 @@ impl ItemEntity {
             | (u8::from(self.thrown) << 3);
         bytes[112] |= u8::from(self.merge_debt) << 4;
         bytes[113..121].copy_from_slice(&self.last_tick.0.to_le_bytes());
+        bytes[121..129].copy_from_slice(&self.stack.payload().map_or(0, |id| id.0).to_le_bytes());
         Ok(bytes)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, EntityError> {
         if bytes.len() != ITEM_BYTES
             || &bytes[..4] != b"ITM1"
-            || bytes[121..].iter().any(|&value| value != 0)
+            || bytes[129..].iter().any(|&value| value != 0)
             || bytes[112] & !31 != 0
         {
             return Err(EntityError::InvalidEncoding);
@@ -158,11 +159,18 @@ impl ItemEntity {
         {
             *value = f64::from_bits(u64::from_le_bytes(raw.try_into().expect("fixed vector")));
         }
+        let mut stack = ItemStack::from_parts(read16(16), read16(18), read16(20))
+            .map_err(|_| EntityError::InvalidEncoding)?;
+        let payload = read64(121);
+        if payload != 0 {
+            stack = stack
+                .with_payload(crate::item_payload::PayloadId(payload))
+                .map_err(|_| EntityError::InvalidEncoding)?;
+        }
         let item = Self {
             id: EntityId(read64(4)),
             space: SpaceId(read32(12)),
-            stack: ItemStack::from_parts(read16(16), read16(18), read16(20))
-                .map_err(|_| EntityError::InvalidEncoding)?,
+            stack,
             pickup_delay: read16(22),
             position: vectors[0],
             previous: vectors[1],

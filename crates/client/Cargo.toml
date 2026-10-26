@@ -29,4 +29,6 @@ pollster.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 server = { path = "../server" }
+save = { path = "../save" }
+gen-authority = { path = "../gen-authority" }
 tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }

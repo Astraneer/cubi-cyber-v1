@@ -591,6 +591,7 @@ fn guard(inventory: &rules::survival::Inventory) -> net::InventoryGuard {
         item: hand.item(),
         count: hand.count(),
         damage: hand.damage(),
+        payload: hand.payload().map_or(0, |id| id.0),
     }
 }
 #[test]
@@ -1066,6 +1067,14 @@ fn ordinary_chat_is_durable_idempotent_and_recovers_before_unpublished_ack() {
     // Process a new action and let its actual writer finish, without polling
     // the publication boundary. Reopening must recover the line and accepted
     // ActionId together, so the retry cannot acknowledge a missing message.
+    // Poll the previous neutral/player WAL at the SAME wall time. A later
+    // client action queued behind that barrier is not yet a submitted write.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while h.server.awaiting_durability() || !h.server.height_ready_for_publication() {
+        h.outputs.extend(h.server.tick(h.now));
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_micros(500));
+    }
     h.now += 1000;
     h.send(
         3,
@@ -1078,6 +1087,10 @@ fn ordinary_chat_is_durable_idempotent_and_recovers_before_unpublished_ack() {
         !h.outputs
             .iter()
             .any(|o| matches!(o.message,ServerMessage::Action(reply) if reply.id==ActionId(2)))
+    );
+    assert!(
+        h.server.awaiting_durability(),
+        "new chat action submitted to the actual WAL writer"
     );
     drop(h);
     let mut h = Harness {

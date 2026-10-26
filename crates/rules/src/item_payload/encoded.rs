@@ -1,10 +1,11 @@
 //! Small persistence values retain an allocation-free codec while exposing only
 //! their used legacy prefix plus optional reference section.
 use super::{Error, PayloadId};
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Encoded<const N: usize> {
     bytes: [u8; N],
     used: usize,
+    referenced: bool,
 }
 impl<const N: usize> Encoded<N> {
     pub fn from_prefix(prefix: &[u8]) -> Self {
@@ -14,12 +15,16 @@ impl<const N: usize> Encoded<N> {
         Self {
             bytes,
             used: prefix.len(),
+            referenced: false,
         }
     }
     pub fn append_refs(
         &mut self,
         refs: impl IntoIterator<Item = (usize, Option<PayloadId>)>,
     ) -> Result<(), Error> {
+        if self.referenced {
+            return Err(Error::Encoding);
+        }
         let mut count = 0u16;
         let mut last = None;
         let original = self.used;
@@ -54,10 +59,17 @@ impl<const N: usize> Encoded<N> {
         }
         if count > 0 {
             self.bytes[original + 4..original + 6].copy_from_slice(&count.to_le_bytes());
+            self.referenced = true;
         }
         Ok(())
     }
 }
+impl<const N: usize> PartialEq for Encoded<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+impl<const N: usize> Eq for Encoded<N> {}
 impl<const N: usize> std::ops::Deref for Encoded<N> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {

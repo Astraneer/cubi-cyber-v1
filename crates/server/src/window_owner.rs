@@ -95,11 +95,23 @@ impl Server {
         };
         let permitted = position
             .is_none_or(|p| p.space != SpaceId(0) || !self.protected([p.x, p.y, p.z], role));
+        let pending = self.payload_delta(batch)?;
+        let view = pending
+            .as_ref()
+            .map(|delta| self.runtimes.payloads.view(delta))
+            .transpose()
+            .map_err(|_| RejectReason::InvalidCell)?;
+        let resolver: &dyn rules::item_payload::Resolver = if let Some(view) = view.as_ref() {
+            view
+        } else {
+            &self.runtimes.payloads
+        };
         let context = windows::Context {
             player: &peer.player,
             space: peer.space,
             inventory: &peer.inventory,
             permitted,
+            payloads: Some(resolver),
         };
         let fresh = if matches!(
             intent,
@@ -128,6 +140,7 @@ impl Server {
         let after = plan.window_after().clone();
         let inventory = *plan.inventory_after();
         let drops = plan.drops().to_vec();
+        let payload_record = self.plan_payloads(batch, plan.take_payloads())?;
         let mut tx = plan.take_transaction();
         if !drops.is_empty() {
             let p = peer.player.pos.map(|v| v.floor() as i32);
@@ -155,6 +168,7 @@ impl Server {
                 .changes
                 .push(self.world.commit(tx).map_err(|_| RejectReason::Stale)?);
         }
+        Self::stage_payloads(batch, payload_record);
         // Values remain private/unpublished while the owner waits for this
         // same batch's durable completion; no further action can observe them.
         peer.window = after;

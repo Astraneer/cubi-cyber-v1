@@ -9,7 +9,9 @@ pub mod health;
 mod inventory;
 pub mod loot;
 
-pub use inventory::{INVENTORY_BYTES, Inventory, InventoryCraftPlan, InventoryPlan, OFFHAND};
+pub use inventory::{
+    INVENTORY_BYTES, INVENTORY_MAX_BYTES, Inventory, InventoryCraftPlan, InventoryPlan, OFFHAND,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CellChange {

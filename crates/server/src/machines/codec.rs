@@ -301,6 +301,16 @@ impl Reader<'_> {
         }
         Ok(GridSnapshot { nodes, slots })
     }
+    fn blob(&mut self, maximum: usize) -> Result<&[u8], MachineError> {
+        let n = self.count(maximum, 1)?;
+        let end = self.cursor.checked_add(n).ok_or(MachineError::Bounds)?;
+        let bytes = self
+            .bytes
+            .get(self.cursor..end)
+            .ok_or(MachineError::Encoding)?;
+        self.cursor = end;
+        Ok(bytes)
+    }
     fn finish(&self) -> Result<(), MachineError> {
         if self.cursor == self.bytes.len() {
             Ok(())
@@ -346,6 +356,25 @@ impl RuntimeSnapshot {
             for &config in &self.configs {
                 w.transmitter(config);
             }
+        }
+        if self.transport != transport::TransportSnapshot::default() {
+            let bytes = self.transport.encode(Config {
+                packets: 65536,
+                transmitters: 1_000_000,
+                ..Config::default()
+            })?;
+            w.raw(b"XPKT");
+            w.count(bytes.len());
+            w.raw(&bytes);
+        }
+        if self.topology_queue != crate::topology_queue::Snapshot::default() {
+            let bytes = self
+                .topology_queue
+                .encode()
+                .map_err(|_| MachineError::Encoding)?;
+            w.raw(b"XTPQ");
+            w.count(bytes.len());
+            w.raw(&bytes);
         }
         w.finish()
     }
@@ -403,6 +432,22 @@ impl RuntimeSnapshot {
                 configs.push(r.transmitter()?);
             }
         }
+        let transport = if r.peek(b"XPKT") {
+            r.raw::<4>()?;
+            transport::TransportSnapshot::decode(r.blob(transport::MAX_TRANSPORT_BYTES)?, config)?
+        } else {
+            transport::TransportSnapshot::default()
+        };
+        let topology_queue = if r.peek(b"XTPQ") {
+            r.raw::<4>()?;
+            crate::topology_queue::Snapshot::decode(
+                r.blob(MAX_BYTES)?,
+                topology_pending::PENDING_TOPOLOGY_CAPACITY,
+            )
+            .map_err(|_| MachineError::Encoding)?
+        } else {
+            crate::topology_queue::Snapshot::default()
+        };
         r.finish()?;
         let snapshot = Self {
             revision,
@@ -413,6 +458,8 @@ impl RuntimeSnapshot {
             network_orders,
             producers,
             configs,
+            transport,
+            topology_queue,
         };
         MachineRuntime::restore(config, &snapshot)?;
         Ok(snapshot)
@@ -427,6 +474,14 @@ impl RuntimeDelta {
             && self.networks.is_empty()
             && self.endpoints.is_empty()
             && self.configs.is_empty()
+            && self
+                .transport
+                .as_ref()
+                .is_none_or(transport::TransportDelta::is_empty)
+            && self
+                .topology_queue
+                .as_ref()
+                .is_none_or(crate::topology_queue::Delta::is_empty)
             && self.next_order_before == self.next_order_after
     }
     pub fn encode(&self) -> Result<Vec<u8>, MachineError> {
@@ -506,6 +561,18 @@ impl RuntimeDelta {
                     w.transmitter(config);
                 }
             }
+        }
+        if let Some(transport) = &self.transport {
+            let bytes = transport.encode()?;
+            w.raw(b"XPKT");
+            w.count(bytes.len());
+            w.raw(&bytes);
+        }
+        if let Some(queue) = &self.topology_queue {
+            let bytes = queue.encode().map_err(|_| MachineError::Encoding)?;
+            w.raw(b"XTPQ");
+            w.count(bytes.len());
+            w.raw(&bytes);
         }
         w.finish()
     }
@@ -625,6 +692,24 @@ impl RuntimeDelta {
                 configs.push(ConfigPatch { before, after });
             }
         }
+        let transport = if r.peek(b"XPKT") {
+            r.raw::<4>()?;
+            Some(transport::TransportDelta::decode(
+                r.blob(transport::MAX_TRANSPORT_DELTA_BYTES)?,
+                config,
+            )?)
+        } else {
+            None
+        };
+        let topology_queue = if r.peek(b"XTPQ") {
+            r.raw::<4>()?;
+            Some(
+                crate::topology_queue::Delta::decode(r.blob(MAX_BYTES)?)
+                    .map_err(|_| MachineError::Encoding)?,
+            )
+        } else {
+            None
+        };
         r.finish()?;
         Ok(Self {
             revision,
@@ -638,6 +723,8 @@ impl RuntimeDelta {
             networks,
             endpoints,
             configs,
+            transport,
+            topology_queue,
         })
     }
 }

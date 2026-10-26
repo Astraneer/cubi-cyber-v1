@@ -820,12 +820,32 @@ impl UiApp {
                     0..=40 => self.snapshot.inventory[slot as usize],
                     41..=94 => self.snapshot.container[(slot - 41) as usize],
                     100..=108 => self.snapshot.craft[(slot - 100) as usize],
+                    109 => self.snapshot.craft_result,
                     _ => return None,
                 };
                 (!stack.is_empty()).then_some(stack.item())
             }
             _ => None,
         }
+    }
+    /// Only the public presence of item state is shown, never private contents.
+    pub fn hovered_state_label(&self) -> Option<&'static str> {
+        let Some(Widget::Slot(slot)) = self.hover else {
+            return None;
+        };
+        let stack = match slot {
+            0..=40 => self.snapshot.inventory[slot as usize],
+            41..=94 => self.snapshot.container[(slot - 41) as usize],
+            100..=108 => self.snapshot.craft[(slot - 100) as usize],
+            109 => self.snapshot.craft_result,
+            _ => return None,
+        };
+        stack.payload()?;
+        Some(if stack.item() == rules::items::I_ENERGY_TABLET {
+            "Сохранённый заряд"
+        } else {
+            "Сохранённое состояние"
+        })
     }
     fn recipes(&mut self, item: ItemId, uses: bool) {
         self.recipes.clear();
@@ -1036,6 +1056,19 @@ impl UiApp {
         self.control(p, widget, rect);
         p.centered(rect, label, TEXT);
     }
+    fn stack_count(p: &mut Painter<'_>, rect: Rect, stack: ItemStack) {
+        if stack.count() > 1 {
+            let mut text = TextBuffer::default();
+            let _ = write!(text, "{}", stack.count());
+            let width = p.text_width(text.as_str());
+            p.text(
+                rect.x + rect.w - width - 1.0,
+                rect.y + rect.h - 16.0,
+                text.as_str(),
+                TEXT,
+            );
+        }
+    }
     fn slot(&mut self, p: &mut Painter<'_>, slot: u16, rect: Rect, stack: ItemStack) {
         self.hits.push(Hit {
             widget: Widget::Slot(slot),
@@ -1055,17 +1088,7 @@ impl UiApp {
                 Rect::new(rect.x + 4.0, rect.y + 4.0, 24.0, 24.0),
                 stack.item(),
             );
-            if stack.count() > 1 {
-                let mut text = TextBuffer::default();
-                let _ = write!(text, "{}", stack.count());
-                let width = p.text_width(text.as_str());
-                p.text(
-                    rect.x + rect.w - width - 1.0,
-                    rect.y + rect.h - 16.0,
-                    text.as_str(),
-                    TEXT,
-                );
-            }
+            Self::stack_count(p, rect, stack);
             if stack.damage() > 0 {
                 let max = rules::item(stack.item()).unwrap().max_damage;
                 let remaining = 1.0 - f32::from(stack.damage()) / f32::from(max.max(1));
@@ -1081,6 +1104,12 @@ impl UiApp {
                         2.0,
                     ),
                     0xff83bf5c,
+                );
+            }
+            if stack.payload().is_some() {
+                p.rect(
+                    Rect::new(rect.x + rect.w - 5.0, rect.y + 3.0, 2.0, 2.0),
+                    ACCENT,
                 );
             }
         }
@@ -1182,16 +1211,37 @@ impl UiApp {
                 ),
                 self.snapshot.cursor.item(),
             );
+            Self::stack_count(
+                &mut p,
+                Rect::new(
+                    self.pointer[0] / self.scale - 12.0,
+                    self.pointer[1] / self.scale - 12.0,
+                    24.0,
+                    24.0,
+                ),
+                self.snapshot.cursor,
+            );
         }
         if let Some(item) = self.hovered_item()
             && let Some(item) = rules::item(item)
         {
-            let width = (p.text_width(item.name) + 16.0).min(w - 16.0);
+            let detail = self.hovered_state_label();
+            let width = (p
+                .text_width(item.name)
+                .max(detail.map_or(0.0, |text| p.text_width(text)))
+                + 16.0)
+                .min(w - 16.0);
+            let height = if detail.is_some() { 44.0 } else { 26.0 };
             let x = (self.pointer[0] / self.scale).min(w - width - 8.0).max(4.0);
-            let y = (self.pointer[1] / self.scale + 24.0).min(h - 30.0).max(4.0);
-            p.rect(Rect::new(x, y, width, 26.0), 0xf0181b23);
-            p.border(Rect::new(x, y, width, 26.0), 0xff6c7288);
+            let y = (self.pointer[1] / self.scale + 24.0)
+                .min(h - height - 4.0)
+                .max(4.0);
+            p.rect(Rect::new(x, y, width, height), 0xf0181b23);
+            p.border(Rect::new(x, y, width, height), 0xff6c7288);
             p.text(x + 8.0, y + 3.0, item.name, TEXT);
+            if let Some(detail) = detail {
+                p.text(x + 8.0, y + 21.0, detail, ACCENT);
+            }
         }
         self.painted = Some(stamp);
         true
@@ -1550,6 +1600,11 @@ impl UiApp {
                 p.item(
                     Rect::new(x + 267.0, y + 71.0, 24.0, 24.0),
                     self.snapshot.craft_result.item(),
+                );
+                Self::stack_count(
+                    p,
+                    Rect::new(x + 259.0, y + 64.0, 38.0, 38.0),
+                    self.snapshot.craft_result,
                 );
             }
         }

@@ -19,6 +19,7 @@ gen-authority = { path = "../gen-authority" }
 jobs = { path = "../jobs" }
 blake3 = { version = "=1.8.2", default-features = false, features = ["std", "pure"] }
 getrandom = "=0.3.4"
+libm = "=0.2.16"
 tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
 
 [lints]

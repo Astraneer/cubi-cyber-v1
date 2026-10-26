@@ -146,6 +146,7 @@ struct Entry {
 /// at most 4096 centers + six adjacent cells per center, and never scans a world.
 pub struct GiSourceBuilder {
     albedo: GiAlbedo,
+    sky_ambient: [f32; 3],
     scratch: Box<[GiVoxel; 4096]>,
     updates: Vec<CellUpdate>,
     entries: BTreeMap<PageId, Entry>,
@@ -159,6 +160,7 @@ impl GiSourceBuilder {
         }
         Ok(Self {
             albedo,
+            sky_ambient: [0.15; 3],
             scratch: Box::new([GiVoxel::UNKNOWN; 4096]),
             updates: Vec::with_capacity(4096),
             entries: BTreeMap::new(),
@@ -168,6 +170,21 @@ impl GiSourceBuilder {
     }
     pub fn forget(&mut self, page: PageId) {
         self.entries.remove(&page);
+    }
+    /// Explicit source model. A physical atmosphere profile uses RGB-only
+    /// bounce until dynamic directional sky transport is supplied separately.
+    pub fn set_sky_ambient(&mut self, rgb: [f32; 3]) -> Result<(), GiSourceError> {
+        if rgb
+            .iter()
+            .any(|v| !v.is_finite() || !(0.0..=8.0).contains(v))
+        {
+            return Err(GiSourceError::InvalidMaterial);
+        }
+        if self.sky_ambient != rgb {
+            self.sky_ambient = rgb;
+            self.entries.clear();
+        }
+        Ok(())
     }
     pub fn invalidate_materials(&mut self, albedo: GiAlbedo) {
         self.albedo = albedo;
@@ -185,8 +202,26 @@ impl GiSourceBuilder {
         if change.space != core_types::SpaceId(0) {
             return;
         }
-        for entry in self.entries.values_mut() {
-            for changed in &change.pages {
+        for changed in &change.pages {
+            self.mark_page_change(changed);
+        }
+        for changed in &change.cells {
+            self.mark_cell_change(changed);
+        }
+        for changed in &change.lights {
+            self.mark_light_change(changed);
+        }
+    }
+    /// Narrow row methods let an owner bound journal ingestion per frame.
+    pub fn mark_page_change(&mut self, changed: &world::PageChange) {
+        if changed.page.space != core_types::SpaceId(0) {
+            return;
+        }
+        let Ok(sources) = input_pages(changed.page) else {
+            return;
+        };
+        for page in sources {
+            if let Some(entry) = self.entries.get_mut(&page) {
                 for (index, input) in entry.inputs.iter().enumerate() {
                     if input.page == changed.page {
                         if entry.versions[index] != changed.before
@@ -200,14 +235,28 @@ impl GiSourceBuilder {
                 }
             }
         }
-        for changed in &change.cells {
+    }
+    pub fn mark_cell_change(&mut self, changed: &world::CellChange) {
+        self.mark_owners(changed.page, changed.index);
+    }
+    pub fn mark_light_change(&mut self, changed: &world::LightChange) {
+        if changed.old.rgb != changed.new.rgb || changed.old.sky != changed.new.sky {
             self.mark_owners(changed.page, changed.index);
         }
-        for changed in &change.lights {
-            if changed.old.rgb != changed.new.rgb || changed.old.sky != changed.new.sky {
-                self.mark_owners(changed.page, changed.index);
-            }
-        }
+    }
+    pub fn invalidate_sources(&mut self) {
+        self.entries.clear();
+    }
+    pub fn retain_aoi(&mut self, origin: [i32; 3], counts: [u32; 3]) {
+        self.entries.retain(|page, _| {
+            [page.x, page.y, page.z]
+                .into_iter()
+                .enumerate()
+                .all(|(axis, value)| {
+                    (0..i64::from(counts[axis]))
+                        .contains(&(i64::from(value) - i64::from(origin[axis])))
+                })
+        });
     }
     fn mark_owners(&mut self, page: PageId, index: LocalIdx) {
         let Ok(center) = position_of(page, index) else {
@@ -475,8 +524,8 @@ impl GiSourceBuilder {
             visible += 1;
             work.reflected_faces += 1;
             for channel in 0..3 {
-                radiance[channel] +=
-                    albedo[channel] * (factor(light.rgb[channel]) + 0.15 * factor(light.sky));
+                radiance[channel] += albedo[channel]
+                    * (factor(light.rgb[channel]) + self.sky_ambient[channel] * factor(light.sky));
             }
         }
         if visible > 0 {
@@ -513,8 +562,10 @@ fn position_of(page: PageId, index: LocalIdx) -> Result<BlockPos, GiSourceError>
 fn factor(level: u8) -> f32 {
     if level == 0 {
         0.
+    } else if level > 15 {
+        f32::from(level) / 15.
     } else {
-        libm::powf(0.8, 15. - f32::from(level.min(15)))
+        libm::powf(0.8, 15. - f32::from(level))
     }
 }
 fn input_pages(page: PageId) -> Result<[PageId; 7], GiSourceError> {
@@ -592,6 +643,36 @@ mod tests {
             );
         }
         world.commit(tx).unwrap();
+    }
+    #[test]
+    fn legal_rgb8_hdr_and_maximum_sky_ambient_fit_the_reflection_cache() {
+        let mut world = source_world();
+        let mut builder = GiSourceBuilder::new(white_albedo(), 4).unwrap();
+        builder.set_sky_ambient([8.; 3]).unwrap();
+        light_neighbors(
+            &mut world,
+            LightSample {
+                sky: 15,
+                block: 15,
+                rgb: [231, 17, 255],
+            },
+            2,
+        );
+        builder
+            .bake(&world, position().page(), &[u16::MAX; 256])
+            .unwrap();
+        let reflected = builder.scratch[usize::from(position().local_index().get())].reflected();
+        let expected = [231. / 15. + 8., 17. / 15. + 8., 255. / 15. + 8.];
+        for c in 0..3 {
+            assert!(
+                (reflected[c] - expected[c]).abs() <= render::gi::MAX_REFLECTED_RADIANCE / 2046.,
+                "HDR source {reflected:?} != {expected:?}"
+            );
+        }
+        assert!(
+            reflected[0] > 23. && reflected[2] > 24.9,
+            "legal HDR must not saturate at old8-unit limit"
+        );
     }
     #[test]
     fn source_uses_linear_masked_albedo_and_excludes_unknown_scalar_and_emitters() {

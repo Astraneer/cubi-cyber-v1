@@ -292,6 +292,8 @@ fn ten_thousand_actual_world_machine_components_add_zero_idle_work_or_allocation
             network_orders: Vec::new(),
             producers: Vec::new(),
             configs: Vec::new(),
+            transport: transport::TransportSnapshot::default(),
+            topology_queue: server::topology_queue::Snapshot::default(),
         },
     )
     .unwrap();
@@ -721,4 +723,46 @@ fn topology_guard_rejects_missing_metadata_duplicate_creation_order_and_late_tam
     assert!(runtime.acknowledge(invalid).is_err());
     assert_eq!(runtime.snapshot(), before);
     commit(&mut world, &mut runtime, plan);
+}
+#[test]
+fn same_batch_immutable_charge_is_resolved_and_normalized_before_machine_energy_tick() {
+    let mut world = scene();
+    let payload = rules::item_payload::Payload::charge(180_000).unwrap();
+    let typed = ItemStack::new(I_ENERGY_TABLET, 1)
+        .unwrap()
+        .with_payload(payload.id())
+        .unwrap();
+    let mut source = Machine::new(MekKind::Smelter);
+    source.eject = true;
+    source.sides = [rules::machines::sides::SideMode::Output; 6];
+    source.slots[1] = Slot::new(typed);
+    add(&mut world, 1, position(4, 4, 4), ENERGIZED_SMELTER, source);
+    let mut cube = Machine::new(MekKind::Cube);
+    cube.sides = [rules::machines::sides::SideMode::Both; 6];
+    add(&mut world, 2, position(5, 4, 4), ENERGY_CUBE, cube);
+    let mut runtime = MachineRuntime::new(Config::default()).unwrap();
+    for id in [ComponentId(1), ComponentId(2)] {
+        runtime
+            .acknowledge(runtime.plan_register(&world, id, Tick(1)).unwrap())
+            .unwrap();
+    }
+    let ledger = rules::item_payload::Ledger::new(rules::item_payload::Config::default()).unwrap();
+    let delta = ledger
+        .extend(ledger.plan().unwrap(), [payload], [])
+        .unwrap();
+    let view = ledger.view(&delta).unwrap();
+    let plan = runtime
+        .plan_tick_with_payloads(&world, &view, Tick(1), Budget::default())
+        .unwrap();
+    commit(&mut world, &mut runtime, plan);
+    assert!(
+        read_machine(&world, ComponentId(1)).unwrap().slots[1]
+            .stack
+            .is_empty()
+    );
+    let cube = read_machine(&world, ComponentId(2)).unwrap();
+    assert_eq!(cube.energy + u64::from(cube.slots[0].charge), 180_000);
+    assert!(cube.energy > 0);
+    assert!(cube.slots[0].stack.payload().is_none());
+    assert_eq!(cube.slots[0].stack.damage(), 0);
 }

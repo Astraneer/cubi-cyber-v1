@@ -490,6 +490,83 @@ pub(crate) fn tree_density(c: &Column) -> f32 {
 pub(crate) const TREE_REACH: i32 = 6;
 pub(crate) const TREE_MAX: f32 = 0.72;
 
+/// Shared canonical terrain baseline material, before vegetation/structures.
+#[inline]
+pub(crate) fn base_materials(c: &Column, low: i32) -> (BlockId, BlockId, i32) {
+    let h = c.h;
+    let drop = h - low;
+    let (top, fill, depth) = match c.biome {
+        Biome::Ocean => (
+            if SEA - h > 9 {
+                GRAVEL
+            } else if c.det > 0.35 {
+                CLAY
+            } else {
+                SAND
+            },
+            SAND,
+            3,
+        ),
+        Biome::River => (
+            if c.det > 0.2 {
+                GRAVEL
+            } else if c.det < -0.35 {
+                CLAY
+            } else {
+                SAND
+            },
+            SAND,
+            2,
+        ),
+        Biome::Beach if c.var == Var::Stony => {
+            (if c.det > 0.15 { GRAVEL } else { STONE }, STONE, 1)
+        }
+        Biome::Beach => (SAND, SAND, 4),
+        Biome::Desert => (if drop >= 3 { SANDSTONE } else { SAND }, SANDSTONE, 5),
+        Biome::Peaks => (if drop >= 5 { STONE } else { SNOW }, STONE, 2),
+        Biome::Mountain => {
+            if drop >= 3 {
+                (STONE, STONE, 0)
+            } else if c.det > 0.35 {
+                (GRAVEL, STONE, 1)
+            } else {
+                (GRASS, DIRT, 2)
+            }
+        }
+        Biome::Savanna | Biome::Taiga => (GRASS, DIRT, 3),
+        Biome::Snowy => (SNOWY_GRASS, DIRT, 3),
+        _ => (GRASS, DIRT, 3),
+    };
+    let t = grass_tint(c);
+    let mut top = top;
+    if top == GRASS {
+        if h <= SEA + 1 && low <= SEA && c.det > -0.15 && c.swamp < 0.5 {
+            top = SAND;
+        } else {
+            top = if drop == 1 {
+                GRASS_FULL
+            } else {
+                GRASS_EDGE + fringe_variant(t) as BlockId
+            };
+        }
+    }
+    (top, fill, depth)
+}
+#[inline]
+pub(crate) fn base_top(c: &Column, top: BlockId) -> BlockId {
+    if c.h <= SEA && (is_grass(top) || top == SNOWY_GRASS) {
+        if c.swamp >= 0.5 {
+            if c.det > 0.3 { CLAY } else { DIRT }
+        } else if c.det > 0.0 {
+            SAND
+        } else {
+            DIRT
+        }
+    } else {
+        top
+    }
+}
+
 pub(crate) fn base(generator: &Gen, cx: i32, cz: i32) -> (Region, Vec<Column>) {
     let x0 = cx * CS - PAD;
     let z0 = cz * CS - PAD;
@@ -521,78 +598,15 @@ pub(crate) fn base(generator: &Gen, cx: i32, cz: i32) -> (Region, Vec<Column>) {
             .iter()
             .fold(h, |a, &b| a.min(b));
             let drop = h - low;
-            let (top, fill, depth) = match c.biome {
-                Biome::Ocean => (
-                    if SEA - h > 9 {
-                        GRAVEL
-                    } else if c.det > 0.35 {
-                        CLAY
-                    } else {
-                        SAND
-                    },
-                    SAND,
-                    3,
-                ),
-                Biome::River => (
-                    if c.det > 0.2 {
-                        GRAVEL
-                    } else if c.det < -0.35 {
-                        CLAY
-                    } else {
-                        SAND
-                    },
-                    SAND,
-                    2,
-                ),
-                Biome::Beach if c.var == Var::Stony => {
-                    (if c.det > 0.15 { GRAVEL } else { STONE }, STONE, 1)
-                }
-                Biome::Beach => (SAND, SAND, 4),
-                Biome::Desert => (if drop >= 3 { SANDSTONE } else { SAND }, SANDSTONE, 5),
-                Biome::Peaks => (if drop >= 5 { STONE } else { SNOW }, STONE, 2),
-                Biome::Mountain => {
-                    if drop >= 3 {
-                        (STONE, STONE, 0)
-                    } else if c.det > 0.35 {
-                        (GRAVEL, STONE, 1)
-                    } else {
-                        (GRASS, DIRT, 2)
-                    }
-                }
-                Biome::Savanna | Biome::Taiga => (GRASS, DIRT, 3),
-                Biome::Snowy => (SNOWY_GRASS, DIRT, 3),
-                _ => (GRASS, DIRT, 3),
-            };
+            let (top, fill, depth) = base_materials(c, low);
             let t = grass_tint(c);
             reg.tint[(lz * W + lx) as usize] = rgb565(t);
-            let mut top = top;
-            if top == GRASS {
-                if h <= SEA + 1 && low <= SEA && c.det > -0.15 && c.swamp < 0.5 {
-                    top = SAND;
-                } else {
-                    top = if drop == 1 {
-                        GRASS_FULL
-                    } else {
-                        GRASS_EDGE + fringe_variant(t) as BlockId
-                    };
-                }
-            }
             let base = Region::idx(lx, 0, lz);
             reg.blocks[base] = BEDROCK as u8;
             for y in 1..=h {
                 let d = h - y;
                 let b = if d == 0 {
-                    if y <= SEA && (is_grass(top) || top == SNOWY_GRASS) {
-                        if c.swamp >= 0.5 {
-                            if c.det > 0.3 { CLAY } else { DIRT }
-                        } else if c.det > 0.0 {
-                            SAND
-                        } else {
-                            DIRT
-                        }
-                    } else {
-                        top
-                    }
+                    base_top(c, top)
                 } else if d <= depth {
                     if drop >= 4 && y > low {
                         STONE

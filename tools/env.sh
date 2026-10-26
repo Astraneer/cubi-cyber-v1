@@ -9,6 +9,9 @@ export XDG_CONFIG_HOME="$_cubi_root/.local/config"
 export XDG_RUNTIME_DIR="$_cubi_root/.local/run"
 export TMPDIR="$_cubi_root/.local/tmp"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
+# Cloud disks are bounded; source checkpoints replace multi-gigabyte incremental
+# histories. Callers may explicitly opt in on a larger development machine.
+export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export PATH="$CARGO_HOME/bin:$_cubi_root/.local/bin:$PATH"
 if [[ -f "$_cubi_root/.local/audio-deps/usr/lib/x86_64-linux-gnu/pkgconfig/alsa.pc" ]]; then
   export PKG_CONFIG_PATH="$_cubi_root/.local/audio-deps/usr/lib/x86_64-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"

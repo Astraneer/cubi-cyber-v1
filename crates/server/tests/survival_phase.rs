@@ -593,3 +593,40 @@ fn two_with_replacement_farm_samples_tick_same_crop_twice_and_survive_codec() {
     assert!(survival::farm_sample_token(Tick(1u64 << 44), 0).is_err());
     assert!(survival::farm_sample_token(Tick(1), 4096).is_err());
 }
+#[test]
+fn typed_drop_bundle_keeps_owned_payload_reference_and_replay_guard() {
+    let mut world = scene();
+    let anchor = pos(2, 2, 2);
+    let payload = rules::item_payload::Payload::charge(200_000).unwrap();
+    let typed = rules::stack::ItemStack::new(rules::items::I_ENERGY_TABLET, 1)
+        .unwrap()
+        .with_payload(payload.id())
+        .unwrap();
+    let plan =
+        survival::plan_drops(&world, anchor, [9; 16], 701, Tick(10), &[typed], 10, None).unwrap();
+    let id = plan.id;
+    assert_eq!(&plan.data.payload[64..70], b"XRF1\x01\x00");
+    let mut tx = Transaction::new(Tick(10), SpaceId(0));
+    plan.append_to(&mut tx);
+    world.commit(tx).unwrap();
+    let data = &world.component(id).unwrap().data.payload;
+    let bundle = DropBundle::decode(data).unwrap();
+    assert_eq!(bundle.entries[0].stack, typed);
+    assert_eq!(bundle.encode().unwrap(), *data);
+    assert!(
+        survival::plan_drops(
+            &world,
+            anchor,
+            [9; 16],
+            701,
+            Tick(11),
+            &[typed.without_payload()],
+            10,
+            None
+        )
+        .is_err()
+    );
+    let replay =
+        survival::plan_drops(&world, anchor, [9; 16], 701, Tick(99), &[typed], 10, None).unwrap();
+    assert_eq!(replay.data.payload, *data);
+}

@@ -70,6 +70,16 @@ impl Payload {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+    pub fn references(&self) -> Result<[Option<(PayloadId, ItemId)>; 5], Error> {
+        let mut refs = [None; 5];
+        if self.bytes[0] == 1 {
+            let machine = self.resolve_machine(self.item())?;
+            for (out, slot) in refs.iter_mut().zip(machine.slots) {
+                *out = slot.stack.payload().map(|id| (id, slot.stack.item()));
+            }
+        }
+        Ok(refs)
+    }
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() < 3 || bytes.len() > MAX_RECORD_BYTES {
             return Err(Error::Bounds);
@@ -119,6 +129,9 @@ impl Payload {
                 if joules == 0 || joules > TABLET_CAPACITY || !joules.is_multiple_of(20) {
                     return Err(Error::Item);
                 }
+            }
+            3 => {
+                self.configurator_mode()?;
             }
             _ => return Err(Error::Encoding),
         }
@@ -252,6 +265,11 @@ impl Ledger {
             }
             ledger.records.insert(record.id, record.payload.clone());
         }
+        for payload in ledger.records.values() {
+            for (id, item) in payload.references()?.into_iter().flatten() {
+                ledger.resolve(id, item)?;
+            }
+        }
         ledger.revision = snapshot.revision;
         Ok(ledger)
     }
@@ -352,6 +370,24 @@ impl Ledger {
         if count > self.config.records || bytes > self.config.bytes {
             return Err(Error::Bounds);
         }
+        for record in &delta.insertions {
+            for (id, item) in record.payload.references()?.into_iter().flatten() {
+                let payload = delta
+                    .insertions
+                    .binary_search_by_key(&id, |r| r.id)
+                    .ok()
+                    .map(|i| &delta.insertions[i].payload)
+                    .or_else(|| {
+                        (!delta.removals.iter().any(|r| r.id == id))
+                            .then(|| self.get(id))
+                            .flatten()
+                    })
+                    .ok_or(Error::Missing)?;
+                if payload.item() != item {
+                    return Err(Error::Item);
+                }
+            }
+        }
         if delta.insertions.windows(2).any(|r| r[0].id >= r[1].id)
             || delta.removals.windows(2).any(|r| r[0].id >= r[1].id)
         {
@@ -387,3 +423,11 @@ mod encoded;
 #[path = "item_payload/refs.rs"]
 pub mod refs;
 pub use encoded::Encoded;
+#[path = "item_payload/machine_slot.rs"]
+mod machine_slot;
+#[path = "item_payload/view.rs"]
+mod view;
+pub use view::{Resolver, View};
+#[path = "item_payload/configurator.rs"]
+mod configurator;
+pub use configurator::{ConfiguratorMode, cycle_configurator, resolve_configurator};

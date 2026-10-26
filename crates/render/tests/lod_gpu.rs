@@ -500,3 +500,103 @@ fn h4_fifty_buildings_three_transitions_six_sides_preserve_gpu_openings() {
         );
     });
 }
+
+#[test]
+fn optional_atmosphere_lighting_tracks_day_and_dark_night_without_recompilation() {
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let mut terrain = terrain(&gpu);
+    let mut budget = UploadBudget::new(1_000_000);
+    let mut atmosphere = render::atmosphere::AtmosphereGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        render::atmosphere::AtmosphereConfig {
+            transmittance_size: [32, 8],
+            sky_size: [16, 8],
+            transmittance_steps: 32,
+            sky_steps: 16,
+        },
+        render::atmosphere::AtmosphereState {
+            sun_direction: [0., -1., 0.],
+            altitude_km: 0.072,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    atmosphere
+        .encode_update(&mut encoder, &mut 1_000_000)
+        .unwrap();
+    gpu.queue.submit([encoder.finish()]);
+    let mut consumer = LodProxyGpu::new_with_atmosphere(
+        &gpu.device,
+        &gpu.queue,
+        terrain.geometry(),
+        ProxyConfig {
+            max_objects: 4,
+            max_payload_words: 65536,
+            atlas_layers: 186,
+            instrument: true,
+        },
+        None,
+        &atmosphere,
+    )
+    .unwrap();
+    let mut source = PublicPage::filled(PublicVoxel::Air);
+    for y in 2..14 {
+        for x in 2..14 {
+            source.set([x, y, 8], PublicVoxel::solid(3, u32::MAX));
+        }
+    }
+    let payload = ProxyPayload::from_public(&proxy(&source), 186).unwrap();
+    consumer
+        .upload(
+            &gpu.queue,
+            None,
+            1,
+            translation([0.; 3]),
+            [0., 0., 0., 1.],
+            &payload,
+            &mut budget,
+        )
+        .unwrap();
+    consumer.take_work();
+    let dark = frame(&gpu, &mut terrain, Some(&mut consumer), camera()).0;
+    let dark_pixels = dark
+        .chunks_exact(4)
+        .filter(|p| p[3] == 255 && p[..3] == [0, 0, 0])
+        .count();
+    assert!(
+        dark_pixels > 50,
+        "night receiver must be dark: {dark_pixels}"
+    );
+    atmosphere
+        .set_state(
+            &gpu.queue,
+            render::atmosphere::AtmosphereState::default(),
+            &mut budget,
+        )
+        .unwrap();
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    atmosphere
+        .encode_update(&mut encoder, &mut 1_000_000)
+        .unwrap();
+    gpu.queue.submit([encoder.finish()]);
+    let day = frame(&gpu, &mut terrain, Some(&mut consumer), camera()).0;
+    let lit_pixels = day
+        .chunks_exact(4)
+        .zip(dark.chunks_exact(4))
+        .filter(|(a, b)| b[3] == 255 && b[..3] == [0, 0, 0] && a[..3].iter().any(|v| *v > 3))
+        .count();
+    assert!(
+        lit_pixels > 50,
+        "day receivers must react to shared atmosphere: {lit_pixels}"
+    );
+    assert_eq!(
+        consumer.take_work().pipeline_compilations,
+        0,
+        "day change must reuse pipelines"
+    );
+    println!(
+        "M10_lod_gpu_ATMOSPHERE_GPU_OK consumer=lod_gpu night_black={dark_pixels} day_lit={lit_pixels} runtime_pipeline_compilations=0"
+    );
+}

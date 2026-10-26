@@ -1,9 +1,15 @@
-//! Physical transmittance and bounded single-scattering LUT foundation for M10.
-//! No asset source or donor renderer code is used. Multiple scattering, the sky
-//! draw, clouds and water integration are separate work; this is not full M10.
+//! Shared transmittance, sky, irradiance and optional Hillaire2020 multiple
+//! scattering LUTs for M10. All shaders are independently implemented.
 
+use crate::multiple_scattering::{
+    MultipleScatteringConfig, MultipleScatteringError, MultipleScatteringGpu,
+    MultipleScatteringWork,
+};
 use crate::terrain_gpu::UploadBudget;
 use bytemuck::{Pod, Zeroable};
+
+pub const SOLAR_IRRADIANCE: f32 = 20.0;
+pub const ILLUMINATION_RAYS: u64 = 16;
 
 #[derive(Clone, Copy, Debug)]
 pub struct AtmosphereConfig {
@@ -43,6 +49,8 @@ pub enum AtmosphereError {
     InvalidState,
     UploadBudget,
     WorkBudget,
+    LatePreparation,
+    MultipleScattering(MultipleScatteringError),
 }
 impl std::fmt::Display for AtmosphereError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -88,7 +96,7 @@ impl Parameters {
         Ok(Self {
             radii: [6360.0, 6460.0, 8.0, 1.2],
             rayleigh: [0.005802, 0.013558, 0.0331, 0.0],
-            mie: [0.003996, 0.000444, 0.8, 20.0],
+            mie: [0.003996, 0.000444, 0.8, SOLAR_IRRADIANCE],
             ozone: [0.000650, 0.001881, 0.000085, 25.0],
             sun_eye: [
                 state.sun_direction[0] / length,
@@ -104,6 +112,8 @@ impl Parameters {
 pub struct AtmosphereGpu {
     config: AtmosphereConfig,
     state: AtmosphereState,
+    solar_scale: f32,
+    lighting: wgpu::Buffer,
     parameters: wgpu::Buffer,
     transmittance: wgpu::Texture,
     sky: wgpu::Texture,
@@ -116,6 +126,38 @@ pub struct AtmosphereGpu {
     transmittance_dirty: bool,
     sky_dirty: bool,
     timer: crate::gpu_time::GpuPassTimer<2>,
+    multiple: Option<MultipleScatteringGpu>,
+    multiple_encoded: bool,
+    encoded: bool,
+}
+
+/// One radiometric contract for prepared terrain, model and horizon variants.
+pub(crate) fn surface_shader(
+    source: &str,
+    shadows: bool,
+    atmosphere: bool,
+    packed_light: bool,
+    legacy_illumination: &str,
+) -> String {
+    let shadow = if shadows {
+        include_str!("shadow_sampling.wgsl")
+    } else {
+        "fn cascade_shadow(p:vec3<f32>,n:vec3<f32>)->f32{return 1.;}"
+    };
+    let source = source.replace("// SHADOWS", shadow);
+    if !atmosphere {
+        return source.replace("// ILLUMINATION", legacy_illumination);
+    }
+    let illumination = if packed_light {
+        "return light.rgb+light.a*(atmosphere_diffuse(normal)+atmosphere_light.sun.rgb*(cascade_shadow(world,normal)*max(dot(normal,atmosphere_light.direction.xyz),0.)/3.141592654));"
+    } else {
+        "return atmosphere_diffuse(normal)+atmosphere_light.sun.rgb*(cascade_shadow(world,normal)*max(dot(normal,atmosphere_light.direction.xyz),0.)/3.141592654);"
+    };
+    format!(
+        "{}\n{}",
+        include_str!("atmosphere_lighting.wgsl"),
+        source.replace("// ILLUMINATION", illumination)
+    )
 }
 
 impl AtmosphereGpu {
@@ -148,6 +190,12 @@ impl AtmosphereGpu {
         });
         queue.write_buffer(&parameters, 0, bytemuck::bytes_of(&data));
         budget.remaining_bytes -= std::mem::size_of::<Parameters>() as u64;
+        let lighting = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shared atmosphere irradiance SH and direct sunlight"),
+            size: 80,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
         let texture = |label, size: [u32; 2]| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -207,7 +255,21 @@ impl AtmosphereGpu {
             });
         let sky_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("atmosphere sky graph"),
-            entries: &[uniform, input, storage(3)],
+            entries: &[
+                uniform,
+                input,
+                storage(3),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
         let transmittance_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("atmosphere transmittance output"),
@@ -239,6 +301,10 @@ impl AtmosphereGpu {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&sky_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: lighting.as_entire_binding(),
+                },
             ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -263,6 +329,8 @@ impl AtmosphereGpu {
         Ok(Self {
             config,
             state,
+            solar_scale: 1.0,
+            lighting,
             parameters,
             transmittance,
             sky,
@@ -275,47 +343,241 @@ impl AtmosphereGpu {
             transmittance_dirty: true,
             sky_dirty: true,
             timer: crate::gpu_time::GpuPassTimer::new(device, queue, "atmosphere LUT pass timings"),
+            multiple: None,
+            multiple_encoded: false,
+            encoded: false,
         })
     }
 
+    /// Prepare the paper's normalized infinite-order LUT before any frame.
+    /// Sky and diffuse surface SH then use the same additional scattering.
+    pub fn prepare_multiple_scattering(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: MultipleScatteringConfig,
+        budget: &mut UploadBudget,
+    ) -> Result<MultipleScatteringWork, AtmosphereError> {
+        if self.encoded || self.multiple.is_some() {
+            return Err(AtmosphereError::LatePreparation);
+        }
+        let mut multiple = MultipleScatteringGpu::new(
+            device,
+            queue,
+            &self.parameters,
+            &self.transmittance_view,
+            config,
+            budget,
+        )
+        .map_err(AtmosphereError::MultipleScattering)?;
+        let c = wgpu::ShaderStages::COMPUTE;
+        let texture = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: c,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("multiple scattering to sky and SH"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: c,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                texture(2),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: c,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: c,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                texture(5),
+            ],
+        });
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shared multiple scattering sky input"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.parameters.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.transmittance_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.sky_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.lighting.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(multiple.view()),
+                },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shared single and multiple scattering sky"),
+            source: wgpu::ShaderSource::Wgsl(
+                crate::multiple_scattering::shader_source(include_str!("atmosphere.wgsl"), true)
+                    .into(),
+            ),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("prepared multi-scattered sky"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        self.sky_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("build multi-scattered sky"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("build_sky"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        self.sky_bind = bind;
+        let mut work = multiple.take_startup_work();
+        work.pipeline_compilations += 1;
+        self.multiple = Some(multiple);
+        self.sky_dirty = true;
+        Ok(work)
+    }
+    pub fn multiple_scattering_view(&self) -> Option<&wgpu::TextureView> {
+        self.multiple.as_ref().map(MultipleScatteringGpu::view)
+    }
+    pub fn multiple_scattering_timing(
+        &self,
+    ) -> Option<(&wgpu::Buffer, f32, crate::gpu_time::PassGraph<1>)> {
+        self.multiple
+            .as_ref()
+            .filter(|_| self.multiple_encoded)
+            .and_then(|multiple| {
+                multiple
+                    .timestamp_buffer()
+                    .map(|(buffer, period)| (buffer, period, multiple.frame_graph()))
+            })
+    }
     pub fn set_state(
         &mut self,
         queue: &wgpu::Queue,
         state: AtmosphereState,
         budget: &mut UploadBudget,
     ) -> Result<(), AtmosphereError> {
-        let data = Parameters::new(self.config, state)?;
-        if state == self.state {
+        self.set_state_and_solar(queue, state, self.solar_scale, budget)
+    }
+    pub fn set_state_and_solar(
+        &mut self,
+        queue: &wgpu::Queue,
+        state: AtmosphereState,
+        scale: f32,
+        budget: &mut UploadBudget,
+    ) -> Result<(), AtmosphereError> {
+        let mut data = Parameters::new(self.config, state)?;
+        if !scale.is_finite() || !(0.0..=100.0).contains(&scale) {
+            return Err(AtmosphereError::InvalidState);
+        }
+        if state == self.state && scale == self.solar_scale {
             return Ok(());
         }
-        let bytes = std::mem::size_of::<Parameters>() as u64;
-        if budget.remaining_bytes < bytes {
+        if budget.remaining_bytes < 96 {
             return Err(AtmosphereError::UploadBudget);
         }
+        data.mie[3] *= scale;
         queue.write_buffer(&self.parameters, 0, bytemuck::bytes_of(&data));
-        budget.remaining_bytes -= bytes;
+        budget.remaining_bytes -= 96;
         self.state = state;
+        self.solar_scale = scale;
         self.sky_dirty = true;
         Ok(())
     }
-
+    pub fn pending_work_for(
+        &self,
+        state: AtmosphereState,
+        scale: f32,
+    ) -> Result<AtmosphereWork, AtmosphereError> {
+        Parameters::new(self.config, state)?;
+        if !scale.is_finite() || !(0.0..=100.0).contains(&scale) {
+            return Err(AtmosphereError::InvalidState);
+        }
+        Ok(self.work(self.sky_dirty || state != self.state || scale != self.solar_scale))
+    }
+    pub fn lighting_buffer(&self) -> &wgpu::Buffer {
+        &self.lighting
+    }
+    /// Shared physical coefficients for bounded aerial-perspective integration.
+    pub fn optical_parameters(&self) -> &wgpu::Buffer {
+        &self.parameters
+    }
     pub fn pending_work(&self) -> AtmosphereWork {
+        self.work(self.sky_dirty)
+    }
+    fn work(&self, sky_dirty: bool) -> AtmosphereWork {
         let pixels = |size: [u32; 2]| u64::from(size[0]) * u64::from(size[1]);
         let trans = if self.transmittance_dirty {
             pixels(self.config.transmittance_size)
         } else {
             0
         };
-        let sky = if self.sky_dirty {
+        let multiple = self
+            .multiple
+            .as_ref()
+            .map_or_else(MultipleScatteringWork::default, |multiple| {
+                multiple.pending_work(0)
+            });
+        let multiple_pixels = self
+            .multiple
+            .as_ref()
+            .filter(|_| multiple.passes > 0)
+            .map_or(0, |multiple| {
+                let size = multiple.size();
+                u64::from(size[0]) * u64::from(size[1])
+            });
+        let sky = if sky_dirty {
             pixels(self.config.sky_size)
         } else {
             0
         };
         AtmosphereWork {
-            lut_pixels: trans + sky,
-            integration_steps: trans * u64::from(self.config.transmittance_steps)
-                + sky * u64::from(self.config.sky_steps),
-            passes: u32::from(self.transmittance_dirty) + u32::from(self.sky_dirty),
+            lut_pixels: trans + sky + multiple_pixels,
+            integration_steps: multiple.integration_steps
+                + trans * u64::from(self.config.transmittance_steps)
+                + (sky + if sky_dirty { ILLUMINATION_RAYS } else { 0 })
+                    * u64::from(self.config.sky_steps)
+                + if sky_dirty {
+                    u64::from(self.config.transmittance_steps)
+                } else {
+                    0
+                },
+            passes: u32::from(self.transmittance_dirty) + u32::from(sky_dirty) + multiple.passes,
         }
     }
 
@@ -323,6 +585,9 @@ impl AtmosphereGpu {
     pub fn invalidate(&mut self) {
         self.transmittance_dirty = true;
         self.sky_dirty = true;
+        if let Some(multiple) = &mut self.multiple {
+            multiple.invalidate();
+        }
     }
 
     /// Refuse the whole update before encoding when its logical integration budget is exhausted.
@@ -332,6 +597,7 @@ impl AtmosphereGpu {
         remaining_steps: &mut u64,
     ) -> Result<AtmosphereWork, AtmosphereError> {
         self.timer.begin();
+        self.multiple_encoded = false;
         let work = self.pending_work();
         if work.integration_steps > *remaining_steps {
             return Err(AtmosphereError::WorkBudget);
@@ -352,6 +618,14 @@ impl AtmosphereGpu {
                 self.config.sky_size,
             ),
         ] {
+            if kind == 2
+                && let Some(multiple) = &mut self.multiple
+            {
+                let result = multiple
+                    .encode(encoder, 0, &mut { work.integration_steps })
+                    .map_err(AtmosphereError::MultipleScattering)?;
+                self.multiple_encoded = result.passes > 0;
+            }
             if dirty {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("bounded atmosphere LUT update"),
@@ -363,6 +637,7 @@ impl AtmosphereGpu {
             }
         }
         self.timer.finish(encoder);
+        self.encoded |= work.passes > 0;
         *remaining_steps -= work.integration_steps;
         self.transmittance_dirty = false;
         self.sky_dirty = false;

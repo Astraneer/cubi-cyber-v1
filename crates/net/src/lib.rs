@@ -6,7 +6,11 @@ pub mod commands;
 pub mod emulator;
 pub mod entities;
 pub mod geometry;
+pub mod height;
+pub mod light;
+pub mod machine_packets;
 pub mod presence;
+pub mod props;
 pub mod window;
 pub use geometry::{PublicGeometry, PublicSurface, PublicSurfaceKind};
 mod replication;
@@ -128,6 +132,7 @@ pub struct InventoryGuard {
     pub item: u16,
     pub count: u16,
     pub damage: u16,
+    pub payload: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -190,6 +195,13 @@ pub enum ClientMessage {
         known: Option<Version>,
     },
     ForgetGeometry(PageId),
+    RequestHeight {
+        key: height::HeightKey,
+        known: Option<u64>,
+    },
+    ForgetHeight(height::HeightKey),
+    RequestLight(light::Request),
+    ForgetLight(PageId),
     Presence(presence::PresenceClientEvent),
     Entities(entities::EntityRequest),
 }
@@ -291,6 +303,10 @@ pub enum ServerMessage {
     Presence(presence::PresenceServerEvent),
     Entities(Box<entities::EntityFrame>),
     Window(Box<window::WindowSnapshot>),
+    Height(Box<height::HeightTile>),
+    HeightUnavailable(height::HeightKey),
+    Light(Box<light::Update>),
+    LightUnavailable(PageId),
     Players {
         tick: Tick,
         players: Vec<PlayerState>,

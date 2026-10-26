@@ -32,6 +32,8 @@ pub struct ProductUi {
     sequence: u64,
     ui_requests: std::collections::VecDeque<net::ActionId>,
     sounds: client::audio_bridge::PredictionSounds,
+    block_sounds: client::audio_bridge::ConfirmedBlockSounds,
+    entity_sounds: client::audio_bridge::EntitySounds,
 }
 fn preferences_storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok().flatten()
@@ -76,6 +78,8 @@ impl ProductUi {
             sequence: 0,
             ui_requests: std::collections::VecDeque::with_capacity(128),
             sounds: client::audio_bridge::PredictionSounds::default(),
+            block_sounds: Default::default(),
+            entity_sounds: Default::default(),
         };
         result.apply_sound()?;
         Ok(result)
@@ -132,6 +136,18 @@ impl ProductUi {
         captured
     }
     pub fn sync(&mut self, network: &Connection, view: &ClientView) -> Result<(), JsValue> {
+        self.block_sounds.observe(network);
+        if let Some(player) = network.player() {
+            self.entity_sounds.visit(network, player.eye(1.0), |cue| {
+                let _ = self.audio.event_gain(
+                    cue.event,
+                    cue.emitter,
+                    Some(cue.position),
+                    cue.seed,
+                    cue.gain,
+                );
+            });
+        }
         if let Some(old) = self.sounds.bind(network) {
             let _ = self.audio.forget_emitter(old);
         }
@@ -156,7 +172,7 @@ impl ProductUi {
                     .event(event, emitter, Some(position), view.tick().0);
             }
             if let Some(player) = network.player() {
-                let eye = player.view(1.0);
+                let eye = player.eye(1.0);
                 let _ = self.audio.listener(client::audio_bridge::listener(
                     player,
                     [eye[0], eye[1], eye[2]],
@@ -187,6 +203,8 @@ impl ProductUi {
         self.layer.app.open(Screen::Loading);
     }
     pub fn disconnected(&mut self, message: &str) {
+        self.block_sounds.clear();
+        self.entity_sounds.clear();
         self.ready_world = false;
         self.bridge = UiBridge::default();
         self.layer.app.clear_chat();
@@ -232,6 +250,15 @@ impl ProductUi {
                 let Some(reply) = socket.session_mut().connection_mut().take_reply() else {
                     break;
                 };
+                if let Some(cue) = self.block_sounds.reply(reply) {
+                    let _ = self.audio.event_gain(
+                        cue.event,
+                        cue.emitter,
+                        Some(cue.position),
+                        cue.seed,
+                        cue.gain,
+                    );
+                }
                 if !self.ui_requests.contains(&reply.id) {
                     continue;
                 }
@@ -314,6 +341,7 @@ impl ProductUi {
                             now_ms,
                         ) {
                             Ok(client::ui_bridge::Dispatch::Sent(id)) => {
+                                self.block_sounds.observe(socket.session().connection());
                                 if self.ui_requests.len() == 128 {
                                     self.ui_requests.pop_front();
                                 }
@@ -399,6 +427,8 @@ pub fn product_ui_stats() -> JsValue {
             ("audioStarted", audio.started),
             ("audioLoopUpdates", audio.loop_updates),
             ("audioStopped", audio.stopped),
+            ("audioAcceptedBlockCues", product.block_sounds.played()),
+            ("audioEntityCues", product.entity_sounds.emitted),
         ] {
             let _ = js_sys::Reflect::set(&value, &name.into(), &(number as f64).into());
         }

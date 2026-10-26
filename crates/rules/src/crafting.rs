@@ -31,7 +31,7 @@ impl Ing {
     }
 
     pub fn accepts(&self, stack: ItemStack) -> bool {
-        !stack.is_empty() && self.items().contains(&stack.item())
+        !stack.is_empty() && stack.payload().is_none() && self.items().contains(&stack.item())
     }
 
     fn validate(&self) -> bool {

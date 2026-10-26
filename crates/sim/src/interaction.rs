@@ -223,6 +223,30 @@ pub fn prepare_edit(
     tick: Tick,
     protected: impl Fn([i32; 3]) -> bool,
 ) -> Result<world::Transaction, EditError> {
+    prepare_edit_inner(world, space, player, action, tick, protected, false)
+}
+/// Authoritative component owner only: the caller must plan block-entity birth,
+/// removal, contents/payload drops and owned inventory in the SAME durable batch.
+/// The plain client/standalone API continues to reject component-bearing blocks.
+pub fn prepare_owned_edit(
+    world: &world::World,
+    space: SpaceId,
+    player: &Player,
+    action: EditAction,
+    tick: Tick,
+    protected: impl Fn([i32; 3]) -> bool,
+) -> Result<world::Transaction, EditError> {
+    prepare_edit_inner(world, space, player, action, tick, protected, true)
+}
+fn prepare_edit_inner(
+    world: &world::World,
+    space: SpaceId,
+    player: &Player,
+    action: EditAction,
+    tick: Tick,
+    protected: impl Fn([i32; 3]) -> bool,
+    owned_components: bool,
+) -> Result<world::Transaction, EditError> {
     if player.mode == GameMode::Spectator {
         return Err(EditError::Spectator);
     }
@@ -266,7 +290,7 @@ pub fn prepare_edit(
             if hit.cell != position {
                 return Err(EditError::Occluded);
             }
-            if rules::blocks::bdef(current.id()).be.is_some() {
+            if !owned_components && rules::blocks::bdef(current.id()).be.is_some() {
                 return Err(EditError::Unsupported);
             }
             if player.mode != GameMode::Creative
@@ -292,7 +316,15 @@ pub fn prepare_edit(
             if position != adjacent && hit.cell != position {
                 return Err(EditError::Occluded);
             }
-            let cell = placement_cell(&query, player, hit, position, cell, current)?;
+            let cell = placement_cell(
+                &query,
+                player,
+                hit,
+                position,
+                cell,
+                current,
+                owned_components,
+            )?;
             let offset = position.map(f64::from);
             if rules::blocks::collision_of(cell.raw()).iter().any(|shape| {
                 shape
@@ -434,10 +466,11 @@ fn placement_cell(
     position: [i32; 3],
     requested: Cell,
     current: Cell,
+    owned_components: bool,
 ) -> Result<Cell, EditError> {
     use rules::blocks::{Place, Support};
     let definition = rules::blocks::bdef(requested.id());
-    if definition.be.is_some() || definition.fluid != 0 {
+    if definition.be.is_some() && !owned_components || definition.fluid != 0 {
         return Err(EditError::Unsupported);
     }
     let read = |p| match world.cell(p) {
@@ -552,6 +585,56 @@ impl InteractionController {
         held: bool,
         protected: impl Fn([i32; 3]) -> bool,
     ) -> Result<Option<world::Transaction>, EditError> {
+        self.tick_break_inner(
+            world,
+            space,
+            player,
+            tick,
+            item,
+            tool_damage,
+            held,
+            protected,
+            false,
+        )
+    }
+    /// Requires the same typed component/inventory owner as prepare_owned_edit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tick_owned_break(
+        &mut self,
+        world: &world::World,
+        space: SpaceId,
+        player: &Player,
+        tick: Tick,
+        item: u16,
+        tool_damage: u16,
+        held: bool,
+        protected: impl Fn([i32; 3]) -> bool,
+    ) -> Result<Option<world::Transaction>, EditError> {
+        self.tick_break_inner(
+            world,
+            space,
+            player,
+            tick,
+            item,
+            tool_damage,
+            held,
+            protected,
+            true,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn tick_break_inner(
+        &mut self,
+        world: &world::World,
+        space: SpaceId,
+        player: &Player,
+        tick: Tick,
+        item: u16,
+        tool_damage: u16,
+        held: bool,
+        protected: impl Fn([i32; 3]) -> bool,
+        owned_components: bool,
+    ) -> Result<Option<world::Transaction>, EditError> {
         if player.mode == GameMode::Spectator {
             return Err(EditError::Spectator);
         }
@@ -607,7 +690,7 @@ impl InteractionController {
             player.eye_water,
             player.mode == GameMode::Creative || player.noclip,
         ) {
-            prepare_edit(
+            prepare_edit_inner(
                 world,
                 space,
                 player,
@@ -617,6 +700,7 @@ impl InteractionController {
                 },
                 tick,
                 protected,
+                owned_components,
             )
             .map(Some)
         } else {

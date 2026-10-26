@@ -2,13 +2,18 @@
 //! World sampling and authoritative fluid/lighting updates belong to the client.
 use crate::{
     OutputTransfer,
+    aerial_gpu::{
+        AerialConfig, AerialError, AerialGpu, AerialInputs, AerialShadows, AerialState, AerialWork,
+    },
     atmosphere::{
         AtmosphereConfig, AtmosphereError, AtmosphereGpu, AtmosphereState, AtmosphereWork,
     },
+    celestial::{CelestialConfig, CelestialError, CelestialGpu, CelestialState, CelestialWork},
     cloud_gpu::{CloudConfig, CloudError, CloudGpu, CloudInputs, CloudState, CloudWork},
     gi::{GiConfig, GiError, GiGpu, GiWork},
     gpu_time::{PassGraph, TimingSource},
     light_volume::LightVolumeGpu,
+    multiple_scattering::MultipleScatteringConfig,
     post::{Exposure, PostConfig, PostError, PostGpu, PostWork},
     shadows::ShadowGpu,
     terrain_gpu::{
@@ -66,6 +71,8 @@ impl EnvironmentState {
 #[derive(Clone, Copy, Debug)]
 pub struct EnvironmentBudget {
     pub upload_bytes: u64,
+    pub aerial_steps: u64,
+    pub aerial_samples: u64,
     pub atmosphere_steps: u64,
     pub water_reflection_steps: u64,
     pub cloud_density_samples: u64,
@@ -74,6 +81,8 @@ pub struct EnvironmentBudget {
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EnvironmentWork {
+    pub aerial: AerialWork,
+    pub celestial: CelestialWork,
     pub atmosphere: AtmosphereWork,
     pub terrain: TerrainFrameWork,
     pub water: WaterWork,
@@ -96,6 +105,8 @@ pub enum EnvironmentError {
     Cloud(CloudError),
     Gi(GiError),
     Post(PostError),
+    Celestial(CelestialError),
+    Aerial(AerialError),
 }
 impl std::fmt::Display for EnvironmentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -118,21 +129,48 @@ error_from!(WaterError, Water);
 error_from!(CloudError, Cloud);
 error_from!(GiError, Gi);
 error_from!(PostError, Post);
+error_from!(CelestialError, Celestial);
+error_from!(AerialError, Aerial);
 
+struct AerialShadowOwner {
+    parameters: wgpu::Buffer,
+    depth: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+}
+impl AerialShadowOwner {
+    fn refs(&self) -> AerialShadows<'_> {
+        AerialShadows {
+            parameters: &self.parameters,
+            depth: &self.depth,
+            sampler: &self.sampler,
+        }
+    }
+}
 pub struct EnvironmentGpu {
     config: EnvironmentConfig,
     atmosphere: AtmosphereGpu,
     atmosphere_state: AtmosphereState,
+    solar_scale: f32,
     water: Option<WaterGpu>,
     clouds: Option<CloudGpu>,
     gi: Option<GiGpu>,
     post: PostGpu,
+    aerial: Option<AerialGpu>,
+    celestial: Option<CelestialGpu>,
+    moon_phase: u8,
+    rotation_offset: f32,
+    encoded: bool,
     water_cover_ready: bool,
     precloud_revision: u64,
+    preaerial_revision: u64,
+    atmosphere_revision: u64,
+    aerial_shadows: Option<AerialShadowOwner>,
+    shadow_revision: u64,
     output_revision: u64,
     last_delta: f32,
     last_gi_attempt: Option<(u64, u32)>,
     last_work: EnvironmentWork,
+    startup_pipeline_compilations: u32,
 }
 impl EnvironmentGpu {
     /// Prepare once during loading, before the first terrain frame. GI requires
@@ -156,19 +194,17 @@ impl EnvironmentGpu {
         if config.gi.is_some() && lighting.is_none() {
             return Err(EnvironmentError::MissingLighting);
         }
-        let atmosphere =
+        let mut atmosphere =
             AtmosphereGpu::new(device, queue, config.atmosphere, state.atmosphere(), budget)?;
+        atmosphere.set_state_and_solar(queue, state.atmosphere(), state.sun_intensity, budget)?;
         let gi = if let Some(config) = config.gi {
             Some(GiGpu::new(device, queue, config, budget)?)
         } else {
             None
         };
         terrain.prepare_scene_sampling(device)?;
-        terrain.attach_atmosphere(device, &atmosphere)?;
-        if let (Some(gi), Some((shadows, lights))) = (&gi, lighting) {
-            terrain.attach_lighting_with_gi(device, shadows, lights, gi)?;
-        }
-        let water = if let Some(config) = config.water {
+        terrain.attach_environment_lighting(device, &atmosphere, lighting, gi.as_ref())?;
+        let mut water = if let Some(config) = config.water {
             Some(WaterGpu::new(
                 device,
                 queue,
@@ -224,20 +260,44 @@ impl EnvironmentGpu {
             config.post,
             budget,
         )?;
+        let startup_pipeline_compilations = 2
+            + post.pipeline_count()
+            + water
+                .as_mut()
+                .map_or(0, |water| water.take_work().pipeline_compilations)
+            + clouds
+                .as_ref()
+                .map_or(0, |clouds| clouds.startup_work().pipeline_compilations)
+            + u32::from(gi.is_some()) * 2;
         Ok(Self {
             config,
             atmosphere,
             atmosphere_state: state.atmosphere(),
+            solar_scale: state.sun_intensity,
             water,
             clouds,
             gi,
             post,
+            aerial: None,
+            celestial: None,
+            moon_phase: 0,
+            rotation_offset: 0.0,
+            encoded: false,
             water_cover_ready: false,
             precloud_revision: 0,
+            preaerial_revision: 0,
+            atmosphere_revision: 0,
+            aerial_shadows: lighting.map(|(shadows, _)| AerialShadowOwner {
+                parameters: shadows.sampling_buffer().clone(),
+                depth: shadows.depth_view().clone(),
+                sampler: shadows.sampler().clone(),
+            }),
+            shadow_revision: 0,
             output_revision: 0,
             last_delta: 1. / 60.,
             last_gi_attempt: None,
             last_work: EnvironmentWork::default(),
+            startup_pipeline_compilations,
         })
     }
     /// Resize targets and bindings while retaining every prepared pipeline,
@@ -252,7 +312,17 @@ impl EnvironmentGpu {
         height: u32,
         budget: &mut UploadBudget,
     ) -> Result<(), EnvironmentError> {
-        if budget.remaining_bytes < 64 {
+        if width == 0 || height == 0 {
+            return Err(EnvironmentError::Terrain(TerrainError::InvalidSize));
+        }
+        if self
+            .aerial
+            .as_ref()
+            .is_some_and(|aerial| !aerial.can_resize(device, width, height))
+        {
+            return Err(EnvironmentError::Aerial(AerialError::InvalidConfig));
+        }
+        if budget.remaining_bytes < self.post.resize_upload_bytes(width, height) {
             return Err(EnvironmentError::UploadBudget);
         }
         terrain.resize(device, width, height)?;
@@ -269,6 +339,27 @@ impl EnvironmentGpu {
                 },
             )?;
         }
+        if let Some(aerial) = &mut self.aerial {
+            aerial.resize_inputs(
+                device,
+                width,
+                height,
+                AerialInputs {
+                    color_msaa: self.water.as_ref().map_or_else(
+                        || terrain.scene_color_msaa_view().expect("prepared sampling"),
+                        WaterGpu::color_msaa,
+                    ),
+                    depth_msaa: self
+                        .water
+                        .as_ref()
+                        .map_or_else(|| terrain.scene_depth_msaa_view(), WaterGpu::depth_msaa),
+                    optics: self.atmosphere.optical_parameters(),
+                    multiple_scattering: self.atmosphere.multiple_scattering_view(),
+                    shadows: self.aerial_shadows.as_ref().map(AerialShadowOwner::refs),
+                    transmittance: self.atmosphere.transmittance_view(),
+                },
+            )?;
+        }
         if let Some(clouds) = &mut self.clouds {
             clouds.resize_inputs(
                 device,
@@ -277,10 +368,16 @@ impl EnvironmentGpu {
                 CloudInputs {
                     transmittance: self.atmosphere.transmittance_view(),
                     sky: self.atmosphere.sky_view(),
-                    scene_color_msaa: self.water.as_ref().map_or_else(
-                        || terrain.scene_color_msaa_view().expect("prepared sampling"),
-                        WaterGpu::color_msaa,
-                    ),
+                    scene_color_msaa: self
+                        .aerial
+                        .as_ref()
+                        .map(AerialGpu::color_msaa)
+                        .unwrap_or_else(|| {
+                            self.water.as_ref().map_or_else(
+                                || terrain.scene_color_msaa_view().expect("prepared sampling"),
+                                WaterGpu::color_msaa,
+                            )
+                        }),
                     scene_depth_msaa: self
                         .water
                         .as_ref()
@@ -292,12 +389,175 @@ impl EnvironmentGpu {
             .clouds
             .as_ref()
             .map(CloudGpu::resolved_view)
+            .or_else(|| self.aerial.as_ref().map(AerialGpu::resolved_view))
             .or_else(|| self.water.as_ref().map(WaterGpu::resolved_view))
             .unwrap_or_else(|| terrain.resolved_hdr_view());
         self.post
             .resize_input(device, queue, source, width, height, budget)?;
         self.last_work = EnvironmentWork::default();
         Ok(())
+    }
+    /// Auxiliary node pipelines only. Terrain's final variants and sky draw
+    /// are already counted by TerrainGpu::take_work and must not be added twice.
+    pub fn startup_pipeline_compilations(&self) -> u32 {
+        self.startup_pipeline_compilations
+    }
+    pub fn take_startup_pipeline_compilations(&mut self) -> u32 {
+        std::mem::take(&mut self.startup_pipeline_compilations)
+    }
+    /// Optional resources are created before the first encoded frame only.
+    pub fn prepare_celestials(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: CelestialConfig,
+        budget: &mut UploadBudget,
+    ) -> Result<(), EnvironmentError> {
+        if self.encoded || self.celestial.is_some() {
+            return Err(EnvironmentError::Terrain(TerrainError::LatePreparation));
+        }
+        let mut celestial = CelestialGpu::new(device, queue, &self.atmosphere, config, budget)?;
+        self.startup_pipeline_compilations += celestial.take_work().pipeline_compilations;
+        self.celestial = Some(celestial);
+        Ok(())
+    }
+    /// Prepare the unit-illuminance transfer before aerial resources and frames.
+    pub fn prepare_multiple_scattering(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: MultipleScatteringConfig,
+        budget: &mut UploadBudget,
+    ) -> Result<(), EnvironmentError> {
+        if self.encoded || self.aerial.is_some() {
+            return Err(EnvironmentError::Terrain(TerrainError::LatePreparation));
+        }
+        let work = self
+            .atmosphere
+            .prepare_multiple_scattering(device, queue, config, budget)?;
+        self.startup_pipeline_compilations += work.pipeline_compilations;
+        Ok(())
+    }
+    /// Insert aerial perspective after water and before clouds, during loading.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_aerial(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        terrain: &TerrainGpu,
+        width: u32,
+        height: u32,
+        config: AerialConfig,
+        budget: &mut UploadBudget,
+    ) -> Result<(), EnvironmentError> {
+        if self.encoded || self.aerial.is_some() {
+            return Err(EnvironmentError::Terrain(TerrainError::LatePreparation));
+        }
+        if width == 0 || height == 0 {
+            return Err(EnvironmentError::Terrain(TerrainError::InvalidSize));
+        }
+        if budget.remaining_bytes < self.post.resize_upload_bytes(width, height) {
+            return Err(EnvironmentError::UploadBudget);
+        }
+        let mut aerial = AerialGpu::new(
+            device,
+            queue,
+            config,
+            width,
+            height,
+            AerialInputs {
+                color_msaa: self.water.as_ref().map_or_else(
+                    || terrain.scene_color_msaa_view().expect("prepared sampling"),
+                    WaterGpu::color_msaa,
+                ),
+                depth_msaa: self
+                    .water
+                    .as_ref()
+                    .map_or_else(|| terrain.scene_depth_msaa_view(), WaterGpu::depth_msaa),
+                optics: self.atmosphere.optical_parameters(),
+                multiple_scattering: self.atmosphere.multiple_scattering_view(),
+                shadows: self.aerial_shadows.as_ref().map(AerialShadowOwner::refs),
+                transmittance: self.atmosphere.transmittance_view(),
+            },
+        )?;
+        self.startup_pipeline_compilations += aerial.take_startup_work().pipeline_compilations;
+        if let Some(clouds) = &mut self.clouds {
+            clouds.resize_inputs(
+                device,
+                width,
+                height,
+                CloudInputs {
+                    transmittance: self.atmosphere.transmittance_view(),
+                    sky: self.atmosphere.sky_view(),
+                    scene_color_msaa: aerial.color_msaa(),
+                    scene_depth_msaa: self
+                        .water
+                        .as_ref()
+                        .map_or_else(|| terrain.scene_depth_msaa_view(), WaterGpu::depth_msaa),
+                },
+            )?;
+        }
+        let source = self
+            .clouds
+            .as_ref()
+            .map(CloudGpu::resolved_view)
+            .unwrap_or_else(|| aerial.resolved_view());
+        self.post
+            .resize_input(device, queue, source, width, height, budget)?;
+        self.aerial = Some(aerial);
+        Ok(())
+    }
+    fn aerial_state(
+        &self,
+        camera: Camera,
+        state: EnvironmentState,
+        source_revision: u64,
+        atmosphere_revision: u64,
+    ) -> AerialState {
+        AerialState {
+            camera,
+            eye: state.eye,
+            source_revision,
+            atmosphere_revision,
+            shadow_revision: self.shadow_revision,
+        }
+    }
+    pub fn set_celestial_calendar(
+        &mut self,
+        phase: u8,
+        rotation_offset: f32,
+    ) -> Result<(), EnvironmentError> {
+        if phase > 7 || !rotation_offset.is_finite() {
+            return Err(EnvironmentError::InvalidState);
+        }
+        self.moon_phase = phase;
+        self.rotation_offset = rotation_offset;
+        Ok(())
+    }
+    /// Update after M4 shadow encoding; source-only color edits need no fog rebuild.
+    pub fn set_shadow_revision(&mut self, revision: u64) {
+        self.shadow_revision = revision;
+    }
+    fn celestial_state(&self, camera: Camera, state: EnvironmentState) -> CelestialState {
+        CelestialState {
+            camera,
+            sun: state.sun,
+            moon: state.sun.map(|v| -v),
+            rotation_radians: self.rotation_offset
+                + state.time_seconds * (std::f32::consts::TAU / 1200.0),
+            time_seconds: state.time_seconds,
+            moon_phase: self.moon_phase,
+            sun_enabled: true,
+            moon_radiance: 0.2,
+            star_radiance: 1.0,
+            altitude_km: state.altitude_km,
+        }
+    }
+    pub fn atmosphere(&self) -> &AtmosphereGpu {
+        &self.atmosphere
+    }
+    pub fn atmosphere_lighting_buffer(&self) -> &wgpu::Buffer {
+        self.atmosphere.lighting_buffer()
     }
     pub fn water_mut(&mut self) -> Option<&mut WaterGpu> {
         self.water.as_mut()
@@ -339,7 +599,7 @@ impl EnvironmentGpu {
                 0.
             },
             sun: state.sun,
-            sun_intensity: state.sun_intensity,
+            sun_intensity: state.sun_intensity * crate::atmosphere::SOLAR_IRRADIANCE,
             underwater: state.underwater,
             scene_revision,
         }
@@ -359,9 +619,46 @@ impl EnvironmentGpu {
             eye: state.eye,
             time_seconds: if animated { state.time_seconds } else { 0. },
             sun: state.sun,
-            sun_intensity: state.sun_intensity,
+            sun_intensity: state.sun_intensity * crate::atmosphere::SOLAR_IRRADIANCE,
             scene_revision,
         }
+    }
+    /// A UI redraw can acquire a new surface while the HDR graph stays cached.
+    pub fn request_present(&mut self) {
+        self.post.request_present();
+    }
+    fn gi_pending(&self, state: EnvironmentState) -> bool {
+        self.gi.as_ref().is_some_and(|gi| {
+            gi.pending() > 0 && self.last_gi_attempt != Some((state.tick, gi.source_revision()))
+        })
+    }
+    /// Predict color-scene work before preparing optional model culling.
+    /// GI prediction assumes the configured frame budget can update one probe.
+    pub fn scene_needed(
+        &self,
+        terrain: &TerrainGpu,
+        camera: &Camera,
+        mode: CullingMode,
+        state: EnvironmentState,
+    ) -> bool {
+        self.scene_needed_with_gi(terrain, camera, mode, state, self.gi_pending(state))
+    }
+    fn scene_needed_with_gi(
+        &self,
+        terrain: &TerrainGpu,
+        camera: &Camera,
+        mode: CullingMode,
+        state: EnvironmentState,
+        gi_planned: bool,
+    ) -> bool {
+        terrain.needs_redraw(camera, mode)
+            || self.atmosphere.pending_work().passes > 0
+            || self.atmosphere_state != state.atmosphere()
+            || self.solar_scale != state.sun_intensity
+            || gi_planned
+            || self.celestial.as_ref().is_some_and(|celestial| {
+                celestial.needs_redraw(self.celestial_state(*camera, state))
+            })
     }
     pub fn needs_redraw(
         &self,
@@ -370,17 +667,20 @@ impl EnvironmentGpu {
         mode: CullingMode,
         state: EnvironmentState,
     ) -> bool {
-        terrain.needs_redraw(camera, mode)
-            || self.atmosphere.pending_work().passes > 0
-            || self.atmosphere_state != state.atmosphere()
-            || self.gi.as_ref().is_some_and(|gi| {
-                gi.pending() > 0 && self.last_gi_attempt != Some((state.tick, gi.source_revision()))
-            })
+        self.scene_needed(terrain, camera, mode, state)
             || self.water.as_ref().is_some_and(|water| {
                 water.needs_redraw(self.water_state(*camera, state, terrain.hdr_revision()))
             })
             || self.clouds.as_ref().is_some_and(|clouds| {
                 clouds.needs_redraw(self.cloud_state(*camera, state, self.precloud_revision))
+            })
+            || self.aerial.as_ref().is_some_and(|aerial| {
+                aerial.needs_redraw(self.aerial_state(
+                    *camera,
+                    state,
+                    self.preaerial_revision,
+                    self.atmosphere_revision,
+                ))
             })
             || self.post.needs_redraw(self.output_revision)
     }
@@ -406,16 +706,11 @@ impl EnvironmentGpu {
         if !self.needs_redraw(terrain, camera, mode, state) {
             return Ok(self.last_work);
         }
-        let mut atmosphere_work = self.atmosphere.pending_work();
-        let atmosphere_changed = self.atmosphere_state != state.atmosphere();
-        if atmosphere_changed {
-            let pixels = u64::from(self.config.atmosphere.sky_size[0])
-                * u64::from(self.config.atmosphere.sky_size[1]);
-            atmosphere_work.integration_steps = atmosphere_work
-                .integration_steps
-                .max(pixels * u64::from(self.config.atmosphere.sky_steps));
-            // If transmittance is still pending, sky is already included.
-        }
+        let atmosphere_work = self
+            .atmosphere
+            .pending_work_for(state.atmosphere(), state.sun_intensity)?;
+        let atmosphere_changed =
+            self.atmosphere_state != state.atmosphere() || self.solar_scale != state.sun_intensity;
         let gi_plan = self
             .gi
             .as_ref()
@@ -428,10 +723,7 @@ impl EnvironmentGpu {
                     .min(config.max_jobs)
                     .min(budget.gi_rays / (config.rays_per_probe + 6))
             });
-        let scene_needed = terrain.needs_redraw(camera, mode)
-            || atmosphere_work.passes > 0
-            || atmosphere_changed
-            || gi_plan > 0;
+        let scene_needed = self.scene_needed_with_gi(terrain, camera, mode, state, gi_plan > 0);
         let water_state = self.water_state(
             *camera,
             state,
@@ -442,7 +734,21 @@ impl EnvironmentGpu {
         } else {
             WaterWork::default()
         };
-        let precloud_changed = scene_needed || water_plan.passes > 0;
+        let preaerial_changed = scene_needed || water_plan.passes > 0;
+        let next_preaerial = self
+            .preaerial_revision
+            .wrapping_add(u64::from(preaerial_changed));
+        let next_atmosphere = self
+            .atmosphere_revision
+            .wrapping_add(u64::from(atmosphere_work.passes > 0));
+        let aerial_state = self.aerial_state(*camera, state, next_preaerial, next_atmosphere);
+        let aerial_plan = self
+            .aerial
+            .as_ref()
+            .map_or_else(AerialWork::default, |aerial| {
+                aerial.pending_work(aerial_state)
+            });
+        let precloud_changed = preaerial_changed || aerial_plan.passes > 0;
         let next_precloud = self
             .precloud_revision
             .wrapping_add(u64::from(precloud_changed));
@@ -463,24 +769,38 @@ impl EnvironmentGpu {
         if atmosphere_work.integration_steps > budget.atmosphere_steps
             || water_plan.max_reflection_steps > budget.water_reflection_steps
             || cloud_plan.max_density_samples > budget.cloud_density_samples
+            || aerial_plan.integration_steps > budget.aerial_steps
+            || aerial_plan.composition_samples > budget.aerial_samples
             || post_plan.pixels() > budget.post_pixels
         {
             return Err(EnvironmentError::WorkBudget);
         }
         let delta_changed = matches!(self.config.post.exposure, Exposure::Automatic { .. })
             && self.last_delta != state.delta_seconds;
+        let celestial_state = self.celestial_state(*camera, state);
+        let celestial_upload = u64::from(
+            self.celestial
+                .as_ref()
+                .is_some_and(|celestial| celestial.needs_redraw(celestial_state)),
+        ) * 144;
         let parameter_bytes = u64::from(atmosphere_changed) * 96
             + u64::from(water_plan.passes > 0) * 256
             + u64::from(cloud_plan.passes > 0) * 176
             + u64::from(delta_changed) * 64
             + u64::from(scene_needed) * 256
-            + u64::from(gi_plan) * 16;
+            + u64::from(gi_plan) * 16
+            + celestial_upload
+            + aerial_plan.upload_bytes;
         if parameter_bytes > budget.upload_bytes {
             return Err(EnvironmentError::UploadBudget);
         }
         let mut upload = UploadBudget::new(budget.upload_bytes);
-        self.atmosphere
-            .set_state(queue, state.atmosphere(), &mut upload)?;
+        self.atmosphere.set_state_and_solar(
+            queue,
+            state.atmosphere(),
+            state.sun_intensity,
+            &mut upload,
+        )?;
         let mut work = EnvironmentWork {
             atmosphere: self
                 .atmosphere
@@ -488,6 +808,7 @@ impl EnvironmentGpu {
             ..EnvironmentWork::default()
         };
         self.atmosphere_state = state.atmosphere();
+        self.solar_scale = state.sun_intensity;
         if gi_plan > 0 {
             let gi = self.gi.as_mut().expect("planned GI");
             work.gi = gi.trace_tick(queue, encoder, state.tick, &mut upload, &mut budget.gi_rays);
@@ -497,14 +818,29 @@ impl EnvironmentGpu {
             terrain.invalidate();
         }
         if scene_needed {
+            if let Some(celestial) = &mut self.celestial {
+                work.celestial = celestial.prepare_frame(queue, celestial_state, &mut upload)?;
+            }
+            let mut celestial_draws = 0;
             work.terrain = terrain.encode_scene_with_extra(
                 queue,
                 encoder,
                 camera,
                 mode,
                 self.water_cover_ready,
-                extra,
+                |pass| {
+                    celestial_draws = self
+                        .celestial
+                        .as_ref()
+                        .map_or(0, |celestial| celestial.draw(pass));
+                    celestial_draws + extra(pass)
+                },
             )?;
+            work.celestial.draws = celestial_draws;
+            work.celestial.vertices = self
+                .celestial
+                .as_ref()
+                .map_or(0, CelestialGpu::vertex_count);
             upload.remaining_bytes -= work.terrain.camera_upload_bytes;
         }
         if let Some(water) = &mut self.water
@@ -518,6 +854,18 @@ impl EnvironmentGpu {
                 budget.water_reflection_steps,
             )?;
             budget.water_reflection_steps -= work.water.max_reflection_steps;
+        }
+        if let Some(aerial) = &mut self.aerial
+            && aerial_plan.passes > 0
+        {
+            work.aerial = aerial.encode(
+                queue,
+                encoder,
+                aerial_state,
+                &mut upload,
+                &mut budget.aerial_steps,
+                &mut budget.aerial_samples,
+            )?;
         }
         if let Some(clouds) = &mut self.clouds
             && cloud_plan.passes > 0
@@ -538,6 +886,8 @@ impl EnvironmentGpu {
             .encode(encoder, output, next_output, &mut budget.post_pixels)?;
         self.last_delta = state.delta_seconds;
         self.precloud_revision = next_precloud;
+        self.preaerial_revision = next_preaerial;
+        self.atmosphere_revision = next_atmosphere;
         self.output_revision = next_output;
         work.upload_bytes = budget.upload_bytes - upload.remaining_bytes;
         budget.upload_bytes = upload.remaining_bytes;
@@ -546,10 +896,15 @@ impl EnvironmentGpu {
             + work.water.passes
             + work.clouds.passes
             + work.gi.passes
-            + work.post.passes;
-        work.draws =
-            work.terrain.draw_calls + work.water.draws + work.clouds.draws + work.post.draws;
+            + work.post.passes
+            + work.aerial.passes;
+        work.draws = work.terrain.draw_calls
+            + work.water.draws
+            + work.clouds.draws
+            + work.post.draws
+            + work.aerial.draws;
         self.last_work = work;
+        self.encoded = true;
         Ok(work)
     }
     /// Call if an encoded graph was abandoned, rather than submitted/presented.
@@ -558,6 +913,9 @@ impl EnvironmentGpu {
         self.atmosphere.invalidate();
         if let Some(water) = &mut self.water {
             water.invalidate();
+        }
+        if let Some(aerial) = &mut self.aerial {
+            aerial.invalidate();
         }
         if let Some(clouds) = &mut self.clouds {
             clouds.invalidate();
@@ -568,8 +926,19 @@ impl EnvironmentGpu {
         self.last_gi_attempt = None;
         self.post.invalidate();
     }
-    pub fn extra_timing_sources(&self) -> [Option<TimingSource<'_>>; 5] {
+    pub fn extra_timing_sources(&self) -> [Option<TimingSource<'_>>; 7] {
         [
+            (self.last_work.atmosphere.passes > 0)
+                .then(|| {
+                    self.atmosphere.multiple_scattering_timing().and_then(
+                        |(buffer, period, graph)| timing(Some((buffer, period)), graph, |_| 5),
+                    )
+                })
+                .flatten(),
+            self.aerial
+                .as_ref()
+                .filter(|_| self.last_work.aerial.passes > 0)
+                .and_then(|aerial| timing(aerial.timestamp_buffer(), aerial.frame_graph(), |_| 5)),
             self.water
                 .as_ref()
                 .filter(|_| self.last_work.water.passes > 0)
@@ -607,7 +976,7 @@ impl EnvironmentGpu {
                 .flatten(),
         ]
     }
-    pub fn timing_sources<'a>(&'a self, terrain: &'a TerrainGpu) -> [Option<TimingSource<'a>>; 6] {
+    pub fn timing_sources<'a>(&'a self, terrain: &'a TerrainGpu) -> [Option<TimingSource<'a>>; 8] {
         let scene = if self.last_work.terrain.passes > 0 {
             terrain.timestamp_buffer().map(|(buffer, period)| {
                 let graph = terrain.frame_graph();
@@ -633,8 +1002,8 @@ impl EnvironmentGpu {
         } else {
             None
         };
-        let [water, clouds, post, gi, atmosphere] = self.extra_timing_sources();
-        [scene, water, clouds, post, gi, atmosphere]
+        let [multiple, aerial, water, clouds, post, gi, atmosphere] = self.extra_timing_sources();
+        [scene, water, aerial, multiple, clouds, post, gi, atmosphere]
     }
 }
 fn timing<const N: usize>(

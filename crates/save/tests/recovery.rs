@@ -336,7 +336,7 @@ fn bounded_inventory_extension_preserves_m6_empty_accounts_and_roundtrips_owned_
     corrupt[legacy.len()] = 0;
     assert!(decode_batch(&corrupt).is_err());
     let mut oversized = batch_empty_inventory();
-    oversized.players[0].inventory = vec![0; 513];
+    oversized.players[0].inventory = vec![0; 1025];
     assert!(encode_batch(&oversized).is_err());
 }
 fn batch_empty_inventory() -> Batch {

@@ -4,6 +4,7 @@ cubi_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$cubi_root/tools/env.sh"
 cd "$cubi_root"
 cargo run --locked -p client --example benchmark -- --software --width 320 --height 224 --out .local/artifacts/bench/acceptance.json
+cargo run --locked -p sim --example replay -- .local/artifacts/bench/acceptance.json
 bash tools/bench report .local/artifacts/bench/acceptance.json --out .local/artifacts/bench/acceptance.html
 python3 - <<'PY'
 from tools.bench_report import load

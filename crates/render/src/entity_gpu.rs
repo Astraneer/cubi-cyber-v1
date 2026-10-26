@@ -30,6 +30,37 @@ const _: () = assert!(std::mem::size_of::<EntityInstance>() == 64);
 /// Local human crouch and camera-only hiding do not hide its shadow.
 pub const CROUCH: u32 = 256;
 pub const PRIMARY_HIDDEN: u32 = 1024;
+/// Block drops use six terrain layers in canonical Down/Up/North/South/West/East
+/// order. Three finite normal floats retain the 64-byte public instance ABI.
+pub const BLOCK_FACE_LAYERS: u32 = 2048;
+/// Public pipe packets use a fixed, centered pose without dropped-item bob/spin.
+pub const PIPE: u32 = 4096;
+impl EntityInstance {
+    pub fn set_block_layers(&mut self, layers: [u16; 6]) -> Result<(), EntityError> {
+        if self.kind != 6 || layers.iter().any(|layer| *layer > 255) {
+            return Err(EntityError::InvalidInstance);
+        }
+        let pack = |a: u16, b: u16| f32::from_bits(0x3f800000 | u32::from(a) | (u32::from(b) << 8));
+        self.head_yaw = pack(layers[0], layers[1]);
+        self.pitch = pack(layers[2], layers[3]);
+        self.limb_amount = pack(layers[4], layers[5]);
+        self.flags |= BLOCK_FACE_LAYERS;
+        Ok(())
+    }
+    pub fn block_layers(&self) -> Option<[u16; 6]> {
+        if self.kind != 6 || self.flags & BLOCK_FACE_LAYERS == 0 {
+            return None;
+        }
+        let words = [
+            self.head_yaw.to_bits(),
+            self.pitch.to_bits(),
+            self.limb_amount.to_bits(),
+        ];
+        Some(std::array::from_fn(|face| {
+            ((words[face / 2] >> (face % 2 * 8)) & 255) as u16
+        }))
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub struct EntityConfig {
     pub max_entities: u32,
@@ -115,7 +146,7 @@ impl EntityGpu {
         config: EntityConfig,
         shadows: Option<&ShadowGpu>,
     ) -> Result<Self, EntityError> {
-        Self::build(device, queue, geometry, config, shadows, None)
+        Self::build(device, queue, geometry, config, shadows, None, None)
     }
     /// Prepare an independent nonblock item texture array once during loading.
     pub fn new_with_items(
@@ -126,8 +157,29 @@ impl EntityGpu {
         shadows: Option<&ShadowGpu>,
         items: &crate::terrain_gpu::AtlasImage,
     ) -> Result<Self, EntityError> {
-        Self::build(device, queue, geometry, config, shadows, Some(items))
+        Self::build(device, queue, geometry, config, shadows, Some(items), None)
     }
+    /// Optional shared atmosphere prepared during loading, including item sprites.
+    pub fn new_with_environment(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        geometry: TerrainGeometry<'_>,
+        config: EntityConfig,
+        shadows: Option<&ShadowGpu>,
+        items: Option<&crate::terrain_gpu::AtlasImage>,
+        atmosphere: &crate::atmosphere::AtmosphereGpu,
+    ) -> Result<Self, EntityError> {
+        Self::build(
+            device,
+            queue,
+            geometry,
+            config,
+            shadows,
+            items,
+            Some(atmosphere),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
     fn build(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -135,6 +187,7 @@ impl EntityGpu {
         config: EntityConfig,
         shadows: Option<&ShadowGpu>,
         items: Option<&crate::terrain_gpu::AtlasImage>,
+        atmosphere: Option<&crate::atmosphere::AtmosphereGpu>,
     ) -> Result<Self, EntityError> {
         if config.max_entities == 0
             || config.atlas_layers == 0
@@ -338,6 +391,9 @@ impl EntityGpu {
                 },
             ]);
         }
+        if atmosphere.is_some() {
+            entries.push(buffer_layout(20, f, false, true));
+        }
         let render_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("instanced entity catalog layout"),
             entries: &entries,
@@ -389,6 +445,9 @@ impl EntityGpu {
                 },
             ]);
         }
+        if let Some(atmosphere) = atmosphere {
+            entries.push(buffer_binding(20, atmosphere.lighting_buffer()));
+        }
         let render_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("entity atlas lights and instance tables"),
             layout: &render_layout,
@@ -405,7 +464,17 @@ impl EntityGpu {
                 buffer_binding(4, &ranges),
             ],
         });
-        let source=include_str!("entity.wgsl").replace("// SHADOWS",if shadows.is_some(){include_str!("shadow_sampling.wgsl")}else{"fn cascade_shadow(p:vec3<f32>,n:vec3<f32>)->f32{return 1.;}"}).replace("// ILLUMINATION",if shadows.is_some(){"return light.rgb+vec3(light.a*(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.0)));"}else{"return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.));"});
+        let source = crate::atmosphere::surface_shader(
+            include_str!("entity.wgsl"),
+            shadows.is_some(),
+            atmosphere.is_some(),
+            true,
+            if shadows.is_some() {
+                "return light.rgb+vec3(light.a*(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.0)));"
+            } else {
+                "return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.));"
+            },
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("GPU model pose and texture shading"),
             source: wgpu::ShaderSource::Wgsl(source.clone().into()),
@@ -719,7 +788,18 @@ impl EntityGpu {
                     || i.kind >= MODEL_KINDS as u32
                     || i.scale <= 0.
                     || i.scale > 16.
-                    || i.flags & !2047 != 0
+                    || i.flags & !8191 != 0
+                    || (i.flags & PIPE != 0 && (i.kind < 6 || i.flags & 32 == 0))
+                    || (i.flags & BLOCK_FACE_LAYERS != 0
+                        && (i.kind != 6
+                            || [i.head_yaw, i.pitch, i.limb_amount]
+                                .iter()
+                                .any(|v| v.to_bits() & 0xffff0000 != 0x3f800000)
+                            || i.block_layers().is_some_and(|layers| {
+                                layers
+                                    .iter()
+                                    .any(|v| u32::from(*v) >= self.config.atlas_layers)
+                            })))
                     || (i.kind == 2 && i.color >= 6)
                     || ((i.kind == 3 || i.kind == 5) && !f32::from_bits(i.color).is_finite())
                     || (i.kind == 6 && i.color >= self.config.atlas_layers)
@@ -730,8 +810,7 @@ impl EntityGpu {
         }
         self.staging_lights.clear();
         self.staging_lights.extend(
-            (0..instances.len())
-                .map(|index| lights.get(index).map_or(15 << 12, |light| light.raw())),
+            (0..instances.len()).map(|index| lights.get(index).map_or(15, |light| light.raw())),
         );
         let instance_changed = self.previous != instances;
         let visibility_changed =
@@ -863,7 +942,8 @@ fn same_shadow_geometry(a: &EntityInstance, b: &EntityInstance) -> bool {
         && a.limb_phase == b.limb_phase
         && a.limb_amount == b.limb_amount
         && a.kind == b.kind
-        && (a.flags & 771) == (b.flags & 771)
+        && (a.flags & (771 | BLOCK_FACE_LAYERS | PIPE))
+            == (b.flags & (771 | BLOCK_FACE_LAYERS | PIPE))
         && a.death_roll == b.death_roll
         && a.scale == b.scale
         && a.reserved == b.reserved

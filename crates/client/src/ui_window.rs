@@ -3,8 +3,15 @@ use net::window::{Stack, WindowKind, WindowSnapshot};
 use rules::stack::ItemStack;
 use ui::app::{Screen, UiApp};
 fn stack(raw: Stack) -> Result<ItemStack, &'static str> {
-    ItemStack::from_parts(raw.item, raw.count, raw.damage)
-        .map_err(|_| "invalid authoritative window stack")
+    let value = ItemStack::from_parts(raw.item, raw.count, raw.damage)
+        .map_err(|_| "invalid authoritative window stack")?;
+    if raw.payload == 0 {
+        Ok(value)
+    } else {
+        value
+            .with_payload(rules::item_payload::PayloadId(raw.payload))
+            .map_err(|_| "invalid authoritative window payload")
+    }
 }
 pub fn apply_window(ui: &mut UiApp, state: &WindowSnapshot) -> Result<bool, &'static str> {
     if state.guard.inventory_revision != ui.snapshot.inventory_revision {

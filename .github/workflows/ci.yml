@@ -17,7 +17,7 @@ jobs:
   linux:
     name: Linux, software Vulkan and browser WebGPU
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -43,6 +43,15 @@ jobs:
         run: |
           xvfb-run -a node tools/web_smoke.mjs --headed
           xvfb-run -a node tools/terrain_smoke.mjs --headed
+      - name: Build portable Linux and web bundles
+        run: bash tools/build_release.sh linux --web
+      - name: Preserve portable Linux and web bundles
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cubi-linux-and-web
+          path: .local/artifacts/dist/*
+          include-hidden-files: true
+          if-no-files-found: error
       - name: Preserve actual browser and GPU evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -53,13 +62,16 @@ jobs:
             .local/artifacts/*smoke.json
             .local/artifacts/bench/*.json
             .local/artifacts/bench/*.html
+            .local/artifacts/product-flight-recorder.json
+            .local/artifacts/*movement-replay.txt
+            .local/artifacts/flight/*.json
           include-hidden-files: true
           if-no-files-found: ignore
 
   windows:
     name: Windows native compilation
     runs-on: windows-2022
-    timeout-minutes: 35
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -76,8 +88,25 @@ jobs:
         run: |
           source tools/env.sh
           cargo test --locked -p render --test software_sky -- --nocapture
+      - name: Validate local material pipelines with D3D12 WARP
+        run: |
+          source tools/env.sh
+          cargo test --locked -p render --test material_pack -- --test-threads=1 --nocapture
+      - name: Validate authoritative light and shadow buffers with D3D12 WARP
+        run: |
+          source tools/env.sh
+          cargo test --locked -p client --test lighting_gpu -- --test-threads=1 --nocapture
       - name: Present three native Windows frames
         run: bash tools/windows_native_smoke.sh
+      - name: Build portable Windows bundle
+        run: bash tools/build_release.sh windows
+      - name: Preserve portable Windows bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cubi-windows
+          path: .local/artifacts/dist/*
+          include-hidden-files: true
+          if-no-files-found: error
 
   report:
     name: Relay actual CI evidence and stage delivery

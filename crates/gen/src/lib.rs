@@ -13,6 +13,7 @@ use std::{
     sync::Arc,
 };
 
+pub mod public_terrain;
 mod v4;
 mod wire;
 pub use wire::{RESULT_BYTES, TASK_BYTES, WireError};

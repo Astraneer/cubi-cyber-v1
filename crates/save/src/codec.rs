@@ -801,7 +801,7 @@ fn write_inventories(w: &mut Writer, players: &[SavedPlayer]) {
     for (index, player) in players.iter().enumerate() {
         if !player.inventory.is_empty() {
             w.u32(index as u32);
-            w.bytes(&player.inventory, 512);
+            w.bytes(&player.inventory, 1024);
         }
     }
 }
@@ -823,7 +823,7 @@ fn read_inventories(r: &mut Reader<'_>, players: &mut [SavedPlayer]) -> Result<(
             return Err(SaveError::Invalid("duplicate inventory extension"));
         }
         *entry = true;
-        players[index].inventory = r.bytes(512)?;
+        players[index].inventory = r.bytes(1024)?;
     }
     Ok(())
 }
@@ -881,7 +881,7 @@ fn write_runtimes(w: &mut Writer, records: &[RuntimeRecord]) -> Result<(), SaveE
     }
     let mut seen = 0u16;
     for record in records {
-        if !(RUNTIME_SURVIVAL..=RUNTIME_CHAT).contains(&record.kind) {
+        if !(RUNTIME_SURVIVAL..=RUNTIME_PAYLOADS).contains(&record.kind) {
             return Err(SaveError::Invalid("runtime kind"));
         }
         let bit = 1u16 << record.kind;
@@ -898,7 +898,7 @@ fn write_runtimes(w: &mut Writer, records: &[RuntimeRecord]) -> Result<(), SaveE
     }
     w.raw(b"RUN1");
     w.count(records.len(), MAX_RUNTIME_RECORDS);
-    for kind in RUNTIME_SURVIVAL..=RUNTIME_CHAT {
+    for kind in RUNTIME_SURVIVAL..=RUNTIME_PAYLOADS {
         if let Some(record) = records.iter().find(|record| record.kind == kind) {
             w.u16(kind);
             w.bytes(&record.payload, MAX_RUNTIME_BYTES);
@@ -918,7 +918,7 @@ fn read_runtimes(r: &mut Reader<'_>) -> Result<Vec<RuntimeRecord>, SaveError> {
     let mut previous = 0u16;
     for _ in 0..count {
         let kind = r.u16()?;
-        if !(RUNTIME_SURVIVAL..=RUNTIME_CHAT).contains(&kind) || kind <= previous {
+        if !(RUNTIME_SURVIVAL..=RUNTIME_PAYLOADS).contains(&kind) || kind <= previous {
             return Err(SaveError::Invalid("runtime kind/order"));
         }
         previous = kind;

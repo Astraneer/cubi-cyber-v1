@@ -7,6 +7,8 @@ use crate::{
     terrain_mesh::{MAX_PAGE_QUADS, MeshClass, OwnerPatch, PageMesh},
 };
 use bytemuck::{Pod, Zeroable};
+mod materials;
+pub use materials::{atmosphere_material_shader_source, material_shader_source};
 
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -304,6 +306,9 @@ pub struct TerrainGpu {
     sampler: wgpu::Sampler,
     cameras: [wgpu::Buffer; 2],
     render_bind: wgpu::BindGroup,
+    render_layout: wgpu::BindGroupLayout,
+    lighting_bindings: Option<materials::LightingBindings>,
+    local_materials: Option<materials::MaterialState>,
     frustum_bind: wgpu::BindGroup,
     cull_layout: wgpu::BindGroupLayout,
     hiz_base_layout: Option<wgpu::BindGroupLayout>,
@@ -317,6 +322,7 @@ pub struct TerrainGpu {
     masked_depth_pipeline: Option<wgpu::RenderPipeline>,
     sky_pipeline: wgpu::RenderPipeline,
     atmosphere_sky: Option<crate::atmosphere::AtmosphereSkyGpu>,
+    atmosphere_lighting: Option<wgpu::Buffer>,
     tone_pipeline: wgpu::RenderPipeline,
     reset_pipeline: wgpu::ComputePipeline,
     frustum_pipeline: wgpu::ComputePipeline,
@@ -446,7 +452,7 @@ impl TerrainGpu {
         });
         let compute = wgpu::ShaderStages::COMPUTE;
         let fragment = wgpu::ShaderStages::FRAGMENT;
-        let render_layout = terrain_render_layout(device, false, false);
+        let render_layout = terrain_render_layout(device, false, false, false, false);
         let frustum_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frustum compute tables"),
             entries: &[
@@ -816,6 +822,9 @@ impl TerrainGpu {
             sampler,
             cameras,
             render_bind,
+            render_layout,
+            lighting_bindings: None,
+            local_materials: None,
             frustum_bind,
             cull_layout,
             hiz_base_layout,
@@ -829,6 +838,7 @@ impl TerrainGpu {
             masked_depth_pipeline,
             sky_pipeline,
             atmosphere_sky: None,
+            atmosphere_lighting: None,
             tone_pipeline,
             reset_pipeline,
             frustum_pipeline,
@@ -959,88 +969,8 @@ impl TerrainGpu {
         {
             return Err(TerrainError::InvalidSize);
         }
-        let layout = terrain_render_layout(device, true, gi.is_some());
-        let mut entries = vec![
-            buffer_binding(0, &self.cameras[0]),
-            buffer_binding(1, &self.objects),
-            buffer_binding(2, &self.quads),
-            buffer_binding(3, &self.visible),
-            buffer_binding(4, &self.materials),
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: wgpu::BindingResource::TextureView(&self.colors),
-            },
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: wgpu::BindingResource::TextureView(&self.tint_masks),
-            },
-            wgpu::BindGroupEntry {
-                binding: 7,
-                resource: wgpu::BindingResource::Sampler(&self.sampler),
-            },
-            buffer_binding(8, &self.edit_masks),
-            buffer_binding(16, &self.edit_neighbors),
-            buffer_binding(9, shadows.sampling_buffer()),
-            wgpu::BindGroupEntry {
-                binding: 10,
-                resource: wgpu::BindingResource::TextureView(shadows.depth_view()),
-            },
-            wgpu::BindGroupEntry {
-                binding: 11,
-                resource: wgpu::BindingResource::Sampler(shadows.sampler()),
-            },
-            buffer_binding(12, lights.buffer()),
-        ];
-        if let Some(gi) = gi {
-            entries.push(buffer_binding(13, gi.sampling_buffer()));
-            entries.push(buffer_binding(14, gi.probe_buffer()));
-        }
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("terrain light volumes, cascades and optional reflected GI"),
-            layout: &layout,
-            entries: &entries,
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("lit terrain pipeline layout"),
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
-        });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("terrain RGB sky and cascaded sunlight"),
-            source: wgpu::ShaderSource::Wgsl(lit_terrain_shader(gi.is_some()).into()),
-        });
-        self.opaque_pipeline =
-            terrain_pipeline(device, &pipeline_layout, &shader, false, false, false);
-        self.cutout_pipeline =
-            terrain_pipeline(device, &pipeline_layout, &shader, true, false, false);
-        self.masked_opaque_pipeline =
-            terrain_pipeline(device, &pipeline_layout, &shader, false, false, true);
-        self.masked_cutout_pipeline =
-            terrain_pipeline(device, &pipeline_layout, &shader, true, false, true);
-        if self.config.occlusion {
-            self.depth_pipeline = Some(terrain_pipeline(
-                device,
-                &pipeline_layout,
-                &shader,
-                false,
-                true,
-                false,
-            ));
-            self.masked_depth_pipeline = Some(terrain_pipeline(
-                device,
-                &pipeline_layout,
-                &shader,
-                false,
-                true,
-                true,
-            ));
-        }
-        self.render_bind = bind;
-        self.work.record(telemetry::WorkCounts {
-            pipeline_compilations: if self.config.occlusion { 6 } else { 4 },
-            ..telemetry::WorkCounts::ZERO
-        });
-        self.invalidate();
+        self.lighting_bindings = Some(materials::LightingBindings::new(shadows, lights, gi));
+        self.rebuild_material_pipelines(device);
         Ok(())
     }
 
@@ -1051,18 +981,44 @@ impl TerrainGpu {
         device: &wgpu::Device,
         atmosphere: &crate::atmosphere::AtmosphereGpu,
     ) -> Result<(), TerrainError> {
+        self.attach_environment_lighting(device, atmosphere, None, None)
+    }
+    /// Configure physical sky/surface illumination and optional M4/GI together,
+    /// preserving local material bindings and compiling each final variant once.
+    pub fn attach_environment_lighting(
+        &mut self,
+        device: &wgpu::Device,
+        atmosphere: &crate::atmosphere::AtmosphereGpu,
+        lighting: Option<(
+            &crate::shadows::ShadowGpu,
+            &crate::light_volume::LightVolumeGpu,
+        )>,
+        gi: Option<&crate::gi::GiGpu>,
+    ) -> Result<(), TerrainError> {
         if self.last_render.is_some() {
             return Err(TerrainError::LatePreparation);
+        }
+        if gi.is_some() && lighting.is_none() {
+            return Err(TerrainError::InvalidSize);
+        }
+        if let Some((shadows, lights)) = lighting {
+            if lights.buffer().size()
+                < u64::from(self.config.max_pages) * crate::light_volume::LIGHT_PAGE_BYTES
+            {
+                return Err(TerrainError::InvalidSize);
+            }
+            self.lighting_bindings = Some(materials::LightingBindings::new(shadows, lights, gi));
         }
         self.atmosphere_sky = Some(crate::atmosphere::AtmosphereSkyGpu::new(
             device,
             atmosphere.sky_view(),
         ));
+        self.atmosphere_lighting = Some(atmosphere.lighting_buffer().clone());
         self.work.record(telemetry::WorkCounts {
             pipeline_compilations: 1,
             ..telemetry::WorkCounts::ZERO
         });
-        self.invalidate();
+        self.rebuild_material_pipelines(device);
         Ok(())
     }
 
@@ -2494,7 +2450,13 @@ fn world_bounds(model: [[f32; 4]; 4]) -> ([f32; 4], [f32; 4]) {
     (low, high)
 }
 
-fn terrain_render_layout(device: &wgpu::Device, lighting: bool, gi: bool) -> wgpu::BindGroupLayout {
+fn terrain_render_layout(
+    device: &wgpu::Device,
+    lighting: bool,
+    gi: bool,
+    local_materials: bool,
+    atmosphere: bool,
+) -> wgpu::BindGroupLayout {
     let vertex = wgpu::ShaderStages::VERTEX;
     let fragment = wgpu::ShaderStages::FRAGMENT;
     let mut entries = vec![
@@ -2551,6 +2513,21 @@ fn terrain_render_layout(device: &wgpu::Device, lighting: bool, gi: bool) -> wgp
             buffer_entry(14, fragment, false, true),
         ]);
     }
+    if local_materials {
+        for binding in [17, 18] {
+            entries.push(texture_entry(
+                binding,
+                fragment,
+                wgpu::TextureViewDimension::D2Array,
+                wgpu::TextureSampleType::Float { filterable: true },
+                false,
+            ));
+        }
+        entries.push(buffer_entry(19, fragment, true, true));
+    }
+    if atmosphere {
+        entries.push(buffer_entry(20, fragment, false, true));
+    }
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("terrain render tables"),
         entries: &entries,
@@ -2579,6 +2556,45 @@ fn lit_terrain_shader(gi: bool) -> String {
         } else {
             ""
         },
+    )
+}
+
+fn environment_terrain_shader(lit: bool, gi: bool) -> String {
+    let source = include_str!("terrain.wgsl");
+    let (before, rest) = source
+        .split_once("// BEGIN_DEFAULT_LIGHTING")
+        .expect("terrain lighting start");
+    let (_, after) = rest
+        .split_once("// END_DEFAULT_LIGHTING")
+        .expect("terrain lighting end");
+    let input = if lit {
+        "let light=sample_page_light(slot,local_position,local_normal);let sky=light.a;let block=light.rgb;let visibility=cascade_shadow(world_position,normal);"
+    } else {
+        "let sky=1.0;let block=vec3(0.0);let visibility=1.0;"
+    };
+    let indirect = if gi {
+        "+reflected_irradiance(world_position,normal)*0.3183098862"
+    } else {
+        ""
+    };
+    format!(
+        "{before}\n{input}let sun=normalize(atmosphere_light.direction.xyz);let direct=atmosphere_light.sun.rgb*(0.3183098862*max(dot(normalize(normal),sun),0.0)*visibility*sky);return albedo*((block+sky*atmosphere_diffuse(normal){indirect})*ao+direct);\n{after}\n{}\n{}\n{}\n{}",
+        include_str!("atmosphere_lighting.wgsl"),
+        if lit {
+            include_str!("shadow_sampling.wgsl")
+        } else {
+            ""
+        },
+        if lit {
+            include_str!("light_volume.wgsl")
+        } else {
+            ""
+        },
+        if gi {
+            include_str!("gi_sampling.wgsl")
+        } else {
+            ""
+        }
     )
 }
 
@@ -2731,7 +2747,7 @@ fn terrain_pipeline(
         depth_stencil: Some(depth_state(true, wgpu::CompareFunction::GreaterEqual)),
         multisample: wgpu::MultisampleState {
             count: MSAA_SAMPLES,
-            alpha_to_coverage_enabled: cutout,
+            alpha_to_coverage_enabled: cutout && !depth_only,
             ..Default::default()
         },
         fragment: (!depth_only || masked).then_some(wgpu::FragmentState {

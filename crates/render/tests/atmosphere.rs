@@ -186,10 +186,98 @@ fn atmosphere_luts_match_numeric_optics_and_budget_updates() {
             trans,
             "sun motion rebuilt or corrupted static transmittance"
         );
-        assert_eq!(night_work.integration_steps, 48 * 32 * 48);
+        assert_eq!(
+            night_work.integration_steps,
+            (48 * 32 + render::atmosphere::ILLUMINATION_RAYS) * 48 + 64
+        );
         println!(
             "ATMOSPHERE_GPU_OK checked_optics={checked} max_abs_error={maximum_error:.8} initial_steps={} sun_change_steps={} static_steps=0 planet_night_leaks=0",
             work.integration_steps, night_work.integration_steps
         );
     });
+}
+
+#[test]
+fn prepared_multiple_scattering_changes_real_sky_and_sh_but_sun_updates_reuse_transfer() {
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let config = AtmosphereConfig {
+        transmittance_size: [64, 32],
+        sky_size: [32, 16],
+        transmittance_steps: 64,
+        sky_steps: 32,
+    };
+    let mut budget = UploadBudget::new(20_000);
+    let mut single = AtmosphereGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        config,
+        AtmosphereState::default(),
+        &mut budget,
+    )
+    .unwrap();
+    let mut multi = AtmosphereGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        config,
+        AtmosphereState::default(),
+        &mut budget,
+    )
+    .unwrap();
+    let startup = multi
+        .prepare_multiple_scattering(
+            &gpu.device,
+            &gpu.queue,
+            render::multiple_scattering::MultipleScatteringConfig {
+                size: [8, 8],
+                directions: 32,
+                steps: 32,
+                ..Default::default()
+            },
+            &mut budget,
+        )
+        .unwrap();
+    assert_eq!(startup.pipeline_compilations, 2);
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    let a = single.encode_update(&mut encoder, &mut 1_000_000).unwrap();
+    let b = multi.encode_update(&mut encoder, &mut 1_000_000).unwrap();
+    assert_eq!((a.passes, b.passes), (2, 3));
+    assert_eq!(b.integration_steps - a.integration_steps, 65536);
+    assert!(multi.multiple_scattering_view().is_some());
+    assert_eq!(multi.multiple_scattering_timing().unwrap().2.count, 1);
+    gpu.queue.submit([encoder.finish()]);
+    let a = pixels(&gpu, single.sky_texture(), config.sky_size);
+    let b = pixels(&gpu, multi.sky_texture(), config.sky_size);
+    let mut brighter = 0;
+    for (a, b) in a.iter().zip(&b) {
+        assert!(b[..3].iter().all(|v| v.is_finite() && *v >= 0.));
+        if b[0] > a[0] + 0.001 {
+            brighter += 1;
+        }
+    }
+    assert!(
+        brighter > 100,
+        "the selected multiple-scattering LUT must actually reach the sky shader"
+    );
+    let night = AtmosphereState {
+        sun_direction: [0., -1., 0.],
+        ..AtmosphereState::default()
+    };
+    multi.set_state(&gpu.queue, night, &mut budget).unwrap();
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    let work = multi.encode_update(&mut encoder, &mut 1_000_000).unwrap();
+    assert_eq!(work.passes, 1);
+    assert!(multi.multiple_scattering_timing().is_none());
+    gpu.queue.submit([encoder.finish()]);
+    let night = pixels(&gpu, multi.sky_texture(), config.sky_size);
+    assert!(
+        night.iter().all(|p| p[..3] == [0.; 3]),
+        "multiple scattering must not introduce a white night source"
+    );
+    assert!(matches!(
+        multi.prepare_multiple_scattering(&gpu.device, &gpu.queue, Default::default(), &mut budget),
+        Err(AtmosphereError::LatePreparation)
+    ));
+    println!(
+        "M10_MULTIPLE_SKY_GPU_OK brighter_texels={brighter} initial_extra_passes=1 initial_extra_steps=65536 sun_change_multiple_passes=0 night_sky_leaks=0"
+    );
 }

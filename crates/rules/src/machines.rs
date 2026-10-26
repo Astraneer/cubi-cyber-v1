@@ -314,6 +314,16 @@ pub trait MachineWorld {
     fn push_items(&mut self, _position: [i32; 3], _face: Face, _stack: ItemStack) -> u16 {
         0
     }
+    /// Owners must preserve numeric slot charge across the item boundary.
+    /// Legacy item-only adapters may accept ordinary stacks; charged slots
+    /// remain owned until an adapter implements the typed conversion.
+    fn push_slot(&mut self, position: [i32; 3], face: Face, slot: Slot) -> u16 {
+        if slot.charge == 0 {
+            self.push_items(position, face, slot.stack)
+        } else {
+            0
+        }
+    }
     fn push_substance(
         &mut self,
         _position: [i32; 3],
@@ -743,11 +753,11 @@ impl Machine {
                 if self.sides[sides::relative(facing, face) as usize] != mode {
                     continue;
                 }
-                let s = self.slots[output].stack;
-                if s.is_empty() {
+                let s = self.slots[output];
+                if s.stack.is_empty() {
                     break;
                 }
-                let n = w.push_items(p, face, s).min(s.count());
+                let n = w.push_slot(p, face, s).min(s.stack.count());
                 self.slots[output].take(n);
             }
         }

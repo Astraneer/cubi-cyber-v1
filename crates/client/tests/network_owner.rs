@@ -17,12 +17,17 @@ use std::{
 };
 use world::{Transaction, World};
 
+static DIRECTORY_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.local/tmp")
-            .join(format!("shared-network-{}", std::process::id()));
+            .join(format!(
+                "shared-network-{}-{}",
+                std::process::id(),
+                DIRECTORY_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
     }
@@ -377,4 +382,187 @@ fn shared_client_predicts_rolls_back_recovers_confirmed_base_and_never_receives_
         runtime.counters().sent_bytes,
         bot.up.counters().lost + bot.down.counters().lost
     );
+}
+
+#[test]
+fn public_light_crosses_actual_lossy_udp_and_repairs_its_own_base_without_cell_changes() {
+    let directory = Directory::new();
+    let mut world = fixture();
+    let page = pos(0, 0, 0).page();
+    let emitter = pos(2, 3, 2);
+    let sample = pos(3, 3, 2);
+    let mut tx = Transaction::new(Tick(2), SpaceId(0));
+    tx.set_cell(emitter, Cell::from_parts(rules::ids::TORCH, 0));
+    world.commit(tx).unwrap();
+    let server = Server::open_with_world(directory.config(), world).unwrap();
+    let ClientMessage::Hello(owner) =
+        net::decode_client(&std::fs::read(directory.0.join("owner.identity")).unwrap()).unwrap()
+    else {
+        unreachable!()
+    };
+    let key: [u8; 32] = std::fs::read(directory.0.join("generation.key"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let mut runtime = Runtime::bind(
+        server,
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
+    let address = runtime.udp_address().unwrap();
+    let guest = Hello {
+        identity: net::PlayerId::default(),
+        name: "light observer".into(),
+        credential: None,
+    };
+    let mut bots = [Bot::new(address, owner, key), Bot::new(address, guest, key)];
+    let mut scenes = std::array::from_fn::<_, 2, _>(|_| {
+        client::ClientScene::new(client::SceneConfig {
+            authoritative_remote: true,
+            center: pos(8, 1, 8),
+            ..client::SceneConfig::forest()
+        })
+        .unwrap()
+    });
+    let mut configured = [false; 2];
+    let mut requested = [false; 2];
+    let mut cell_views = [0; 2];
+    let mut shape_versions = [core_types::Version(0); 2];
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut stable_at = None;
+    let mut injected = false;
+    let mut base_lost = false;
+    let mut initial_snapshots = 0;
+    let desired = world::LightSample {
+        sky: 4,
+        block: 5,
+        rgb: [231, 17, 255],
+    };
+    let mut complete = false;
+    for now in (0..=40_000).step_by(5) {
+        assert!(Instant::now() < deadline, "actual UDP light deadline");
+        runtime.poll(now).unwrap();
+        for (index, bot) in bots.iter_mut().enumerate() {
+            bot.step(now);
+            bot.client
+                .advance_to(bot.client.acknowledged_tick())
+                .unwrap();
+            if let Some(w) = bot.client.welcome()
+                && !configured[index]
+            {
+                scenes[index]
+                    .configure_authority(w.public_seed, pos(8, 1, 8))
+                    .unwrap();
+                configured[index] = true;
+            }
+            if bot.client.player().is_some() && !requested[index] {
+                bot.client.request_page(page, now).unwrap();
+                requested[index] = true;
+            }
+            if let Some(image) = bot.client.replica().page(page)
+                && scenes[index]
+                    .authoritative_version(page)
+                    .is_none_or(|v| v.view != image.version)
+            {
+                scenes[index]
+                    .import_replica_page(image, bot.client.acknowledged_tick())
+                    .unwrap();
+            }
+            for _ in 0..16 {
+                let Some(update) = bot.client.take_light_update() else {
+                    break;
+                };
+                let result = scenes[index]
+                    .import_authoritative_light(&update, bot.client.acknowledged_tick());
+                assert!(
+                    result.is_ok()
+                        || matches!(
+                            result,
+                            Err(client::SceneError::Light(
+                                net::light::Error::MissingCells { .. }
+                                    | net::light::Error::MissingBase { .. }
+                            ))
+                        )
+                );
+            }
+            if let Some(image) = bot.client.light_replica().page(page)
+                && scenes[index]
+                    .authoritative_version(page)
+                    .is_some_and(|v| v.view == image.header.cell_view)
+                && scenes[index]
+                    .authoritative_light_version(page)
+                    .is_none_or(|v| v.view < image.header.version)
+            {
+                scenes[index]
+                    .import_replica_light(image, bot.client.acknowledged_tick())
+                    .unwrap();
+            }
+        }
+        let lit = scenes.iter().all(|s| {
+            s.read_authoritative_light(sample)
+                .is_some_and(|l| l.block >= 12)
+        });
+        if lit && !injected {
+            let start = *stable_at.get_or_insert(now);
+            if now >= start + 1500 {
+                for i in 0..2 {
+                    cell_views[i] = bots[i].client.replica().page(page).unwrap().version;
+                    shape_versions[i] = scenes[i]
+                        .world()
+                        .page(page)
+                        .unwrap()
+                        .channel_version(core_types::ChannelMask::SHAPE);
+                }
+                initial_snapshots = runtime.server().counters().light_snapshot_cells;
+                let mut tx =
+                    Transaction::new(Tick(runtime.server().current_tick().0 + 1), SpaceId(0));
+                tx.set_light(sample, desired);
+                runtime
+                    .server_mut()
+                    .queue_transaction(tx)
+                    .unwrap_or_else(|_| panic!("trusted light owner queue"));
+                injected = true;
+            }
+        }
+        if injected
+            && scenes
+                .iter()
+                .all(|s| s.read_authoritative_light(sample) == Some(desired))
+        {
+            for i in 0..2 {
+                assert_eq!(
+                    bots[i].client.replica().page(page).unwrap().version,
+                    cell_views[i]
+                );
+                assert_eq!(
+                    scenes[i]
+                        .world()
+                        .page(page)
+                        .unwrap()
+                        .channel_version(core_types::ChannelMask::SHAPE),
+                    shape_versions[i]
+                );
+            }
+            if !base_lost {
+                bots[0].client.request_light_snapshot(page).unwrap();
+                assert!(bots[0].client.light_replica().page(page).is_none());
+                base_lost = true;
+            } else if bots[0].client.light_replica().page(page).is_some()
+                && runtime.server().counters().light_snapshot_cells >= initial_snapshots + 4096
+            {
+                complete = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_micros(300));
+    }
+    assert!(complete && base_lost);
+    assert!(runtime.server().counters().light_deltas > 0);
+    assert!(runtime.server().counters().light_delta_cells >= 2);
+    assert!(bots.iter().all(|b| !b.secret_seen));
+    for scene in scenes {
+        assert_eq!(scene.read_authoritative_light(sample), Some(desired));
+        assert_eq!(scene.world().loaded_pages(), 1);
+    }
 }

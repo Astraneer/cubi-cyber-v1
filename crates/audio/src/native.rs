@@ -14,6 +14,7 @@ pub struct NativeOutput {
     mixer: Arc<Mutex<Mixer>>,
     errors: Arc<AtomicU64>,
     missed: Arc<AtomicU64>,
+    rate: u32,
 }
 impl NativeOutput {
     pub fn open(voices: usize, memory_limit: usize) -> Result<Self, AudioError> {
@@ -30,7 +31,8 @@ impl NativeOutput {
         if channels == 0 || channels > 8 {
             return Err(AudioError::UnsupportedDevice);
         }
-        prepared.endpoint_rate(config.sample_rate().0)?;
+        let rate = config.sample_rate().0;
+        prepared.endpoint_rate(rate)?;
         let mixer = Arc::new(Mutex::new(prepared));
         let errors = Arc::new(AtomicU64::new(0));
         let missed = Arc::new(AtomicU64::new(0));
@@ -67,7 +69,20 @@ impl NativeOutput {
             mixer,
             errors,
             missed,
+            rate,
         })
+    }
+    /// Loading publishes one complete bank. Destroy the old buffers outside the
+    /// callback mutex so their deallocation cannot stall the audio thread.
+    pub fn replace_prepared(&self, mut prepared: Mixer) -> Result<(), AudioError> {
+        prepared.endpoint_rate(self.rate)?;
+        let old = {
+            let mut active = self.mixer.lock().map_err(|_| AudioError::DeviceFailure)?;
+            prepared.inherit_control(&mut active)?;
+            std::mem::replace(&mut *active, prepared)
+        };
+        drop(old);
+        Ok(())
     }
     pub fn with_mixer<T>(&self, action: impl FnOnce(&mut Mixer) -> T) -> Result<T, AudioError> {
         let mut mixer = self.mixer.lock().map_err(|_| AudioError::DeviceFailure)?;

@@ -740,6 +740,14 @@ impl DropBundle {
             raw[51..53].copy_from_slice(&entry.stack.count().to_le_bytes());
             raw[53..55].copy_from_slice(&entry.stack.damage().to_le_bytes());
         }
+        rules::item_payload::refs::append(
+            &mut bytes,
+            self.entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (i, e.stack.payload())),
+        )
+        .map_err(|_| SurvivalError::InvalidEncoding)?;
         Ok(bytes)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, SurvivalError> {
@@ -747,13 +755,15 @@ impl DropBundle {
             || &bytes[..4] != b"DRP1"
             || bytes[4] > 64
             || bytes[5..8].iter().any(|&value| value != 0)
-            || bytes.len() != 8 + usize::from(bytes[4]) * 56
+            || bytes.len() < 8 + usize::from(bytes[4]) * 56
+            || bytes.len() > 8 + 64 * 56 + 6 + 64 * 10
         {
             return Err(SurvivalError::InvalidEncoding);
         }
         let mut entries = Vec::with_capacity(usize::from(bytes[4]));
         let mut ids = BTreeSet::new();
-        for raw in bytes[8..].chunks_exact(56) {
+        let prefix = 8 + usize::from(bytes[4]) * 56;
+        for raw in bytes[8..prefix].chunks_exact(56) {
             let read64 = |i| u64::from_le_bytes(raw[i..i + 8].try_into().expect("fixed drop"));
             let read16 = |i| u16::from_le_bytes([raw[i], raw[i + 1]]);
             let entry = DropEntry {
@@ -775,6 +785,17 @@ impl DropBundle {
                 return Err(SurvivalError::InvalidEncoding);
             }
             entries.push(entry);
+        }
+        let (refs, used) = rules::item_payload::refs::read(&bytes[prefix..], entries.len())
+            .map_err(|_| SurvivalError::InvalidEncoding)?;
+        if prefix + used != bytes.len() {
+            return Err(SurvivalError::InvalidEncoding);
+        }
+        for (slot, id) in refs {
+            entries[slot].stack = entries[slot]
+                .stack
+                .with_payload(id)
+                .map_err(|_| SurvivalError::InvalidStack)?;
         }
         Ok(Self { entries })
     }

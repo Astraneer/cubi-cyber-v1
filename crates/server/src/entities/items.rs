@@ -685,3 +685,5 @@ impl ItemDelta {
         })
     }
 }
+#[path = "items/spawn.rs"]
+mod spawn;

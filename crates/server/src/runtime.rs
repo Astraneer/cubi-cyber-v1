@@ -15,6 +15,13 @@ pub(super) struct Runtimes {
     pub(super) items: ItemRuntime,
     pub(super) machines: machines::MachineRuntime,
     pub(super) chat: chat::Ledger,
+    pub(super) payloads: rules::item_payload::Ledger,
+    pub(super) height: height_authority::HeightAuthority,
+    pub(super) height_loaded: bool,
+    pub(super) topology_bootstrap: BTreeSet<BlockPos>,
+    machine_activity: BTreeSet<PageId>,
+    machine_activity_initialized: bool,
+    machine_activity_revision: u64,
     drops: BTreeSet<ComponentId>,
     furnace_bootstrap: BTreeSet<ComponentId>,
     machine_bootstrap: BTreeSet<ComponentId>,
@@ -22,6 +29,7 @@ pub(super) struct Runtimes {
     section_centers: BTreeMap<PlayerId, PageId>,
     active_sections: BTreeSet<PageId>,
     sections_dirty: bool,
+    sections_revision: u64,
 }
 impl Runtimes {
     pub(super) fn new(entropy: &[u8; 32]) -> Result<Self, ServerError> {
@@ -45,6 +53,15 @@ impl Runtimes {
             machines: machines::MachineRuntime::new(machines::Config::default())
                 .map_err(|_| ServerError::Invalid("machine runtime initialization"))?,
             chat: chat::Ledger::default(),
+            payloads: rules::item_payload::Ledger::new(rules::item_payload::Config::default())
+                .map_err(|_| ServerError::Invalid("item payload ledger limits"))?,
+            height: height_authority::HeightAuthority::new(height_authority::Config::default())
+                .map_err(|_| ServerError::Invalid("height authority limits"))?,
+            height_loaded: false,
+            topology_bootstrap: BTreeSet::new(),
+            machine_activity: BTreeSet::new(),
+            machine_activity_initialized: false,
+            machine_activity_revision: 0,
             drops: BTreeSet::new(),
             furnace_bootstrap: BTreeSet::new(),
             machine_bootstrap: BTreeSet::new(),
@@ -52,6 +69,7 @@ impl Runtimes {
             section_centers: BTreeMap::new(),
             active_sections: BTreeSet::new(),
             sections_dirty: true,
+            sections_revision: 1,
         })
     }
     pub(super) fn restore(&mut self, records: &[RuntimeRecord]) -> Result<(), ServerError> {
@@ -94,6 +112,25 @@ impl Runtimes {
                         .map_err(|_| ServerError::Invalid("machine snapshot codec"))?,
                     )
                     .map_err(|_| ServerError::Invalid("machine snapshot state"))?
+                }
+                save::RUNTIME_HEIGHT => {
+                    self.height = height_authority::HeightAuthority::restore(
+                        &record.payload,
+                        height_authority::Config::default(),
+                    )
+                    .map_err(|_| ServerError::Invalid("height snapshot codec/state"))?;
+                    self.height_loaded = true;
+                }
+                save::RUNTIME_PAYLOADS => {
+                    self.payloads = rules::item_payload::Ledger::restore(
+                        rules::item_payload::Config::default(),
+                        &rules::item_payload::Snapshot::decode(
+                            &record.payload,
+                            rules::item_payload::Config::default(),
+                        )
+                        .map_err(|_| ServerError::Invalid("item payload snapshot codec"))?,
+                    )
+                    .map_err(|_| ServerError::Invalid("item payload snapshot state"))?
                 }
                 save::RUNTIME_CHAT => {
                     self.chat =
@@ -142,6 +179,18 @@ impl Runtimes {
                         .map_err(|_| ServerError::Invalid("machine delta codec"))?,
                     )
                     .map_err(|_| ServerError::Invalid("machine delta state"))?,
+                save::RUNTIME_HEIGHT => {
+                    self.height
+                        .apply_encoded_delta(&record.payload)
+                        .map_err(|_| ServerError::Invalid("height delta codec/state"))?;
+                }
+                save::RUNTIME_PAYLOADS => self
+                    .payloads
+                    .acknowledge(
+                        rules::item_payload::Delta::decode(&record.payload)
+                            .map_err(|_| ServerError::Invalid("item payload delta codec"))?,
+                    )
+                    .map_err(|_| ServerError::Invalid("item payload delta state"))?,
                 save::RUNTIME_CHAT => self
                     .chat
                     .apply(&chat::decode_delta(&record.payload).map_err(ServerError::Invalid)?)
@@ -189,7 +238,28 @@ impl Runtimes {
                 kind: save::RUNTIME_CHAT,
                 payload: self.chat.snapshot().map_err(ServerError::Invalid)?,
             },
+            RuntimeRecord {
+                kind: save::RUNTIME_HEIGHT,
+                payload: self
+                    .height
+                    .snapshot()
+                    .map_err(|_| ServerError::Invalid("height snapshot bounds"))?,
+            },
+            RuntimeRecord {
+                kind: save::RUNTIME_PAYLOADS,
+                payload: self
+                    .payloads
+                    .snapshot()
+                    .encode(rules::item_payload::Config::default())
+                    .map_err(|_| ServerError::Invalid("item payload snapshot bounds"))?,
+            },
         ])
+    }
+    pub(super) fn active_sections(&self) -> impl Iterator<Item = PageId> + '_ {
+        self.active_sections.iter().copied()
+    }
+    pub(super) fn sections_revision(&self) -> u64 {
+        self.sections_revision
     }
     pub(super) fn bootstrap_drops(&mut self, world: &World) -> Result<(), ServerError> {
         // Startup migration scans component metadata once, never4096 cells or
@@ -302,8 +372,12 @@ impl Server {
         self.submit_batch(batch, Vec::new());
         Ok(true)
     }
-    pub(super) fn tick_items(&mut self, batch: &mut Batch) -> Result<(), ServerError> {
-        if self.runtimes.items.entities().active_len() == 0 {
+    pub(super) fn tick_items(
+        &mut self,
+        batch: &mut Batch,
+        spawns: Vec<rules::entities::item::ItemEntity>,
+    ) -> Result<(), ServerError> {
+        if self.runtimes.items.entities().active_len() == 0 && spawns.is_empty() {
             return Ok(());
         }
         let mut identities = BTreeMap::new();
@@ -349,8 +423,12 @@ impl Server {
                 return Err(ServerError::Invalid("item pickup inventory changed"));
             }
         }
-        let payload = plan
-            .delta
+        let delta = self
+            .runtimes
+            .items
+            .extend_spawn(plan.delta, spawns, true)
+            .map_err(|_| ServerError::Invalid("machine item spawn guard/capacity"))?;
+        let payload = delta
             .encode()
             .map_err(|_| ServerError::Invalid("item physics delta bounds"))?;
         for patch in plan.inventories {
@@ -625,10 +703,7 @@ impl Server {
 }
 
 impl Server {
-    fn sample_farms(
-        &mut self,
-        events: &mut BTreeMap<survival::Event, Tick>,
-    ) -> Result<(), ServerError> {
+    fn refresh_active_sections(&mut self) -> Result<(), ServerError> {
         fn center(peer: &Peer) -> PageId {
             BlockPos {
                 space: peer.space,
@@ -668,7 +743,19 @@ impl Server {
                 }
             }
             self.runtimes.sections_dirty = false;
+            self.runtimes.sections_revision = self
+                .runtimes
+                .sections_revision
+                .checked_add(1)
+                .ok_or(ServerError::Invalid("active section revision exhausted"))?;
         }
+        Ok(())
+    }
+    fn sample_farms(
+        &mut self,
+        events: &mut BTreeMap<survival::Event, Tick>,
+    ) -> Result<(), ServerError> {
+        self.refresh_active_sections()?;
         let mut samples = [core_types::LocalIdx::default(); 3];
         for page in &self.runtimes.active_sections {
             let Some(image) = self.world.page(*page) else {
@@ -706,7 +793,68 @@ impl Server {
         }
         Ok(())
     }
-    pub(super) fn tick_machines(&mut self, batch: &mut Batch) -> Result<(), ServerError> {
+    pub(super) fn tick_machines(
+        &mut self,
+        batch: &mut Batch,
+    ) -> Result<Vec<rules::entities::item::ItemEntity>, ServerError> {
+        self.refresh_active_sections()?;
+        let mut activity = Vec::new();
+        if !self.runtimes.machine_activity_initialized {
+            activity.extend(
+                self.runtimes
+                    .machines
+                    .activity_pages()
+                    .map(|p| (p, self.runtimes.active_sections.contains(&p))),
+            );
+        } else if self.runtimes.machine_activity_revision != self.runtimes.sections_revision {
+            activity.extend(
+                self.runtimes
+                    .machine_activity
+                    .symmetric_difference(&self.runtimes.active_sections)
+                    .map(|p| (*p, self.runtimes.active_sections.contains(p))),
+            );
+        }
+        let bootstrap: Vec<_> = self
+            .runtimes
+            .topology_bootstrap
+            .iter()
+            .take(64)
+            .copied()
+            .collect();
+        let mut topology: BTreeSet<_> = bootstrap.iter().copied().collect();
+        let endpoint = |id: u16| {
+            matches!(
+                id,
+                rules::ids::UNIVERSAL_CABLE
+                    | rules::ids::MECHANICAL_PIPE
+                    | rules::ids::PRESSURIZED_TUBE
+                    | rules::ids::LOGISTICAL_TRANSPORTER
+            ) || rules::blocks::bdef(id).be.is_some()
+        };
+        for cell in batch.changes.iter().flat_map(|c| &c.cells) {
+            if (endpoint(cell.old.id()) || endpoint(cell.new.id()))
+                && (cell.old.id() != cell.new.id() || cell.old.state() & 7 != cell.new.state() & 7)
+            {
+                let (x, y, z) = cell.index.xyz();
+                topology.insert(BlockPos {
+                    space: cell.page.space,
+                    x: cell.page.x * 16 + i32::from(x),
+                    y: cell.page.y * 16 + i32::from(y),
+                    z: cell.page.z * 16 + i32::from(z),
+                });
+            }
+        }
+        for component in batch
+            .changes
+            .iter()
+            .flat_map(|c| &c.components)
+            .filter(|c| c.channels.intersects(core_types::ChannelMask::CONNECTIONS))
+        {
+            if let Some(record) = component.after.as_ref().or(component.before.as_ref()) {
+                topology.insert(record.data.anchor);
+            }
+        }
+        let topology: Vec<_> = topology.into_iter().collect();
         let mut changed: BTreeSet<_> = self.runtimes.machine_bootstrap.iter().copied().collect();
         for c in batch.changes.iter().flat_map(|c| &c.components) {
             if c.before
@@ -719,14 +867,91 @@ impl Server {
                 changed.insert(c.id);
             }
         }
-        if self.runtimes.machines.event_count() == 0 && changed.is_empty() {
-            return Ok(());
+        if self.runtimes.machines.event_count() == 0
+            && !self.runtimes.machines.transport_due(self.tick)
+            && changed.is_empty()
+            && topology.is_empty()
+            && activity.is_empty()
+        {
+            return Ok(Vec::new());
         }
-        let plan = self
+        let pending = self
+            .payload_delta(batch)
+            .map_err(|_| ServerError::Invalid("pending item payload delta"))?;
+        let view = pending
+            .as_ref()
+            .map(|delta| self.runtimes.payloads.view(delta))
+            .transpose()
+            .map_err(|_| ServerError::Invalid("pending payload view"))?;
+        let resolver: &dyn rules::item_payload::Resolver = if let Some(view) = view.as_ref() {
+            view
+        } else {
+            &self.runtimes.payloads
+        };
+        let active_sections = &self.runtimes.active_sections;
+        let active = |p: BlockPos| active_sections.contains(&p.page());
+        let mut plan = self
             .runtimes
             .machines
-            .plan_tick(&self.world, self.tick, machines::Budget::default())
+            .plan_tick_with_topology(
+                &self.world,
+                machines::PhaseContext {
+                    payloads: Some(resolver),
+                    active: Some(&active),
+                    activity: &activity,
+                },
+                &topology,
+                self.tick,
+                machines::Budget {
+                    item_spawns: MAX_ITEMS.saturating_sub(self.runtimes.items.entities().len()),
+                    ..machines::Budget::default()
+                },
+            )
             .map_err(|_| ServerError::Invalid("machine phase planning"))?;
+        // Admission precedes every World write. A full item store or payload
+        // ledger leaves packets and source inventories intact for a later tick.
+        let spawn_delta = self
+            .runtimes
+            .items
+            .plan_activity(&[])
+            .map_err(|_| ServerError::Invalid("item spawn preflight revision"))?;
+        let spawn_admission =
+            self.runtimes
+                .items
+                .extend_spawn(spawn_delta, plan.item_spawns.iter().copied(), true);
+        let payload_admission = self.plan_payloads(batch, std::mem::take(&mut plan.payloads));
+        let deferred = matches!(spawn_admission, Err(EntityError::Capacity))
+            || matches!(payload_admission, Err(RejectReason::Capacity));
+        let payload_record = if deferred {
+            // Zero work still supplies one guarded registration boundary, so
+            // external machine births/edits remain recoverable with their ACK.
+            plan = self
+                .runtimes
+                .machines
+                .plan_tick_with_topology(
+                    &self.world,
+                    machines::PhaseContext {
+                        payloads: Some(resolver),
+                        active: Some(&active),
+                        activity: &activity,
+                    },
+                    &topology,
+                    self.tick,
+                    machines::Budget {
+                        events: 0,
+                        item_spawns: 0,
+                        reads: 0,
+                        bytes: 0,
+                        endpoints: 0,
+                        route_nodes: 0,
+                    },
+                )
+                .map_err(|_| ServerError::Invalid("deferred machine registration"))?;
+            None
+        } else {
+            spawn_admission.map_err(|_| ServerError::Invalid("machine spawn identity/row"))?;
+            payload_admission.map_err(|_| ServerError::Invalid("machine payload admission"))?
+        };
         self.runtimes
             .machines
             .validate(&self.world, &plan)
@@ -751,12 +976,23 @@ impl Server {
                     .map_err(|_| ServerError::Invalid("machine delta bounds"))?,
             });
         }
+        Self::stage_payloads(batch, payload_record);
         self.counters.machine_events += plan.work.events;
         self.counters.machine_steps += plan.work.machines;
         self.counters.machine_reads += plan.work.reads;
         self.counters.machine_transfers += plan.work.transfers;
         self.runtimes.machine_bootstrap.clear();
-        Ok(())
+        for p in bootstrap {
+            self.runtimes.topology_bootstrap.remove(&p);
+        }
+        if !self.runtimes.machine_activity_initialized
+            || self.runtimes.machine_activity_revision != self.runtimes.sections_revision
+        {
+            self.runtimes.machine_activity = self.runtimes.active_sections.clone();
+            self.runtimes.machine_activity_initialized = true;
+            self.runtimes.machine_activity_revision = self.runtimes.sections_revision;
+        }
+        Ok(plan.item_spawns)
     }
 }
 
@@ -772,6 +1008,8 @@ pub(super) fn component_birth(
     world: &World,
     tx: &mut Transaction,
     position: BlockPos,
+    held: rules::stack::ItemStack,
+    payloads: &dyn rules::item_payload::Resolver,
 ) -> Result<(), RejectReason> {
     let actual = tx
         .cell_updates()
@@ -779,7 +1017,8 @@ pub(super) fn component_birth(
         .map(|(_, cell)| cell)
         .ok_or(RejectReason::InvalidCell)?;
     if let Some((id, data)) =
-        block_loot::initial_component(world, position, actual).map_err(block_reason)?
+        block_loot::initial_component_with_payload(world, position, actual, held, payloads)
+            .map_err(block_reason)?
     {
         tx.set_component(
             id,
@@ -796,10 +1035,28 @@ pub(super) fn prepare_break(
     seed: u64,
     tx: &mut Transaction,
     now: Tick,
-) -> Result<rules::survival::Inventory, RejectReason> {
-    let contents = block_loot::prepare_contents(world, mining.position).map_err(block_reason)?;
-    let mut stacks = contents.stacks;
+) -> Result<
+    (
+        rules::survival::Inventory,
+        Vec<rules::item_payload::Payload>,
+    ),
+    RejectReason,
+> {
+    let coordinates = rules::blocks::main_of(
+        mining.expected.raw(),
+        [mining.position.x, mining.position.y, mining.position.z],
+    );
+    let anchor = BlockPos {
+        space: mining.position.space,
+        x: coordinates[0],
+        y: coordinates[1],
+        z: coordinates[2],
+    };
+    let CellRead::Known(source) = world.read(anchor) else {
+        return Err(RejectReason::Unknown);
+    };
     let mut inventory = peer.inventory;
+    let mut stacks = Vec::new();
     if peer.player.mode == GameMode::Survival {
         let player_key = u64::from_le_bytes(
             blake3::hash(&peer.identity.0).as_bytes()[..8]
@@ -810,11 +1067,19 @@ pub(super) fn prepare_break(
             core_types::DeterministicRng::from_key(seed, 0x4d494e45, player_key, mining.id.0);
         let plan = peer
             .inventory
-            .plan_mine(mining.held, contents.cell, &mut rng)
+            .plan_mine(mining.held, source, &mut rng)
             .map_err(survival_reason)?;
         stacks.extend_from_slice(plan.drops.stacks());
         inventory = *plan.inventory.after();
     }
+    let block_item = rules::items::block_item(source.id());
+    let has_block_drop = stacks.iter().any(|s| s.item() == block_item);
+    let contents = block_loot::prepare_for_break(world, mining.position, has_block_drop)
+        .map_err(block_reason)?;
+    if contents.replace_block_drop {
+        stacks.retain(|s| s.item() != block_item);
+    }
+    stacks.extend(contents.stacks);
     if !stacks.is_empty() {
         survival::plan_drops(
             world,
@@ -834,5 +1099,145 @@ pub(super) fn prepare_break(
             core_types::ChannelMask::CONTENTS | core_types::ChannelMask::CONNECTIONS,
         );
     }
-    Ok(inventory)
+    Ok((inventory, contents.payloads))
+}
+
+impl Runtimes {
+    pub(super) fn validate_owned_payloads(
+        &self,
+        world: &World,
+        players: &BTreeMap<PlayerId, SavedPlayer>,
+    ) -> Result<(), ServerError> {
+        let check = |stack: rules::stack::ItemStack| -> Result<(), ServerError> {
+            if let Some(id) = stack.payload() {
+                self.payloads
+                    .resolve(id, stack.item())
+                    .map_err(|_| ServerError::Invalid("owned item payload reference"))?;
+            }
+            Ok(())
+        };
+        for saved in players.values() {
+            if !saved.inventory.is_empty() {
+                let inventory = rules::survival::Inventory::decode(&saved.inventory)
+                    .map_err(|_| ServerError::Invalid("owned inventory codec"))?;
+                for stack in inventory.slots() {
+                    check(*stack)?;
+                }
+            }
+            if !saved.window.is_empty() {
+                let bound = windows::BoundWindow::decode(&saved.window)
+                    .map_err(|_| ServerError::Invalid("owned window codec"))?;
+                check(bound.state.cursor())?;
+                for stack in bound.state.craft().cells() {
+                    check(*stack)?;
+                }
+                // Container entries are projections of World-owned state. In
+                // particular, moving charge can yield a cache-only content ID;
+                // only cursor/crafting are independently owned by this window.
+            }
+        }
+        for (_, record) in world.components() {
+            match record.data.kind {
+                survival::CHEST_COMPONENT => {
+                    let chest = rules::survival::furnace::Chest::decode(&record.data.payload)
+                        .map_err(|_| ServerError::Invalid("owned chest codec"))?;
+                    for stack in chest.slots() {
+                        check(*stack)?;
+                    }
+                }
+                survival::FURNACE_COMPONENT => {
+                    let furnace = rules::survival::furnace::Furnace::decode(&record.data.payload)
+                        .map_err(|_| ServerError::Invalid("owned furnace codec"))?;
+                    for stack in furnace.slots() {
+                        check(*stack)?;
+                    }
+                }
+                machines::MACHINE_COMPONENT => {
+                    let machine = rules::machines::Machine::decode(&record.data.payload)
+                        .map_err(|_| ServerError::Invalid("owned machine codec"))?;
+                    for slot in machine.slots {
+                        check(slot.stack)?;
+                    }
+                }
+                survival::DROP_COMPONENT => {
+                    let bundle = survival::DropBundle::decode(&record.data.payload)
+                        .map_err(|_| ServerError::Invalid("owned drop codec"))?;
+                    for entry in bundle.entries {
+                        check(entry.stack)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for item in self.items.entities().rows() {
+            check(item.stack)?;
+        }
+        Ok(())
+    }
+}
+
+impl Server {
+    pub(super) fn payload_delta(
+        &self,
+        batch: &Batch,
+    ) -> Result<Option<rules::item_payload::Delta>, RejectReason> {
+        batch
+            .runtimes
+            .iter()
+            .find(|r| r.kind == save::RUNTIME_PAYLOADS)
+            .map(|r| {
+                rules::item_payload::Delta::decode(&r.payload)
+                    .map_err(|_| RejectReason::StorageUnavailable)
+            })
+            .transpose()
+    }
+    pub(super) fn plan_payloads(
+        &self,
+        batch: &Batch,
+        payloads: Vec<rules::item_payload::Payload>,
+    ) -> Result<Option<RuntimeRecord>, RejectReason> {
+        if payloads.is_empty() {
+            return Ok(None);
+        }
+        let delta = match self.payload_delta(batch)? {
+            Some(delta) => delta,
+            None => self
+                .runtimes
+                .payloads
+                .plan()
+                .map_err(|_| RejectReason::StorageUnavailable)?,
+        };
+        let delta = self
+            .runtimes
+            .payloads
+            .extend(delta, payloads, std::iter::empty())
+            .map_err(|error| match error {
+                rules::item_payload::Error::Bounds => RejectReason::Capacity,
+                _ => RejectReason::InvalidCell,
+            })?;
+        self.runtimes
+            .payloads
+            .validate(&delta)
+            .map_err(|_| RejectReason::InvalidCell)?;
+        if delta.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(RuntimeRecord {
+            kind: save::RUNTIME_PAYLOADS,
+            payload: delta.encode().map_err(|_| RejectReason::Capacity)?,
+        }))
+    }
+    pub(super) fn stage_payloads(batch: &mut Batch, record: Option<RuntimeRecord>) {
+        if let Some(record) = record {
+            if let Some(existing) = batch
+                .runtimes
+                .iter_mut()
+                .find(|r| r.kind == save::RUNTIME_PAYLOADS)
+            {
+                *existing = record
+            } else {
+                batch.runtimes.push(record)
+            }
+        }
+    }
 }

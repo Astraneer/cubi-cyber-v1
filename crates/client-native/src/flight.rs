@@ -28,6 +28,14 @@ pub struct NativeFlight {
     presented: u64,
 }
 impl NativeFlight {
+    pub fn begin_scene(&mut self) -> Result<(), String> {
+        self.recorder
+            .begin_input_epoch()
+            .map_err(|error| format!("input epoch: {error:?}"))
+    }
+    pub fn recorder(&self) -> &FlightRecorder {
+        &self.recorder
+    }
     pub fn new(device: &wgpu::Device, options: Option<BenchmarkOptions>) -> Result<Self, String> {
         if options
             .as_ref()
@@ -122,8 +130,7 @@ impl NativeFlight {
         view: &mut ClientView,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Option<client::capture::CaptureTicket> {
-        self.capture
-            .encode(view.renderer_mut(), encoder, self.frame + 1)
+        view.encode_gpu_capture(&mut self.capture, encoder, self.frame + 1)
     }
     pub fn submitted(&mut self, ticket: client::capture::CaptureTicket) {
         self.capture.submitted(ticket)
@@ -209,6 +216,17 @@ impl NativeFlight {
         width: u32,
         height: u32,
     ) -> Result<(), String> {
+        self.export_with_movement(path, adapter, view, width, height, None)
+    }
+    pub fn export_with_movement(
+        &self,
+        path: &std::path::Path,
+        adapter: &wgpu::AdapterInfo,
+        view: Option<&ClientView>,
+        width: u32,
+        height: u32,
+        movement: Option<&client::replay::Recorder>,
+    ) -> Result<(), String> {
         let (seed, hash, tick) =
             if let Some(route) = self.route.as_ref().filter(|route| route.started) {
                 (
@@ -217,11 +235,7 @@ impl NativeFlight {
                     route.start_tick,
                 )
             } else if let Some(view) = view {
-                (
-                    u64::from(view.scene.config().seed.0),
-                    view.scene.world().canonical_hash(),
-                    view.tick().0,
-                )
+                (u64::from(view.scene.config().seed.0), 0, 0)
             } else {
                 (0, 0, 0)
             };
@@ -262,10 +276,20 @@ impl NativeFlight {
             }
         });
         let object_limit = view.map_or(0, ClientView::gpu_object_limit);
-        write!(json, ",\"benchmark\":{{\"route\":\"{}\",\"width\":{},\"height\":{},\"presentationIncluded\":true,\"presentationMeaning\":\"surface.present plus completed GPU submission; scanout is not instrumented\",\"framesRequested\":{},\"routeFrames\":{},\"routeComplete\":{},\"renderedFrames\":{},\"fixedStepHz\":{},\"blockingReadback\":false,\"scene\":\"{}\",\"colorPassIncludesSky\":true,\"nearRasterization\":\"{}\",\"quadStorage\":\"greedy-16B\",\"gpuObjectCapacity\":{},\"workerAllocationsMeasured\":false,\"oldestJobAgeMeasured\":false,\"checkpointStateEmbedded\":false,\"captureIncludesWarmup\":true,\"forcePresentation\":{},\"allocatorScope\":\"simulation jobs upload encode present; loading and callback polling excluded\"}},\"gpuCapture\":{{\"completed\":{},\"unsupported\":{},\"full\":{},\"failed\":{},\"expired\":{}}}}}",
-            route_name, width, height, requested, route_frames, complete, self.presented, step_hz, scene, raster, object_limit, requested != 0,
+        write!(json, ",\"benchmark\":{{\"route\":\"{}\",\"width\":{},\"height\":{},\"presentationIncluded\":true,\"presentationMeaning\":\"surface.present plus completed GPU submission; scanout is not instrumented\",\"framesRequested\":{},\"routeFrames\":{},\"routeComplete\":{},\"renderedFrames\":{},\"fixedStepHz\":{},\"blockingReadback\":false,\"scene\":\"{}\",\"colorPassIncludesSky\":true,\"nearRasterization\":\"{}\",\"quadStorage\":\"greedy-16B\",\"gpuObjectCapacity\":{},\"workerAllocationsMeasured\":false,\"oldestJobAgeMeasured\":false,\"checkpointStateEmbedded\":false,\"warmupExcluded\":{},\"gpuTimeMeaning\":\"sum of measured pass intervals; gaps and scanout excluded\",\"forcePresentation\":{},\"allocatorScope\":\"simulation jobs upload encode present; loading and callback polling excluded\"}},\"gpuCapture\":{{\"completed\":{},\"unsupported\":{},\"full\":{},\"failed\":{},\"expired\":{}}}}}",
+            route_name, width, height, requested, route_frames, complete, self.presented, step_hz, scene, raster, object_limit, requested != 0, requested != 0,
             self.capture.stats().completed, self.capture.stats().unsupported, self.capture.stats().full,
             self.capture.stats().failed, self.capture.stats().expired).map_err(|error| error.to_string())?;
+        let movement = movement.or_else(|| view.map(ClientView::movement_replay));
+        let available = movement.is_some_and(|movement| movement.append_json(&mut json).is_ok());
+        json.pop();
+        write!(json, ",\"initialPublicWorldHashKnown\":{},\"currentPublicWorldHash\":\"{:016x}\",\"movementReplayAvailable\":{}", self.route.as_ref().is_some_and(|route| route.started), view.map_or(0, |view| view.scene.world().canonical_hash()), available).map_err(|error| error.to_string())?;
+        if !available {
+            json.push_str(
+                ",\"movementReplayUnavailableReason\":\"no complete movement steps retained\"",
+            );
+        }
+        json.push('}');
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }

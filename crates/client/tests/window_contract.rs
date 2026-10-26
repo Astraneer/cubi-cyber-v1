@@ -64,6 +64,7 @@ fn ui_projection_is_registry_validated_atomic_and_preserves_server_counts() {
         item: rules::items::block_item(rules::ids::STONE),
         count: 3,
         damage: 0,
+        payload: 0,
     };
     assert!(bridge::apply_window(&mut ui, &image).unwrap());
     assert_eq!(ui.screen, ui::app::Screen::Inventory);
@@ -83,4 +84,51 @@ fn ui_projection_is_registry_validated_atomic_and_preserves_server_counts() {
     assert_eq!(ui.screen, ui::app::Screen::Game);
     assert_eq!(ui.snapshot.window_id, 0);
     assert!(ui.snapshot.cursor.is_empty());
+}
+
+#[test]
+fn window_payload_survives_cursor_carry_without_disclosing_private_contents() {
+    let payload = rules::item_payload::Payload::charge(120_000).unwrap();
+    let mut ui = ui::app::UiApp::new().unwrap();
+    ui.set_snapshot(ui::app::Snapshot {
+        connected: true,
+        inventory_revision: 4,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut image = state();
+    image.cursor = Stack {
+        item: rules::items::I_ENERGY_TABLET,
+        count: 1,
+        damage: 0,
+        payload: payload.id().0,
+    };
+    let image = decode_snapshot(&encode_snapshot(&image).unwrap()).unwrap();
+    bridge::apply_window(&mut ui, &image).unwrap();
+    assert_eq!(ui.snapshot.cursor.payload(), Some(payload.id()));
+    assert_eq!(ui.snapshot.cursor.count(), 1);
+    let mut moved = image.clone();
+    moved.guard.revision += 1;
+    moved.cursor = Stack::EMPTY;
+    moved.craft[0] = image.cursor;
+    bridge::apply_window(&mut ui, &moved).unwrap();
+    assert!(ui.snapshot.cursor.is_empty());
+    assert_eq!(ui.snapshot.craft[0].payload(), Some(payload.id()));
+    let atlas = ui::atlas::UiAtlas::load().unwrap();
+    let mut paint = ui::paint::PaintList::default();
+    ui.paint(&atlas, &mut paint, 780, 437);
+    let rect = ui.hit(ui::app::Widget::Slot(100)).unwrap();
+    ui.pointer(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+    assert_eq!(ui.hovered_state_label(), Some("Сохранённый заряд"));
+    assert!(ui.paint(&atlas, &mut paint, 780, 437));
+    assert!(
+        paint
+            .quads
+            .iter()
+            .any(|quad| quad.color == 0xf0181b23 && quad.rect.h == 44.0)
+    );
+    let before = ui.snapshot.clone();
+    moved.craft[0].count = 2;
+    assert!(bridge::apply_window(&mut ui, &moved).is_err());
+    assert!(ui.snapshot == before);
 }

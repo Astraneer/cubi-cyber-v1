@@ -12,6 +12,7 @@ pub mod crafting;
 mod crafting_data;
 pub mod entities;
 pub mod ids;
+pub mod item_payload;
 pub mod items;
 pub mod machine_recipes;
 pub mod machines;

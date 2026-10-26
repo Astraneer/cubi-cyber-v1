@@ -28,6 +28,9 @@ impl UiLayer {
     pub fn needs_redraw(&self, width: u32, height: u32) -> bool {
         self.last != Some((self.app.revision(), width, height))
     }
+    pub fn uploaded_revision(&self) -> Option<u64> {
+        self.last.map(|stamp| stamp.0)
+    }
     pub fn upload(
         &mut self,
         queue: &wgpu::Queue,

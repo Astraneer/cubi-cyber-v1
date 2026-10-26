@@ -1,8 +1,10 @@
 //! Shared M0 sky pipeline. Platform shells own windows, surfaces, and event loops.
 //! Resources and pipelines are prepared at startup and on explicit resize only.
 
+pub mod aerial_gpu;
 pub mod atmosphere;
 pub mod block_models;
+pub mod celestial;
 pub mod cloud_gpu;
 pub mod entity_gpu;
 pub mod entity_models;
@@ -14,6 +16,8 @@ pub mod height_tile;
 pub mod light_volume;
 pub mod lod;
 pub mod lod_gpu;
+pub mod material_pack;
+pub mod multiple_scattering;
 pub mod post;
 pub mod shadows;
 pub mod terrain_gpu;

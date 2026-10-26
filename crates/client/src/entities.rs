@@ -11,6 +11,9 @@ pub struct ItemVisual {
 pub trait ItemVisuals {
     /// Return a stable local icon/atlas mapping; it must not perform I/O.
     fn visual(&self, item: rules::items::ItemId) -> Option<ItemVisual>;
+    fn block_layers(&self, _item: rules::items::ItemId) -> Option<[u16; 6]> {
+        None
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntityFrameError {
@@ -59,6 +62,22 @@ impl EntityFrame {
         origin: [i64; 3],
         items: &impl ItemVisuals,
     ) -> Result<EntityCopyWork, EntityFrameError> {
+        self.prepare_sampled(source, space, origin, items, |position| {
+            world
+                .page(position.page())
+                .map(|page| page.light(position.local_index()))
+        })
+    }
+    /// Client authority adapters can withhold uncertified light while retaining
+    /// the same bounded instance conversion and GPU ABI.
+    pub fn prepare_sampled(
+        &mut self,
+        source: &[rules::entities::mob::Instance],
+        space: SpaceId,
+        origin: [i64; 3],
+        items: &impl ItemVisuals,
+        mut light_at: impl FnMut(BlockPos) -> Option<world::LightSample>,
+    ) -> Result<EntityCopyWork, EntityFrameError> {
         if source.len() > self.maximum {
             return Err(EntityFrameError::Capacity);
         }
@@ -85,7 +104,7 @@ impl EntityFrame {
             } else {
                 (instance.kind, instance.color)
             };
-            self.staging_instances.push(EntityInstance {
+            let mut output = EntityInstance {
                 position: instance.position,
                 body_yaw: instance.body_yaw,
                 head_yaw: instance.head_yaw,
@@ -100,7 +119,17 @@ impl EntityFrame {
                 death_roll: instance.death_roll,
                 scale: instance.scale,
                 reserved: instance.reserved,
-            });
+            };
+            if kind == 6 {
+                let item = u16::try_from(instance.color)
+                    .map_err(|_| EntityFrameError::MissingItemIcon(u16::MAX))?;
+                if let Some(layers) = items.block_layers(item) {
+                    output
+                        .set_block_layers(layers)
+                        .map_err(|_| EntityFrameError::InvalidKind)?;
+                }
+            }
+            self.staging_instances.push(output);
             let eye = match kind {
                 0 => 0.75,
                 1 => 1.25,
@@ -130,9 +159,7 @@ impl EntityFrame {
                     y: position[1].floor() as i32,
                     z: position[2].floor() as i32,
                 };
-                world
-                    .page(position.page())
-                    .map(|page| page.light(position.local_index()))
+                light_at(position)
             };
             self.staging_lights.push(if let Some(light) = light {
                 PackedLight::new(light.sky, light.block, light.rgb)
@@ -165,6 +192,15 @@ impl ItemVisuals for RegistryItemVisuals<'_> {
                 atlas_layer: (self.icon_layer)(item)?,
             }),
         }
+    }
+    fn block_layers(&self, item: rules::items::ItemId) -> Option<[u16; 6]> {
+        let rules::items::ItemKind::Block(block) = rules::item(item)?.kind else {
+            return None;
+        };
+        let layers = std::array::from_fn(|face| {
+            rules::blocks::layer_cell(block, 0, rules::blocks::mesh_face(face as u8)).0
+        });
+        Some(layers.map(|layer| layer as u16))
     }
 }
 /// A single 64-byte local human replaces six terrain-page avatar objects. First
@@ -241,6 +277,18 @@ pub fn instance_light(
     origin: [i64; 3],
     instance: &EntityInstance,
 ) -> Option<PackedLight> {
+    instance_light_sampled(space, origin, instance, |position| {
+        world
+            .page(position.page())
+            .map(|page| page.light(position.local_index()))
+    })
+}
+pub fn instance_light_sampled(
+    space: SpaceId,
+    origin: [i64; 3],
+    instance: &EntityInstance,
+    mut light_at: impl FnMut(BlockPos) -> Option<world::LightSample>,
+) -> Option<PackedLight> {
     let eye = match instance.kind {
         0 => 0.75,
         1 => 1.25,
@@ -275,6 +323,6 @@ pub fn instance_light(
         y: p[1].floor() as i32,
         z: p[2].floor() as i32,
     };
-    let light = world.page(p.page())?.light(p.local_index());
+    let light = light_at(p)?;
     PackedLight::new(light.sky, light.block, light.rgb)
 }

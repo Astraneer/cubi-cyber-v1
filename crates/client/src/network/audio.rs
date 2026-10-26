@@ -3,11 +3,41 @@
 use super::Connection;
 use core_types::Tick;
 use sim::prediction::PredictionState;
+#[derive(Clone, Copy, Debug)]
+pub struct PendingBlockSound {
+    pub id: net::ActionId,
+    pub position: core_types::BlockPos,
+    pub cell: core_types::Cell,
+    pub action: crate::audio_bridge::BlockSound,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioHistoryError {
     Range,
 }
 impl Connection {
+    /// Read only the actor's public block edits, never inventory guards or other
+    /// spaces. Presentation caches these before the durable final reply arrives.
+    pub fn pending_block_sounds(&self) -> impl Iterator<Item = PendingBlockSound> + '_ {
+        let space = self.welcome().map(|welcome| welcome.player.space);
+        self.actions.iter().filter_map(move |(&id, pending)| {
+            let (position, cell, action) = match &pending.action {
+                net::Action::Mine {
+                    position, expected, ..
+                } => (*position, *expected, crate::audio_bridge::BlockSound::Break),
+                net::Action::Place { position, cell, .. }
+                | net::Action::PlaceOwned { position, cell, .. } => {
+                    (*position, *cell, crate::audio_bridge::BlockSound::Place)
+                }
+                _ => return None,
+            };
+            (Some(position.space) == space).then_some(PendingBlockSound {
+                id,
+                position,
+                cell,
+                action,
+            })
+        })
+    }
     /// Inclusive range of at most 64 ticks. Borrowed snapshots are never cloned
     /// or regenerated; corrected/replayed ticks can be skipped by the sound owner.
     pub fn audio_history(

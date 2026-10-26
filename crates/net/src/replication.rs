@@ -133,6 +133,14 @@ impl ViewHistory {
             next_version: 1,
         }
     }
+    pub fn confirmed_version(&self, page: PageId) -> Option<u64> {
+        self.confirmed.get(&page).copied()
+    }
+    pub fn has_version(&self, page: PageId, version: u64) -> bool {
+        self.pages
+            .get(&page)
+            .is_some_and(|p| p.iter().any(|h| h.version == version))
+    }
     pub fn acknowledge(&mut self, page: PageId, version: u64) -> bool {
         if self
             .pages

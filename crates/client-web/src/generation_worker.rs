@@ -17,3 +17,18 @@ pub fn generate_public_page(
         .map(|page| page.encode())
         .map_err(|error| JsValue::from_str(&error))
 }
+
+/// Public render data only; this module is initialized inside owned Workers
+/// without starting a canvas, socket, audio context or product UI.
+#[wasm_bindgen]
+pub fn execute_horizon_task(
+    request: &[u8],
+    control: Option<js_sys::Int32Array>,
+) -> Result<Vec<u8>, JsValue> {
+    client::view::horizon::execute_background_request(request, || {
+        control
+            .as_ref()
+            .is_some_and(|flags| js_sys::Atomics::load(flags, 0) != Ok(0))
+    })
+    .map_err(|error| JsValue::from_str(&error.to_string()))
+}

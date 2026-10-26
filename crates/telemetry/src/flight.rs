@@ -80,6 +80,7 @@ pub struct Loss {
     pub inputs: u64,
 }
 pub struct FlightRecorder {
+    input_epoch: u64,
     frames: VecDeque<Sample>,
     inputs: VecDeque<ReplayInput>,
     frame_limit: usize,
@@ -96,6 +97,7 @@ impl FlightRecorder {
             return Err("recorder capacities outside 2..65536");
         }
         Ok(Self {
+            input_epoch: 0,
             frames: VecDeque::with_capacity(frame_limit),
             inputs: VecDeque::with_capacity(input_limit),
             frame_limit,
@@ -233,6 +235,19 @@ impl FlightRecorder {
         self.inputs.push_back(input);
         Ok(())
     }
+    /// A new scene has a different simulation tick domain. Retain CPU/GPU frame
+    /// measurements, discard incompatible old inputs, and expose the boundary as
+    /// an incomplete window. Strict ordering within the new epoch is unchanged.
+    pub fn begin_input_epoch(&mut self) -> Result<(), RecordError> {
+        self.input_epoch = self
+            .input_epoch
+            .checked_add(1)
+            .ok_or(RecordError::InvalidInput)?;
+        self.loss.inputs = self.loss.inputs.saturating_add(self.inputs.len() as u64);
+        self.inputs.clear();
+        self.last_capacity_loss_ns = Some(self.last_ns);
+        Ok(())
+    }
     /// Local export is intentionally outside the frame loop and may allocate.
     /// Unknown measurements remain JSON null. Observations are concurrent events,
     /// not an assertion that an allocation caused a measured hitch.
@@ -247,6 +262,7 @@ impl FlightRecorder {
             String::with_capacity(self.frames.len() * 400 + self.inputs.len() * 100 + 512);
         let _ = write!(out, "{{\"schemaVersion\":1,\"backend\":");
         quote(&mut out, backend);
+        let _ = write!(out, ",\"inputEpoch\":{}", self.input_epoch);
         let window = self.window_ns.unwrap_or_else(|| {
             self.last_ns
                 .saturating_sub(self.started_ns.unwrap_or(self.last_ns))

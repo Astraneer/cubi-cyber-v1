@@ -78,6 +78,7 @@ fn all_client_messages_roundtrip_and_secrets_are_redacted() {
                     item: 3,
                     count: 2,
                     damage: 0,
+                    payload: 0,
                 },
             },
         },
@@ -116,7 +117,12 @@ fn owner_inventory_and_public_prediction_frames_are_bounded() {
         decode_server(&encode_server(&message).unwrap()).unwrap(),
         message
     );
-    assert!(encode_server(&ServerMessage::Inventory { data: vec![0; 513] }).is_err());
+    assert!(
+        encode_server(&ServerMessage::Inventory {
+            data: vec![0; 1025]
+        })
+        .is_err()
+    );
     let message = ServerMessage::Prediction {
         tick: Tick(7),
         player: PlayerState::default(),

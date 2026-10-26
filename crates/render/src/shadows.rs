@@ -435,6 +435,7 @@ pub struct ShadowGpu {
     sampling_dirty: bool,
     combined: Option<CombinedDepth>,
     last_dynamic: Option<DynamicStamp>,
+    timer: crate::gpu_time::GpuPassTimer<9>,
 }
 impl ShadowGpu {
     pub fn new(
@@ -774,6 +775,11 @@ impl ShadowGpu {
             sampling_dirty: false,
             combined,
             last_dynamic: None,
+            timer: crate::gpu_time::GpuPassTimer::new(
+                device,
+                queue,
+                "cached/dynamic shadow pass timestamps",
+            ),
         })
     }
     /// Two render pipelines (depth/rect clear) and two compute pipelines (reset/cull), all loading-only.
@@ -793,6 +799,37 @@ impl ShadowGpu {
     }
     pub fn sampler(&self) -> &wgpu::Sampler {
         &self.sampler
+    }
+    /// Pass kinds1=static frustum,2=static depth/clear,3=dynamic model depth.
+    /// Copy commands and caster-owned compute remain separate unmeasured work.
+    pub fn graph(&self) -> crate::gpu_time::PassGraph<9> {
+        self.timer.graph()
+    }
+    pub fn timestamp_buffer(&self) -> Option<(&wgpu::Buffer, f32)> {
+        self.timer.timestamp_buffer()
+    }
+    pub fn copy_timestamps_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        destination: &wgpu::Buffer,
+        offset: u64,
+    ) {
+        self.timer.copy_into(encoder, destination, offset);
+    }
+    pub fn clear_timing(&self) {
+        self.timer.begin();
+    }
+    pub fn timing_source(&self) -> Option<crate::gpu_time::TimingSource<'_>> {
+        let graph = self.timer.graph();
+        self.timer
+            .timestamp_buffer()
+            .filter(|_| graph.count > 0)
+            .map(|(buffer, period)| crate::gpu_time::TimingSource {
+                buffer,
+                period,
+                kinds: [4; 32],
+                count: graph.count,
+            })
     }
     pub fn texture(&self) -> &wgpu::Texture {
         &self.texture
@@ -823,6 +860,7 @@ impl ShadowGpu {
         encoder: &mut wgpu::CommandEncoder,
         caster: &mut impl DynamicShadowCaster,
     ) -> Result<ShadowWork, ShadowError> {
+        self.timer.begin();
         if self.combined.is_none() {
             return Err(ShadowError::DynamicDisabled);
         }
@@ -890,7 +928,7 @@ impl ShadowGpu {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self.timer.render(3),
                 occlusion_query_set: None,
             });
             work.dynamic_draw_calls += caster.draw_shadow(&mut pass, cascade);
@@ -900,6 +938,7 @@ impl ShadowGpu {
             matrices: sampling.matrices,
             valid: sampling.params[0],
         });
+        self.timer.finish(encoder);
         Ok(work)
     }
     pub fn encode(
@@ -907,6 +946,7 @@ impl ShadowGpu {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
     ) -> ShadowWork {
+        self.timer.begin();
         let mut work = self.encode_static(queue, encoder);
         if let Some(combined) = &self.combined {
             let sampling = self.cache.sampling();
@@ -946,6 +986,7 @@ impl ShadowGpu {
                 work.dynamic_copy_bytes += u64::from(self.cache.config.resolution).pow(2) * 4;
             }
         }
+        self.timer.finish(encoder);
         work
     }
     fn encode_static(
@@ -988,7 +1029,7 @@ impl ShadowGpu {
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("shadow independent frustum compaction"),
-                    timestamp_writes: None,
+                    timestamp_writes: self.timer.compute(1),
                 });
                 pass.set_bind_group(0, &self.cull_binds[update.cascade], &[]);
                 pass.set_pipeline(&self.reset);
@@ -1008,7 +1049,7 @@ impl ShadowGpu {
                         }),
                         stencil_ops: None,
                     }),
-                    timestamp_writes: None,
+                    timestamp_writes: self.timer.render(2),
                     occlusion_query_set: None,
                 });
                 let rect = update.rect;
@@ -1046,8 +1087,9 @@ impl ShadowGpu {
 }
 const SHADOW_FRAGMENT: &str = r#"
 @fragment fn shadow_fragment(input:VertexOut) {
+    let du=dpdx(input.uv);let dv=dpdy(input.uv);
     if edited_owner(input) {discard;}
-    if input.bucket==1u {let alpha=textureSample(colors,texels,input.uv,i32(materials[input.material].x)).a;if alpha<0.5 {discard;}}
+    if input.bucket==1u {let alpha=textureSampleGrad(colors,texels,input.uv,i32(materials[input.material].x),du,dv).a;if alpha<0.5 {discard;}}
 }
 "#;
 const CLEAR_SHADER: &str = r#"

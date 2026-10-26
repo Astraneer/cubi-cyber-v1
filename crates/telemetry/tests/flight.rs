@@ -214,3 +214,59 @@ fn steady_recording_has_no_allocation_or_deallocation_with_positive_control() {
     assert!(control.allocating_calls() > 0);
     assert!(control.dealloc_calls > 0);
 }
+
+#[test]
+fn reconnect_resets_only_input_epoch_and_keeps_strict_order_and_frame_metrics() {
+    let mut recorder = FlightRecorder::new(32, 32).unwrap();
+    recorder
+        .record_frame(Sample {
+            frame: 1,
+            monotonic_ns: 100,
+            ..Sample::default()
+        })
+        .unwrap();
+    recorder
+        .record_input(ReplayInput {
+            monotonic_ns: 100,
+            tick: 900,
+            sequence: 1,
+            ..ReplayInput::default()
+        })
+        .unwrap();
+    assert_eq!(
+        recorder.record_input(ReplayInput {
+            monotonic_ns: 101,
+            tick: 1,
+            sequence: 2,
+            ..ReplayInput::default()
+        }),
+        Err(RecordError::OutOfOrder)
+    );
+    recorder.begin_input_epoch().unwrap();
+    assert_eq!(recorder.frames().len(), 1);
+    assert_eq!(recorder.inputs().len(), 0);
+    assert_eq!(recorder.loss().inputs, 1);
+    assert!(!recorder.complete_window());
+    recorder
+        .record_input(ReplayInput {
+            monotonic_ns: 101,
+            tick: 1,
+            sequence: 2,
+            ..ReplayInput::default()
+        })
+        .unwrap();
+    assert_eq!(
+        recorder.record_input(ReplayInput {
+            monotonic_ns: 102,
+            tick: 0,
+            sequence: 3,
+            ..ReplayInput::default()
+        }),
+        Err(RecordError::OutOfOrder)
+    );
+    assert!(
+        recorder
+            .export_json("test", 0, 0, 0)
+            .contains("\"inputEpoch\":1")
+    );
+}

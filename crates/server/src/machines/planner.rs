@@ -384,6 +384,7 @@ impl MachineRuntime {
                     .set_cell(p, Cell::from_parts(cell.id(), state));
             }
         }
+        let delta = self.register_pulls(delta, world, affected, now)?;
         self.validate_delta(&delta)?;
         Ok(PhasePlan {
             transactions: transactions.into_values().collect(),
@@ -394,6 +395,8 @@ impl MachineRuntime {
                 .map(|(page, version)| jobs::InputVersion { page, version })
                 .collect(),
             fluid_wakes: Vec::new(),
+            payloads: Vec::new(),
+            item_spawns: Vec::new(),
             work: reads.work,
         })
     }

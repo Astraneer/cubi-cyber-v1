@@ -15,9 +15,13 @@ use sim::{CameraMode, Keys, Permissions, Player, WorldQuery};
 use std::collections::{BTreeMap, VecDeque};
 use world::CellRead;
 mod entities;
+pub mod environment;
+pub mod horizon;
+mod horizon_runtime;
 mod lighting;
 mod remote;
 pub use entities::{EntityStats, ViewEntities};
+pub use environment::{EnvironmentProfile, EnvironmentStats, ViewEnvironment};
 pub use lighting::{LightingStats, ViewLighting};
 pub use remote::RemoteInput;
 
@@ -125,12 +129,47 @@ struct Overlay {
     owner_faces: Box<[u8; 4096]>,
 }
 
+#[derive(Clone, Copy)]
+struct CameraParameters {
+    eye: [f32; 3],
+    target: [f32; 3],
+    up: [f32; 3],
+    fov: f32,
+    far: f32,
+}
+struct PreparedEnvironment {
+    owner: ViewEnvironment,
+    queue: wgpu::Queue,
+    width: u32,
+    height: u32,
+}
+impl CameraParameters {
+    fn projection(self, width: u32, height: u32) -> Camera {
+        Camera::perspective(
+            self.eye,
+            self.target,
+            self.up,
+            self.fov.to_radians(),
+            width.max(1) as f32 / height.max(1) as f32,
+            0.05,
+            self.far,
+        )
+    }
+}
+
 pub struct ClientView {
     pub scene: ClientScene,
     renderer: TerrainGpu,
     lighting: Option<Box<ViewLighting>>,
     entities: Option<Box<ViewEntities>>,
+    environment: Option<Box<PreparedEnvironment>>,
+    horizon: Option<Box<horizon_runtime::PreparedHorizon>>,
+    frame_upload_remaining: u64,
+    frame_delta_seconds: f32,
     player: Player,
+    movement_replay: Box<sim::replay::Recorder>,
+    replay_time_ns: u64,
+    replay_external_clock: bool,
     interactions: DemoInteractions,
     edit_shell: EditShell,
     pending_patches: VecDeque<EditOwnerUpdates>,
@@ -212,11 +251,20 @@ impl ClientView {
             renderer,
             lighting: None,
             entities: None,
+            environment: None,
+            horizon: None,
+            frame_upload_remaining: 0,
+            frame_delta_seconds: 1. / 60.,
             player: Player::new([
                 f64::from(config.center.x) + 0.5,
                 f64::from(config.center.y),
                 f64::from(config.center.z) + 0.5,
             ]),
+            movement_replay: Box::new(
+                sim::replay::Recorder::new(sim::replay::DEFAULT_STEPS).map_err(str::to_owned)?,
+            ),
+            replay_time_ns: 0,
+            replay_external_clock: false,
             interactions: DemoInteractions::new(config.seed),
             edit_shell: EditShell::new(
                 crate::edit_shell::DEFAULT_SHELL_PAGES,
@@ -281,6 +329,19 @@ impl ClientView {
     pub fn player_mut(&mut self) -> &mut Player {
         &mut self.player
     }
+    pub fn movement_replay(&self) -> &sim::replay::Recorder {
+        &self.movement_replay
+    }
+    /// Platform clocks keep replay expiry tied to real time even in a fixed-step
+    /// benchmark. Once selected, this clock is supplied before every advance.
+    pub fn set_movement_replay_time(&mut self, monotonic_ns: u64) -> Result<(), String> {
+        self.movement_replay
+            .set_time(monotonic_ns)
+            .map_err(str::to_owned)?;
+        self.replay_time_ns = monotonic_ns;
+        self.replay_external_clock = true;
+        Ok(())
+    }
     pub fn renderer_mut(&mut self) -> &mut TerrainGpu {
         &mut self.renderer
     }
@@ -294,6 +355,8 @@ impl ClientView {
     ) -> Result<(), String> {
         if self.lighting.is_some()
             || self.entities.is_some()
+            || self.environment.is_some()
+            || self.horizon.is_some()
             || self.terrain_frames != 0
             || !self.resident.is_empty()
             || self.self_handles.iter().any(Option::is_some)
@@ -322,7 +385,9 @@ impl ClientView {
         Ok(())
     }
     pub fn lighting_stats(&self) -> Option<LightingStats> {
-        self.lighting.as_ref().map(|lighting| lighting.stats)
+        self.lighting
+            .as_ref()
+            .map(|lighting| lighting.snapshot(&self.scene))
     }
     pub fn lighting_mut(&mut self) -> Option<&mut ViewLighting> {
         self.lighting.as_deref_mut()
@@ -350,13 +415,19 @@ impl ClientView {
         {
             return Err("prepare lighting with dynamic model casters before entities".into());
         }
-        let entities = ViewEntities::prepare(
+        let entities = ViewEntities::prepare_with_source(
             device,
             queue,
             &self.renderer,
             self.lighting
                 .as_ref()
                 .map(|lighting| lighting.owner.shadows()),
+            self.environment
+                .as_ref()
+                .map(|environment| environment.owner.gpu.atmosphere()),
+            self.lighting
+                .as_ref()
+                .is_some_and(|lighting| lighting.stats.authoritative_source),
         )
         .map_err(|error| error.to_string())?;
         self.pipeline_compilations = self
@@ -372,6 +443,104 @@ impl ClientView {
     pub fn entities_mut(&mut self) -> Option<&mut ViewEntities> {
         self.entities.as_deref_mut()
     }
+    #[allow(clippy::too_many_arguments)] // Explicit loading resource/profile context.
+    pub fn prepare_environment(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        transfer: render::OutputTransfer,
+        profile: EnvironmentProfile,
+        atlas: &render::terrain_gpu::AtlasImage,
+    ) -> Result<(), String> {
+        if self.environment.is_some()
+            || self.entities.is_some()
+            || self.horizon.is_some()
+            || self.terrain_frames != 0
+            || !self.resident.is_empty()
+            || self.self_handles.iter().any(Option::is_some)
+        {
+            return Err("environment must be prepared once during loading".into());
+        }
+        let eye = self.camera_parameters().eye;
+        let mut owner = ViewEnvironment::prepare(
+            device,
+            queue,
+            &mut self.renderer,
+            &mut self.scene,
+            self.lighting.as_deref(),
+            atlas,
+            width,
+            height,
+            transfer,
+            profile,
+            eye,
+            lighting::SUN,
+        )
+        .map_err(|error| error.to_string())?;
+        let setup = self.renderer.take_work();
+        self.pipeline_compilations = self
+            .pipeline_compilations
+            .saturating_add(setup.pipeline_compilations)
+            .saturating_add(u64::from(owner.gpu.take_startup_pipeline_compilations()));
+        self.environment = Some(Box::new(PreparedEnvironment {
+            owner,
+            queue: queue.clone(),
+            width,
+            height,
+        }));
+        self.invalidate();
+        Ok(())
+    }
+    pub fn environment_stats(&self) -> Option<EnvironmentStats> {
+        self.environment
+            .as_ref()
+            .map(|environment| environment.owner.stats)
+    }
+    pub fn environment_mut(&mut self) -> Option<&mut ViewEnvironment> {
+        self.environment
+            .as_deref_mut()
+            .map(|environment| &mut environment.owner)
+    }
+    /// Uses only the timing nodes encoded for this submitted image. In
+    /// particular, a post-only image never copies a previous terrain query.
+    pub fn encode_gpu_capture(
+        &self,
+        capture: &mut crate::capture::FrameGpuCapture,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: u64,
+    ) -> Option<crate::capture::CaptureTicket> {
+        let shadows = self
+            .lighting
+            .as_ref()
+            .and_then(|lighting| lighting.owner.shadows().timing_source());
+        if let Some(environment) = &self.environment {
+            capture.encode_sources(
+                environment
+                    .owner
+                    .gpu
+                    .timing_sources(&self.renderer)
+                    .into_iter()
+                    .flatten()
+                    .chain(shadows),
+                encoder,
+                frame,
+            )
+        } else {
+            capture.encode_terrain_and(&self.renderer, shadows.as_slice(), encoder, frame)
+        }
+    }
+    fn environment_state(&self, eye: [f32; 3]) -> render::environment_gpu::EnvironmentState {
+        ViewEnvironment::state(
+            eye,
+            (self.tick.0 as f64 * sim::TICK_SECONDS + self.accumulator) as f32,
+            self.frame_delta_seconds,
+            self.tick,
+            lighting::SUN,
+            self.player.eye_water,
+        )
+    }
     /// Install public interpolated records without scanning the world. Returns
     /// false while this loading profile has no entity renderer attached.
     pub fn set_remote_entities(
@@ -384,7 +553,7 @@ impl ClientView {
             return Ok(false);
         };
         let work = entities
-            .set_remote_frame(source, self.scene.world(), space, origin)
+            .set_remote_frame(source, &self.scene, space, origin)
             .map_err(|error| format!("public entity frame: {error:?}"))?;
         self.retained_foreground_work.record(telemetry::WorkCounts {
             cells_scanned: work.light_reads,
@@ -564,6 +733,15 @@ impl ClientView {
         if !elapsed_seconds.is_finite() || elapsed_seconds < 0.0 {
             return Err("invalid frame duration".into());
         }
+        self.frame_delta_seconds = elapsed_seconds.min(0.1) as f32;
+        if !self.replay_external_clock {
+            self.replay_time_ns = self
+                .replay_time_ns
+                .saturating_add((elapsed_seconds * 1_000_000_000.).round() as u64);
+            self.movement_replay
+                .set_time(self.replay_time_ns)
+                .map_err(str::to_owned)?;
+        }
         let elapsed = elapsed_seconds.min(0.25);
         self.dropped_time_seconds += elapsed_seconds - elapsed;
         self.accumulator += elapsed;
@@ -582,7 +760,8 @@ impl ClientView {
             }
             if self.active {
                 let query = WorldQuery::new(self.scene.world(), SpaceId(0));
-                self.player.tick(
+                self.movement_replay.tick(
+                    &mut self.player,
                     &query,
                     Keys {
                         fwd: self.keys[InputKey::Forward as usize],
@@ -593,6 +772,7 @@ impl ClientView {
                         sneak: self.keys[InputKey::Sneak as usize],
                         sprint: self.keys[InputKey::Sprint as usize],
                     },
+                    false,
                 );
                 let attack = self.keys[InputKey::Attack as usize];
                 let place = self.keys[InputKey::Place as usize];
@@ -619,6 +799,11 @@ impl ClientView {
                     self.scene.set_center(center).map_err(|e| e.to_string())?;
                 }
             }
+        }
+        if let Some(lighting) = &mut self.lighting {
+            lighting
+                .advance_cpu(&mut self.scene)
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -798,9 +983,32 @@ impl ClientView {
         if width == 0 || height == 0 {
             return Ok(());
         }
-        self.renderer
-            .resize(device, width, height)
-            .map_err(|e| e.to_string())
+        if let Some(environment) = &mut self.environment {
+            let mut budget = UploadBudget::new(16 * 1024 * 1024);
+            let before = budget.remaining_bytes;
+            environment
+                .owner
+                .resize(
+                    device,
+                    &environment.queue,
+                    &mut self.renderer,
+                    width,
+                    height,
+                    &mut budget,
+                )
+                .map_err(|error| error.to_string())?;
+            environment.width = width;
+            environment.height = height;
+            self.retained_foreground_work.record(telemetry::WorkCounts {
+                upload_bytes: before - budget.remaining_bytes,
+                ..telemetry::WorkCounts::ZERO
+            });
+            Ok(())
+        } else {
+            self.renderer
+                .resize(device, width, height)
+                .map_err(|error| error.to_string())
+        }
     }
     fn refresh_patches(&mut self) -> Result<(), String> {
         if self.edit_shell.dirty_pages().next().is_none() {
@@ -835,7 +1043,7 @@ impl ClientView {
                 self.active.then_some(&self.player),
                 self.accumulator / sim::TICK_SECONDS,
                 self.camera_mode,
-                self.scene.world(),
+                &self.scene,
                 SpaceId(0),
                 [0; 3],
                 budget,
@@ -850,6 +1058,7 @@ impl ClientView {
                 ..telemetry::WorkCounts::ZERO
             });
             if update.changed {
+                self.renderer.invalidate();
                 self.invalidate();
             }
             return Ok(());
@@ -926,6 +1135,10 @@ impl ClientView {
         budget: &mut UploadBudget,
     ) -> Result<(), String> {
         let before = budget.remaining_bytes;
+        // Keep one allowance for the complete frame. Small environment/camera
+        // uniforms cannot be starved behind a ready terrain replacement.
+        let environment_reserve = budget.remaining_bytes.min(4096);
+        budget.remaining_bytes -= environment_reserve;
         while budget.remaining_bytes >= 256 {
             let Some(page) = self.scene.take_hidden_page() else {
                 break;
@@ -1255,6 +1468,7 @@ impl ClientView {
             }
         }
         self.upload_page_links(queue, budget)?;
+        self.pump_horizon(queue, budget)?;
         if let Some(lighting) = &mut self.lighting {
             let light_before = budget.remaining_bytes;
             let work = lighting
@@ -1276,6 +1490,35 @@ impl ClientView {
                 ..telemetry::WorkCounts::ZERO
             });
         }
+        let source_camera = self
+            .environment
+            .as_ref()
+            .filter(|environment| environment.owner.gpu.gi().is_some())
+            .map(|environment| {
+                let parameters = self.camera_parameters();
+                (
+                    parameters.eye,
+                    parameters.projection(environment.width, environment.height),
+                )
+            });
+        if let (Some(environment), Some((eye, camera))) = (&mut self.environment, source_camera) {
+            let before = budget.remaining_bytes;
+            let work = environment
+                .owner
+                .pump(queue, &mut self.scene, eye, &camera, self.tick, budget)
+                .map_err(|error| error.to_string())?;
+            let bytes = before - budget.remaining_bytes;
+            self.retained_foreground_work.record(telemetry::WorkCounts {
+                cells_scanned: work.source_reads,
+                upload_bytes: bytes,
+                ..telemetry::WorkCounts::ZERO
+            });
+            if bytes != 0 {
+                self.renderer.invalidate();
+            }
+        }
+        budget.remaining_bytes += environment_reserve;
+        self.frame_upload_remaining = budget.remaining_bytes;
         self.upload_bytes_total = self
             .upload_bytes_total
             .saturating_add(before - budget.remaining_bytes);
@@ -1344,7 +1587,7 @@ impl ClientView {
         }
         Ok(())
     }
-    fn camera(&self, width: u32, height: u32) -> Camera {
+    fn camera_parameters(&self) -> CameraParameters {
         let (eye, target, up, fov) = if self.active {
             let query = WorldQuery::new(self.scene.world(), SpaceId(0));
             let camera = self.player.camera(
@@ -1360,7 +1603,11 @@ impl ClientView {
                     self.player.view(self.accumulator / sim::TICK_SECONDS),
                 )
             } else {
-                (camera.eye, camera.look, [0., 1., 0.])
+                (
+                    camera.eye,
+                    camera.look,
+                    pole_safe_up(camera.look, self.player.yaw),
+                )
             };
             (
                 eye.map(|v| v as f32),
@@ -1381,15 +1628,19 @@ impl ClientView {
                 self.field_of_view,
             )
         };
-        Camera::perspective(
+        CameraParameters {
             eye,
             target,
             up,
-            fov.to_radians(),
-            width.max(1) as f32 / height.max(1) as f32,
-            0.05,
-            2048.0,
-        )
+            fov,
+            far: self
+                .horizon
+                .as_ref()
+                .map_or(2048., |horizon| horizon.far_plane),
+        }
+    }
+    fn camera(&self, width: u32, height: u32) -> Camera {
+        self.camera_parameters().projection(width, height)
     }
     pub fn current_camera_signature(&self, width: u32, height: u32) -> u64 {
         camera_signature(self.camera(width, height))
@@ -1406,15 +1657,29 @@ impl ClientView {
     /// Call before acquiring the surface or creating an encoder. A clean static
     /// iteration keeps the presented image and allocates no GPU dispatch handles.
     pub fn needs_redraw(&self, width: u32, height: u32) -> bool {
+        let parameters = self.camera_parameters();
+        let camera = parameters.projection(width, height);
         self.force_redraw
             || self.page_links_dirty
-            || self.cached_camera != Some(self.camera(width, height))
+            || self.cached_camera != Some(camera)
+            || self
+                .renderer
+                .needs_redraw(&camera, CullingMode::FrustumAndHiZ)
             || self.cached_world_version != self.scene.world().version()
             || self.cached_upload_bytes != self.upload_bytes_total
             || self
                 .lighting
                 .as_ref()
                 .is_some_and(|lighting| lighting.owner.needs_work(self.scene.world()))
+            || self.environment.as_ref().is_some_and(|environment| {
+                environment.owner.needs_cpu_work(&self.scene)
+                    || environment.owner.needs_redraw(
+                        &self.renderer,
+                        &camera,
+                        CullingMode::FrustumAndHiZ,
+                        self.environment_state(parameters.eye),
+                    )
+            })
     }
     pub fn invalidate(&mut self) {
         self.force_redraw = true;
@@ -1427,7 +1692,20 @@ impl ClientView {
         width: u32,
         height: u32,
     ) -> Result<TerrainFrameWork, String> {
-        let camera = self.camera(width, height);
+        if self.frame_upload_remaining < 4096 {
+            return Err(
+                "frame uniform upload allowance unavailable; run upload_ready first".into(),
+            );
+        }
+        let parameters = self.camera_parameters();
+        let camera = parameters.projection(width, height);
+        if self.renderer.material_pack_revision().is_some() {
+            let bytes = self
+                .renderer
+                .set_material_view(queue, parameters.eye, 0)
+                .map_err(|error| error.to_string())?;
+            self.frame_upload_remaining -= bytes;
+        }
         let center = self.lighting_center();
         if let Some(lighting) = &mut self.lighting {
             let work = if let Some(entities) = &mut self.entities {
@@ -1442,36 +1720,105 @@ impl ClientView {
                 lighting.encode(queue, encoder, &mut self.renderer, center)
             }
             .map_err(|error| error.to_string())?;
+            self.frame_upload_remaining -= work.uniform_upload_bytes;
             self.retained_foreground_work.record(telemetry::WorkCounts {
                 upload_bytes: work.uniform_upload_bytes,
                 ..telemetry::WorkCounts::ZERO
             });
         }
-        if let Some(entities) = &mut self.entities {
+        if let (Some(lighting), Some(environment)) = (&self.lighting, &mut self.environment) {
+            environment.owner.gpu.set_shadow_revision(
+                lighting
+                    .stats
+                    .shadow_draws
+                    .wrapping_add(lighting.stats.shadow_updates),
+            );
+        }
+        let state = self.environment_state(parameters.eye);
+        let scene_needed = self.environment.as_ref().is_none_or(|environment| {
+            environment.owner.gpu.scene_needed(
+                &self.renderer,
+                &camera,
+                CullingMode::FrustumAndHiZ,
+                state,
+            )
+        });
+        if scene_needed && let Some(entities) = &mut self.entities {
             let work = entities
                 .prepare_camera(queue, encoder, camera)
                 .map_err(|error| error.to_string())?;
+            self.frame_upload_remaining -= work.camera_upload_bytes;
             self.retained_foreground_work.record(telemetry::WorkCounts {
                 upload_bytes: work.camera_upload_bytes,
                 ..telemetry::WorkCounts::ZERO
             });
         }
+        if scene_needed && let Some(horizon) = &mut self.horizon {
+            horizon
+                .owner
+                .prepare_camera(queue, encoder, camera, parameters.eye, height)
+                .map_err(|error| error.to_string())?;
+            let h = horizon.owner.height.take_work();
+            let p = horizon.owner.proxies.take_work();
+            let bytes = h.camera_upload_bytes + p.camera_upload_bytes;
+            self.frame_upload_remaining -= bytes;
+            self.retained_foreground_work.record(telemetry::WorkCounts {
+                upload_bytes: bytes,
+                ..telemetry::WorkCounts::ZERO
+            });
+        }
         let entities = self.entities.as_ref();
-        let work = self
-            .renderer
-            .encode_frame_with_extra(
-                queue,
-                encoder,
-                output,
-                &camera,
-                CullingMode::FrustumAndHiZ,
-                |pass| {
-                    entities
-                        .filter(|entities| entities.stats.active)
-                        .map_or(0, |entities| entities.draw(pass))
-                },
-            )
-            .map_err(|e| e.to_string())?;
+        let horizon = self.horizon.as_ref();
+        let extra = |pass: &mut wgpu::RenderPass<'_>| {
+            entities
+                .filter(|entities| entities.stats.primary_records != 0)
+                .map_or(0, |entities| entities.draw(pass))
+                + horizon.map_or(0, |horizon| horizon.owner.draw(pass))
+        };
+        let work = if let Some(environment) = &mut self.environment {
+            // An acquired surface needs a complete background even when only
+            // UI changed. Reuse the HDR scene, exposure and bloom in that case.
+            environment.owner.gpu.request_present();
+            let mut upload = UploadBudget::new(self.frame_upload_remaining);
+            let work = environment
+                .owner
+                .encode(
+                    queue,
+                    encoder,
+                    &mut self.renderer,
+                    output,
+                    &camera,
+                    CullingMode::FrustumAndHiZ,
+                    state,
+                    &mut upload,
+                    extra,
+                )
+                .map_err(|error| error.to_string())?;
+            self.frame_upload_remaining = upload.remaining_bytes;
+            let environment_bytes = work
+                .upload_bytes
+                .saturating_sub(work.terrain.camera_upload_bytes);
+            self.retained_foreground_work.record(telemetry::WorkCounts {
+                upload_bytes: environment_bytes,
+                ..telemetry::WorkCounts::ZERO
+            });
+            self.upload_bytes_total = self.upload_bytes_total.saturating_add(environment_bytes);
+            work.terrain
+        } else {
+            let work = self
+                .renderer
+                .encode_frame_with_extra(
+                    queue,
+                    encoder,
+                    output,
+                    &camera,
+                    CullingMode::FrustumAndHiZ,
+                    extra,
+                )
+                .map_err(|error| error.to_string())?;
+            self.frame_upload_remaining -= work.camera_upload_bytes;
+            work
+        };
         self.self_model_rendered = self.entities.as_ref().map_or_else(
             || {
                 self.self_uploaded_pose.is_some_and(|pose| pose.visible)
@@ -1493,7 +1840,7 @@ impl ClientView {
         self.cached_world_version = self.scene.world().version();
         self.cached_upload_bytes = self.upload_bytes_total;
         self.force_redraw = false;
-        if self.resident.values().any(|p| p.quads != 0) {
+        if work.passes != 0 && self.resident.values().any(|p| p.quads != 0) {
             self.terrain_frames += 1;
         }
         let measured = self.renderer.take_work();
@@ -1570,9 +1917,10 @@ impl ClientView {
                         })
                 })
             })
-            && self.lighting.as_ref().is_none_or(|lighting| {
-                lighting.stats.ready && lighting.owner.shadows().cache().pending() == 0
-            })
+            && self
+                .lighting
+                .as_ref()
+                .is_none_or(|lighting| lighting.is_ready(&self.scene))
             && self.resident.values().any(|p| p.quads > 0)
             && self.terrain_frames > 0
     }
@@ -1628,6 +1976,20 @@ impl ClientView {
                 && self.pending_patches.is_empty(),
         }
     }
+}
+
+/// Looking straight up/down must not make the view/up cross product zero.
+fn pole_safe_up(look: [f64; 3], yaw: f32) -> [f64; 3] {
+    if look[1].abs() < 0.9999 {
+        return [0., 1., 0.];
+    }
+    let yaw = f64::from(yaw).to_radians();
+    let right = [-libm::cos(yaw), 0., -libm::sin(yaw)];
+    [
+        right[1] * look[2] - right[2] * look[1],
+        right[2] * look[0] - right[0] * look[2],
+        right[0] * look[1] - right[1] * look[0],
+    ]
 }
 
 /// Inverse of the Java-style local view bob transform. The simulation owns the
@@ -1688,7 +2050,28 @@ pub fn terrain_gpu_config() -> render::terrain_gpu::GpuConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::camera_bob;
+    use super::{CameraParameters, camera_bob, pole_safe_up};
+
+    #[test]
+    fn vertical_look_with_bob_disabled_has_a_finite_projection() {
+        for vertical in [-1., 1.] {
+            let parameters = CameraParameters {
+                eye: [96., 75., 96.],
+                target: [96., 75. + vertical, 96.],
+                up: pole_safe_up([0., f64::from(vertical), 0.], 135.).map(|v| v as f32),
+                fov: 70.,
+                far: 2048.,
+            };
+            let camera = parameters.projection(780, 437);
+            assert!(
+                camera
+                    .view_projection
+                    .into_iter()
+                    .flatten()
+                    .all(f32::is_finite)
+            );
+        }
+    }
 
     #[test]
     fn view_bob_inverse_has_known_local_translation_and_rotation() {

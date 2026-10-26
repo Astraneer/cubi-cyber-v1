@@ -1,6 +1,7 @@
 //! Deterministic 20Hz movement and world interactions. The caller owns the world
 //! and commits transactions; simulation queries never generate unknown pages.
 #![forbid(unsafe_code)]
+pub use camera::wrap_degrees;
 
 mod camera;
 pub mod collision;

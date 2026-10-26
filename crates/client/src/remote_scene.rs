@@ -40,7 +40,7 @@ impl ClientScene {
     pub fn authoritative_version(&self, page: PageId) -> Option<ConfirmedPageVersion> {
         self.confirmed_versions.get(&page).copied()
     }
-    fn check_remote_page(&self, page: PageId) -> Result<(), SceneError> {
+    pub(super) fn check_remote_page(&self, page: PageId) -> Result<(), SceneError> {
         if !self.config.authoritative_remote {
             return Err(SceneError::AuthorityMode);
         }
@@ -218,6 +218,7 @@ impl ClientScene {
         }
         if self.world.page(page).is_none() {
             self.confirmed_versions.remove(&page);
+            self.confirmed_lights.remove(&page);
             return Ok(None);
         }
         let mut tx = Transaction::new(Tick(tick.0.max(self.world.tick().0)), page.space);

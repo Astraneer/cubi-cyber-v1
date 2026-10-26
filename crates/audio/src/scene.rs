@@ -162,6 +162,7 @@ impl SoundEvents {
                     tick,
                 )?;
                 request.gain = cue.gain;
+                request.category = crate::Category::Players;
                 result[index] = Some(request);
             }
         }
@@ -194,6 +195,12 @@ impl NativeScene {
     pub fn output(&self) -> &crate::native::NativeOutput {
         &self.output
     }
+    pub fn replace_bank(&mut self, prepared: PreparedSounds) -> Result<(), AudioError> {
+        let (mixer, events) = prepared.into_parts();
+        self.output.replace_prepared(mixer)?;
+        self.events = events;
+        Ok(())
+    }
     pub fn forget_emitter(&mut self, id: EmitterId) -> Result<usize, AudioError> {
         self.events.forget_emitter(id);
         self.output.with_mixer(|mixer| mixer.stop_emitter(id))
@@ -206,6 +213,18 @@ impl NativeScene {
         seed: u64,
     ) -> Result<VoiceHandle, AudioError> {
         let request = self.events.request(event, emitter, position, seed)?;
+        self.output.with_mixer(|mixer| mixer.play(request))?
+    }
+    pub fn event_gain(
+        &self,
+        event: &str,
+        emitter: EmitterId,
+        position: Option<[f64; 3]>,
+        seed: u64,
+        gain: f32,
+    ) -> Result<VoiceHandle, AudioError> {
+        let mut request = self.events.request(event, emitter, position, seed)?;
+        request.gain = gain;
         self.output.with_mixer(|mixer| mixer.play(request))?
     }
     pub fn steps(
@@ -281,6 +300,21 @@ impl WebScene {
             .events
             .request(event, emitter, position, seed)
             .map_err(|error| wasm_bindgen::JsValue::from_str(&format!("{error:?}")))?;
+        self.output.play(request)
+    }
+    pub fn event_gain(
+        &mut self,
+        event: &str,
+        emitter: EmitterId,
+        position: Option<[f64; 3]>,
+        seed: u64,
+        gain: f32,
+    ) -> Result<VoiceHandle, wasm_bindgen::JsValue> {
+        let mut request = self
+            .events
+            .request(event, emitter, position, seed)
+            .map_err(|error| wasm_bindgen::JsValue::from_str(&format!("{error:?}")))?;
+        request.gain = gain;
         self.output.play(request)
     }
     pub fn steps(

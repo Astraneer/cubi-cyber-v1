@@ -7,11 +7,23 @@ pub mod block_loot;
 mod chat;
 pub mod entities;
 mod geometry;
+pub mod height_authority;
+pub mod height_index;
+pub mod height_migration;
+mod height_stream;
+pub mod height_tile;
+mod light_owner;
+mod light_stream;
+pub mod lighting;
 pub mod lod;
 pub mod machines;
+mod migration_owner;
+pub mod mob_spawn;
 pub mod presence;
 mod runtime;
 pub mod survival;
+mod topology_owner;
+pub mod topology_queue;
 pub mod transport;
 pub mod ui;
 mod visibility;
@@ -142,6 +154,27 @@ pub struct ServerCounters {
     pub machine_steps: u64,
     pub machine_reads: u64,
     pub machine_transfers: u64,
+    pub height_submitted: u64,
+    pub height_published: u64,
+    pub height_discarded: u64,
+    pub topology_completed: u64,
+    pub topology_retried: u64,
+    pub mob_steps: u64,
+    pub mob_cell_reads: u64,
+    pub mob_waiting: u64,
+    pub mob_deferred: u64,
+    pub mob_drops: u64,
+    pub mob_activity_buckets: u64,
+    pub height_migration_cells: u64,
+    pub height_migration_pages: u64,
+    pub light_cells: u64,
+    pub light_neighbor_reads: u64,
+    pub light_updates: u64,
+    pub light_profile_columns: u64,
+    pub light_snapshots: u64,
+    pub light_deltas: u64,
+    pub light_snapshot_cells: u64,
+    pub light_delta_cells: u64,
 }
 struct MiningAction {
     id: ActionId,
@@ -180,6 +213,9 @@ struct Peer {
     geometry_requests: VecDeque<(PageId, Option<Version>)>,
     geometry_subscriptions: BTreeMap<PageId, Version>,
     geometry_view: u64,
+    geometry_views: BTreeMap<PageId, u64>,
+    height_requests: VecDeque<(net::height::HeightKey, Option<u64>)>,
+    height_subscriptions: BTreeMap<net::height::HeightKey, u64>,
     last_view_position: [f64; 3],
     roster_revision: Option<u64>,
     entities: Option<entities::replication::EntityHistory>,
@@ -218,12 +254,16 @@ pub struct Server {
     spawn: [f64; 3],
     generation: Option<Generation>,
     geometry: geometry::GeometryWorker,
+    height_worker: height_stream::HeightWorker,
+    height_migration: Option<migration_owner::LegacyMigration>,
     failed: bool,
     counters: ServerCounters,
     recent_changes: VecDeque<WorldChange>,
     drop_seed: u64,
     authoritative_transactions: VecDeque<Transaction>,
     runtimes: runtime::Runtimes,
+    lighting: light_owner::LightOwner,
+    light_stream: light_stream::LightStream,
     presence: presence::Presence,
     staged_chats: Vec<presence::ChatReservation>,
     now_ms: u64,
@@ -287,6 +327,21 @@ impl Server {
             public_seed = config.public_seed;
             initial_world
         };
+        if !runtimes.height_loaded {
+            runtimes
+                .height
+                .begin_legacy(
+                    TxId(world.checkpoint().next_tx().saturating_sub(1)),
+                    world.pages().map(|(page, _)| page),
+                )
+                .map_err(|_| ServerError::Invalid("height legacy migration metadata"))?;
+            if world.loaded_pages() == 0 {
+                runtimes
+                    .height
+                    .finish_legacy()
+                    .map_err(|_| ServerError::Invalid("empty height baseline"))?;
+            }
+        }
         for (_, batch) in recovery.batches {
             runtimes.replay(&batch.runtimes)?;
             for change in batch.changes {
@@ -318,6 +373,7 @@ impl Server {
         }
         tick = Tick(tick.0.max(world.tick().0));
         runtimes.bootstrap_drops(&world)?;
+        runtimes.validate_owned_payloads(&world, &players)?;
         // Fresh baselines, including fixture worlds, are saved before the first WAL
         // record. This also ensures private world bytes are never regenerated on load.
         if store.last_sequence() == 0 {
@@ -393,6 +449,13 @@ impl Server {
         // seeded by private loot/world generation state.
         let mut presence = presence::Presence::new(u64::from_le_bytes(random::<8>()?));
         presence.set_chat_frontier(runtimes.chat.frontier());
+        let height_migration =
+            migration_owner::LegacyMigration::new(&world, &runtimes.height, generator.clone())?;
+        let lighting = light_owner::LightOwner::attach(&mut world)?;
+        let light_stream = light_stream::LightStream::new(&world);
+        let height_worker = height_stream::HeightWorker::new(r#gen::Generator::new(
+            r#gen::TerrainSeed(public_seed),
+        ))?;
         Ok(Self {
             config,
             world,
@@ -410,12 +473,16 @@ impl Server {
             spawn,
             generation,
             geometry,
+            height_worker,
+            height_migration,
             failed: false,
             counters: ServerCounters::default(),
             recent_changes: VecDeque::new(),
             drop_seed,
             authoritative_transactions: VecDeque::new(),
             runtimes,
+            lighting,
+            light_stream,
             presence,
             staged_chats: Vec::new(),
             now_ms: 0,
@@ -426,8 +493,23 @@ impl Server {
     pub fn world(&self) -> &World {
         &self.world
     }
+    pub fn height_authority(&self) -> &height_authority::HeightAuthority {
+        &self.runtimes.height
+    }
+    pub fn item_payloads(&self) -> &rules::item_payload::Ledger {
+        &self.runtimes.payloads
+    }
+    pub fn machine_runtime(&self) -> &machines::MachineRuntime {
+        &self.runtimes.machines
+    }
     pub fn item_entities(&self) -> &rules::entities::item::ItemStore {
         self.runtimes.items.entities()
+    }
+    pub fn height_ready_for_publication(&self) -> bool {
+        self.height_ready()
+    }
+    pub fn awaiting_durability(&self) -> bool {
+        self.pending.is_some()
     }
     pub fn current_tick(&self) -> Tick {
         self.tick
@@ -456,6 +538,7 @@ impl Server {
     }
     pub fn disconnect(&mut self, connection: u64) {
         self.peers.remove(&connection);
+        self.light_stream.forget_peer(connection);
         self.inbox.retain(|(c, _, _)| *c != connection);
     }
     pub fn handle(
@@ -487,6 +570,22 @@ impl Server {
         if self.pending.is_some() {
             self.counters.storage_stalls += 1;
             return output;
+        }
+        match self.poll_height_migration() {
+            Ok(true) => return output,
+            Ok(false) => {}
+            Err(_) => {
+                self.failed = true;
+                return output;
+            }
+        }
+        match self.reconcile_topology() {
+            Ok(true) => return output,
+            Ok(false) => {}
+            Err(_) => {
+                self.failed = true;
+                return output;
+            }
         }
         match self.import_items() {
             Ok(true) => return output,
@@ -627,15 +726,22 @@ impl Server {
                 self.peers.insert(connection, peer);
             }
         }
-        if self.tick_machines(&mut batch).is_err() {
-            self.failed = true;
-            return output;
-        }
+        let machine_spawns = match self.tick_machines(&mut batch) {
+            Ok(spawns) => spawns,
+            Err(_) => {
+                self.failed = true;
+                return output;
+            }
+        };
         if self.tick_survival(&mut batch).is_err() {
             self.failed = true;
             return output;
         }
-        if self.tick_items(&mut batch).is_err() {
+        if self.tick_items(&mut batch, machine_spawns).is_err() {
+            self.failed = true;
+            return output;
+        }
+        if self.tick_lighting(&mut batch).is_err() {
             self.failed = true;
             return output;
         }
@@ -663,16 +769,33 @@ impl Server {
                 break;
             }
             if pending.checkpoint {
+                if self
+                    .height_migration
+                    .as_ref()
+                    .is_some_and(|m| m.checkpoint_requested)
+                {
+                    self.height_migration = None;
+                    self.refresh_heights();
+                }
                 continue;
             }
             if self.runtimes.replay(&pending.runtimes).is_err()
                 || self.runtimes.committed_changes(&pending.changes).is_err()
+                || self.lighting.acknowledge(&mut self.world).is_err()
+                || self.observe_lights(&pending.changes).is_err()
             {
                 self.failed = true;
                 break;
             }
             self.counters.durable_batches += 1;
-            if !pending.changes.is_empty() {
+            if pending.changes.iter().any(|c| !c.cells.is_empty()) {
+                self.refresh_heights();
+            }
+            if pending
+                .changes
+                .iter()
+                .any(|c| !c.cells.is_empty() || c.pages.iter().any(|p| p.created || p.removed))
+            {
                 // A changed occluder can reveal an ore in an unchanged page.
                 // Queue all bounded subscriptions after the durable frontier.
                 for peer in self.peers.values_mut() {
@@ -852,7 +975,7 @@ impl Server {
         });
     }
     pub fn request_checkpoint(&mut self) -> bool {
-        if self.pending.is_some() || self.failed {
+        if self.pending.is_some() || self.failed || !self.runtimes.topology_bootstrap.is_empty() {
             return false;
         }
         let ticket = self.next_ticket;
@@ -1000,7 +1123,9 @@ impl Server {
                 }
             }
             ClientMessage::AckPage { page, version } => {
-                peer.history.acknowledge(page, version);
+                if peer.history.acknowledge(page, version) {
+                    self.light_stream.queue_auto(connection, page, version);
+                }
             }
             ClientMessage::RequestSummary { page } => {
                 if peer.summaries.len() < 16 {
@@ -1008,7 +1133,7 @@ impl Server {
                 }
             }
             ClientMessage::RequestGeometry { page, known } => {
-                if peer.geometry_subscriptions.len() >= 16
+                if peer.geometry_subscriptions.len() >= height_stream::MAX_GEOMETRY
                     && !peer.geometry_subscriptions.contains_key(&page)
                 {
                     out.push(Outgoing::reliable(
@@ -1019,15 +1144,51 @@ impl Server {
                     peer.geometry_subscriptions
                         .entry(page)
                         .or_insert(Version(0));
-                    if peer.geometry_requests.len() < 16
+                    if peer.geometry_requests.len() < height_stream::MAX_GEOMETRY
                         && !peer.geometry_requests.iter().any(|(p, _)| *p == page)
                     {
                         peer.geometry_requests.push_back((page, known));
                     }
                 }
             }
+            ClientMessage::RequestHeight { key, known } => {
+                if peer.height_subscriptions.len() < height_stream::MAX_TILES
+                    || peer.height_subscriptions.contains_key(&key)
+                {
+                    peer.height_subscriptions.entry(key).or_insert(0);
+                    if peer.height_requests.len() < height_stream::MAX_TILES
+                        && !peer.height_requests.iter().any(|(k, _)| *k == key)
+                    {
+                        peer.height_requests.push_back((key, known));
+                    }
+                } else {
+                    out.push(Outgoing::reliable(
+                        connection,
+                        ServerMessage::HeightUnavailable(key),
+                    ));
+                }
+            }
+            ClientMessage::RequestLight(request) => {
+                if peer.pages.contains(&request.page)
+                    && peer.history.has_version(request.page, request.cell_view)
+                {
+                    peer.history.acknowledge(request.page, request.cell_view);
+                    self.light_stream.request(connection, request);
+                } else {
+                    out.push(Outgoing::reliable(
+                        connection,
+                        ServerMessage::LightUnavailable(request.page),
+                    ));
+                }
+            }
+            ClientMessage::ForgetLight(page) => self.light_stream.forget(connection, page),
+            ClientMessage::ForgetHeight(key) => {
+                peer.height_subscriptions.remove(&key);
+                peer.height_requests.retain(|(k, _)| *k != key);
+            }
             ClientMessage::ForgetGeometry(page) => {
                 peer.geometry_subscriptions.remove(&page);
+                peer.geometry_views.remove(&page);
                 peer.geometry_requests.retain(|(p, _)| *p != page);
             }
             ClientMessage::Presence(event) => match event {
@@ -1288,6 +1449,9 @@ impl Server {
                 geometry_requests: VecDeque::new(),
                 geometry_subscriptions: BTreeMap::new(),
                 geometry_view: 0,
+                geometry_views: BTreeMap::new(),
+                height_requests: VecDeque::new(),
+                height_subscriptions: BTreeMap::new(),
                 last_view_position: position,
                 roster_revision: None,
                 entities: None,
@@ -1370,6 +1534,7 @@ impl Server {
         {
             if peer.player.mode == GameMode::Creative
                 && self.identities[&peer.identity].role.can_admin()
+                && inventory.payload == 0
             {
                 self.perform_action(
                     connection,
@@ -1431,7 +1596,7 @@ impl Server {
                     let prepared = self
                         .precheck_edit(peer, target, Some(value), role)
                         .and_then(|_| {
-                            sim::prepare_edit(
+                            sim::prepare_owned_edit(
                                 &self.world,
                                 peer.space,
                                 &peer.player,
@@ -1445,8 +1610,14 @@ impl Server {
                             )
                         });
                     match prepared {
-                        Ok(mut tx) => match runtime::component_birth(&self.world, &mut tx, target)
-                            .and_then(|_| self.world.commit(tx).map_err(|_| RejectReason::Stale))
+                        Ok(mut tx) => match runtime::component_birth(
+                            &self.world,
+                            &mut tx,
+                            target,
+                            rules::stack::ItemStack::EMPTY,
+                            &self.runtimes.payloads,
+                        )
+                        .and_then(|_| self.world.commit(tx).map_err(|_| RejectReason::Stale))
                         {
                             Ok(change) => {
                                 transaction = Some(change.tx);
@@ -1507,7 +1678,7 @@ impl Server {
                     Err(sim::EditError::OutOfReach)
                 } else {
                     self.precheck_edit(peer, target, None, role).and_then(|_| {
-                        sim::prepare_edit(
+                        sim::prepare_owned_edit(
                             &self.world,
                             peer.space,
                             &peer.player,
@@ -1628,7 +1799,8 @@ impl Server {
         let hand = peer.inventory.hand();
         let role = self.identities[&peer.identity].role;
         let result = (|| {
-            if peer.player.mode != GameMode::Survival {
+            let creative = peer.player.mode == GameMode::Creative && role.can_admin();
+            if peer.player.mode != GameMode::Survival && !creative {
                 return Err(RejectReason::Unauthorized);
             }
             if self.tick.0 < peer.place_ready_at.0 {
@@ -1639,6 +1811,7 @@ impl Server {
                 || guard.item != hand.item()
                 || guard.count != hand.count()
                 || guard.damage != hand.damage()
+                || guard.payload != hand.payload().map_or(0, |id| id.0)
             {
                 return Err(RejectReason::Stale);
             }
@@ -1651,7 +1824,7 @@ impl Server {
             }
             self.precheck_edit(peer, position, Some(cell), role)
                 .map_err(edit_reason)?;
-            let mut tx = sim::prepare_edit(
+            let mut tx = sim::prepare_owned_edit(
                 &self.world,
                 peer.space,
                 &peer.player,
@@ -1664,11 +1837,24 @@ impl Server {
                 |p| self.protected(p, role),
             )
             .map_err(edit_reason)?;
-            runtime::component_birth(&self.world, &mut tx, position)?;
+            let pending = self.payload_delta(batch)?;
+            let view = pending
+                .as_ref()
+                .map(|delta| self.runtimes.payloads.view(delta))
+                .transpose()
+                .map_err(|_| RejectReason::InvalidCell)?;
+            let resolver: &dyn rules::item_payload::Resolver = if let Some(view) = view.as_ref() {
+                view
+            } else {
+                &self.runtimes.payloads
+            };
+            runtime::component_birth(&self.world, &mut tx, position, hand, resolver)?;
             let change = self.world.commit(tx).map_err(|_| RejectReason::Stale)?;
             let transaction = change.tx;
             batch.changes.push(change);
-            peer.inventory = *plan.after();
+            if !creative {
+                peer.inventory = *plan.after();
+            }
             peer.place_ready_at = Tick(self.tick.0.saturating_add(4));
             let actual = match self.world.read(position) {
                 CellRead::Known(actual) => actual,
@@ -1704,7 +1890,7 @@ impl Server {
         out: &mut Vec<Outgoing>,
     ) {
         let Some(mining) = peer.mining.as_ref() else {
-            let _ = peer.interaction.tick_break(
+            let _ = peer.interaction.tick_owned_break(
                 &self.world,
                 peer.space,
                 &peer.player,
@@ -1721,7 +1907,7 @@ impl Server {
         let prepared = self
             .precheck_edit(peer, mining.position, None, role)
             .and_then(|_| {
-                sim::prepare_edit(
+                sim::prepare_owned_edit(
                     &self.world,
                     peer.space,
                     &peer.player,
@@ -1758,7 +1944,7 @@ impl Server {
         if peer.last_keys & InputFrame::ATTACK == 0 {
             return;
         }
-        let result = peer.interaction.tick_break(
+        let result = peer.interaction.tick_owned_break(
             &self.world,
             peer.space,
             &peer.player,
@@ -1790,7 +1976,7 @@ impl Server {
                     );
                     return;
                 }
-                let inventory_after = match runtime::prepare_break(
+                let (inventory_after, payloads) = match runtime::prepare_break(
                     &self.world,
                     peer,
                     &mining,
@@ -1817,8 +2003,29 @@ impl Server {
                         return;
                     }
                 };
+                let payload_record = match self.plan_payloads(batch, payloads) {
+                    Ok(record) => record,
+                    Err(reason) => {
+                        self.terminal(
+                            connection,
+                            peer.identity,
+                            reply(
+                                mining.id,
+                                ActionStatus::Rejected(reason),
+                                None,
+                                self.world.version(),
+                                Some(mining.position),
+                                None,
+                            ),
+                            batch,
+                            out,
+                        );
+                        return;
+                    }
+                };
                 match self.world.commit(tx) {
                     Ok(change) => {
+                        Self::stage_payloads(batch, payload_record);
                         let tx = change.tx;
                         peer.inventory = inventory_after;
                         let cooldown = u64::from(peer.interaction.mining.cooldown);
@@ -2131,6 +2338,7 @@ impl Server {
                 for page in evicted {
                     peer.pages.remove(&page);
                     peer.history.remove(page);
+                    self.light_stream.forget(connection, page);
                 }
                 // Revisit visible pages when the eye moves. This is required for
                 // visibility-only reveals even if their world versions are equal.
@@ -2234,6 +2442,8 @@ impl Server {
             self.peers.insert(connection, peer);
         }
         output.extend(self.publish_geometry());
+        output.extend(self.publish_heights());
+        output.extend(self.publish_lights());
         output
     }
     fn observer_page(&self, peer: &Peer, space: SpaceId) -> Option<PageId> {

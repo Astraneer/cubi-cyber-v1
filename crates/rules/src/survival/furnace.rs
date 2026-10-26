@@ -7,6 +7,8 @@ use crate::{ids::*, items::*, stack::ItemStack};
 pub const COOK_TICKS: u16 = 200;
 pub const FURNACE_BYTES: usize = 30;
 pub const CHEST_BYTES: usize = 174;
+pub const FURNACE_MAX_BYTES: usize = FURNACE_BYTES + 6 + 3 * 10;
+pub const CHEST_MAX_BYTES: usize = CHEST_BYTES + 6 + 27 * 10;
 
 /// Pure approved donor tables (world/blockentity.rs), stable registry IDs.
 pub fn fuel_ticks(item: ItemId) -> u32 {
@@ -151,7 +153,7 @@ impl Furnace {
             active: self.needs_tick(),
         }
     }
-    pub fn encode(&self) -> [u8; FURNACE_BYTES] {
+    pub fn encode(&self) -> crate::item_payload::Encoded<FURNACE_MAX_BYTES> {
         let mut bytes = [0; FURNACE_BYTES];
         bytes[..4].copy_from_slice(b"FUR1");
         for (stack, raw) in self.slots.iter().zip(bytes[4..22].chunks_exact_mut(6)) {
@@ -165,10 +167,14 @@ impl Furnace {
         {
             raw.copy_from_slice(&value.to_le_bytes());
         }
-        bytes
+        let mut encoded = crate::item_payload::Encoded::from_prefix(&bytes);
+        encoded
+            .append_refs(self.slots.iter().enumerate().map(|(i, s)| (i, s.payload())))
+            .expect("validated furnace references");
+        encoded
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, SurvivalError> {
-        if bytes.len() != FURNACE_BYTES || &bytes[..4] != b"FUR1" {
+        if !(FURNACE_BYTES..=FURNACE_MAX_BYTES).contains(&bytes.len()) || &bytes[..4] != b"FUR1" {
             return Err(SurvivalError::InvalidEncoding);
         }
         let mut furnace = Self::default();
@@ -189,6 +195,16 @@ impl Furnace {
             || furnace.cook > furnace.cook_total
         {
             return Err(SurvivalError::InvalidEncoding);
+        }
+        let (refs, used) = crate::item_payload::refs::read(&bytes[FURNACE_BYTES..], 3)
+            .map_err(|_| SurvivalError::InvalidEncoding)?;
+        if FURNACE_BYTES + used != bytes.len() {
+            return Err(SurvivalError::InvalidEncoding);
+        }
+        for (slot, id) in refs {
+            furnace.slots[slot] = furnace.slots[slot]
+                .with_payload(id)
+                .map_err(|_| SurvivalError::InvalidStack)?;
         }
         Ok(furnace)
     }
@@ -226,7 +242,7 @@ impl Chest {
         }
         Ok(())
     }
-    pub fn encode(&self) -> [u8; CHEST_BYTES] {
+    pub fn encode(&self) -> crate::item_payload::Encoded<CHEST_MAX_BYTES> {
         let mut bytes = [0; CHEST_BYTES];
         bytes[..4].copy_from_slice(b"CHS1");
         bytes[4..12].copy_from_slice(&self.revision.to_le_bytes());
@@ -235,10 +251,14 @@ impl Chest {
             raw[2..4].copy_from_slice(&value.count().to_le_bytes());
             raw[4..].copy_from_slice(&value.damage().to_le_bytes());
         }
-        bytes
+        let mut encoded = crate::item_payload::Encoded::from_prefix(&bytes);
+        encoded
+            .append_refs(self.slots.iter().enumerate().map(|(i, s)| (i, s.payload())))
+            .expect("validated chest references");
+        encoded
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, SurvivalError> {
-        if bytes.len() != CHEST_BYTES || &bytes[..4] != b"CHS1" {
+        if !(CHEST_BYTES..=CHEST_MAX_BYTES).contains(&bytes.len()) || &bytes[..4] != b"CHS1" {
             return Err(SurvivalError::InvalidEncoding);
         }
         let mut chest = Self {
@@ -249,9 +269,23 @@ impl Chest {
             ),
             ..Self::default()
         };
-        for (slot, raw) in chest.slots.iter_mut().zip(bytes[12..].chunks_exact(6)) {
+        for (slot, raw) in chest
+            .slots
+            .iter_mut()
+            .zip(bytes[12..CHEST_BYTES].chunks_exact(6))
+        {
             let read = |i| u16::from_le_bytes([raw[i], raw[i + 1]]);
             *slot = ItemStack::from_parts(read(0), read(2), read(4))
+                .map_err(|_| SurvivalError::InvalidStack)?;
+        }
+        let (refs, used) = crate::item_payload::refs::read(&bytes[CHEST_BYTES..], 27)
+            .map_err(|_| SurvivalError::InvalidEncoding)?;
+        if CHEST_BYTES + used != bytes.len() {
+            return Err(SurvivalError::InvalidEncoding);
+        }
+        for (slot, id) in refs {
+            chest.slots[slot] = chest.slots[slot]
+                .with_payload(id)
                 .map_err(|_| SurvivalError::InvalidStack)?;
         }
         Ok(chest)

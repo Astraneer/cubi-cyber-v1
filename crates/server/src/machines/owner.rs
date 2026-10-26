@@ -16,6 +16,7 @@ impl MachineRuntime {
             next_order: 0,
             machines: BTreeMap::new(),
             positions: BTreeMap::new(),
+            machine_pages: BTreeMap::new(),
             events: BTreeMap::new(),
             keys: BTreeMap::new(),
             grids: BTreeMap::new(),
@@ -23,6 +24,10 @@ impl MachineRuntime {
             producers: BTreeMap::new(),
             configs: BTreeMap::new(),
             phase_scratch: PhaseScratch::new(config.endpoints),
+            transport: transport::TransportOwner::new(),
+            topology_queue: topology_pending::new_queue()?,
+            dirty_networks: BTreeMap::new(),
+            dirty_positions: BTreeMap::new(),
         })
     }
     pub fn pending(&self, event: Event) -> Option<Pending> {
@@ -37,10 +42,15 @@ impl MachineRuntime {
     pub fn event_count(&self) -> usize {
         self.events.len()
     }
+    pub fn noop_delta(&self) -> Result<RuntimeDelta, MachineError> {
+        self.delta(Vec::new(), Vec::new(), Vec::new(), self.next_order)
+    }
     pub fn snapshot(&self) -> RuntimeSnapshot {
         RuntimeSnapshot {
             revision: self.revision,
             next_order: self.next_order,
+            transport: self.transport.snapshot(),
+            topology_queue: self.topology_queue.snapshot(),
             machines: self.machines.values().copied().collect(),
             events: self.events.values().copied().collect(),
             network_orders: self
@@ -71,6 +81,8 @@ impl MachineRuntime {
         let mut runtime = Self::new(config)?;
         runtime.revision = snapshot.revision;
         runtime.next_order = snapshot.next_order;
+        runtime.transport = transport::TransportOwner::restore(config, &snapshot.transport)?;
+        runtime.topology_queue = topology_pending::restore_queue(&snapshot.topology_queue)?;
         let mut orders = BTreeSet::new();
         for &m in &snapshot.machines {
             if m.order >= snapshot.next_order
@@ -80,6 +92,11 @@ impl MachineRuntime {
             {
                 return Err(MachineError::Encoding);
             }
+            runtime
+                .machine_pages
+                .entry(m.anchor.page())
+                .or_default()
+                .insert(m.id);
         }
         for &p in &snapshot.events {
             if runtime.keys.insert(p.event, queue_key(p)).is_some()
@@ -164,6 +181,7 @@ impl MachineRuntime {
             validate_config(config)?;
             runtime.configs.insert(config.position, config);
         }
+        runtime.restore_dirty();
         Ok(runtime)
     }
     pub(super) fn delta(
@@ -185,6 +203,8 @@ impl MachineRuntime {
             networks: Vec::new(),
             endpoints: Vec::new(),
             configs: Vec::new(),
+            transport: None,
+            topology_queue: None,
         })
     }
     pub fn plan_register(
@@ -320,6 +340,10 @@ impl MachineRuntime {
         Ok(delta)
     }
     pub fn validate_delta(&self, delta: &RuntimeDelta) -> Result<(), MachineError> {
+        self.validate_topology_queue(delta)?;
+        if let Some(transport) = &delta.transport {
+            self.transport.validate(self.config, transport)?;
+        }
         if delta.revision != self.revision
             || delta.next_revision != self.revision.checked_add(1).ok_or(MachineError::Overflow)?
             || delta.next_order_before != self.next_order
@@ -481,18 +505,38 @@ impl MachineRuntime {
     }
     pub fn acknowledge(&mut self, delta: RuntimeDelta) -> Result<(), MachineError> {
         self.validate_delta(&delta)?;
+        let dirty_rechecks = self.dirty_rechecks(&delta);
         let prepared = self.prepare_topology(&delta)?;
         self.apply_extensions(&delta, prepared)?;
+        if let Some(transport) = delta.transport {
+            self.transport.apply(self.config, transport)?;
+        }
+        self.acknowledge_topology_queue(delta.topology_queue)?;
+        self.refresh_dirty(dirty_rechecks);
         for patch in &delta.machines {
-            if let Some(before) = patch.before {
+            if let Some(before) = patch.before
+                && patch.after.is_none()
+            {
                 self.machines.remove(&before.id);
                 self.positions.remove(&before.anchor);
+                if let Some(ids) = self.machine_pages.get_mut(&before.anchor.page()) {
+                    ids.remove(&before.id);
+                    if ids.is_empty() {
+                        self.machine_pages.remove(&before.anchor.page());
+                    }
+                }
             }
         }
         for patch in delta.machines {
             if let Some(after) = patch.after {
                 self.machines.insert(after.id, after);
-                self.positions.insert(after.anchor, after.id);
+                if patch.before.is_none() {
+                    self.positions.insert(after.anchor, after.id);
+                    self.machine_pages
+                        .entry(after.anchor.page())
+                        .or_default()
+                        .insert(after.id);
+                }
             }
         }
         for patch in delta.queue {

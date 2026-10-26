@@ -118,17 +118,18 @@ impl Archive {
         if json.len() > MAX_ARCHIVE_BYTES * 2 + 16 * 1024 * 1024 {
             return Err("movement report exceeds bound");
         }
-        let (_, tail) = json
-            .split_once("\"movementReplay\":{")
-            .ok_or("report has no movement replay")?;
-        let (_, tail) = tail
-            .split_once("\"dataHex\":\"")
-            .ok_or("report has no movement bytes")?;
-        let hex = tail
-            .split_once('"')
-            .ok_or("unterminated movement bytes")?
-            .0
-            .as_bytes();
+        let movement = object_member(json.as_bytes(), b"movementReplay")?;
+        let data = object_member(movement, b"dataHex")?;
+        if data.first() != Some(&b'"') {
+            return Err("movement bytes are not a string");
+        }
+        let hex = data[1..]
+            .split(|byte| *byte == b'"')
+            .next()
+            .ok_or("unterminated movement bytes")?;
+        if data.get(hex.len() + 1) != Some(&b'"') {
+            return Err("unterminated movement bytes");
+        }
         if hex.len() > MAX_ARCHIVE_BYTES * 2 || hex.len() % 2 != 0 {
             return Err("invalid movement hex length");
         }
@@ -200,6 +201,71 @@ impl Archive {
             complete_window: self.complete,
         })
     }
+}
+/// Select a direct member while skipping strings and nested containers. This
+/// bounded extractor accepts formatting whitespace and ignores quoted copies of
+/// field names; payload validation remains the strict binary decoder's job.
+fn object_member<'a>(object: &'a [u8], key: &[u8]) -> Result<&'a [u8], &'static str> {
+    let mut at = 0;
+    while object.get(at).is_some_and(u8::is_ascii_whitespace) {
+        at += 1;
+    }
+    if object.get(at) != Some(&b'{') {
+        return Err("movement report member is not an object");
+    }
+    let mut depth = 0usize;
+    while let Some(byte) = object.get(at).copied() {
+        match byte {
+            b'{' | b'[' => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or("movement JSON nesting overflow")?;
+                at += 1;
+            }
+            b'}' | b']' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or("invalid movement JSON nesting")?;
+                at += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            b'"' => {
+                let start = at + 1;
+                at = start;
+                while let Some(byte) = object.get(at) {
+                    if *byte == b'"' {
+                        break;
+                    }
+                    if *byte == b'\\' {
+                        at = at.checked_add(1).ok_or("movement JSON offset overflow")?;
+                    }
+                    at = at.checked_add(1).ok_or("movement JSON offset overflow")?;
+                }
+                if object.get(at) != Some(&b'"') {
+                    return Err("unterminated movement JSON string");
+                }
+                let matches = depth == 1 && &object[start..at] == key;
+                at += 1;
+                if matches {
+                    while object.get(at).is_some_and(u8::is_ascii_whitespace) {
+                        at += 1;
+                    }
+                    if object.get(at) != Some(&b':') {
+                        continue;
+                    }
+                    at += 1;
+                    while object.get(at).is_some_and(u8::is_ascii_whitespace) {
+                        at += 1;
+                    }
+                    return Ok(&object[at..]);
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    Err("movement report member is missing")
 }
 fn failure(step: &Step, reason: &'static str, actual_hash: u64) -> ReplayFailure {
     ReplayFailure {

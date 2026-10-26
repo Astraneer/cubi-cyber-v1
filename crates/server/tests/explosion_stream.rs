@@ -118,6 +118,9 @@ struct Traffic {
     received_bytes: u64,
     sent_packets: u64,
     received_packets: u64,
+    page_bytes: u64,
+    light_bytes: u64,
+    other_bytes: u64,
 }
 impl Traffic {
     fn since(self, before: Self) -> Self {
@@ -126,6 +129,9 @@ impl Traffic {
             received_bytes: self.received_bytes - before.received_bytes,
             sent_packets: self.sent_packets - before.sent_packets,
             received_packets: self.received_packets - before.received_packets,
+            page_bytes: self.page_bytes - before.page_bytes,
+            light_bytes: self.light_bytes - before.light_bytes,
+            other_bytes: self.other_bytes - before.other_bytes,
         }
     }
 }
@@ -138,6 +144,7 @@ struct Bot {
     hello: Vec<u8>,
     next_hello: u64,
     replica: Replica,
+    lights: net::light::Replica,
     fence_sent: u64,
     fence_received: u64,
     snapshots: u64,
@@ -170,6 +177,7 @@ impl Bot {
             .unwrap(),
             next_hello: 0,
             replica: Replica::new(8),
+            lights: net::light::Replica::new(8).unwrap(),
             fence_sent: 0,
             fence_received: 0,
             snapshots: 0,
@@ -197,6 +205,12 @@ impl Bot {
                 .is_none_or(|channel| channel.pending_messages() != 0)
     }
     fn receive_message(&mut self, message: ServerMessage) {
+        let bytes = net::encode_server(&message).unwrap().len() as u64;
+        match &message {
+            ServerMessage::Page(_) => self.traffic.page_bytes += bytes,
+            ServerMessage::Light(_) => self.traffic.light_bytes += bytes,
+            _ => self.traffic.other_bytes += bytes,
+        }
         match message {
             ServerMessage::Welcome(welcome) if self.channel.is_none() => {
                 self.channel = Some(Channel::new(
@@ -239,6 +253,33 @@ impl Bot {
                     Err(error) => panic!("explosion replica: {error:?}"),
                 }
             }
+            ServerMessage::Light(update) => {
+                let header = update.header();
+                let cell_view = self.replica.page(header.page).map(|page| page.version);
+                match self.lights.apply(*update, cell_view) {
+                    Ok(_) => {
+                        if let Some(image) = self.lights.page(header.page)
+                            && Some(image.header.cell_view) == cell_view
+                        {
+                            self.enqueue(ClientMessage::RequestLight(net::light::Request {
+                                page: header.page,
+                                cell_view: image.header.cell_view,
+                                acknowledged: Some(image.header.version),
+                            }));
+                        }
+                    }
+                    Err(net::light::Error::MissingBase { .. }) => {
+                        self.enqueue(ClientMessage::RequestLight(net::light::Request {
+                            page: header.page,
+                            cell_view: cell_view.expect("known fixture cell page"),
+                            acknowledged: None,
+                        }));
+                    }
+                    Err(net::light::Error::MissingCells { .. }) => {}
+                    Err(error) => panic!("explosion light replica: {error:?}"),
+                }
+            }
+            ServerMessage::LightUnavailable(_) => panic!("fixture LIGHT must be available"),
             ServerMessage::Pong(fence) => self.fence_received = self.fence_received.max(fence),
             ServerMessage::PageUnavailable(_) => {
                 panic!("all eight fixture pages must be available")
@@ -318,6 +359,15 @@ impl Bot {
             self.packets(packets, now);
         }
     }
+    fn lights_bound(&self) -> bool {
+        pages().iter().all(|page| {
+            self.lights.page(*page).is_some_and(|image| {
+                self.replica
+                    .page(*page)
+                    .is_some_and(|cells| image.header.cell_view == cells.version)
+            })
+        })
+    }
     fn explosion_applied(&self, targets: &[BlockPos], version: Version) -> bool {
         self.replica.len() == 8
             && pages()
@@ -350,7 +400,7 @@ fn one_ten_thousand_cell_transaction_reaches_two_confirmed_lossy_udp_replicas() 
         );
         for bot in &mut bots {
             bot.step(now);
-            if bot.replica.len() == 8 && baseline.is_none() {
+            if bot.replica.len() == 8 && bot.lights_bound() && baseline.is_none() {
                 bot.fence(BASELINE_FENCE);
             }
         }
@@ -392,7 +442,7 @@ fn one_ten_thousand_cell_transaction_reaches_two_confirmed_lossy_udp_replicas() 
         if baseline.is_some() {
             let version = Version(initial_version.0 + 1);
             for bot in &mut bots {
-                if bot.explosion_applied(&targets, version) {
+                if bot.explosion_applied(&targets, version) && bot.lights_bound() {
                     bot.fence(EXPLOSION_FENCE);
                 }
             }
@@ -438,6 +488,13 @@ fn one_ten_thousand_cell_transaction_reaches_two_confirmed_lossy_udp_replicas() 
     );
     for (index, bot) in bots.iter().enumerate() {
         let traffic = bot.traffic.since(traffic_before[index]);
+        eprintln!(
+            "explosion decoded client={index} page_bytes={} light_bytes={} other_bytes={} wire_bytes={}",
+            traffic.page_bytes, traffic.light_bytes, traffic.other_bytes, traffic.received_bytes
+        );
+        // Fence the independently acknowledged initial LIGHT stream before
+        // measuring the edit. The explosion still includes every wire byte,
+        // including the new cell-view LIGHT bindings and transport retries.
         assert!(traffic.received_bytes > 0 && traffic.received_bytes < 131_072);
         assert!(traffic.received_packets > 0 && traffic.received_packets < 1024);
         assert!(
