@@ -42,13 +42,15 @@ enum Variant {
     Current,
     LegacyFunction,
     ConstantLayers,
+    ExplicitPcf,
+    ConstantExplicitPcf,
 }
 
 fn annotation(variant: Variant, status: &str) {
     use std::io::Write;
     let _ = writeln!(
         std::io::stdout().lock(),
-        "::notice title=Shadow fragment differential::{variant:?} {status} struct=416 storage=8 trace_dispatches=0"
+        "\n::notice title=Shadow fragment differential::{variant:?} {status} struct=416 storage=8 trace_dispatches=0"
     );
 }
 
@@ -57,6 +59,8 @@ fn sampling_source(variant: Variant) -> String {
     match variant {
         Variant::Current => CURRENT.to_owned(),
         Variant::LegacyFunction => format!("{declarations}{LEGACY_FUNCTION}"),
+        Variant::ExplicitPcf => explicit_pcf(CURRENT),
+        Variant::ConstantExplicitPcf => explicit_pcf(&sampling_source(Variant::ConstantLayers)),
         Variant::ConstantLayers => {
             let layer = functions.split_once("fn cascade_shadow(").unwrap().0;
             let layer = format!("fn shadow_layer({layer}");
@@ -88,6 +92,30 @@ fn sampling_source(variant: Variant) -> String {
             output
         }
     }
+}
+
+fn explicit_pcf(source: &str) -> String {
+    let mut output = source.to_owned();
+    while let Some(start) = output.find("    for(var y=0;") {
+        let end = start + output[start..].find("    return vec2(visibility").unwrap();
+        let mut taps = String::new();
+        // The constant-layer variant has literal indices instead of the original
+        // parameter. Preserve that function's argument in all four taps.
+        let body = &output[start..end];
+        let argument = body
+            .split_once("i32(")
+            .unwrap()
+            .1
+            .split_once(')')
+            .unwrap()
+            .0;
+        // Keep the original y-major tap order and floating-point addition order.
+        for offset in ["-.5,-.5", ".5,-.5", "-.5,.5", ".5,.5"] {
+            taps.push_str(&format!("visibility+=textureSampleCompareLevel(shadow_depth,shadow_compare,uv+vec2({offset})*texel,i32({argument}),p.z+bias+plane_bias);\n"));
+        }
+        output.replace_range(start..end, &taps);
+    }
+    output
 }
 
 fn buffer_layout(
@@ -142,6 +170,21 @@ fn binary16(bits: u16) -> f32 {
 
 fn differential(variant: Variant) {
     let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    gpu.device.on_uncaptured_error(Box::new(move |error| {
+        let message = error.to_string();
+        let details = message
+            .lines()
+            .filter(|line| {
+                line.contains("X35")
+                    || line.contains("Shader")
+                    || line.contains("shader compilation")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let details: String = details.chars().take(500).collect();
+        annotation(variant, &format!("FAIL validation {details}"));
+        panic!("{variant:?} GPU validation {message}");
+    }));
     gpu.device.set_device_lost_callback(move |reason, message| {
         if reason != wgpu::DeviceLostReason::Destroyed {
             annotation(variant, "FAIL device lost");
@@ -575,4 +618,14 @@ fn legacy_shadow_function_with_current_uniform_layout() {
 #[test]
 fn constant_shadow_layers_with_current_uniform_layout() {
     differential(Variant::ConstantLayers);
+}
+
+#[test]
+fn explicit_pcf_taps_with_current_uniform_layout() {
+    differential(Variant::ExplicitPcf);
+}
+
+#[test]
+fn constant_layers_and_explicit_pcf_taps_with_current_uniform_layout() {
+    differential(Variant::ConstantExplicitPcf);
 }
