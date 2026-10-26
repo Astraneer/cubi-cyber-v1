@@ -886,7 +886,7 @@ mod tests {
             thread,
             time::{Duration, Instant},
         };
-        use tungstenite::{Error as WsError, Message};
+        use tungstenite::{Error as WsError, HandshakeError, Message};
         use world::{Transaction, World};
         struct Directory(PathBuf);
         impl Drop for Directory {
@@ -936,7 +936,23 @@ mod tests {
             socket
                 .set_write_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            let (mut socket, _) = tungstenite::client(format!("ws://{address}/"), socket).unwrap();
+            // A short read timeout may interrupt the HTTP upgrade while the
+            // canonical owner performs real work. Resume the same handshake;
+            // dropping its buffered state would make this load test flaky.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut handshake = tungstenite::client(format!("ws://{address}/"), socket);
+            let mut socket = loop {
+                match handshake {
+                    Ok((socket, _)) => break socket,
+                    Err(HandshakeError::Interrupted(pending)) => {
+                        assert!(Instant::now() < deadline, "real socket handshake deadline");
+                        handshake = pending.handshake();
+                    }
+                    Err(HandshakeError::Failure(error)) => {
+                        panic!("real socket handshake failed: {error:?}")
+                    }
+                }
+            };
             let hello = ClientMessage::Hello(Hello {
                 identity: PlayerId::default(),
                 name: "ingress-pressure".into(),
@@ -945,7 +961,6 @@ mod tests {
             socket
                 .send(Message::Binary(net::encode_client(&hello).unwrap().into()))
                 .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(15);
             let mut joined = false;
             let mut pongs = BTreeSet::new();
             loop {
