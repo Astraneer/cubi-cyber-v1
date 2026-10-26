@@ -1509,9 +1509,8 @@ impl Server {
                     self.packet_stream.queue(connection, page, false, self.tick);
                     self.props_stream.queue(connection, page, false);
                 }
-                if peer.page_requests.len() < MAX_AOI_PAGES {
-                    peer.page_requests.push_back((page, !confirmed));
-                }
+                peer.raw_view
+                    .queue_request(&mut peer.page_requests, page, !confirmed);
             }
             ClientMessage::AckPage { page, version } => {
                 if peer.history.acknowledge(page, version) {
@@ -2958,6 +2957,10 @@ impl Server {
                     else {
                         break;
                     };
+                    let force = peer
+                        .raw_view
+                        .coalesce_pending_request(&mut peer.page_requests, page, force)
+                        .unwrap_or(force);
                     if !self.in_aoi(&peer, page, peer.pages.contains(&page))
                         || peer.pages.len() >= MAX_AOI_PAGES && !peer.pages.contains(&page)
                     {
@@ -2985,12 +2988,12 @@ impl Server {
                         let Some((raw_source, cells, force)) =
                             self.build_raw_view(connection, &mut peer, page, force)
                         else {
-                            if !peer.page_requests.iter().any(|(p, _)| *p == page) {
-                                peer.page_requests.push_back((page, force));
-                            }
                             if peer.raw_view.pending_request().is_some() {
+                                peer.raw_view
+                                    .queue_request(&mut peer.page_requests, page, force);
                                 break;
                             }
+                            raw_views::restore_popped_request(&mut peer.page_requests, page, force);
                             continue;
                         };
                         let applied_action = ActionId(

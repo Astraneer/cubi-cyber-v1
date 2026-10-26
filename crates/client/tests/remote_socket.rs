@@ -22,7 +22,10 @@ impl Drop for Directory {
 fn fixture() -> World {
     let mut world = World::new(rules::properties, 256);
     let mut tx = Transaction::new(Tick(0), SpaceId(0));
-    for y in -2..=2 {
+    // The requested5³ halo is an outdoor fixture. Keep the known AIR chain to
+    // profile top127 so certified projection can distinguish it from a sealed
+    // private cavity; these extra server pages are never requested by this peer.
+    for y in -2..=7 {
         for z in -2..=2 {
             for x in -2..=2 {
                 let mut cells = vec![Cell::AIR; PAGE_VOLUME];
@@ -73,6 +76,22 @@ fn native_websocket_pump_imports_real_authority_without_client_generation() {
         "127.0.0.1:0".parse().unwrap(),
     )
     .unwrap();
+    // Prepare the authored outdoor world using the real bounded migration.
+    // That has dedicated recovery tests; this test measures the
+    // socket/backpressure phase against its original15s deadline.
+    let setup_deadline = Instant::now() + Duration::from_secs(60);
+    let mut authority_offset = 0;
+    while !runtime.server().height_ready_for_publication() {
+        assert!(
+            Instant::now() < setup_deadline,
+            "fixture height certificate"
+        );
+        runtime.poll(authority_offset).unwrap();
+        authority_offset += server::TICK_MILLIS;
+        assert!(!runtime.server().is_failed());
+        thread::sleep(Duration::from_millis(2));
+    }
+    let started = Instant::now();
     let mut socket =
         transport::Socket::connect(format!("ws://{}/", runtime.ws_address().unwrap())).unwrap();
     let mut remote = RemoteSession::new(NetworkConfig {
@@ -97,18 +116,46 @@ fn native_websocket_pump_imports_real_authority_without_client_generation() {
     let mut complete = false;
     let mut persisted = false;
     let mut stalled = false;
-    let started = Instant::now();
     for _ in 0..30_000 {
-        assert!(Instant::now() < deadline, "real WebSocket/fsync deadline");
+        if Instant::now() >= deadline {
+            let missing: Vec<_> = scene
+                .requested_pages()
+                .filter(|p| scene.world().page(*p).is_none())
+                .map(|p| {
+                    let at = BlockPos {
+                        space: p.space,
+                        x: p.x * 16,
+                        y: p.y * 16,
+                        z: p.z * 16,
+                    };
+                    (p, remote.connection().read(at))
+                })
+                .collect();
+            eprintln!(
+                "remote-socket missing={missing:?} client={:?} queues={:?}",
+                remote.connection().counters(),
+                remote.connection().queue_depths()
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "real WebSocket/fsync deadline: loaded={} player={:?} tick={} counters={:?}",
+            scene.stats().loaded_pages,
+            remote.connection().player().map(|p| p.pos),
+            runtime.server().current_tick().0,
+            runtime.server().counters(),
+        );
         let now = started.elapsed().as_millis() as u64;
-        runtime.poll(now).unwrap();
+        runtime.poll(authority_offset + now).unwrap();
         if persisted && !stalled && now >= 500 {
             // Reproduce a slow first GPU/pipeline frame: owner keeps ticking
             // while the render thread does not drain its32-frame queue. TCP
             // backpressure must retain all reliable pages and the session.
             let resume = Instant::now() + Duration::from_millis(800);
             while Instant::now() < resume {
-                runtime.poll(started.elapsed().as_millis() as u64).unwrap();
+                runtime
+                    .poll(authority_offset + started.elapsed().as_millis() as u64)
+                    .unwrap();
                 thread::sleep(Duration::from_millis(2));
             }
             stalled = true;
