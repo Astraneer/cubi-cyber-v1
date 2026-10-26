@@ -123,7 +123,8 @@ impl BrowserState {
         let _ = js_sys::Reflect::set(&value, &"pendingLightBindings".into(), pending.as_ref());
         if let Some(product) = &self.product {
             for (name, item) in [
-                ("uiScreen", format!("{:?}", product.layer.app.screen)),
+                ("uiScreen", format!("{:?}", product.displayed_screen())),
+                ("plannedUiScreen", format!("{:?}", product.layer.app.screen)),
                 ("uiStatus", product.layer.app.status().to_owned()),
                 (
                     "scene",
@@ -135,6 +136,14 @@ impl BrowserState {
                 ),
             ] {
                 let _ = js_sys::Reflect::set(&value, &name.into(), &item.into());
+            }
+            for (name, flag) in [
+                ("cpuSceneReady", self.view.is_ready()),
+                ("ready", product.game_inputs_ready()),
+                ("gameInputAdmitted", product.game_inputs_ready()),
+                ("gameUiPresentationPending", product.needs_game_ui()),
+            ] {
+                let _ = js_sys::Reflect::set(&value, &name.into(), &flag.into());
             }
             let _ = js_sys::Reflect::set(
                 &value,
@@ -332,6 +341,9 @@ impl BrowserState {
     /// Bounded CPU/network/worker progress, with no GPU queue or surface access.
     fn advance_cpu(&mut self, now: f64) -> Result<(), JsValue> {
         let started = clock_ms();
+        if let Some(product) = &mut self.product {
+            product.observe_completed(u64::from(self.completed_submission.load(Ordering::Acquire)));
+        }
         let elapsed = (now - self.last_ms).max(0.0) / 1000.0;
         self.last_ms = now;
         if self.product.is_none()
@@ -395,11 +407,9 @@ impl BrowserState {
         let can_upload = self.in_flight.load(Ordering::Acquire) < 1;
         if can_upload && !self.resetting {
             let mut upload = UploadBudget::new(2 * 1024 * 1024);
-            if self
-                .product
-                .as_ref()
-                .is_some_and(|product| product.layer.app.uses_cached_background())
-                && self.view.has_cached_present()
+            if self.product.as_ref().is_some_and(|product| {
+                product.layer.app.uses_cached_background() || product.needs_game_ui()
+            }) && self.view.has_cached_present()
             {
                 self.view
                     .upload_cached_settings(&self.gpu.queue, &mut upload)
@@ -431,7 +441,6 @@ impl BrowserState {
             }
             ui_changed = can_upload
                 && product
-                    .layer
                     .upload(&self.gpu.queue, self.config.width, self.config.height)
                     .map_err(js_error)?;
         }
@@ -456,7 +465,7 @@ impl BrowserState {
         let initial_loading = self
             .product
             .as_ref()
-            .is_some_and(|product| product.layer.app.screen == ui::app::Screen::Loading)
+            .is_some_and(|product| product.displayed_screen() == ui::app::Screen::Loading)
             && !self.view.has_cached_present()
             && !self.view.initial_scene_inputs_ready();
         let draw_world = !self.resetting
@@ -465,12 +474,15 @@ impl BrowserState {
                 .as_ref()
                 .is_none_or(|product| product.layer.app.snapshot.connected);
         let cached_background = draw_world
-            && self
-                .product
-                .as_ref()
-                .is_some_and(|product| product.layer.app.uses_cached_background())
+            && self.product.as_ref().is_some_and(|product| {
+                product.layer.app.uses_cached_background() || product.needs_game_ui()
+            })
             && self.view.has_cached_present();
         if !(self.ui_pending
+            || self
+                .product
+                .as_ref()
+                .is_some_and(|product| product.needs_game_ui())
             || draw_world
                 && !cached_background
                 && self
@@ -491,6 +503,8 @@ impl BrowserState {
             Err(error) => return Err(js_error(format!("WebGPU frame failed:{error}"))),
         };
         let output = frame.texture.create_view(&Default::default());
+        let mut world_ready = false;
+        let mut used_cached = false;
         let mut encoder = self
             .gpu
             .device
@@ -503,12 +517,15 @@ impl BrowserState {
         if initial_loading {
             self.view.encode_loading_clear(&mut encoder, &output);
         } else if draw_world {
-            if !(cached_background
+            if cached_background
                 && self
                     .view
                     .encode_cached_present(&mut encoder, &output)
-                    .map_err(js_error)?)
+                    .map_err(js_error)?
             {
+                used_cached = true;
+            } else {
+                let hdr_before = self.view.renderer_mut().hdr_revision();
                 self.view
                     .encode(
                         &self.gpu.queue,
@@ -518,6 +535,9 @@ impl BrowserState {
                         self.config.height,
                     )
                     .map_err(js_error)?;
+                world_ready = self.view.renderer_mut().hdr_revision() != hdr_before
+                    && self.view.is_ready()
+                    && self.view.has_cached_present();
             }
         } else {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -568,6 +588,15 @@ impl BrowserState {
             .checked_add(1)
             .ok_or("frame sequence exhausted")?;
         let submitted = self.submitted;
+        if let Some(product) = &mut self.product {
+            let game_ui = used_cached
+                && product.needs_game_ui()
+                && matches!(
+                    product.layer.app.screen,
+                    ui::app::Screen::Game | ui::app::Screen::Death
+                );
+            product.submitted(u64::from(submitted), world_ready, game_ui);
+        }
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         let pending_cpu_ns = std::mem::take(&mut self.pending_cpu_ns);
         if let Some(recorder) = &mut self.recorder {
@@ -1648,6 +1677,13 @@ fn install_input(state: &Rc<RefCell<BrowserState>>) -> Result<(), JsValue> {
                 .is_some_and(|d| d.pointer_lock_element().is_some());
             let mut state = state.borrow_mut();
             if locked {
+                if state
+                    .product
+                    .as_ref()
+                    .is_some_and(|product| !product.game_inputs_ready())
+                {
+                    return;
+                }
                 let delta = state.product.as_ref().map_or(
                     Some([f64::from(event.movement_x()), f64::from(event.movement_y())]),
                     |p| {
@@ -1701,6 +1737,14 @@ fn install_input(state: &Rc<RefCell<BrowserState>>) -> Result<(), JsValue> {
                 } = &mut *borrowed;
                 if let Some(product) = product {
                     product.gesture();
+                    if !product.game_inputs_ready()
+                        && matches!(
+                            product.layer.app.screen,
+                            ui::app::Screen::Game | ui::app::Screen::Death
+                        )
+                    {
+                        return;
+                    }
                     if product.layer.app.captures_keyboard() {
                         product.layer.app.click(
                             x,
@@ -1757,6 +1801,14 @@ fn install_input(state: &Rc<RefCell<BrowserState>>) -> Result<(), JsValue> {
             let mut state = state.borrow_mut();
             if let Some(product) = &mut state.product {
                 event.prevent_default();
+                if !product.game_inputs_ready()
+                    && matches!(
+                        product.layer.app.screen,
+                        ui::app::Screen::Game | ui::app::Screen::Death
+                    )
+                {
+                    return;
+                }
                 product.layer.app.wheel(event.delta_y().signum() as i32);
             }
         }
@@ -1771,6 +1823,7 @@ fn install_input(state: &Rc<RefCell<BrowserState>>) -> Result<(), JsValue> {
             let mut state = state.borrow_mut();
             state.view.clear_keys();
             if let Some(product) = &mut state.product
+                && product.game_inputs_ready()
                 && product.layer.app.screen == ui::app::Screen::Game
                 && product.layer.app.focus == ui::app::Focus::None
             {

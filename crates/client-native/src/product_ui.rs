@@ -52,6 +52,7 @@ pub struct ProductUi {
     local: Option<audio::resources::LocalResources>,
     importing: Option<mpsc::Receiver<Result<Option<Box<Imported>>, String>>>,
     ready_world: bool,
+    presentation: client::presentation_gate::PresentationGate,
     sequence: u64,
     preferences: PathBuf,
     diagnostics: bool,
@@ -130,6 +131,7 @@ impl ProductUi {
             local: None,
             importing: None,
             ready_world: false,
+            presentation: Default::default(),
             sequence: 0,
             preferences,
             diagnostics: std::env::var_os("CUBI_UI_DIAGNOSTICS").is_some(),
@@ -163,7 +165,7 @@ impl ProductUi {
         }
         let snapshot = &self.layer.app.snapshot;
         let stamp = (
-            self.layer.app.screen,
+            self.displayed_screen(),
             snapshot.window_id,
             snapshot.inventory_revision,
             self.layer.app.chat_len(),
@@ -274,7 +276,7 @@ impl ProductUi {
             );
             println!(
                 "NATIVE_UI_PAINTED screen={:?} window={:016x} tab={} debug={} focus={:?} revision={} window_revision={}",
-                self.layer.app.screen,
+                self.displayed_screen(),
                 self.layer.app.snapshot.window_id,
                 self.layer.app.player_list,
                 self.layer.app.show_debug,
@@ -345,6 +347,15 @@ impl ProductUi {
         text: Option<&str>,
         modifiers: Modifiers,
     ) {
+        if !self.ready_world && matches!(self.layer.app.screen, Screen::Game | Screen::Death) {
+            if pressed && code == "Escape" {
+                self.commands.clear();
+                self.commands.push_back(Command::Disconnect);
+            } else if pressed && code == "F8" {
+                self.command(Command::BugReport);
+            }
+            return;
+        }
         let focus = matches!(
             self.layer.app.focus,
             Focus::Name | Focus::Address | Focus::Search | Focus::Chat
@@ -364,6 +375,7 @@ impl ProductUi {
         }
     }
     pub fn connecting(&mut self) {
+        self.presentation.reset();
         self.intent_sender.clear();
         self.intent_waiting = false;
         self.last_near_diagnostic = None;
@@ -373,6 +385,7 @@ impl ProductUi {
         self.report_state();
     }
     pub fn disconnected(&mut self, message: &str) {
+        self.presentation.reset();
         self.intent_sender.clear();
         self.intent_waiting = false;
         self.quality.cancel_pending(self.quality_now_ms);
@@ -403,6 +416,11 @@ impl ProductUi {
     }
     pub fn sync_quality(&mut self, view: &mut ClientView, now_ms: u64, benchmark: bool) {
         self.quality_now_ms = now_ms;
+        if !self.ready_world && matches!(self.layer.app.screen, Screen::Game | Screen::Death) {
+            self.quality.runtime.set_active(false, now_ms);
+            self.layer.app.set_quality(self.quality.hud());
+            return;
+        }
         if let Some(request) = self
             .quality
             .advance(&self.layer.app, view, now_ms, benchmark)
@@ -673,15 +691,70 @@ impl ProductUi {
         self.bridge
             .sync_authority(&mut self.layer.app, network)
             .map_err(str::to_owned)?;
-        if network.player().is_some() && view.is_ready() && !self.ready_world {
-            self.ready_world = true;
-            self.layer.app.set_status("");
-            if self.layer.app.screen == Screen::Loading {
-                self.layer.app.open(Screen::Game);
-            }
-        }
         self.report_state();
         Ok(())
+    }
+    pub fn observe_completed(&mut self, id: u64) {
+        match self.presentation.completed(id) {
+            Some(client::presentation_gate::Event::PrepareGameUi) => {
+                if self.diagnostics {
+                    println!("NATIVE_INITIAL_PRESENT stage=world_gpu_complete frame={id}");
+                }
+                client::presentation_gate::prepare_game_ui(&mut self.layer.app);
+            }
+            Some(client::presentation_gate::Event::AdmitInput) => {
+                if self.diagnostics {
+                    println!("NATIVE_INITIAL_PRESENT stage=game_ui_gpu_complete frame={id}");
+                }
+                self.ready_world = true;
+                self.report_state();
+                self.painted();
+            }
+            None => {}
+        }
+    }
+    pub fn submitted(&mut self, id: u64, world: bool, game_ui: bool) {
+        if self.diagnostics && !self.ready_world && (world || game_ui) {
+            println!(
+                "NATIVE_INITIAL_PRESENT stage={} frame={id}",
+                if game_ui {
+                    "cached_game_ui_submitted"
+                } else {
+                    "world_submitted"
+                }
+            );
+        }
+        self.presentation.submitted(id, world, game_ui);
+    }
+    pub fn needs_game_ui(&self) -> bool {
+        self.presentation.needs_game_ui()
+    }
+    pub fn game_inputs_ready(&self) -> bool {
+        self.ready_world
+    }
+    pub fn displayed_screen(&self) -> Screen {
+        if !self.ready_world && matches!(self.layer.app.screen, Screen::Game | Screen::Death) {
+            Screen::Loading
+        } else {
+            self.layer.app.screen
+        }
+    }
+    pub fn upload(
+        &mut self,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+    ) -> Result<bool, &'static str> {
+        let screen = self.layer.app.screen;
+        if !self.ready_world
+            && !self.needs_game_ui()
+            && matches!(screen, Screen::Game | Screen::Death)
+        {
+            self.layer.app.screen = Screen::Loading;
+        }
+        let result = self.layer.upload(queue, width, height);
+        self.layer.app.screen = screen;
+        result
     }
     pub fn drain(
         &mut self,

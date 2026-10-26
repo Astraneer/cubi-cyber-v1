@@ -22,6 +22,7 @@ pub mod network;
 mod overrides;
 pub mod packet_source;
 pub mod presentation;
+pub mod presentation_gate;
 pub mod props_source;
 pub mod quality;
 mod rebase;

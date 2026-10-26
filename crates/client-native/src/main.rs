@@ -8,7 +8,7 @@ use render::terrain_gpu::UploadBudget;
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -181,6 +181,7 @@ struct NativeState {
     network_started: Instant,
     flight: flight::NativeFlight,
     in_flight: Arc<AtomicU32>,
+    completed_submission: Arc<AtomicU64>,
     drawable: bool,
     product: Option<Box<product_ui::ProductUi>>,
     ui_loading: Option<mpsc::Receiver<Result<Box<product_ui::Prepared>, String>>>,
@@ -567,6 +568,7 @@ impl NativeState {
             network_started,
             flight,
             in_flight: Arc::new(AtomicU32::new(0)),
+            completed_submission: Arc::new(AtomicU64::new(0)),
             drawable: size.width != 0 && size.height != 0,
             product: None,
             ui_loading,
@@ -663,6 +665,9 @@ impl NativeState {
             .map_err(|error| error.to_string())?;
         self.collect_quality();
         let mut stages = [None; telemetry::flight::CPU_STAGES.len()];
+        if let Some(product) = &mut self.product {
+            product.observe_completed(self.completed_submission.load(Ordering::Acquire));
+        }
         if let Some(remote) = &mut self.remote
             && let Err(error) = remote.pump_socket()
         {
@@ -731,6 +736,9 @@ impl NativeState {
             .map_err(|error| error.to_string())?;
         self.collect_quality();
         self.poll_product_loading()?;
+        if let Some(product) = &mut self.product {
+            product.observe_completed(self.completed_submission.load(Ordering::Acquire));
+        }
         self.poll_loading()?;
         if let Some(product) = &mut self.product {
             product.poll_import(&self.gpu.device, &self.gpu.queue, self.view.as_deref_mut());
@@ -837,11 +845,9 @@ impl NativeState {
             {
                 let upload_started = Instant::now();
                 let mut upload = UploadBudget::new(2 * 1024 * 1024);
-                if self
-                    .product
-                    .as_ref()
-                    .is_some_and(|product| product.layer.app.uses_cached_background())
-                    && view.has_cached_present()
+                if self.product.as_ref().is_some_and(|product| {
+                    product.layer.app.uses_cached_background() || product.needs_game_ui()
+                }) && view.has_cached_present()
                 {
                     view.upload_cached_settings(&self.gpu.queue, &mut upload)?;
                 } else {
@@ -870,7 +876,6 @@ impl NativeState {
             }
             if !busy
                 && product
-                    .layer
                     .upload(&self.gpu.queue, self.config.width, self.config.height)
                     .map_err(str::to_owned)?
             {
@@ -878,16 +883,18 @@ impl NativeState {
                 product.painted();
             }
         }
-        let cached_background = self
-            .product
-            .as_ref()
-            .is_some_and(|product| product.layer.app.uses_cached_background())
-            && self
-                .view
-                .as_deref()
-                .is_some_and(ClientView::has_cached_present);
+        let cached_background = self.product.as_ref().is_some_and(|product| {
+            product.layer.app.uses_cached_background() || product.needs_game_ui()
+        }) && self
+            .view
+            .as_deref()
+            .is_some_and(ClientView::has_cached_present);
         let clean = !self.ui_pending
             && !force_present
+            && self
+                .product
+                .as_ref()
+                .is_none_or(|product| !product.needs_game_ui())
             && !self.flight.route_active()
             && (cached_background
                 || self
@@ -916,6 +923,12 @@ impl NativeState {
             Err(error) => return Err(format!("surface frame failed:{error}")),
         };
         let output = frame.texture.create_view(&Default::default());
+        let submission = self
+            .frames
+            .checked_add(1)
+            .ok_or("frame sequence exhausted")?;
+        let mut world_ready = false;
+        let mut used_cached = false;
         let encode_started = Instant::now();
         let mut work = if let Some(view) = self.view.as_deref_mut() {
             let mut encoder =
@@ -929,12 +942,15 @@ impl NativeState {
             let initial_loading = self
                 .product
                 .as_ref()
-                .is_some_and(|product| product.layer.app.screen == ui::app::Screen::Loading)
+                .is_some_and(|product| product.displayed_screen() == ui::app::Screen::Loading)
                 && !view.has_cached_present()
                 && !view.initial_scene_inputs_ready();
             if initial_loading {
                 view.encode_loading_clear(&mut encoder, &output);
-            } else if !(cached_background && view.encode_cached_present(&mut encoder, &output)?) {
+            } else if cached_background && view.encode_cached_present(&mut encoder, &output)? {
+                used_cached = true;
+            } else {
+                let hdr_before = view.renderer_mut().hdr_revision();
                 view.encode(
                     &self.gpu.queue,
                     &mut encoder,
@@ -942,6 +958,9 @@ impl NativeState {
                     self.config.width,
                     self.config.height,
                 )?;
+                world_ready = view.renderer_mut().hdr_revision() != hdr_before
+                    && view.is_ready()
+                    && view.has_cached_present();
             }
             if let Some(product) = &mut self.product {
                 product.layer.encode(&mut encoder, &output);
@@ -971,11 +990,13 @@ impl NativeState {
         stages[5] = Some(flight::nanos(encode_started.elapsed()));
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         let pending = self.in_flight.clone();
+        let completed = self.completed_submission.clone();
         let ui_presentation = self
             .product
             .as_ref()
             .and_then(|product| product.presentation());
         self.gpu.queue.on_submitted_work_done(move || {
+            completed.fetch_max(submission, Ordering::Release);
             pending.fetch_sub(1, Ordering::AcqRel);
             if let Some(report) = ui_presentation {
                 report();
@@ -984,8 +1005,21 @@ impl NativeState {
         let present_started = Instant::now();
         self.window.pre_present_notify();
         frame.present();
+        if let Some(product) = &mut self.product {
+            let game_ui = used_cached
+                && product.needs_game_ui()
+                && matches!(
+                    product.layer.app.screen,
+                    ui::app::Screen::Game | ui::app::Screen::Death
+                );
+            product.submitted(
+                submission,
+                world_ready && product.layer.app.snapshot.connected,
+                game_ui,
+            );
+        }
         stages[6] = Some(flight::nanos(present_started.elapsed()));
-        self.frames += 1;
+        self.frames = submission;
         self.recorder.push(telemetry::FrameRecord {
             frame: self.frames,
             cpu_ns: flight::nanos(started.elapsed()),
@@ -997,6 +1031,10 @@ impl NativeState {
         let ready = self.mode == SceneMode::Sky
             || if self.mode == SceneMode::Product && self.remote.is_none() {
                 self.product.is_some()
+            } else if self.mode == SceneMode::Product {
+                self.product
+                    .as_ref()
+                    .is_some_and(|product| product.game_inputs_ready())
             } else {
                 self.view.as_deref().is_some_and(ClientView::is_ready)
             };
@@ -1259,6 +1297,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Focused(false) => {
                 if let Some(product) = &mut state.product
+                    && product.game_inputs_ready()
                     && product.layer.app.screen == ui::app::Screen::Game
                     && product.layer.app.focus == ui::app::Focus::None
                 {
@@ -1296,15 +1335,26 @@ impl ApplicationHandler for App {
             } => {
                 let pressed = button_state == ElementState::Pressed;
                 if state.product.is_some() {
+                    if state.product.as_ref().is_some_and(|product| {
+                        !product.game_inputs_ready()
+                            && matches!(
+                                product.layer.app.screen,
+                                ui::app::Screen::Game | ui::app::Screen::Death
+                            )
+                    }) {
+                        return;
+                    }
                     let world = state.captured
                         && state.product.as_ref().is_some_and(|p| {
-                            p.layer.app.screen == ui::app::Screen::Game
+                            p.game_inputs_ready()
+                                && p.layer.app.screen == ui::app::Screen::Game
                                 && p.layer.app.focus == ui::app::Focus::None
                         });
                     if !state.captured
                         && pressed
                         && state.product.as_ref().is_some_and(|p| {
-                            p.layer.app.screen == ui::app::Screen::Game
+                            p.game_inputs_ready()
+                                && p.layer.app.screen == ui::app::Screen::Game
                                 && p.layer.app.focus == ui::app::Focus::None
                         })
                     {
@@ -1348,6 +1398,14 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(product) = &mut state.product {
+                    if !product.game_inputs_ready()
+                        && matches!(
+                            product.layer.app.screen,
+                            ui::app::Screen::Game | ui::app::Screen::Death
+                        )
+                    {
+                        return;
+                    }
                     let y = match delta {
                         winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                         winit::event::MouseScrollDelta::PixelDelta(position) => {
@@ -1442,6 +1500,7 @@ impl ApplicationHandler for App {
         {
             if let Some(product) = &state.product {
                 if product.layer.app.screen == ui::app::Screen::Game
+                    && product.game_inputs_ready()
                     && product.layer.app.focus == ui::app::Focus::None
                     && let Some([dx, dy]) = client::ui_bridge::mouse_delta(
                         &product.layer.app.settings,
