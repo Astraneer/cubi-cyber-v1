@@ -9,6 +9,16 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
 };
 
+fn action_annotation(kind: &str, phase: u32, label: &str) {
+    use std::io::Write;
+    // Direct stdout bypasses libtest's per-test capture, so successful controls
+    // remain visible to Actions even when an independent test later fails.
+    let _ = writeln!(
+        std::io::stdout().lock(),
+        "::{kind} title=Material GPU execution control::phase={phase} {label}"
+    );
+}
+
 struct MaterialGpuDiagnostics {
     phase: AtomicU32,
     lost: Mutex<Option<String>>,
@@ -25,12 +35,18 @@ fn gpu_diagnostics(gpu: &render::Gpu) -> Arc<MaterialGpuDiagnostics> {
                 "phase={} reason={reason:?} message={message}",
                 lost.phase.load(Ordering::Relaxed)
             );
+            action_annotation("error", lost.phase.load(Ordering::Relaxed), "device lost");
             eprintln!("MATERIAL_DEVICE_LOST {text}");
             *lost.lost.lock().unwrap() = Some(text);
         }
     });
     let error = Arc::clone(&diagnostics);
     gpu.device.on_uncaptured_error(Box::new(move |failure| {
+        action_annotation(
+            "error",
+            error.phase.load(Ordering::Relaxed),
+            "uncaptured GPU validation failure",
+        );
         panic!(
             "MATERIAL_GPU_ERROR phase={} {failure}",
             error.phase.load(Ordering::Relaxed)
@@ -525,11 +541,20 @@ fn image_with_diagnostics(
     let result = loop {
         gpu.device
             .poll(wgpu::PollType::Poll)
-            .unwrap_or_else(|error| panic!("MATERIAL_POLL_FAILED phase={phase} {error:?}"));
+            .unwrap_or_else(|error| {
+                action_annotation("error", phase, "device poll failed");
+                panic!("MATERIAL_POLL_FAILED phase={phase} {error:?}")
+            });
         match rx.try_recv() {
             Ok(result) => break result,
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(error) => panic!("MATERIAL_MAP_CHANNEL_FAILED phase={phase} {error:?}"),
+            Err(error) => {
+                action_annotation("error", phase, "map callback channel failed");
+                panic!("MATERIAL_MAP_CHANNEL_FAILED phase={phase} {error:?}")
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            action_annotation("error", phase, "readback timed out");
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -539,6 +564,7 @@ fn image_with_diagnostics(
         std::thread::sleep(std::time::Duration::from_millis(1));
     };
     result.unwrap_or_else(|error| {
+        action_annotation("error", phase, "readback map failed");
         panic!(
             "MATERIAL_READBACK_FAILED phase={phase} map={error:?} adapter={:?} device_lost={:?}",
             gpu.adapter.get_info(),
@@ -822,4 +848,157 @@ fn local_materials_and_light_gi_attachments_preserve_each_other_in_either_order(
         );
         assert_eq!(first.take_work().pipeline_compilations, 0);
     });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlGi {
+    Absent,
+    Prepared,
+    Attached,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlPack {
+    Absent,
+    Disabled,
+    Enabled,
+}
+// Each control owns a fresh device. Device loss in one execution path cannot
+// contaminate another result, and the original attachment-order test is intact.
+fn attachment_execution_control(pack_mode: ControlPack, gi_mode: ControlGi) {
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let diagnostics = gpu_diagnostics(&gpu);
+    diagnostics.phase.store(
+        100 + pack_mode as u32 * 10 + gi_mode as u32,
+        Ordering::Relaxed,
+    );
+    eprintln!("MATERIAL_CONTROL_BEGIN pack={pack_mode:?} gi={gi_mode:?} trace_dispatches=0");
+    let original = PreparedMaterials::prepare(&base(4, 4), &[], 0, Limits::default()).unwrap();
+    let normal = png(4, 1, png::ColorType::Rgba, &[145, 155, 255, 255]);
+    let spec = png(4, 1, png::ColorType::Rgba, &[64, 10, 0, 255]);
+    let pack = PreparedMaterials::prepare(
+        original.atlas(),
+        &[LayerSource {
+            layer: 0,
+            albedo_png: None,
+            normal_png: Some(&normal),
+            specular_png: Some(&spec),
+        }],
+        7,
+        Limits::default(),
+    )
+    .unwrap();
+    let mut renderer = terrain(&gpu, original.atlas());
+    let shadows = render::shadows::ShadowGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        renderer.geometry(),
+        render::shadows::ShadowConfig {
+            resolution: 64,
+            ..Default::default()
+        },
+        [8.; 3],
+        [0.35, 0.8, 0.2],
+    )
+    .unwrap();
+    let mut lights = render::light_volume::LightVolumeGpu::new(&gpu.device, 1).unwrap();
+    lights
+        .upload_page(
+            &gpu.queue,
+            render::terrain_gpu::PageHandle {
+                slot: 0,
+                generation: 1,
+            },
+            1,
+            &[render::light_volume::PackedLight::new(15, 15, [2, 1, 0]).unwrap();
+                render::light_volume::LIGHT_SAMPLES],
+            &mut render::terrain_gpu::UploadBudget::new(1_000_000),
+        )
+        .unwrap();
+    let gi = if gi_mode != ControlGi::Absent {
+        Some(
+            render::gi::GiGpu::new(
+                &gpu.device,
+                &gpu.queue,
+                render::gi::GiConfig {
+                    world_origin_page: [0; 3],
+                    world_pages: [1; 3],
+                    probe_origin: [0.5; 3],
+                    probe_counts: [2; 3],
+                    rays_per_probe: 16,
+                    max_steps: 16,
+                    max_distance: 8.,
+                    max_jobs: 8,
+                    ..Default::default()
+                },
+                &mut render::terrain_gpu::UploadBudget::new(1_000_000),
+            )
+            .unwrap(),
+        )
+    } else {
+        None
+    };
+    if pack_mode != ControlPack::Absent {
+        renderer
+            .prepare_material_pack(
+                &gpu.device,
+                &gpu.queue,
+                MaterialPackGpu::upload(&gpu.device, &gpu.queue, &pack).unwrap(),
+                pack_mode == ControlPack::Enabled,
+            )
+            .unwrap();
+        renderer
+            .set_material_view(&gpu.queue, [27., 21., 30.], 0)
+            .unwrap();
+    }
+    if gi_mode == ControlGi::Attached {
+        renderer
+            .attach_lighting_with_gi(&gpu.device, &shadows, &lights, gi.as_ref().unwrap())
+            .unwrap();
+    } else {
+        renderer
+            .attach_lighting(&gpu.device, &shadows, &lights)
+            .unwrap();
+    }
+    let pixels = image_with_diagnostics(&gpu, &mut renderer, Some(&diagnostics));
+    assert!(
+        pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[0] > pixel[1].saturating_add(8))
+            .count()
+            > 100,
+        "control must draw the actual red terrain material"
+    );
+    action_annotation(
+        "notice",
+        diagnostics.phase.load(Ordering::Relaxed),
+        &format!("pack={pack_mode:?} GI={gi_mode:?} PASS trace_dispatches=0"),
+    );
+    eprintln!(
+        "MATERIAL_CONTROL_COMPLETE pack={pack_mode:?} gi={gi_mode:?} pixels={} trace_dispatches=0",
+        pixels.len() / 4
+    );
+}
+#[test]
+fn control_light_without_pack_or_gi_executes_real_fragment() {
+    attachment_execution_control(ControlPack::Absent, ControlGi::Absent);
+}
+#[test]
+fn control_created_gi_unattached_executes_real_light_fragment() {
+    attachment_execution_control(ControlPack::Absent, ControlGi::Prepared);
+}
+#[test]
+fn control_attached_gi_without_pack_executes_real_fragment() {
+    attachment_execution_control(ControlPack::Absent, ControlGi::Attached);
+}
+#[test]
+fn control_enabled_pack_light_without_gi_executes_real_fragment() {
+    attachment_execution_control(ControlPack::Enabled, ControlGi::Absent);
+}
+#[test]
+fn control_disabled_pack_attached_gi_executes_real_fragment() {
+    attachment_execution_control(ControlPack::Disabled, ControlGi::Attached);
+}
+#[test]
+fn control_enabled_pack_attached_gi_executes_one_renderer() {
+    attachment_execution_control(ControlPack::Enabled, ControlGi::Attached);
 }
