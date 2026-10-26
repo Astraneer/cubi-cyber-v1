@@ -181,11 +181,14 @@ impl Server {
             .lighting
             .engine
             .step(&mut self.world, self.tick, &certified)
-            .map_err(|_| ServerError::Invalid("authority lighting phase"))?;
+            .map_err(|error| ServerError::Invalid(error.diagnostic()))?;
         self.counters.light_pending_cells = phase.progress.pending_cells;
         self.counters.light_pending_seed_pages = phase.progress.pending_seed_pages;
+        self.counters.light_pending_bootstrap_pages = phase.bootstrap_pending;
         self.counters.light_pending_sky_pages = self.lighting.sky_pending.len();
         self.counters.light_sky_pages_queued += phase.work.sky_pages_queued;
+        self.counters.light_input_recoveries += phase.work.input_recoveries;
+        self.counters.light_recovery_page_probes += phase.work.recovery_page_probes;
         self.counters.light_cells += phase.progress.work.cells_examined;
         self.counters.light_neighbor_reads += phase.progress.work.neighbor_reads;
         self.counters.light_updates += phase.progress.work.light_updates;

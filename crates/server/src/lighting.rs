@@ -1,15 +1,15 @@
 //! Authoritative CPU light adapter. Returned derived records belong to the same
 //! durable server phase as gameplay; no renderer or generation call is made here.
-use core_types::{BlockPos, PageId, SpaceId, Tick};
+use core_types::{BlockPos, PageId, SpaceId, Tick, Version};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
 };
 use world::{
     CursorError, CursorId, World, WorldChange,
     lighting::{
-        LightBudget, LightIngestBudget, LightPriority, LightProgress, LightingEngine,
-        LightingError, LightingLimits, SkyAccess,
+        LIGHT_INPUT_CHANNELS, LightBudget, LightIngestBudget, LightPriority, LightProgress,
+        LightingEngine, LightingError, LightingLimits, SkyAccess,
     },
 };
 
@@ -121,6 +121,28 @@ impl std::fmt::Display for ServerLightingError {
     }
 }
 impl std::error::Error for ServerLightingError {}
+impl ServerLightingError {
+    /// Fixed diagnostic classes contain no cells, positions or private state.
+    pub fn diagnostic(&self) -> &'static str {
+        match self {
+            Self::InvalidLimits => "lighting limits",
+            Self::Capacity => "lighting capacity",
+            Self::AwaitingDurability => "lighting awaiting durability",
+            Self::InvalidDurableToken => "lighting durable token",
+            Self::CaptureInvariant => "lighting capture invariant",
+            Self::Cursor(CursorError::Lagged { .. }) => "lighting capture cursor lagged",
+            Self::Cursor(_) => "lighting capture cursor",
+            Self::Engine(LightingError::Cursor(CursorError::Lagged { .. })) => {
+                "lighting input cursor lagged"
+            }
+            Self::Engine(LightingError::Cursor(_)) => "lighting input cursor",
+            Self::Engine(LightingError::InvalidLimits) => "lighting engine limits",
+            Self::Engine(LightingError::TickWentBackwards) => "lighting tick order",
+            Self::Engine(LightingError::CoordinateOverflow(_)) => "lighting coordinate overflow",
+            Self::Engine(LightingError::Commit(_)) => "lighting commit",
+        }
+    }
+}
 impl From<CursorError> for ServerLightingError {
     fn from(error: CursorError) -> Self {
         Self::Cursor(error)
@@ -137,6 +159,8 @@ pub struct ServerLightWork {
     pub bootstrap_pages_queued: u64,
     pub sky_pages_queued: u64,
     pub capture_recoveries: u64,
+    pub input_recoveries: u64,
+    pub recovery_page_probes: u64,
     pub foreground_cell_reads: u64,
 }
 /// The token is private and bound to this owner's exact captured journal range.
@@ -154,6 +178,7 @@ pub struct ServerLighting {
     engine: LightingEngine,
     capture: CursorId,
     bootstrap: VecDeque<PageId>,
+    recovery_sources: BTreeMap<PageId, Version>,
     awaiting: Option<(u64, u64)>,
     nonce: u64,
     work: ServerLightWork,
@@ -172,11 +197,16 @@ impl ServerLighting {
         let engine = LightingEngine::attach(world, config.engine)?;
         let capture = world.register_cursor();
         let bootstrap = world.pages().map(|(page, _)| page).collect();
+        let recovery_sources = world
+            .pages()
+            .map(|(id, page)| (id, page.channel_version(LIGHT_INPUT_CHANNELS)))
+            .collect();
         Ok(Self {
             config,
             engine,
             capture,
             bootstrap,
+            recovery_sources,
             awaiting: None,
             nonce: 0,
             work: ServerLightWork::default(),
@@ -220,6 +250,15 @@ impl ServerLighting {
                 self.work.capture_recoveries += 1;
             }
             Err(error) => return Err(error.into()),
+        }
+        // Derived LIGHT can evict older input history while bounded page seeds
+        // drain. Recover from retained current source metadata, never by seeking
+        // past an opacity/emission change without a complete reseed obligation.
+        if matches!(
+            world.read_cursor(self.engine.cursor(), 0),
+            Err(CursorError::Lagged { .. })
+        ) {
+            self.recover_inputs(world, boundary)?;
         }
         for _ in 0..self.config.bootstrap_pages_per_phase {
             let Some(page) = self.bootstrap.front().copied() else {
@@ -270,6 +309,72 @@ impl ServerLighting {
             work: std::mem::take(&mut self.work),
             durable_token,
         })
+    }
+    fn recover_inputs(
+        &mut self,
+        world: &mut World,
+        boundary: u64,
+    ) -> Result<(), ServerLightingError> {
+        if world.loaded_pages() > self.config.max_bootstrap_pages {
+            return Err(ServerLightingError::Capacity);
+        }
+        let mut sources = BTreeMap::new();
+        for (id, page) in world.pages() {
+            self.work.recovery_page_probes += 1;
+            sources.insert(id, page.channel_version(LIGHT_INPUT_CHANNELS));
+        }
+        // Preserve order and progress for pending current pages. Repeated lag
+        // caused only by LIGHT/CONTENTS must not restart every page's seed.
+        self.bootstrap.retain(|page| {
+            self.work.recovery_page_probes += 1;
+            sources.contains_key(page)
+        });
+        let mut pending: BTreeSet<_> = self.bootstrap.iter().copied().collect();
+        for (&page, version) in &sources {
+            self.work.recovery_page_probes += 1;
+            if self.recovery_sources.get(&page) != Some(version) && pending.insert(page) {
+                self.bootstrap.push_back(page);
+            }
+        }
+        // A removed emitter/occluder can leave light in unchanged neighbours.
+        // Retain current neighbours rather than an unbounded list of tombstones.
+        for page in self.recovery_sources.keys() {
+            self.work.recovery_page_probes += 1;
+            if sources.contains_key(page) {
+                continue;
+            }
+            for [dx, dy, dz] in [
+                [-1, 0, 0],
+                [1, 0, 0],
+                [0, -1, 0],
+                [0, 1, 0],
+                [0, 0, -1],
+                [0, 0, 1],
+            ] {
+                self.work.recovery_page_probes += 1;
+                let (Some(x), Some(y), Some(z)) = (
+                    page.x.checked_add(dx),
+                    page.y.checked_add(dy),
+                    page.z.checked_add(dz),
+                ) else {
+                    continue;
+                };
+                let neighbour = PageId {
+                    space: page.space,
+                    x,
+                    y,
+                    z,
+                };
+                if sources.contains_key(&neighbour) && pending.insert(neighbour) {
+                    self.bootstrap.push_back(neighbour);
+                }
+            }
+        }
+        debug_assert!(self.bootstrap.len() <= self.config.max_bootstrap_pages);
+        self.recovery_sources = sources;
+        self.engine.recover_cursor(world, boundary)?;
+        self.work.input_recoveries += 1;
+        Ok(())
     }
     /// Only the canonical persistence owner invokes this after the SAME WAL group
     /// containing every phase.change is durable. Calling it is not publication.
