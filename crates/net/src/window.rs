@@ -85,6 +85,8 @@ pub struct WindowSnapshot {
     pub guard: WindowGuard,
     pub kind: WindowKind,
     pub closed: bool,
+    /// Protected public display: viewing/closing is allowed, mutations are not.
+    pub read_only: bool,
     pub binding: Option<BlockPos>,
     pub cursor: Stack,
     pub craft: [Stack; 9],
@@ -137,6 +139,7 @@ pub fn validate_intent(intent: WindowIntent) -> Result<(), WindowCodecError> {
 }
 pub fn validate_snapshot(state: &WindowSnapshot) -> Result<(), WindowCodecError> {
     if !guard_valid(state.guard)
+        || (state.read_only && (state.closed || state.binding.is_none()))
         || state.kind.container_len() != Some(state.container.len())
         || state.binding.is_some_and(|at| !position_valid(at))
         || state.progress > 1000
@@ -264,7 +267,7 @@ pub fn encode_snapshot(state: &WindowSnapshot) -> Result<Vec<u8>, WindowCodecErr
     out.extend_from_slice(&[
         kind,
         parameter,
-        u8::from(state.closed),
+        u8::from(state.closed) | (u8::from(state.read_only) << 1),
         u8::from(state.binding.is_some()),
     ]);
     if let Some(position) = state.binding {
@@ -313,7 +316,12 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<WindowSnapshot, WindowCodecError>
         (4, n @ 0..=9) => WindowKind::Machine(n),
         _ => return Err(WindowCodecError::Value),
     };
-    let closed = read.boolean()?;
+    let flags = read.byte()?;
+    if flags & !3 != 0 {
+        return Err(WindowCodecError::Value);
+    }
+    let closed = flags & 1 != 0;
+    let read_only = flags & 2 != 0;
     let binding = if read.boolean()? {
         Some(read.position()?)
     } else {
@@ -364,6 +372,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<WindowSnapshot, WindowCodecError>
         guard,
         kind,
         closed,
+        read_only,
         binding,
         cursor,
         craft,

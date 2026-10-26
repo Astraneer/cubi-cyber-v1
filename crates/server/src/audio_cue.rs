@@ -2,7 +2,7 @@
 use super::*;
 use net::audio_cue::{Cue, Kind};
 pub(crate) const EGG_EVENT: u16 = 0x8501;
-const OWNED_EVENT: u16 = 0x8502;
+pub(super) const OWNED_EVENT: u16 = 0x8502;
 pub(crate) const MAX_EVENTS: usize = 64;
 const MAX_PER_PEER: usize = 8;
 /// The recipient is private WAL routing data, never part of the public cue.
@@ -77,7 +77,7 @@ impl Server {
             .changes
             .iter()
             .flat_map(|c| &c.events)
-            .filter(|e| matches!(e.kind, EGG_EVENT | OWNED_EVENT))
+            .filter(|e| matches!(e.kind, EGG_EVENT | OWNED_EVENT | block_audio::EVENT))
             .count();
         if count >= MAX_EVENTS {
             self.counters.audio_cues_clipped += 1;
@@ -126,12 +126,13 @@ impl Server {
                 self.counters.audio_cues_clipped += 1;
                 continue;
             }
-            if seen.insert((owner, cue.tick, cue.kind as u8, cue.actor, cue.sequence)) {
+            if seen.insert((owner, cue.tick, cue.kind.tag(), cue.actor, cue.sequence)) {
                 cues.push((owner, cue));
             }
         }
         let mut output = Vec::new();
         if cues.is_empty() {
+            self.publish_block_audio(changes, &mut output);
             return output;
         }
         for (connection, peer) in self.peers.iter().filter(|(_, p)| p.ready) {
@@ -158,6 +159,7 @@ impl Server {
                 self.counters.audio_cues_sent += 1;
             }
         }
+        self.publish_block_audio(changes, &mut output);
         output
     }
 }

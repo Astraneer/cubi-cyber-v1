@@ -10,6 +10,7 @@ pub mod blocks;
 pub mod cell;
 pub mod crafting;
 mod crafting_data;
+pub mod crossroads;
 pub mod entities;
 pub mod ids;
 pub mod item_payload;

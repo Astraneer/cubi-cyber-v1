@@ -1178,6 +1178,10 @@ impl TerrainGpu {
     pub fn resolved_hdr_view(&self) -> &wgpu::TextureView {
         &self.targets.resolved
     }
+    /// Color-input epoch, including geometry, textures and material bindings.
+    pub fn visual_revision(&self) -> u64 {
+        self.scene_revision
+    }
     /// Changes after each newly encoded HDR scene, including camera movement.
     /// The caller must submit that encoder before using this revision as a cache key.
     pub fn hdr_revision(&self) -> u64 {

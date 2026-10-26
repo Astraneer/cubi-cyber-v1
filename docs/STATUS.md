@@ -1,6 +1,6 @@
 # Статус — 2026-10-26
 
-**M0–M13 продолжаются автономно. M1–M3 приняты Linux+Windows CI; M4–M13 целиком ещё не приняты.** Среда работает, конфигурация сохранена черновиком. Донор — только §2:780 файлов/12 220 972Б, хеши проверены.
+**M0–M13 продолжаются автономно. M1–M3 приняты Linux+Windows; M4 render-gates прошли Windows/WARP. M5–M13 целиком ещё не приняты.** Среда работает, конфигурация сохранена черновиком. Донор — только §2:780 файлов/12 220 972Б, хеши проверены.
 
 | Этап | Проверенный результат / остаток |
 |---|---|
@@ -8,23 +8,19 @@
 | M1 | Версии/Unknown,4 PROBE_REF, native/WASM детерминизм;100000 правок→1 производная задача. |
 | M2 | Лес9915квадов×16Б; FLIP=0, Hi-Z66→54объекта без изменения кадра. |
 | M3 | Правка видна за1завершённый кадр; физика/полёт/откат проверены. |
-| M4 | Sun: побитная глубина sparse/full. Windows/WARP1,49× вместо≥2×; Cutout≈531мс. Sampler-free PASS/MIXED: native/Dawn13 PASS; новый WARP замер впереди. |
-| M5 | H4:50построек/8,29млн проверок; два seed≤31,98px при цели32. JOIN18Dawn/обаMesa прошли. Полный1024/Near32: native Game+FarFront получены, подтверждение LOD Error ещё отсутствует. |
-| M6 | UDP75±20мс/2%:0коррекций; Raw/LIGHT privacy, Forget/ABA/restart. Взрыв10000блоков: оба клиента точны,28770/29275Б. Очередь Raw исправлена, реальные socket-тесты прошли. |
+| M4 | Windows H5=4,0786×≥2×; побитная глубина/receivers, SMAA, AO/emission, complete View PASS. Mixed-парный замер0,9740× сохранён. |
+| M5 | JOIN18Dawn/обаMesa PASS; два seed≤31,98px при цели32. Исправлены повторная загрузка staged proxy и ранний HDR до сертифицированного Far; GPU/смена проекции/пустое покрытие PASS. Полный1024/Near32-прогон новой пары впереди. |
+| M6 | UDP75±20мс/2%:0коррекций; Raw/LIGHT privacy, Forget/ABA/restart. Взрыв10000блоков: оба клиента точны,28770/29275Б. Raw очередь исправлена, реальные socket-тесты PASS. |
 | M7 | GPU-инстансинг, ИИ/PvP/смерть/дропы/respawn/WAL;7 owner-сценариев. |
-| M8 | Golden выживания/жидкостей/фермы/окон; печь:тик200; заряд180000J. Еда32тика и вёдра подключены к авторитетному вводу/WAL; серверные и сетевые тесты прошли. Проверка через UI впереди. |
-| M9 | §8.6:32UDP/5000мобов/10000машин/100000событий — локальный PASS217с; последний настоящий server_scale CI зелёный. World+LIGHT после WAL совпадают точно. |
-| M10 | Native+Dawn GI/вода/SSR/SSAO/labPBR, SMAA, Scale85–100%. Windows AO/свечение лавы и полный View теперь PASS. Optional TAA: общий View проверяется, UI скрыт. |
-| M11 | Свежая пара/native1МиБ: Owner-крафт/сундук/creative/config/reconnect, F8/80шагов прошли. HDR488→HUD489, повтор735→736. Полный профиль ещё не принят. |
-| M12 | Реальный локальный импорт пака/.minecraft:0HTTP/утечек; WebAudio/CPAL. Browser: HDR1243→cached HUD1244→ввод. Причинные звуки Owner сохраняются вместе с действием, дубликаты отсеиваются. |
-| M13 | F3/F8/HTML/compare,1800оконных кадров. Debug-ZIP web/native распакованы и запущены: Sky3,WINDOW18/18GPU+HTML,WS ping. Release Windows ещё впереди. |
+| M8 | Golden выживания/фермы/окон; печь:тик200; заряд180000J. Настоящий Native UI: HP13→17,1яблоко; ведро269→268→269, два Store-restart/та же identity PASS. Browser проверяется следующим. |
+| M9 | §8.6:32UDP/5000мобов/10000машин/100000событий — локальный PASS217с; настоящий CI server_scale PASS. Спавн:3линии/42клетки/17компонентов/4активные страницы производят без наблюдателей к тику936; WAL точен. Пользовательская линия×2 ещё впереди. |
+| M10 | Native+Dawn GI/вода/SSR/SSAO/labPBR, MSAA/SMAA, Scale85–100%. Optional TAA: общий View/Human/Far/Cutout Native+Dawn PASS; доски19/оболочка ещё проверяются, UI2 скрыт. |
+| M11 | Owner-крафт/сундук/creative/config/reconnect и F8/80шагов PASS. Физические доски:12реальных рецептов/9панелей, Native+Dawn, opaqueness/depth/Raw+LIGHT revoke PASS. Защищённые окна readonly даже Owner/при старте; совместный тест Store-reopen PASS. Настоящие PNG спавна впереди. |
+| M12 | Локальный импорт пака/.minecraft:0HTTP/утечек; WebAudio/CPAL. Owner+публичные Mine/Place cues после durable commit, exactUUID/action, privacy/ретраи/decodedPCM PASS. Два настоящих клиента ещё проверяются; аппаратная слышимость не подтверждена. |
+| M13 | F3/F8/HTML/compare,1800оконных кадров. Debug web/native ZIP запущены. Настоящий Windows release ZIP распакован в CI e516: Sky3,WINDOW18/18GPU+HTML,WS ping PASS. Linux/Web release новой версии впереди. |
 
-**Последние проверки:** `50e5f65` —1619входов: workspace/all-targets+WASM Clippy PASS. Новый frozen snapshot1625входов: еда/вёдра/звук, обработка отказа начала еды, ожидание LIGHT-upload и диагностика опубликованного LOD; повторные workspace/all-targets+WASM Clippy и fmt PASS. Optional TAA в этот набор не входит.
+**Общий снимок:**1662входа, defaultMSAA4; optional TAA исключён. Workspace/all-targets+WASM Clippy и fmt PASS; совместные UI5/Client10/Server4 теста PASS. Дополнительные scoped backend63/audio18/board Native+Dawn/проверки старого→нового proxy сохранены. Удалённый legacy TAA slot сохраняет старые CUI1-байты, скрыт и не выдаётся за применённую настройку.
 
-**Сейчас исправляется:**
+**Следом:** свежая Native/WASM release-пара из одного снимка; полный1024/32 и физические сценарии Factory×2, Browser Food/Bucket, спавн/readonly/Day–Night, звук двух клиентов. PNG принимаются отдельно от счётчиков. После этого — оставшиеся UI/TAA и release-проверки.
 
-1. Тени: последний Windows H5=1,4916×; точность глубины, SMAA, AO/emission и complete View прошли. PASS-материалы рисуются без fragment shader; mixed сохраняет исходный alpha-test. Native6,23×; Dawn13 и независимый bounded-stress PASS. Смешанный парный LVP замер0,848× также сохранён; Windows-результат ещё не получен.
-2. Полный профиль: native release достиг Game95,11с/FarFront106,40с; маска настроек3/7, отсутствует LOD Error. Browser за120с остался Loading: producer сошёлся, GPU-staging не завершился. Новый gate ждёт реальные LIGHT-upload до тяжёлого первого HDR; условие физического HDR+HUD completion сохранено. Следующая свежая пара проверит исправление и показатели опубликованного LOD.
-3. Геймплей: точное подтверждение еды/вёдер, отмена/отказ/повтор/WAL и причинные Owner-звуки покрыты тестами. Готовится проверка мышью/клавиатурой в настоящей Owner-сессии. Аудит выявил отсутствующие физическую витрину/доски спавна и звук чужих Mine/Place; они добавлены в работу. Слышимость на аппаратном аудиовыходе ещё не подтверждена.
-
-[Последний CI50e5f65](https://github.com/Astraneer/cubi-cyber-v1/actions/runs/40379269839): Linux — последний ProductUI Loading timeout; Windows — H5 cost; server_scale PASS. [Последний принятый Linux+Windows CI](https://github.com/Astraneer/cubi-cyber-v1/actions/runs/40240830659). PR отсутствуют: GitHub HTTP403; main не менялся. Подробности: [история](STATUS_HISTORY.md), M4–M13, PUBLIC-PRIVACY.md, SERVER_SCALE.md. VPS/DNS/секреты не менялись.
+[Последний CIe516a44](https://github.com/Astraneer/cubi-cyber-v1/actions/runs/40390948705): Windows целиком PASS, server_scale PASS; Linux остановился в player_smoke на обращении к ещё отсутствующему documentElement. Узкий optional-chain guard подготовлен; H1/deadlines сохранены. [Последний принятый Linux+Windows CI](https://github.com/Astraneer/cubi-cyber-v1/actions/runs/40240830659). PR отсутствуют: GitHub HTTP403; main не менялся. Подробности: [история](STATUS_HISTORY.md), M4–M13, RECIPE_BOARDS.md, M11-CROSSROADS-SERVER.md, BLOCK-AUDIO.md. VPS/DNS/секреты не менялись.

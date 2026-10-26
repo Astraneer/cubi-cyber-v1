@@ -17,6 +17,7 @@ fn state() -> WindowSnapshot {
         },
         kind: WindowKind::Inventory,
         closed: false,
+        read_only: false,
         binding: None,
         cursor: Stack::EMPTY,
         craft: [Stack::EMPTY; 9],
@@ -27,6 +28,38 @@ fn state() -> WindowSnapshot {
         energy: 0,
         sides: [0; 6],
     }
+}
+
+#[test]
+fn encoded_read_only_window_is_projected_and_close_clears_the_ui_lock() {
+    let mut app = ui::app::UiApp::new().unwrap();
+    app.set_snapshot(ui::app::Snapshot {
+        connected: true,
+        inventory_revision: 4,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut image = state();
+    image.kind = WindowKind::Machine(0);
+    image.binding = Some(core_types::BlockPos {
+        space: core_types::SpaceId(0),
+        x: 0,
+        y: 64,
+        z: 0,
+    });
+    image.container = vec![Stack::EMPTY; 2];
+    image.read_only = true;
+    let encoded = encode_snapshot(&image).unwrap();
+    let decoded = decode_snapshot(&encoded).unwrap();
+    bridge::apply_window(&mut app, &decoded).unwrap();
+    assert!(app.snapshot.window_read_only);
+    assert_eq!(app.screen, ui::app::Screen::Machine);
+    image.closed = true;
+    image.read_only = false;
+    image.guard.revision += 1;
+    bridge::apply_window(&mut app, &image).unwrap();
+    assert!(!app.snapshot.window_read_only);
+    assert_eq!(app.screen, ui::app::Screen::Game);
 }
 #[test]
 fn stale_epochs_and_mismatched_inventory_cannot_supply_actionable_windows() {

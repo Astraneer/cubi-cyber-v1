@@ -147,6 +147,7 @@ impl RemoteSession {
         }
         let input = view.take_remote_input();
         let changes = self.pump_scene(&mut view.scene, input, now_ms)?;
+        view.set_recipe_board_landmark(self.connection.spawn_landmark())?;
         if self.connection.welcome().is_some() {
             let (tick, sub_tick) = self.connection.visual_clock_sample(now_ms);
             view.set_public_clock(tick, sub_tick)?;

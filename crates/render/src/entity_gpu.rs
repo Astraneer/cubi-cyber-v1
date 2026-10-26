@@ -950,6 +950,10 @@ impl EntityGpu {
         self.work.instance_records += work.instance_records;
         Ok(work)
     }
+    /// Exact records admitted to the current GPU bank, not pending network poses.
+    pub fn instance_records(&self) -> &[EntityInstance] {
+        &self.previous
+    }
     pub fn prepare_frame(
         &mut self,
         queue: &wgpu::Queue,

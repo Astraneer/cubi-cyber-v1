@@ -1,5 +1,6 @@
 //! Native event/file/device glue for the same Rust UI and authority adapter.
 mod consumable_diagnostics;
+mod factory_diagnostics;
 use audio::{
     EmitterId,
     scene::{NativeScene, PreparedSounds},
@@ -58,6 +59,7 @@ pub struct ProductUi {
     preferences: PathBuf,
     diagnostics: bool,
     consumable_diagnostics: consumable_diagnostics::Observations,
+    factory_diagnostics: factory_diagnostics::Observations,
     last_diagnostic: Option<DiagnosticStamp>,
     last_aim: Option<(Option<[i32; 3]>, u16)>,
     last_world_diagnostic: Option<(usize, usize, bool, Option<u8>)>,
@@ -152,6 +154,7 @@ impl ProductUi {
             preferences,
             diagnostics: std::env::var_os("CUBI_UI_DIAGNOSTICS").is_some(),
             consumable_diagnostics: Default::default(),
+            factory_diagnostics: Default::default(),
             last_diagnostic: None,
             last_aim: None,
             last_world_diagnostic: None,
@@ -435,6 +438,12 @@ impl ProductUi {
     }
     pub fn sync_quality(&mut self, view: &mut ClientView, now_ms: u64, benchmark: bool) {
         self.quality_now_ms = now_ms;
+        if let Some(choice) = view.take_recipe_board_time()
+            && self.layer.app.set_world_time(choice)
+        {
+            self.quality.update_saved(&self.layer.app.settings, now_ms);
+            self.save_preferences();
+        }
         if !self.ready_world && matches!(self.layer.app.screen, Screen::Game | Screen::Death) {
             self.quality.runtime.set_active(false, now_ms);
             self.layer.app.set_quality(self.quality.hud());
@@ -548,13 +557,14 @@ impl ProductUi {
             );
             if self.last_time_diagnostic != Some(stamp) {
                 println!(
-                    "NATIVE_UI_TIME choice={} known={} samples={} exposure_percent={} time_of_day={:?} sun_y={:?}",
+                    "NATIVE_UI_TIME choice={} known={} samples={} exposure_percent={} time_of_day={:?} sun_y={:?} public_tick={:?}",
                     stamp.0,
                     stamp.1,
                     stamp.2,
                     stamp.3,
                     clock.map(|clock| clock.time_of_day),
-                    clock.map(|clock| clock.sun_direction[1])
+                    clock.map(|clock| clock.sun_direction[1]),
+                    clock.map(|clock| clock.public_tick.0)
                 );
                 self.last_time_diagnostic = Some(stamp);
             }
@@ -754,11 +764,16 @@ impl ProductUi {
         if self.diagnostics {
             self.consumable_diagnostics
                 .observe(network, self.layer.app.snapshot.hp);
+            self.factory_diagnostics
+                .observe(network, view, self.layer.app.revision());
         }
         self.report_state();
         Ok(())
     }
     pub fn observe_completed(&mut self, id: u64) {
+        if self.diagnostics {
+            self.factory_diagnostics.completed(id);
+        }
         match self.presentation.completed(id) {
             Some(client::presentation_gate::Event::PrepareGameUi) => {
                 if self.diagnostics {
@@ -778,6 +793,10 @@ impl ProductUi {
         }
     }
     pub fn submitted(&mut self, id: u64, world: bool, game_ui: bool) {
+        if self.diagnostics {
+            self.factory_diagnostics
+                .submitted(id, world, self.layer.uploaded_revision());
+        }
         if self.diagnostics && !self.ready_world && (world || game_ui) {
             println!(
                 "NATIVE_INITIAL_PRESENT stage={} frame={id}",

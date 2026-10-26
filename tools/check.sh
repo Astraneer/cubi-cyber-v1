@@ -32,6 +32,8 @@ run_check 'WebGPU public hill building cutout and Unknown shadows' node tools/di
 run_check 'WebGPU exact shadow alpha lifecycle' node tools/shadow_alpha_gpu_smoke.mjs
 run_check 'Model GI oracle inputs' cargo run --locked -p render --example model_shaders
 run_check 'WebGPU model GI and absent-probe behavior' node tools/model_gi_gpu_smoke.mjs
+run_check 'World recipe board shader inputs' cargo run --locked -p render --example recipe_board_shaders -- .local/recipe-board-shaders
+run_check 'WebGPU world recipe boards and depth' node tools/recipe_boards_gpu_smoke.mjs
 run_check 'WebGPU water reflections and fallback' node tools/water_reflection_gpu_smoke.mjs
 run_check 'WebGPU contact occlusion and direct-light preservation' node tools/contact_ao_gpu_smoke.mjs
 run_check 'WebGPU SMAA analytic coverage and phase sweeps' node tools/smaa_gpu_smoke.mjs

@@ -13,8 +13,9 @@ pub(super) struct Stamp {
     component: Option<Version>,
     target: Version,
     anchor: Version,
+    read_only: bool,
 }
-fn stamp(world: &World, peer: &Peer) -> Stamp {
+fn stamp(world: &World, peer: &Peer, showcase: Option<&spawn_showcase::Owner>) -> Stamp {
     let guard = peer.window.state.guard(&peer.inventory);
     let (component, target, anchor) =
         peer.window
@@ -36,6 +37,10 @@ fn stamp(world: &World, peer: &Peer) -> Stamp {
         component,
         target,
         anchor,
+        read_only: !peer.window.state.closed()
+            && peer.window.binding.is_some_and(|binding| {
+                showcase.is_some_and(|owner| owner.contains_window(world, binding.anchor))
+            }),
     }
 }
 pub(super) fn initial(
@@ -98,8 +103,23 @@ impl Server {
             WindowIntent::OpenBlock { position, .. } => Some(position),
             _ => peer.window.binding.map(|b| b.anchor),
         };
-        let permitted = position
-            .is_none_or(|p| p.space != SpaceId(0) || !self.protected([p.x, p.y, p.z], role));
+        let display_bound = peer
+            .window
+            .binding
+            .is_some_and(|binding| self.showcase_window(binding.anchor));
+        if display_bound
+            && !matches!(
+                intent,
+                WindowIntent::OpenInventory
+                    | WindowIntent::OpenBlock { .. }
+                    | WindowIntent::Close { .. }
+            )
+        {
+            return Err(RejectReason::Protected);
+        }
+        let permitted = position.is_some_and(|p| self.showcase_window(p))
+            || position
+                .is_none_or(|p| p.space != SpaceId(0) || !self.protected([p.x, p.y, p.z], role));
         let pending = self.payload_delta(batch)?;
         let view = pending
             .as_ref()
@@ -260,8 +280,9 @@ impl Server {
     }
     pub(super) fn publish_windows(&mut self) -> Vec<Outgoing> {
         let mut output = Vec::new();
+        let showcase = self.spawn_showcase.as_ref();
         for (connection, peer) in self.peers.iter_mut().filter(|(_, p)| p.ready) {
-            let current = stamp(&self.world, peer);
+            let current = stamp(&self.world, peer, showcase);
             if peer.window_sent == Some(current) {
                 continue;
             }
@@ -271,7 +292,7 @@ impl Server {
             {
                 continue;
             }
-            let Ok(snapshot) = windows::snapshot(
+            let Ok(mut snapshot) = windows::snapshot(
                 &self.world,
                 &peer.window,
                 &peer.inventory,
@@ -279,7 +300,9 @@ impl Server {
             ) else {
                 continue;
             };
-            peer.window_sent = Some(stamp(&self.world, peer));
+            let published = stamp(&self.world, peer, showcase);
+            snapshot.read_only = published.read_only;
+            peer.window_sent = Some(published);
             output.push(Outgoing::reliable(
                 *connection,
                 ServerMessage::Window(Box::new(snapshot)),

@@ -1,6 +1,6 @@
 use super::{ClientView, SettingsApplication};
 use render::terrain_gpu::UploadBudget;
-use ui::settings::{Section, Setting, Settings};
+use ui::settings::{Setting, Settings};
 impl ClientView {
     pub fn requested_near_blocks(&self) -> Option<u16> {
         self.requested_settings
@@ -167,13 +167,7 @@ impl ClientView {
         if self.environment.is_some() && self.sun_clock().is_some() {
             applied |= 1 << Setting::ViewTime as u32;
         }
-        let mut pending_render = 0;
-        for definition in ui::settings::SCHEMA {
-            let bit = 1 << definition.id as u32;
-            if definition.section == Section::Graphics && applied & bit == 0 {
-                pending_render |= bit;
-            }
-        }
+        let pending_render = ui::settings::pending_graphics_mask(applied);
         SettingsApplication {
             applied,
             pending_render,

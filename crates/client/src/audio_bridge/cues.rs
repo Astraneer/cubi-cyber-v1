@@ -86,15 +86,31 @@ impl CausalSounds {
                 net::audio_cue::Kind::BucketEmpty => "bucket.empty",
                 net::audio_cue::Kind::Eat => "player.eat",
                 net::audio_cue::Kind::EatDone => "player.eat_done",
+                net::audio_cue::Kind::BlockBreak(block) => {
+                    let Some((event, _)) =
+                        super::block_material_event(block.material, super::BlockSound::Break)
+                    else {
+                        continue;
+                    };
+                    event
+                }
+                net::audio_cue::Kind::BlockPlace(block) => {
+                    let Some((event, _)) =
+                        super::block_material_event(block.material, super::BlockSound::Place)
+                    else {
+                        continue;
+                    };
+                    event
+                }
             };
             emit(BlockCue {
                 event,
                 gain: 1.,
                 position: cue.position,
                 emitter: audio::EmitterId(
-                    cue.actor ^ 0x4547_4700_0000_0000 ^ ((cue.kind as u64) << 48),
+                    cue.actor ^ 0x4547_4700_0000_0000 ^ (u64::from(cue.kind.tag()) << 48),
                 ),
-                seed: cue.sequence ^ cue.actor ^ (cue.kind as u64),
+                seed: cue.sequence ^ cue.actor ^ u64::from(cue.kind.tag()),
             });
             self.emitted = self.emitted.saturating_add(1);
             played += 1;

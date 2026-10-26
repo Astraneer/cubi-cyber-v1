@@ -9,6 +9,9 @@ const MAX_ITEMS: usize = 8192;
 const MAX_MOBS: usize = 5000;
 const MAX_EVENTS: usize = 100_000;
 const MAX_DROP_SOURCES: usize = 16_384;
+#[cfg(test)]
+#[path = "runtime_wind_tests.rs"]
+mod wind_tests;
 pub(super) struct Runtimes {
     pub(super) survival: survival::SurvivalRuntime,
     pub(super) mobs: entities::MobRuntime,
@@ -387,7 +390,7 @@ impl Runtimes {
                 self.queue_drop(id)?;
             }
             if record.data.kind == machines::MACHINE_COMPONENT
-                && self.machines.machine_meta(id).is_none()
+                && (self.machines.machine_meta(id).is_none() || wind_sky_changed(world, record)?)
             {
                 self.machine_bootstrap.insert(id);
             }
@@ -410,10 +413,50 @@ impl Runtimes {
         self.drops.insert(id);
         Ok(())
     }
-    pub(super) fn committed_changes(&mut self, changes: &[WorldChange]) -> Result<(), ServerError> {
+    pub(super) fn committed_changes(
+        &mut self,
+        world: &World,
+        changes: &[WorldChange],
+    ) -> Result<(), ServerError> {
         for change in changes {
             if change.pages.iter().any(|p| p.created || p.removed) {
                 self.sections_dirty = true;
+            }
+            // A blocked wind generator sleeps after its twentieth sky poll.
+            // Wake only the actual head whose committed skylight changed;
+            // RGB-only changes and unrelated LIGHT never scan machines.
+            for light in change.lights.iter().filter(|c| c.old.sky != c.new.sky) {
+                let (x, y, z) = light.index.xyz();
+                let head = BlockPos {
+                    space: light.page.space,
+                    x: light.page.x * 16 + i32::from(x),
+                    y: light.page.y * 16 + i32::from(y),
+                    z: light.page.z * 16 + i32::from(z),
+                };
+                let CellRead::Known(cell) = world.read(head) else {
+                    continue;
+                };
+                if cell.id() != rules::ids::BOUNDING || rules::blocks::bounding_dy(cell.raw()) != 4
+                {
+                    continue;
+                }
+                let base = BlockPos {
+                    y: head.y - 4,
+                    ..head
+                };
+                if !matches!(world.read(base),CellRead::Known(cell) if cell.id()==rules::ids::WIND_GENERATOR)
+                {
+                    continue;
+                }
+                if let Some(id) = world
+                    .page(base.page())
+                    .and_then(|p| p.component(base.local_index()))
+                    && let Some(record) = world.component(id)
+                    && record.data.anchor == base
+                    && record.data.kind == machines::MACHINE_COMPONENT
+                {
+                    self.machine_bootstrap.insert(id);
+                }
             }
             for component in &change.components {
                 if component
@@ -427,6 +470,27 @@ impl Runtimes {
         }
         Ok(())
     }
+}
+fn wind_sky_changed(world: &World, record: &world::ComponentRecord) -> Result<bool, ServerError> {
+    let base = record.data.anchor;
+    if !matches!(world.read(base),CellRead::Known(cell) if cell.id()==rules::ids::WIND_GENERATOR) {
+        return Ok(false);
+    }
+    let machine = rules::machines::Machine::decode(&record.data.payload)
+        .map_err(|_| ServerError::Invalid("wind sky recovery state"))?;
+    if machine.kind != rules::blocks::MekKind::Wind {
+        return Ok(false);
+    }
+    let head = BlockPos {
+        y: base.y.saturating_add(4),
+        ..base
+    };
+    let open = world
+        .page(head.page())
+        .is_some_and(|p| p.light(head.local_index()).sky == 15);
+    // Historical blocked snapshots could stop at ticker20 before ever polling.
+    // Repair this derived scheduling obligation once, alongside sky recovery.
+    Ok((machine.produced > 0) != open || (machine.produced == 0 && machine.ticker % 20 != 1))
 }
 pub(crate) fn player_entity(id: PlayerId) -> EntityId {
     EntityId(net::player_entity_id(id))
@@ -837,6 +901,13 @@ impl Server {
                         }
                     }
                 }
+            }
+            if let Some(showcase) = &self.spawn_showcase {
+                self.runtimes.active_sections.extend(
+                    showcase
+                        .active_pages()
+                        .filter(|page| self.world.page(*page).is_some()),
+                );
             }
             self.runtimes.sections_dirty = false;
             self.runtimes.sections_revision = self

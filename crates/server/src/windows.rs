@@ -681,6 +681,7 @@ pub fn snapshot(
         },
         kind,
         closed: bound.state.closed(),
+        read_only: false,
         binding,
         cursor: stack(bound.state.cursor()),
         craft,

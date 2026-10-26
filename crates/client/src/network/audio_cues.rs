@@ -2,6 +2,7 @@
 //! server tick; late events and duplicates never replay a historical sound.
 use net::audio_cue::Cue;
 pub const CAPACITY: usize = 64;
+type CueKey = (u8, Option<net::PlayerId>, u64, u64);
 #[derive(Clone, Copy, Debug)]
 pub struct Entry {
     pub revision: u64,
@@ -25,7 +26,7 @@ pub struct AudioCues {
     len: usize,
     revision: u64,
     tick: u64,
-    keys: [Option<(net::audio_cue::Kind, u64, u64)>; CAPACITY],
+    keys: [Option<CueKey>; CAPACITY],
     keys_len: usize,
     counts: Counts,
 }
@@ -50,7 +51,12 @@ impl AudioCues {
             self.counts.stale = self.counts.stale.saturating_add(1);
             return Ok(false);
         }
-        let key = Some((cue.kind, cue.actor, cue.sequence));
+        let key = Some((
+            cue.kind.tag(),
+            cue.kind.block().map(|b| b.player),
+            cue.actor,
+            cue.sequence,
+        ));
         if cue.tick.0 == self.tick {
             if self.keys[..self.keys_len].contains(&key) {
                 self.counts.duplicate = self.counts.duplicate.saturating_add(1);

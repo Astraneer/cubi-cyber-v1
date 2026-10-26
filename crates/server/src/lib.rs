@@ -4,6 +4,7 @@
 
 mod actor;
 mod audio_cue;
+mod block_audio;
 pub mod block_loot;
 mod chat;
 pub mod cold_projection;
@@ -42,6 +43,8 @@ mod props_stream;
 mod raw_sources;
 mod raw_views;
 mod runtime;
+mod spawn_landmark;
+mod spawn_showcase;
 pub mod survival;
 mod tool_owner;
 mod topology_owner;
@@ -158,6 +161,9 @@ pub struct ServerCounters {
     pub audio_cues_sent: u64,
     pub audio_cues_clipped: u64,
     pub audio_cues_not_recorded: u64,
+    pub block_audio_rays: u64,
+    pub block_audio_segments: u64,
+    pub block_audio_cell_reads: u64,
     pub ticks: u64,
     pub input_steps: u64,
     pub committed_transactions: u64,
@@ -337,6 +343,7 @@ pub struct Server {
     next_tick_at: u64,
     last_checkpoint_tick: u64,
     spawn: [f64; 3],
+    spawn_showcase: Option<spawn_showcase::Owner>,
     generation: Option<Generation>,
     geometry: geometry::GeometryWorker,
     far_water: far_water::Owner,
@@ -658,6 +665,8 @@ impl Server {
         let height_worker = height_stream::HeightWorker::new(r#gen::Generator::new(
             r#gen::TerrainSeed(public_seed),
         ))?;
+        let spawn_showcase =
+            spawn_showcase::Owner::new(&config, generator.terrain().spawn().center);
         let mut server = Self {
             config,
             world,
@@ -673,6 +682,7 @@ impl Server {
             next_tick_at: 0,
             last_checkpoint_tick: tick.0,
             spawn,
+            spawn_showcase,
             generation,
             geometry,
             far_water,
@@ -904,6 +914,14 @@ impl Server {
         {
             return output;
         }
+        match self.finish_showcase_boundary() {
+            Ok(true) => return output,
+            Ok(false) => {}
+            Err(error) => {
+                self.fail_error("finish_showcase_boundary", &error);
+                return output;
+            }
+        }
         if now_ms < self.next_tick_at {
             return output;
         }
@@ -941,6 +959,10 @@ impl Server {
             self.process_message(connection, message, received_at, &mut batch, &mut deferred);
         }
         self.poll_generation(&mut batch);
+        if let Err(error) = self.tick_showcase(&mut batch) {
+            self.fail_error("tick_showcase", &error);
+            return output;
+        }
         let connections: Vec<_> = self.peers.keys().copied().collect();
         for connection in connections {
             let Some(mut peer) = self.peers.remove(&connection) else {
@@ -1129,7 +1151,10 @@ impl Server {
                 self.fail_error("durable_runtime_replay", &error);
                 break;
             }
-            if let Err(error) = self.runtimes.committed_changes(&pending.changes) {
+            if let Err(error) = self
+                .runtimes
+                .committed_changes(&self.world, &pending.changes)
+            {
                 self.fail_error("durable_runtime_observe", &error);
                 break;
             }
@@ -1206,6 +1231,9 @@ impl Server {
                 .filter(|o| matches!(o.message, ServerMessage::Welcome(_)))
             {
                 output.push(welcome.clone());
+                if let ServerMessage::Welcome(value) = &welcome.message {
+                    self.append_spawn_landmark(welcome.connection, value.session, &mut output);
+                }
             }
             for permit in pending.chats {
                 let event = self.presence.publish_chat(permit, self.tick);
@@ -2260,8 +2288,19 @@ impl Server {
                             rules::stack::ItemStack::EMPTY,
                             &self.runtimes.payloads,
                         )
-                        .and_then(|_| self.world.commit(tx).map_err(|_| RejectReason::Stale))
-                        {
+                        .and_then(|_| {
+                            self.stage_block_audio(
+                                batch,
+                                &mut tx,
+                                peer,
+                                block_audio::ActionSound {
+                                    id,
+                                    position: target,
+                                    breaking: false,
+                                },
+                            );
+                            self.world.commit(tx).map_err(|_| RejectReason::Stale)
+                        }) {
                             Ok(change) => {
                                 transaction = Some(change.tx);
                                 if let CellRead::Known(actual) = self.world.read(target) {
@@ -2492,6 +2531,16 @@ impl Server {
                 &self.runtimes.payloads
             };
             runtime::component_birth(&self.world, &mut tx, position, hand, resolver)?;
+            self.stage_block_audio(
+                batch,
+                &mut tx,
+                peer,
+                block_audio::ActionSound {
+                    id,
+                    position,
+                    breaking: false,
+                },
+            );
             let change = self.world.commit(tx).map_err(|_| RejectReason::Stale)?;
             let transaction = change.tx;
             batch.changes.push(change);
@@ -2686,6 +2735,16 @@ impl Server {
                         return;
                     }
                 };
+                self.stage_block_audio(
+                    batch,
+                    &mut tx,
+                    peer,
+                    block_audio::ActionSound {
+                        id: mining.id,
+                        position: mining.position,
+                        breaking: true,
+                    },
+                );
                 match self.world.commit(tx) {
                     Ok(change) => {
                         Self::stage_payloads(batch, payload_record);

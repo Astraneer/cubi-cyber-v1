@@ -12,7 +12,7 @@ assert(!((unitControl||legacyControl)&&gpuUnitControl),'Choose one unit tessella
 const expectedGpuUnit=!(unitControl||legacyControl);
 const dir=join(root,'.local/artifacts',`m3-${Date.now()}`);await mkdir(dir,{recursive:true});
 await withBrowser({headed,width:780,height:437,path:'/?scene=forest&meshDelayMs=200&workerMeshDelayMs=200'+(unitControl?'&unit_mesh=1':'')+(gpuUnitControl?'&gpu_unit_mesh=1':'')+(legacyControl?'&legacy_gpu_greedy=1':'')},async({call,evaluate,waitFor})=>{
-  await waitFor('document.documentElement.dataset.m2',s=>{if(s==='error')throw new Error('Client loading failed');return s==='ready';});
+  await waitFor('document.documentElement?.dataset.m2',s=>{if(s==='error')throw new Error('Client loading failed');return s==='ready';});
   const stats=async()=>JSON.parse(await evaluate('JSON.stringify(window.__M2Stats())'));
   async function until(test,timeout=20000){const end=Date.now()+timeout;let last;while(Date.now()<end){last=await stats();if(test(last))return last;await pause(30);}throw new Error(`Player condition timed out: ${JSON.stringify(last)}`);}
   const tap=async(code,key)=>{await call('Input.dispatchKeyEvent',{type:'keyDown',code,key});await call('Input.dispatchKeyEvent',{type:'keyUp',code,key});};

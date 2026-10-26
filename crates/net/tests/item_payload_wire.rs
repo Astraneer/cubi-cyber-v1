@@ -10,6 +10,7 @@ fn image() -> WindowSnapshot {
         },
         kind: WindowKind::Inventory,
         closed: false,
+        read_only: false,
         binding: None,
         cursor: Stack {
             item: 63,

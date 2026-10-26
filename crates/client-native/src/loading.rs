@@ -137,6 +137,7 @@ pub fn prepare(
             .prepare_material_pack(device, queue, pack, false)
             .map_err(|error| error.to_string())?;
     }
+    view.prepare_recipe_boards_from_assets(device, queue)?;
     if let Some(settings) = &preparation.settings {
         view.apply_settings(settings);
     }

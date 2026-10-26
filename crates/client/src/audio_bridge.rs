@@ -201,7 +201,30 @@ fn emitter(identity: net::PlayerId) -> audio::EmitterId {
     audio::EmitterId(((first ^ second.rotate_left(17)) & !3) | 1)
 }
 pub fn block_event(cell: Cell, action: BlockSound) -> Option<(&'static str, f32)> {
-    let surface = surface(cell);
+    block_surface_event(surface(cell), action)
+}
+pub(crate) fn block_material_event(
+    material: net::audio_cue::BlockMaterial,
+    action: BlockSound,
+) -> Option<(&'static str, f32)> {
+    use net::audio_cue::BlockMaterial as M;
+    block_surface_event(
+        match material {
+            M::Stone => Surface::Stone,
+            M::Wood => Surface::Wood,
+            M::Gravel => Surface::Gravel,
+            M::Grass => Surface::Grass,
+            M::Sand => Surface::Sand,
+            M::Snow => Surface::Snow,
+            M::Wool => Surface::Wool,
+            M::Glass => Surface::Glass,
+            M::Metal => Surface::Metal,
+            M::Ladder => Surface::Ladder,
+        },
+        action,
+    )
+}
+fn block_surface_event(surface: Surface, action: BlockSound) -> Option<(&'static str, f32)> {
     if surface == Surface::None {
         return None;
     }

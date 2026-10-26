@@ -26,6 +26,7 @@ pub mod presentation_gate;
 pub mod props_source;
 pub mod quality;
 mod rebase;
+pub mod recipe_board_images;
 pub mod remote;
 pub mod remote_humans;
 mod scene;

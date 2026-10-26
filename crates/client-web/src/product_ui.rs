@@ -171,6 +171,12 @@ impl ProductUi {
     }
     pub fn sync_quality(&mut self, view: &mut ClientView, now_ms: u64, benchmark: bool) {
         self.quality_now_ms = now_ms;
+        if let Some(choice) = view.take_recipe_board_time()
+            && self.layer.app.set_world_time(choice)
+        {
+            self.quality.update_saved(&self.layer.app.settings, now_ms);
+            self.save_preferences();
+        }
         if !self.ready_world && matches!(self.layer.app.screen, Screen::Game | Screen::Death) {
             self.quality.runtime.set_active(false, now_ms);
             self.layer.app.set_quality(self.quality.hud());

@@ -140,6 +140,12 @@ jobs:
         run: |
           source tools/env.sh
           bash tools/check_one.sh 'Windows WARP complete visual owners' cargo test --locked -p client --test visual_settings_gpu --test view_far_shadows -- --test-threads=1 --nocapture
+      - name: Validate recipe boards and initial far loading with D3D12 WARP
+        if: ${{ !cancelled() && steps.windows_targets.outcome == 'success' }}
+        run: |
+          source tools/env.sh
+          bash tools/check_one.sh 'Windows WARP world recipe board component' cargo test --locked -p render --test recipe_boards --test recipe_board_shader -- --test-threads=1 --nocapture
+          bash tools/check_one.sh 'Windows WARP world cards and first far publication' cargo test --locked -p client --test view_recipe_boards --test view_initial_horizon --test horizon_replacement_gpu --test view_cached_present -- --test-threads=1 --nocapture
       - name: Present three native Windows frames
         run: bash tools/windows_native_smoke.sh
       - name: Build portable Windows bundle

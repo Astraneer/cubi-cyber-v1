@@ -1170,6 +1170,8 @@ fn prepare_product_world(
     view.prepare_far_water(Default::default())
         .map_err(js_error)?;
     view.prepare_distant_shadows(device).map_err(js_error)?;
+    view.prepare_recipe_boards_from_assets(device, queue)
+        .map_err(js_error)?;
     view.apply_settings(settings);
     Ok(())
 }

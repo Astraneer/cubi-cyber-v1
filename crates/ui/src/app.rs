@@ -149,6 +149,7 @@ pub struct Snapshot {
     pub craft_result: ItemStack,
     pub window_id: u64,
     pub window_revision: u64,
+    pub window_read_only: bool,
     pub container: [ItemStack; 54],
     pub container_slots: u8,
     pub container_name: String,
@@ -177,6 +178,7 @@ impl Default for Snapshot {
             craft_result: ItemStack::EMPTY,
             window_id: 0,
             window_revision: 0,
+            window_read_only: false,
             container: [ItemStack::EMPTY; 54],
             container_slots: 0,
             container_name: String::new(),
@@ -577,10 +579,35 @@ impl UiApp {
             self.dirty();
         }
     }
+    /// Mirror a certified physical sky button into local preferences. This is
+    /// personal presentation state and never creates a server/world command.
+    pub fn set_world_time(&mut self, value: i32) -> bool {
+        if !matches!(value, 1 | 2)
+            || (self.settings.get(Setting::ViewTime) == value
+                && self.personal_time == PersonalTime::from_setting(value))
+            || self.settings.set(Setting::ViewTime, value).is_err()
+        {
+            return false;
+        }
+        self.personal_time = PersonalTime::from_setting(value);
+        self.dirty();
+        true
+    }
     fn dirty(&mut self) {
         self.revision = self.revision.saturating_add(1);
     }
     fn intent(&mut self, intent: Intent) {
+        if self.snapshot.window_read_only
+            && matches!(
+                intent,
+                Intent::SlotClick { .. }
+                    | Intent::RecipeFill { .. }
+                    | Intent::TakeCraft { .. }
+                    | Intent::MachineSide { .. }
+            )
+        {
+            return;
+        }
         if self.intents.len() < 64 {
             self.intents.push_back(intent);
         } else {
@@ -1204,13 +1231,18 @@ const MUTED: u32 = 0xffa7aaa8;
 const ACCENT: u32 = 0xff74c5b6;
 impl UiApp {
     fn control(&mut self, p: &mut Painter<'_>, widget: Widget, rect: Rect) {
-        if let Some(visible) = rect.intersection(p.clip) {
+        let disabled = self.snapshot.window_read_only
+            && matches!(
+                widget,
+                Widget::RecipePlus(_) | Widget::TakeCraft | Widget::Side(_)
+            );
+        if !disabled && let Some(visible) = rect.intersection(p.clip) {
             self.hits.push(Hit {
                 widget,
                 rect: visible.scaled(self.scale),
             });
         }
-        let hover = self.hover == Some(widget);
+        let hover = !disabled && self.hover == Some(widget);
         p.rect(rect, if hover { 0xff3d514f } else { 0xff292f34 });
         p.border(rect, if hover { ACCENT } else { 0xff59616a });
         p.rect(
@@ -1509,7 +1541,7 @@ impl UiApp {
         let old_clip = p.clip;
         p.clip = viewport;
         for def in SCHEMA {
-            if def.section != section || def.id == Setting::Animations {
+            if def.section != section || def.id.is_retired() || def.id == Setting::Animations {
                 continue;
             }
             let y = 108.0 + (row as f32 - self.scroll as f32) * 36.0;
@@ -1734,6 +1766,9 @@ impl UiApp {
             },
             TEXT,
         );
+        if self.snapshot.window_read_only {
+            p.text(x + 125.0, y, "Витрина · только просмотр", MUTED);
+        }
         if self.screen == Screen::Furnace {
             for (slot, dx, dy) in [(0, 98.0, 32.0), (1, 98.0, 105.0), (2, 227.0, 68.0)] {
                 if slot < usize::from(self.snapshot.container_slots) {

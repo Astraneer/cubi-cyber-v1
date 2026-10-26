@@ -1,6 +1,26 @@
 //! Fixed causal audio event. No item state, RNG, or private actor fields.
 use core_types::{SpaceId, Tick};
+mod block;
+pub use block::{BlockActor, BlockMaterial};
 pub const BYTES: usize = 64;
+pub const MAX_BYTES: usize = 80;
+/// Stack-owned encoding; legacy events do not gain an extra allocation.
+#[derive(Clone, Copy, Debug)]
+pub struct EncodedCue {
+    bytes: [u8; MAX_BYTES],
+    len: u8,
+}
+impl std::ops::Deref for EncodedCue {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+impl std::ops::DerefMut for EncodedCue {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes[..usize::from(self.len)]
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     ChickenEgg,
@@ -15,6 +35,34 @@ pub enum Kind {
     BucketEmpty,
     Eat,
     EatDone,
+    BlockBreak(BlockActor),
+    BlockPlace(BlockActor),
+}
+impl Kind {
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::ChickenEgg => 0,
+            Self::ChestOpen => 1,
+            Self::ChestClose => 2,
+            Self::ItemPickup => 3,
+            Self::AttackWeak => 4,
+            Self::AttackStrong => 5,
+            Self::AttackCrit => 6,
+            Self::AttackKnockback => 7,
+            Self::BucketFill => 8,
+            Self::BucketEmpty => 9,
+            Self::Eat => 10,
+            Self::EatDone => 11,
+            Self::BlockBreak(_) => 12,
+            Self::BlockPlace(_) => 13,
+        }
+    }
+    pub const fn block(self) -> Option<BlockActor> {
+        match self {
+            Self::BlockBreak(actor) | Self::BlockPlace(actor) => Some(actor),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cue {
@@ -42,26 +90,31 @@ impl Cue {
         {
             return Err(Error::Invalid);
         }
+        if let Some(block) = self.kind.block()
+            && (self.actor != crate::player_entity_id(block.player)
+                || self.position.iter().any(|p| p - p.floor() != 0.5))
+        {
+            return Err(Error::Invalid);
+        }
         Ok(())
     }
-    pub fn encode(self) -> Result<[u8; BYTES], Error> {
+    pub fn encode(self) -> Result<EncodedCue, Error> {
         self.validate()?;
-        let mut bytes = [0; BYTES];
-        bytes[..4].copy_from_slice(b"ACU1");
-        bytes[4] = match self.kind {
-            Kind::ChickenEgg => 0,
-            Kind::ChestOpen => 1,
-            Kind::ChestClose => 2,
-            Kind::ItemPickup => 3,
-            Kind::AttackWeak => 4,
-            Kind::AttackStrong => 5,
-            Kind::AttackCrit => 6,
-            Kind::AttackKnockback => 7,
-            Kind::BucketFill => 8,
-            Kind::BucketEmpty => 9,
-            Kind::Eat => 10,
-            Kind::EatDone => 11,
+        let block = self.kind.block();
+        let mut bytes = EncodedCue {
+            bytes: [0; MAX_BYTES],
+            len: if block.is_some() {
+                MAX_BYTES as u8
+            } else {
+                BYTES as u8
+            },
         };
+        bytes[..4].copy_from_slice(if block.is_some() { b"ACU2" } else { b"ACU1" });
+        bytes[4] = self.kind.tag();
+        if let Some(block) = block {
+            bytes[5] = block.material as u8;
+            bytes[BYTES..MAX_BYTES].copy_from_slice(&block.player.0);
+        }
         bytes[8..16].copy_from_slice(&self.actor.to_le_bytes());
         bytes[16..24].copy_from_slice(&self.sequence.to_le_bytes());
         bytes[24..32].copy_from_slice(&self.tick.0.to_le_bytes());
@@ -72,13 +125,28 @@ impl Cue {
         Ok(bytes)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() != BYTES
-            || &bytes[..4] != b"ACU1"
-            || bytes[5..8] != [0; 3]
+        let legacy = bytes.len() == BYTES && bytes.get(..4) == Some(b"ACU1".as_slice());
+        let block = bytes.len() == MAX_BYTES && bytes.get(..4) == Some(b"ACU2".as_slice());
+        if (!legacy && !block)
+            || bytes[6..8] != [0; 2]
+            || (legacy && bytes[5] != 0)
             || bytes[36..40] != [0; 4]
         {
             return Err(Error::Invalid);
         }
+        let block_actor = || -> Result<BlockActor, Error> {
+            if !block {
+                return Err(Error::Invalid);
+            }
+            Ok(BlockActor {
+                player: crate::PlayerId(
+                    bytes[BYTES..MAX_BYTES]
+                        .try_into()
+                        .map_err(|_| Error::Invalid)?,
+                ),
+                material: BlockMaterial::decode(bytes[5]).ok_or(Error::Invalid)?,
+            })
+        };
         let kind = match bytes[4] {
             0 => Kind::ChickenEgg,
             1 => Kind::ChestOpen,
@@ -92,8 +160,13 @@ impl Cue {
             9 => Kind::BucketEmpty,
             10 => Kind::Eat,
             11 => Kind::EatDone,
+            12 => Kind::BlockBreak(block_actor()?),
+            13 => Kind::BlockPlace(block_actor()?),
             _ => return Err(Error::Invalid),
         };
+        if block != kind.block().is_some() {
+            return Err(Error::Invalid);
+        }
         let actor = u64::from_le_bytes(bytes[8..16].try_into().map_err(|_| Error::Invalid)?);
         let sequence = u64::from_le_bytes(bytes[16..24].try_into().map_err(|_| Error::Invalid)?);
         let tick = Tick(u64::from_le_bytes(

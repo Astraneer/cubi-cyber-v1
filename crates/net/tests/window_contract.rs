@@ -19,6 +19,50 @@ fn at() -> BlockPos {
     }
 }
 #[test]
+fn protected_display_bit_preserves_legacy_layout_and_rejects_unknown_flags() {
+    let mut state = WindowSnapshot {
+        guard: guard(),
+        kind: WindowKind::Chest(27),
+        closed: false,
+        read_only: false,
+        binding: Some(at()),
+        cursor: Stack::EMPTY,
+        craft: [Stack::EMPTY; 9],
+        craft_result: Stack::EMPTY,
+        container: vec![Stack::EMPTY; 27],
+        progress: 0,
+        fuel: 0,
+        energy: 0,
+        sides: [0; 6],
+    };
+    let legacy = encode_snapshot(&state).unwrap();
+    assert_eq!(legacy[30], 0);
+    state.read_only = true;
+    let bytes = encode_snapshot(&state).unwrap();
+    let differences: Vec<_> = bytes
+        .iter()
+        .zip(&legacy)
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(differences, [30]);
+    assert_eq!(bytes[30], 2);
+    assert_eq!(decode_snapshot(&bytes).unwrap(), state);
+    let mut invalid = bytes.clone();
+    invalid[30] |= 4;
+    assert_eq!(decode_snapshot(&invalid), Err(WindowCodecError::Value));
+    invalid[30] = 3;
+    assert_eq!(decode_snapshot(&invalid), Err(WindowCodecError::Value));
+    state.closed = true;
+    assert_eq!(encode_snapshot(&state), Err(WindowCodecError::Value));
+    state.closed = false;
+    state.binding = None;
+    state.kind = WindowKind::Inventory;
+    state.container.clear();
+    assert_eq!(encode_snapshot(&state), Err(WindowCodecError::Value));
+}
+#[test]
 fn typed_window_commands_roundtrip_and_never_accept_truncation_or_trailing_data() {
     for intent in [
         WindowIntent::OpenInventory,
@@ -85,6 +129,7 @@ fn all_window_kinds_have_bounded_snapshots_with_strict_shapes_and_values() {
             guard: guard(),
             kind,
             closed: false,
+            read_only: false,
             binding: (kind != WindowKind::Inventory).then(at),
             cursor: Stack {
                 item: 1,

@@ -20,6 +20,7 @@ mod entities;
 pub mod environment;
 pub mod horizon;
 mod horizon_runtime;
+pub mod recipe_boards;
 mod settings;
 pub use horizon_runtime::HorizonJobStats;
 mod lighting;
@@ -182,6 +183,7 @@ pub struct ClientView {
     environment: Option<Box<PreparedEnvironment>>,
     horizon: Option<Box<horizon_runtime::PreparedHorizon>>,
     distant_shadows: Option<Box<distant_shadows::ViewDistantShadows>>,
+    recipe_boards: Option<Box<recipe_boards::ViewRecipeBoards>>,
     frame_upload_remaining: u64,
     frame_delta_seconds: f32,
     clock: clock::ClockState,
@@ -246,6 +248,7 @@ pub struct ClientView {
     view_bob: bool,
     cached_world_version: Version,
     cached_upload_bytes: u64,
+    cached_visual_revision: u64,
     observed_world_version: Version,
     observed_upload_bytes: u64,
     encoded_shadows: bool,
@@ -288,6 +291,7 @@ impl ClientView {
             environment: None,
             horizon: None,
             distant_shadows: None,
+            recipe_boards: None,
             frame_upload_remaining: 0,
             frame_delta_seconds: 1. / 60.,
             clock: Default::default(),
@@ -361,6 +365,7 @@ impl ClientView {
             view_bob: false,
             cached_world_version: Version(0),
             cached_upload_bytes: 0,
+            cached_visual_revision: 0,
             observed_world_version: Version(0),
             observed_upload_bytes: 0,
             encoded_shadows: false,
@@ -437,6 +442,7 @@ impl ClientView {
         config: crate::lighting::ClientLightingConfig,
     ) -> Result<(), String> {
         if self.lighting.is_some()
+            || self.recipe_boards.is_some()
             || self.entities.is_some()
             || self.props.is_some()
             || self.environment.is_some()
@@ -529,6 +535,13 @@ impl ClientView {
     }
     pub fn entities_mut(&mut self) -> Option<&mut ViewEntities> {
         self.entities.as_deref_mut()
+    }
+    /// Diagnostic borrow of the last uploaded entity bank. It does not prove
+    /// that a frame using these records was submitted, completed or presented.
+    pub fn factory_uploaded_entities(&self) -> Option<&[render::entity_gpu::EntityInstance]> {
+        self.entities
+            .as_ref()
+            .map(|owner| owner.gpu.instance_records())
     }
     pub fn prepare_props(
         &mut self,
@@ -712,6 +725,7 @@ impl ClientView {
         atlas: &render::terrain_gpu::AtlasImage,
     ) -> Result<(), String> {
         if self.environment.is_some()
+            || self.recipe_boards.is_some()
             || self.entities.is_some()
             || self.props.is_some()
             || self.horizon.is_some()
@@ -940,6 +954,11 @@ impl ClientView {
     }
     fn set_key_inner(&mut self, key: InputKey, down: bool, tool_back: Option<bool>) {
         let rising = down && !self.keys[key as usize];
+        if key == InputKey::Place && self.recipe_board_place(down, rising) {
+            self.keys[key as usize] = false;
+            self.place_pressed = false;
+            return;
+        }
         self.keys[key as usize] = down;
         if down {
             self.activate_player();
@@ -993,6 +1012,7 @@ impl ClientView {
     }
     pub fn clear_keys(&mut self) {
         self.keys.fill(false);
+        self.recipe_board_place(false, false);
         self.place_pressed = false;
         self.place_sneaking = false;
     }
@@ -2127,8 +2147,18 @@ impl ClientView {
     pub fn rendered_world_version(&self) -> Version {
         self.cached_world_version
     }
+    /// Last encoded scene revision. GPU completion is a separate frame token.
+    pub fn rendered_visual_revision(&self) -> u64 {
+        self.cached_visual_revision
+    }
     pub fn rendered_camera_signature(&self) -> u64 {
         self.cached_camera.map_or(0, camera_signature)
+    }
+    /// Last encoded HDR camera, not a GPU-completion/presentation certificate.
+    /// This View uploads terrain/models in absolute space (origin zero), as in
+    /// upload_model and the shared RemoteSession entity conversion.
+    pub fn factory_encoded_camera(&self) -> Option<(Camera, [i64; 3])> {
+        self.cached_camera.map(|camera| (camera, [0; 3]))
     }
     /// Call before acquiring the surface or creating an encoder. A clean static
     /// iteration keeps the presented image and allocates no GPU dispatch handles.
@@ -2337,6 +2367,19 @@ impl ClientView {
             );
         }
         let state = self.environment_state(parameters.eye);
+        if let Some(boards) = &mut self.recipe_boards {
+            let mut upload = UploadBudget::new(self.frame_upload_remaining);
+            if boards.prepare_frame(&self.scene, &self.resident, queue, &mut upload)? {
+                self.renderer.invalidate();
+            }
+            let bytes = self.frame_upload_remaining - upload.remaining_bytes;
+            self.frame_upload_remaining = upload.remaining_bytes;
+            self.retained_foreground_work.record(telemetry::WorkCounts {
+                upload_bytes: bytes,
+                ..telemetry::WorkCounts::ZERO
+            });
+            self.upload_bytes_total = self.upload_bytes_total.saturating_add(bytes);
+        }
         let scene_needed = self.environment.as_ref().is_none_or(|environment| {
             environment.owner.scene_needed(
                 &self.renderer,
@@ -2383,9 +2426,19 @@ impl ClientView {
                 ..telemetry::WorkCounts::ZERO
             });
         }
+        if scene_needed && let Some(boards) = &mut self.recipe_boards {
+            let mut upload = UploadBudget::new(self.frame_upload_remaining);
+            let bytes = boards.prepare_camera(queue, camera, &mut upload)?;
+            self.frame_upload_remaining = upload.remaining_bytes;
+            self.retained_foreground_work.record(telemetry::WorkCounts {
+                upload_bytes: bytes,
+                ..telemetry::WorkCounts::ZERO
+            });
+        }
         let entities = self.entities.as_ref();
         let horizon = self.horizon.as_ref();
         let props = self.props.as_ref();
+        let boards = self.recipe_boards.as_ref();
         let props_encoded = std::cell::Cell::new(false);
         let extra = |pass: &mut wgpu::RenderPass<'_>| {
             let entity_draws = entities
@@ -2396,7 +2449,10 @@ impl ClientView {
             props_encoded.set(
                 model_draws > 0 && props.is_some_and(|props| props.gpu.active_instances() > 0),
             );
-            entity_draws + horizon_draws + model_draws
+            entity_draws
+                + horizon_draws
+                + model_draws
+                + boards.map_or(0, |boards| boards.draw(pass))
         };
         let work = if let Some(environment) = &mut self.environment {
             // An acquired surface needs a complete background even when only
@@ -2470,6 +2526,7 @@ impl ClientView {
             self.encoded_terrain = work.passes != 0;
             self.cached_presentation_available = self.environment.is_some();
             self.cached_camera = Some(camera);
+            self.cached_visual_revision = self.renderer.visual_revision();
             self.cached_world_version = self.scene.world().version();
             self.cached_upload_bytes = self.upload_bytes_total;
             if work.passes != 0 && self.resident.values().any(|p| p.quads != 0) {
@@ -2551,6 +2608,10 @@ impl ClientView {
     /// this gate, so an initial Loading clear cannot make the world ready.
     pub fn initial_scene_inputs_ready(&self) -> bool {
         self.near_far_join_ready()
+            && self
+                .horizon
+                .as_ref()
+                .is_none_or(|horizon| horizon.owner.initial_inputs_ready())
             && self.near_meshes_ready()
             && self.scene.is_ready()
             && self

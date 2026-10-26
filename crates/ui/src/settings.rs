@@ -29,6 +29,7 @@ pub enum Setting {
     Reflections,
     Clouds,
     Gi,
+    /// Retired CUI1 compatibility slot. Antialiasing is selected by `Msaa`.
     Taa,
     Hold60,
     Fov,
@@ -51,6 +52,27 @@ pub enum Setting {
 }
 pub const COUNT: usize = 32;
 const LEGACY_COUNT: usize = 29;
+impl Setting {
+    /// Retained serialized values never request or acknowledge renderer work.
+    pub const fn is_retired(self) -> bool {
+        matches!(self, Self::Taa)
+    }
+}
+
+/// Missing active graphics receipts. Compatibility slots are not backends.
+pub fn pending_graphics_mask(applied: u32) -> u32 {
+    SCHEMA.iter().fold(0, |mask, definition| {
+        let bit = 1u32 << definition.id as u32;
+        if definition.section == Section::Graphics
+            && !definition.id.is_retired()
+            && applied & bit == 0
+        {
+            mask | bit
+        } else {
+            mask
+        }
+    })
+}
 #[derive(Clone, Copy)]
 pub enum Domain {
     Range { step: i32, min: i32, max: i32 },

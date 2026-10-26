@@ -21,6 +21,7 @@ pub mod lod_gpu;
 pub mod material_pack;
 pub mod multiple_scattering;
 pub mod post;
+pub mod recipe_boards;
 pub mod shadow_alpha;
 pub mod shadows;
 pub mod smaa;

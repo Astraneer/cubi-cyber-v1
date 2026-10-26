@@ -15,19 +15,12 @@ pub enum AudioHistoryError {
     Range,
 }
 impl Connection {
-    /// Read only the actor's public block edits, never inventory guards or other
-    /// spaces. Presentation caches these before the durable final reply arrives.
+    /// Only the retained bucket plant-break fallback uses local pending actions.
+    /// Mine/Place use the same durable ACU2 path for the owner and observers.
     pub fn pending_block_sounds(&self) -> impl Iterator<Item = PendingBlockSound> + '_ {
         let space = self.welcome().map(|welcome| welcome.player.space);
         self.actions.iter().filter_map(move |(&id, pending)| {
             let (position, cell, action) = match &pending.action {
-                net::Action::Mine {
-                    position, expected, ..
-                } => (*position, *expected, crate::audio_bridge::BlockSound::Break),
-                net::Action::Place { position, cell, .. }
-                | net::Action::PlaceOwned { position, cell, .. } => {
-                    (*position, *cell, crate::audio_bridge::BlockSound::Place)
-                }
                 net::Action::UseBucket {
                     position,
                     expected,

@@ -728,7 +728,9 @@ fn advance_idle_clocks(machine: &mut Machine, elapsed: u64) {
     if machine.active.delay == 0 {
         machine.active.shown = machine.active.logic;
     }
-    if machine.kind == MekKind::Wind {
+    if machine.kind == MekKind::Wind && machine.ticker != 0 {
+        // A newly admitted component has not performed its initial sky poll.
+        // Time before its first execution cannot advance that poll past zero.
         machine.ticker = machine.ticker.saturating_add(elapsed);
     }
 }
@@ -751,7 +753,9 @@ fn should_continue(before: &Machine, after: &Machine) -> bool {
             after.heat > 3000.0 || after.tank.amount > 0 || after.energy != before.energy
         }
         MekKind::Wind => {
-            after.produced > 0 || after.energy != before.energy || !after.ticker.is_multiple_of(20)
+            // wind_tick polls before incrementing. Sleep only immediately
+            // after a blocked poll, never just before the next one.
+            after.produced > 0 || after.energy != before.energy || after.ticker % 20 != 1
         }
         MekKind::Cube => {
             after.energy != before.energy

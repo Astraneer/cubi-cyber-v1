@@ -30,6 +30,7 @@ pub fn apply_window(ui: &mut UiApp, state: &WindowSnapshot) -> Result<bool, &'st
     if state.closed {
         snapshot.window_id = 0;
         snapshot.window_revision = 0;
+        snapshot.window_read_only = false;
         snapshot.cursor = ItemStack::EMPTY;
         snapshot.craft = [ItemStack::EMPTY; 9];
         snapshot.craft_result = ItemStack::EMPTY;
@@ -39,6 +40,7 @@ pub fn apply_window(ui: &mut UiApp, state: &WindowSnapshot) -> Result<bool, &'st
     } else {
         snapshot.window_id = state.guard.id;
         snapshot.window_revision = state.guard.revision;
+        snapshot.window_read_only = state.read_only;
         snapshot.cursor = stack(state.cursor)?;
         for (index, raw) in state.craft.iter().copied().enumerate() {
             snapshot.craft[index] = stack(raw)?;

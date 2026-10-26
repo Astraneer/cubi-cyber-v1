@@ -482,6 +482,8 @@ pub struct ViewHorizon {
     plan_generation: u64,
     last_request: Option<(u32, [i64; 2], u64)>,
     projection: Option<Projection>,
+    candidate_projection: Option<Projection>,
+    committed_projection: Option<Projection>,
     quality: SelectionQuality,
     requested_selection: (u32, f64),
     candidate_selection: Option<(u32, f64)>,
@@ -604,6 +606,8 @@ impl ViewHorizon {
             plan_generation: 0,
             last_request: None,
             projection: None,
+            candidate_projection: None,
+            committed_projection: None,
             quality: SelectionQuality::default(),
             requested_selection: (2_u32 << config.horizon_level, config.screen_error_pixels),
             candidate_selection: None,
@@ -855,6 +859,7 @@ impl ViewHorizon {
                     .any(|tile| wire_key(tile.key) == *key)
         });
         self.quality = result.quality;
+        self.candidate_projection = self.projection;
         self.candidate_selection = Some(self.requested_selection);
         self.exact_leaves = result.exact_leaves.into_iter().collect();
         let keys = self.cache.wanted().map(wire_key).collect::<Vec<_>>();
@@ -1075,8 +1080,34 @@ impl ViewHorizon {
         self.committed_horizon_pages() == Some(horizon_pages)
     }
     pub fn error_selection_applied(&self, maximum_error_pixels: f64) -> bool {
-        self.has_committed_front()
-            && self.projection.is_some()
+        self.has_committed_front() && self.committed_error_satisfies(maximum_error_pixels)
+    }
+    /// Initial Loading frames keep the normal upload budget until the requested
+    /// cover and its error certificate have actually committed. This needs no
+    /// scene encode; later settings changes retain the existing presented front.
+    pub fn initial_inputs_ready(&self) -> bool {
+        if self.display_space != 0 {
+            return true;
+        }
+        // A fully near-covered selection may legitimately publish no Far tiles.
+        // An initially empty cache or an uncommitted candidate is not that proof.
+        let committed_empty = self.committed_plan_id != 0
+            && self.committed_plan_id == self.accepted_plan_id
+            && self.accepted_plan_id == self.plan_id
+            && self
+                .last_request
+                .is_some_and(|(_, _, generation)| generation == self.plan_generation)
+            && self.cache.wanted().len() == 0
+            && self.enabled
+            && self.guard_ready
+            && self.water_guard_ready();
+        (self.has_committed_front() || committed_empty)
+            && self.committed_selection == Some(self.requested_selection)
+            && self.committed_error_satisfies(self.requested_selection.1)
+    }
+    fn committed_error_satisfies(&self, maximum_error_pixels: f64) -> bool {
+        self.projection.is_some()
+            && self.committed_projection == self.projection
             && self
                 .committed_selection
                 .is_some_and(|(_, error)| error == maximum_error_pixels)
@@ -1377,8 +1408,11 @@ impl ViewHorizon {
             if self
                 .front
                 .get(&page)
-                .or_else(|| self.staged.get(&page))
                 .is_some_and(|resident| resident.stamp == stamp)
+                || self
+                    .staged
+                    .get(&page)
+                    .is_some_and(|resident| resident.stamp == stamp)
             {
                 continue;
             }
@@ -1546,6 +1580,7 @@ impl ViewHorizon {
             self.dirty = false;
             self.committed_selection = self.candidate_selection;
             self.committed_quality = self.quality;
+            self.committed_projection = self.candidate_projection;
             self.committed_plan_id = self.accepted_plan_id;
             self.enabled = self.near_radius.is_some() && self.guard_ready;
         }

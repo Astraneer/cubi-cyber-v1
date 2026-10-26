@@ -1472,7 +1472,7 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, CodecError> {
         ),
         26 => ServerMessage::WaterUnavailable(input.page()?),
         27 => ServerMessage::AudioCue(
-            audio_cue::Cue::decode(read_blob(&mut input, 64)?)
+            audio_cue::Cue::decode(read_blob(&mut input, audio_cue::MAX_BYTES)?)
                 .map_err(|_| CodecError::InvalidBounds)?,
         ),
         30 => {

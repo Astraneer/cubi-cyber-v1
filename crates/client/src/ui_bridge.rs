@@ -127,6 +127,7 @@ struct AuthorityStamp {
 struct WindowStamp {
     guard: net::window::WindowGuard,
     closed: bool,
+    read_only: bool,
     progress: u16,
     fuel: u16,
     energy: u64,
@@ -183,6 +184,7 @@ impl UiBridge {
             window: network.window().map(|state| WindowStamp {
                 guard: state.guard,
                 closed: state.closed,
+                read_only: state.read_only,
                 progress: state.progress,
                 fuel: state.fuel,
                 energy: state.energy,

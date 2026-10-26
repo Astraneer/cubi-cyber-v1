@@ -46,7 +46,7 @@ fn reply(id: ActionId, status: ActionStatus) -> ActionReply {
     }
 }
 #[test]
-fn accepted_effect_is_once_rejections_are_silent_and_other_spaces_are_excluded() {
+fn accepted_bucket_plant_break_is_once_rejections_are_silent_and_other_spaces_are_excluded() {
     let mut network = connection(1);
     let mut sounds = ConfirmedBlockSounds::default();
     let position = BlockPos {
@@ -57,10 +57,10 @@ fn accepted_effect_is_once_rejections_are_silent_and_other_spaces_are_excluded()
     };
     let id = network
         .action(
-            Action::Place {
+            Action::UseBucket {
                 position,
-                expected: Cell::AIR,
-                cell: Cell::from_parts(rules::ids::CHEST, 0),
+                expected: Cell::from_parts(rules::ids::TALL_GRASS, 0),
+                inventory: guard(),
             },
             false,
             0,
@@ -68,13 +68,13 @@ fn accepted_effect_is_once_rejections_are_silent_and_other_spaces_are_excluded()
         .unwrap();
     network
         .action(
-            Action::Place {
+            Action::UseBucket {
                 position: BlockPos {
                     space: SpaceId(1),
                     ..position
                 },
-                expected: Cell::AIR,
-                cell: Cell::from_parts(rules::ids::STONE, 0),
+                expected: Cell::from_parts(rules::ids::TALL_GRASS, 0),
+                inventory: guard(),
             },
             false,
             0,
@@ -88,17 +88,17 @@ fn accepted_effect_is_once_rejections_are_silent_and_other_spaces_are_excluded()
         .unwrap();
     sounds.observe(&network);
     let cue = sounds.reply(network.take_reply().unwrap()).unwrap();
-    assert_eq!(cue.event, "block.wood.step");
+    assert_eq!(cue.event, "block.grass.dig");
     assert_eq!(cue.gain, 1.0);
     assert_eq!(cue.position, [12.5, 80.5, 4.5]);
     assert!(sounds.reply(reply(id, ActionStatus::Accepted)).is_none());
     assert_eq!(sounds.played(), 1);
     let id = network
         .action(
-            Action::Mine {
+            Action::UseBucket {
                 position,
-                expected: Cell::from_parts(rules::ids::GLASS, 0),
-                tool: 0,
+                expected: Cell::from_parts(rules::ids::TALL_GRASS, 0),
+                inventory: guard(),
             },
             false,
             2,
@@ -122,15 +122,15 @@ fn observing_steady_pending_actions_allocates_nothing_and_session_change_clears_
     let mut sounds = ConfirmedBlockSounds::default();
     let id = network
         .action(
-            Action::Mine {
+            Action::UseBucket {
                 position: BlockPos {
                     space: SpaceId(0),
                     x: 1,
                     y: 2,
                     z: 3,
                 },
-                expected: Cell::from_parts(rules::ids::STONE, 0),
-                tool: 0,
+                expected: Cell::from_parts(rules::ids::TALL_GRASS, 0),
+                inventory: guard(),
             },
             false,
             0,
@@ -149,4 +149,15 @@ fn observing_steady_pending_actions_allocates_nothing_and_session_change_clears_
     sounds.observe(&next);
     assert!(sounds.reply(reply(id, ActionStatus::Accepted)).is_none());
     assert_eq!(sounds.played(), 0);
+}
+
+fn guard() -> net::InventoryGuard {
+    net::InventoryGuard {
+        revision: 1,
+        selected: 0,
+        item: rules::items::I_WATER_BUCKET,
+        count: 1,
+        damage: 0,
+        payload: 0,
+    }
 }
