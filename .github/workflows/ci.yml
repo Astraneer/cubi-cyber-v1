@@ -82,20 +82,20 @@ jobs:
       - name: Compile Windows shell and all native targets
         run: |
           source tools/env.sh
-          cargo check --locked --workspace --all-targets
-          cargo test --locked -p core-types -p telemetry
+          bash tools/check_one.sh 'Windows native targets' cargo check --locked --workspace --all-targets
+          bash tools/check_one.sh 'Windows core and telemetry' cargo test --locked -p core-types -p telemetry
       - name: Render shared sky with D3D12 WARP
         run: |
           source tools/env.sh
-          cargo test --locked -p render --test software_sky -- --nocapture
+          bash tools/check_one.sh 'Windows WARP sky' cargo test --locked -p render --test software_sky -- --nocapture
       - name: Validate local material pipelines with D3D12 WARP
         run: |
           source tools/env.sh
-          cargo test --locked -p render --test material_pack -- --test-threads=1 --nocapture
+          bash tools/check_one.sh 'Windows WARP material pack' cargo test --locked -p render --test material_pack -- --test-threads=1 --nocapture
       - name: Validate authoritative light and shadow buffers with D3D12 WARP
         run: |
           source tools/env.sh
-          cargo test --locked -p client --test lighting_gpu -- --test-threads=1 --nocapture
+          bash tools/check_one.sh 'Windows WARP authoritative light' cargo test --locked -p client --test lighting_gpu -- --test-threads=1 --nocapture
       - name: Present three native Windows frames
         run: bash tools/windows_native_smoke.sh
       - name: Build portable Windows bundle
