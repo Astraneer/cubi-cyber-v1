@@ -630,3 +630,132 @@ fn typed_drop_bundle_keeps_owned_payload_reference_and_replay_guard() {
         survival::plan_drops(&world, anchor, [9; 16], 701, Tick(99), &[typed], 10, None).unwrap();
     assert_eq!(replay.data.payload, *data);
 }
+
+#[test]
+fn crop_growth_uses_canonical_night_darkness_without_changing_raw_sky_or_block_light() {
+    for (tick, block, expected_age) in [(6000, 0, 1), (18000, 0, 0), (18000, 12, 1)] {
+        let now = Tick(tick);
+        let mut world = scene();
+        let crop = pos(0, 2, 0);
+        let mut tx = Transaction::new(Tick(0), SpaceId(0));
+        tx.set_cell(pos(0, 1, 0), Cell::from_parts(FARMLAND, 7));
+        tx.set_cell(pos(4, 1, 0), Cell::from_parts(WATER, 0));
+        tx.set_cell(crop, Cell::from_parts(WHEAT, 0));
+        tx.set_light(
+            crop,
+            world::LightSample {
+                sky: 15,
+                block,
+                rgb: [block; 3],
+            },
+        );
+        world.commit(tx).unwrap();
+        let seed = (0..10000u64)
+            .find(|&seed| {
+                core_types::DeterministicRng::from_key(seed, 0x4641524d, 0, tick).below(7)
+                    == Some(0)
+            })
+            .unwrap();
+        let mut runtime = SurvivalRuntime::with_seed(4, seed);
+        runtime
+            .register(
+                Event::FarmSample(crop, survival::farm_sample_token(now, 0).unwrap()),
+                now,
+            )
+            .unwrap();
+        let plan = runtime.plan_tick(&world, now, Budget::default()).unwrap();
+        assert_eq!(plan.work.events, 1);
+        for tx in plan.transactions {
+            world.commit(tx).unwrap();
+        }
+        runtime.acknowledge(plan.delta).unwrap();
+        assert_eq!(
+            world.read(crop),
+            CellRead::Known(Cell::from_parts(WHEAT, expected_age))
+        );
+        assert_eq!(
+            world
+                .page(crop.page())
+                .unwrap()
+                .light(crop.local_index())
+                .sky,
+            15
+        );
+        assert_eq!(
+            world
+                .page(crop.page())
+                .unwrap()
+                .light(crop.local_index())
+                .block,
+            block
+        );
+    }
+}
+
+#[test]
+fn fluid_read_reservation_refunds_unused_work_but_keeps_whole_event_admission() {
+    let mut world = World::new(rules::properties, 1024);
+    let page = pos(0, 0, 0).page();
+    let water = Cell::from_parts(WATER, 0);
+    let mut tx = Transaction::new(Tick(0), SpaceId(0));
+    tx.create_page(page, vec![water; PAGE_VOLUME]);
+    world.commit(tx).unwrap();
+    let mut owner = SurvivalRuntime::new(256);
+    for i in 0..128 {
+        owner
+            .register(
+                Event::Fluid(pos(2 + i % 8, 2 + i / 64, 2 + (i / 8) % 8), Liquid::Water),
+                Tick(1),
+            )
+            .unwrap();
+    }
+    let original = owner.snapshot().encode();
+    let blocked = owner
+        .plan_tick(
+            &world,
+            Tick(20),
+            Budget {
+                cells: 2047,
+                ..Budget::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(blocked.work.events, 0);
+    assert_eq!(blocked.work.reads, 0);
+    let single = owner
+        .plan_tick(
+            &world,
+            Tick(20),
+            Budget {
+                cells: 2048,
+                ..Budget::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(single.work.events, 1);
+    assert!(single.work.reads > 0 && single.work.reads < 2048);
+    let plan = owner
+        .plan_tick(&world, Tick(20), Budget::default())
+        .unwrap();
+    assert_eq!(
+        plan.work.events, 128,
+        "stable actual water events share the released reservation"
+    );
+    assert!(plan.work.reads >= 128 && plan.work.reads < 2048);
+    assert_eq!(plan.work.writes, 0);
+    assert!(plan.transactions.is_empty());
+    assert_eq!(
+        owner.snapshot().encode(),
+        original,
+        "planning cannot consume events"
+    );
+    owner.acknowledge(plan.delta).unwrap();
+    assert!(owner.is_empty());
+    assert!(
+        owner
+            .plan_tick(&world, Tick(21), Budget::default())
+            .unwrap()
+            .delta
+            .is_empty()
+    );
+}

@@ -562,4 +562,21 @@ fn shared_view_composes_near_models_hdr_and_dynamic_shadows_then_remains_idle() 
         view.lighting_stats().unwrap().dynamic_shadow_draws,
         light.dynamic_shadow_draws
     );
+    view.set_place_key(true, true);
+    view.set_key(client::view::InputKey::Place, false);
+    view.set_key(client::view::InputKey::Sneak, false);
+    let pressed = view.take_remote_input();
+    assert!(pressed.place_pressed && pressed.place_sneaking && !pressed.placing);
+    assert_eq!(pressed.keys & net::InputFrame::SNEAK, 0);
+    let consumed = view.take_remote_input();
+    assert!(!consumed.place_pressed && !consumed.place_sneaking);
+    view.set_key(client::view::InputKey::Sneak, true);
+    view.set_place_key(true, false);
+    view.set_key(client::view::InputKey::Place, false);
+    let physical = view.take_remote_input();
+    assert!(
+        physical.place_pressed && !physical.place_sneaking,
+        "physical pointer Shift is independent of rebindable Sneak"
+    );
+    view.clear_keys();
 }

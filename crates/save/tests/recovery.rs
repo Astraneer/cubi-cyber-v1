@@ -386,3 +386,73 @@ fn background_writer_drains_queued_writes_and_returns_durability_tickets() {
     let (_store, recovery) = Store::open(&directory.0).unwrap();
     assert_eq!(recovery.batches.len(), 1);
 }
+
+#[test]
+fn writer_publishes_exact_durable_wal_bytes_and_resets_after_checkpoint() {
+    let directory = Directory::new();
+    let (mut store, _) = Store::open(&directory.0).unwrap();
+    let mut world = world();
+    store.checkpoint(&snapshot(&world, 0)).unwrap();
+    let initial = store.wal_bytes().unwrap();
+    let writer = SaveWorker::spawn(store, 2).unwrap();
+    assert_eq!(writer.wal_bytes(), initial);
+    let mut batch = Batch::empty(Tick(1));
+    batch.changes.push(edit(&mut world, 1));
+    writer
+        .try_submit(WriteRequest::Batch { ticket: 1, batch })
+        .unwrap_or_else(|_| panic!("writer space"));
+    let wait = |ticket| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match writer.try_complete() {
+                Ok(completion) => {
+                    assert_eq!(completion.ticket, ticket);
+                    return completion.result.unwrap();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("writer {error:?}"),
+            }
+        }
+    };
+    assert!(matches!(wait(1), Durability::Batch { sequence: 1 }));
+    let durable = writer.wal_bytes();
+    assert!(durable > initial);
+    assert_eq!(
+        durable,
+        std::fs::metadata(directory.0.join("world.wal"))
+            .unwrap()
+            .len()
+    );
+    let image = snapshot(&world, 1);
+    writer
+        .try_submit(WriteRequest::Checkpoint {
+            ticket: 2,
+            checkpoint: world.checkpoint(),
+            metadata: SnapshotMetadata {
+                server_tick: image.server_tick,
+                public_seed: image.public_seed,
+                generator_version: image.generator_version,
+                rules_version: image.rules_version,
+                identities: image.identities,
+                players: image.players,
+                dedup: image.dedup,
+                runtimes: image.runtimes,
+            },
+        })
+        .unwrap_or_else(|_| panic!("checkpoint space"));
+    assert!(matches!(wait(2), Durability::Checkpoint { sequence: 1 }));
+    assert_eq!(writer.wal_bytes(), initial);
+    assert_eq!(
+        writer.wal_bytes(),
+        std::fs::metadata(directory.0.join("world.wal"))
+            .unwrap()
+            .len()
+    );
+    drop(writer);
+    let (_store, recovery) = Store::open(&directory.0).unwrap();
+    assert_eq!(recovery.snapshot.unwrap().record_sequence, 1);
+    assert!(recovery.batches.is_empty());
+}

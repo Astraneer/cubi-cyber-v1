@@ -11,6 +11,7 @@ pub mod entity_models;
 pub mod environment_gpu;
 pub mod gi;
 pub mod gi_directional;
+mod gi_model;
 pub mod gpu_time;
 pub mod height_gpu;
 pub mod height_tile;
@@ -25,6 +26,7 @@ pub mod terrain_gpu;
 pub mod terrain_mesh;
 pub mod terrain_unit;
 pub mod water_gpu;
+pub mod water_reflection;
 
 pub const MSAA_SAMPLES: u32 = 4;
 mod sampling;
@@ -398,3 +400,8 @@ impl Readback {
         })
     }
 }
+
+mod ambient_mrt;
+pub mod contact_ao;
+
+pub mod near_cover;

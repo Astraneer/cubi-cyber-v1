@@ -102,11 +102,11 @@ impl<'a> Stage<'a> {
             if !matches!(blocks::bdef(cell.id()).be,Some(BeKind::Mek(kind)) if kind==before.kind) {
                 return Err(MachineError::Component);
             }
-            MachineChange {
+            Box::new(MachineChange {
                 version,
                 before: before.clone(),
                 after: before,
-            }
+            })
         };
         self.local.machines.insert(id, change);
         Ok(())
@@ -515,29 +515,12 @@ impl MachineWorld for Stage<'_> {
     }
     fn push_slot(&mut self, p: [i32; 3], face: Face, slot: machines::Slot) -> u16 {
         let result = (|| {
-            let (stack, payload) = slot.to_item().map_err(|_| MachineError::Encoding)?;
-            let mut temporary = None;
-            if let Some(payload) = payload {
-                let id = payload.id();
-                match self.local.payloads.entry(id) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(payload);
-                        temporary = Some(id);
-                    }
-                    std::collections::btree_map::Entry::Occupied(entry) => {
-                        if entry.get() != &payload {
-                            return Err(MachineError::Encoding);
-                        }
-                    }
-                }
-            }
             let position = BlockPos {
                 space: self.current_space(),
                 x: p[0],
                 y: p[1],
                 z: p[2],
             };
-            let accepted = self.push_items_result(position, face, stack)?;
             let normalized = offset(position, face)
                 .ok()
                 .and_then(|p| {
@@ -547,10 +530,20 @@ impl MachineWorld for Stage<'_> {
                 })
                 .and_then(|id| self.world.component(id))
                 .is_some_and(|r| r.data.kind == MACHINE_COMPONENT);
+            let (stack, payload) = slot.to_item().map_err(|_| MachineError::Encoding)?;
+            let mut temporary = None;
+            if let Some(payload) = payload {
+                match self.admit_payload(payload, !normalized)? {
+                    payload_admission::Admission::Full => return Ok(0),
+                    payload_admission::Admission::Inserted(id) => temporary = Some(id),
+                    payload_admission::Admission::Reused => {}
+                }
+            }
+            let accepted = self.push_items_result(position, face, stack)?;
             if (accepted == 0 || normalized)
                 && let Some(id) = temporary
             {
-                self.local.payloads.remove(&id);
+                self.release_payload(id);
             }
             Ok(accepted)
         })();
@@ -713,6 +706,7 @@ impl Overlay {
                 .and_modify(|old| old.after = patch.after)
                 .or_insert(patch);
         }
+        self.payload_bytes += local.payload_bytes;
         self.payloads.extend(local.payloads);
         self.item_spawns.extend(local.item_spawns);
         for (position, (before, after)) in local.cells {

@@ -49,6 +49,20 @@ impl PublicGeometryData {
     }
 }
 pub fn geometry_from_page(page: &Page, public_tints: Option<&[u16; 256]>) -> PublicGeometryData {
+    geometry_from_read(|index| Some(page.cell(index)), public_tints)
+}
+pub fn geometry_from_cells(
+    cells: &[core_types::Cell; 4096],
+    public_tints: Option<&[u16; 256]>,
+) -> PublicGeometryData {
+    geometry_from_read(|index| Some(cells[usize::from(index.get())]), public_tints)
+}
+/// Shared public policy for resident and cold immutable sources. Unknown stays
+/// outside the known mask; private ore IDs always become host stone.
+pub fn geometry_from_read(
+    mut read: impl FnMut(LocalIdx) -> Option<core_types::Cell>,
+    public_tints: Option<&[u16; 256]>,
+) -> PublicGeometryData {
     let mut out = PublicGeometryData {
         known: [0; 512],
         occupied: [0; 512],
@@ -61,10 +75,8 @@ pub fn geometry_from_page(page: &Page, public_tints: Option<&[u16; 256]>) -> Pub
     let mut indices = [0u16; 4096];
     for (index, output_palette) in indices.iter_mut().enumerate() {
         let at = LocalIdx::new(index as u16).expect("page index");
-        let mut cell = page.cell(at);
-        if ore(cell.id()) {
-            cell = core_types::Cell::from_parts(rules::ids::STONE, 0);
-        }
+        let Some(mut cell) = read(at) else { continue };
+        cell = redact_private_material(cell);
         let Some(definition) = rules::block(cell.id()) else {
             continue;
         };
@@ -122,6 +134,13 @@ pub fn geometry_from_page(page: &Page, public_tints: Option<&[u16; 256]>) -> Pub
         }
     }
     out
+}
+pub(crate) fn redact_private_material(cell: core_types::Cell) -> core_types::Cell {
+    if ore(cell.id()) {
+        core_types::Cell::from_parts(rules::ids::STONE, 0)
+    } else {
+        cell
+    }
 }
 fn ore(id: u16) -> bool {
     matches!(

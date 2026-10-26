@@ -2,7 +2,10 @@
 //! Decoder loops are bounded validation, never generator/mesher execution.
 use super::*;
 use render::lod_gpu::ProxyPayload;
-const MAX_BYTES: usize = 180_000;
+pub const MAX_BACKGROUND_BYTES: usize = 450_000;
+// CHR4 Proxy envelope: magic/type/status6 +stamp32 +revision8 +length4.
+const _: () = assert!(render::lod_gpu::MAX_PUBLIC_BYTES + 50 <= MAX_BACKGROUND_BYTES);
+const MAX_BYTES: usize = MAX_BACKGROUND_BYTES;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireError {
     Length,
@@ -18,12 +21,12 @@ impl std::fmt::Display for WireError {
 impl std::error::Error for WireError {}
 pub fn encode_background_task(task: &BackgroundTask) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::with_capacity(30_000);
-    out.extend_from_slice(b"CHJ2");
+    out.extend_from_slice(b"CHJ4");
     match task {
         BackgroundTask::Plan(task) => {
-            if task.refine.len() > 512
-                || task.certificates.len() > 4096
-                || task.previous.len() > 512
+            if task.refine.len() > net::height::MAX_TILES
+                || task.certificates.len() > net::height::MAX_SOURCES
+                || task.previous.len() > net::height::MAX_TILES
             {
                 return Err(WireError::Length);
             }
@@ -41,6 +44,14 @@ pub fn encode_background_task(task: &BackgroundTask) -> Result<Vec<u8>, WireErro
             out.push(task.config.horizon_level);
             w64(&mut out, task.config.screen_error_pixels.to_bits());
             w64(&mut out, task.config.hysteresis_pixels.to_bits());
+            out.push(u8::from(task.config.near_volume.is_some()));
+            if let Some(volume) = task.config.near_volume {
+                for p in volume {
+                    for c in p {
+                        w32(&mut out, c as u32);
+                    }
+                }
+            }
             w32(&mut out, task.space);
             for n in task.camera {
                 w64(&mut out, n as u64);
@@ -90,6 +101,7 @@ pub fn encode_background_task(task: &BackgroundTask) -> Result<Vec<u8>, WireErro
             stamp_write(&mut out, task.stamp);
             w64(&mut out, task.revision);
             w32(&mut out, task.atlas_layers);
+            out.push(u8::from(task.separate_water));
             out.extend_from_slice(&task.input.known);
             out.extend_from_slice(&task.input.occupied);
             out.push(task.input.index_bits);
@@ -106,6 +118,11 @@ pub fn encode_background_task(task: &BackgroundTask) -> Result<Vec<u8>, WireErro
             }
             out.extend_from_slice(&task.input.indices);
         }
+        BackgroundTask::Water { context, task } => {
+            out.push(3);
+            water_context_write(&mut out, *context);
+            out.extend_from_slice(&task.encode().map_err(|_| WireError::Invalid)?);
+        }
     }
     if out.len() > MAX_BYTES {
         return Err(WireError::Length);
@@ -117,7 +134,7 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
         return Err(WireError::Length);
     }
     let mut r = Reader { bytes, at: 0 };
-    if r.take::<4>()? != *b"CHJ2" {
+    if r.take::<4>()? != *b"CHJ4" {
         return Err(WireError::Magic);
     }
     let task = match r.u8()? {
@@ -131,14 +148,30 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
             let horizon_level = r.u8()?;
             let screen_error_pixels = f64::from_bits(r.u64()?);
             let hysteresis_pixels = f64::from_bits(r.u64()?);
+            let near_volume = match r.u8()? {
+                0 => None,
+                1 => {
+                    let mut volume = [[0; 3]; 2];
+                    for p in &mut volume {
+                        for c in p {
+                            *c = r.u32()? as i32;
+                        }
+                    }
+                    Some(volume)
+                }
+                _ => return Err(WireError::Invalid),
+            };
+            if !valid_near_volume(near_volume) {
+                return Err(WireError::Invalid);
+            }
             let space = r.u32()?;
             let camera = [r.u64()? as i64, r.u64()? as i64];
             let near_radius = i64::from(r.u32()?);
             let n = r.u16()? as usize;
             if id == 0
-                || !(16..=512).contains(&max_tiles)
+                || !(16..=net::height::MAX_TILES).contains(&max_tiles)
                 || max_sources < max_tiles
-                || max_sources > 4096
+                || max_sources > net::height::MAX_SOURCES
                 || max_proxy_pages == 0
                 || max_proxy_pages > 512
                 || atlas_layers == 0
@@ -150,7 +183,7 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
                 || hysteresis_pixels < 0.
                 || hysteresis_pixels >= screen_error_pixels
                 || near_radius > 128
-                || n > 512
+                || n > net::height::MAX_TILES
                 || camera
                     .iter()
                     .any(|p| *p < i64::from(i32::MIN) / 16 || *p > i64::from(i32::MAX) / 16)
@@ -187,7 +220,9 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
                 _ => return Err(WireError::Invalid),
             };
             let count = r.u16()? as usize;
-            if count > 4096 || r.bytes.len().saturating_sub(r.at) < count * 38 + 2 {
+            if count > net::height::MAX_SOURCES
+                || r.bytes.len().saturating_sub(r.at) < count * 38 + 2
+            {
                 return Err(WireError::Length);
             }
             let mut certificates = Vec::with_capacity(count);
@@ -222,7 +257,7 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
                 return Err(WireError::Invalid);
             }
             let count = r.u16()? as usize;
-            if count > 512 || r.bytes.len().saturating_sub(r.at) != count * 13 {
+            if count > net::height::MAX_TILES || r.bytes.len().saturating_sub(r.at) != count * 13 {
                 return Err(WireError::Length);
             }
             let mut previous = Vec::with_capacity(count);
@@ -240,6 +275,7 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
                     horizon_level,
                     screen_error_pixels,
                     hysteresis_pixels,
+                    near_volume,
                 },
                 space,
                 camera,
@@ -254,6 +290,11 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
             let stamp = stamp_read(&mut r)?;
             let revision = r.u64()?;
             let atlas_layers = r.u32()?;
+            let separate_water = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(WireError::Invalid),
+            };
             let known = r.take::<512>()?;
             let occupied = r.take::<512>()?;
             let index_bits = r.u8()?;
@@ -304,7 +345,17 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
                 revision,
                 atlas_layers,
                 input,
+                separate_water,
             })
+        }
+        3 => {
+            let context = water_context_read(&mut r)?;
+            let task = FarWaterTask::decode(&r.bytes[r.at..]).map_err(|_| WireError::Invalid)?;
+            r.at = r.bytes.len();
+            if task.stamp() != context.stamp {
+                return Err(WireError::Invalid);
+            }
+            BackgroundTask::Water { context, task }
         }
         _ => return Err(WireError::Invalid),
     };
@@ -324,6 +375,10 @@ pub fn execute_background_request(
     let result = match task {
         BackgroundTask::Plan(task) => BackgroundResult::Plan(task.execute()),
         BackgroundTask::Proxy(task) => BackgroundResult::Proxy(task.execute()),
+        BackgroundTask::Water { context, task } => BackgroundResult::Water {
+            context,
+            result: task.execute(&cancel),
+        },
     };
     if cancel() {
         return Err(WireError::Cancelled);
@@ -332,12 +387,12 @@ pub fn execute_background_request(
 }
 fn encode_result(result: &BackgroundResult) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::with_capacity(10_000);
-    out.extend_from_slice(b"CHR2");
+    out.extend_from_slice(b"CHR4");
     match result {
         BackgroundResult::Plan(Err(_)) => out.extend_from_slice(&[1, 1]),
         BackgroundResult::Proxy(Err(_)) => out.extend_from_slice(&[2, 1]),
         BackgroundResult::Plan(Ok(result)) => {
-            if result.plan.tiles.len() > 512 {
+            if result.plan.tiles.len() > net::height::MAX_TILES {
                 return Err(WireError::Length);
             }
             out.extend_from_slice(&[1, 0]);
@@ -379,6 +434,13 @@ fn encode_result(result: &BackgroundResult) -> Result<Vec<u8>, WireError> {
             w32(&mut out, payload.len() as u32);
             out.extend_from_slice(&payload);
         }
+        BackgroundResult::Water { context, result } => {
+            out.extend_from_slice(&[3, u8::from(result.is_err())]);
+            water_context_write(&mut out, *context);
+            if let Ok(built) = result {
+                out.extend_from_slice(&built.encode().map_err(|_| WireError::Invalid)?);
+            }
+        }
     }
     if out.len() > MAX_BYTES {
         return Err(WireError::Length);
@@ -390,7 +452,7 @@ pub fn decode_background_result(bytes: &[u8]) -> Result<BackgroundResult, WireEr
         return Err(WireError::Length);
     }
     let mut r = Reader { bytes, at: 0 };
-    if r.take::<4>()? != *b"CHR2" {
+    if r.take::<4>()? != *b"CHR4" {
         return Err(WireError::Magic);
     }
     let kind = r.u8()?;
@@ -398,6 +460,21 @@ pub fn decode_background_result(bytes: &[u8]) -> Result<BackgroundResult, WireEr
     let result = match (kind, status) {
         (1, 1) => BackgroundResult::Plan(Err(Error::Plan)),
         (2, 1) => BackgroundResult::Proxy(Err(ProxyError::InvalidMaterial)),
+        (3, 0) | (3, 1) => {
+            let context = water_context_read(&mut r)?;
+            let result = if status == 0 {
+                let built =
+                    BuiltFarWater::decode(&r.bytes[r.at..]).map_err(|_| WireError::Invalid)?;
+                r.at = r.bytes.len();
+                if built.stamp != context.stamp {
+                    return Err(WireError::Invalid);
+                }
+                Ok(built)
+            } else {
+                Err(far_water_worker::Error::Mesh)
+            };
+            BackgroundResult::Water { context, result }
+        }
         (1, 0) => {
             let id = r.u64()?;
             let generation = r.u64()?;
@@ -424,8 +501,8 @@ pub fn decode_background_result(bytes: &[u8]) -> Result<BackgroundResult, WireEr
             let leaf_limited = r.u64()?;
             let maximum_error_pixels = f64::from_bits(r.u64()?);
             let sse_refinements = r.u64()?;
-            if missing_certificates > 512
-                || leaf_limited > 512
+            if missing_certificates > net::height::MAX_TILES as u64
+                || leaf_limited > net::height::MAX_TILES as u64
                 || maximum_error_pixels.is_nan()
                 || maximum_error_pixels < 0.
                 || sse_refinements > 8192
@@ -440,7 +517,9 @@ pub fn decode_background_result(bytes: &[u8]) -> Result<BackgroundResult, WireEr
                 sse_refinements,
             };
             let exact_count = r.u16()? as usize;
-            if exact_count > 512 || r.bytes.len().saturating_sub(r.at) < exact_count * 13 {
+            if exact_count > net::height::MAX_TILES
+                || r.bytes.len().saturating_sub(r.at) < exact_count * 13
+            {
                 return Err(WireError::Length);
             }
             let mut exact_leaves = Vec::with_capacity(exact_count);
@@ -463,7 +542,7 @@ pub fn decode_background_result(bytes: &[u8]) -> Result<BackgroundResult, WireEr
             ];
             let n = r.u16()? as usize;
             if id == 0
-                || n > 512
+                || n > net::height::MAX_TILES
                 || bounds[0] >= bounds[2]
                 || bounds[1] >= bounds[3]
                 || r.bytes.len().saturating_sub(r.at) != n * 17
@@ -535,6 +614,38 @@ fn key_write(out: &mut Vec<u8>, key: HeightKey) {
     out.push(key.level);
     w32(out, key.x as u32);
     w32(out, key.z as u32);
+}
+fn water_context_write(out: &mut Vec<u8>, context: far_water_source::Context) {
+    w64(out, context.epoch);
+    stamp_write(
+        out,
+        GeometryStamp {
+            page: context.stamp.page,
+            source: context.stamp.geometry_source,
+            view: context.stamp.geometry_view,
+        },
+    );
+    w64(out, context.stamp.column_source);
+    w64(out, context.stamp.water_view);
+}
+fn water_context_read(r: &mut Reader<'_>) -> Result<far_water_source::Context, WireError> {
+    let epoch = r.u64()?;
+    let geometry = stamp_read(r)?;
+    let column_source = r.u64()?;
+    let water_view = r.u64()?;
+    if epoch == 0 || column_source == 0 || water_view == 0 {
+        return Err(WireError::Invalid);
+    }
+    Ok(far_water_source::Context {
+        epoch,
+        stamp: far_water_worker::Stamp {
+            page: geometry.page,
+            geometry_source: geometry.source,
+            geometry_view: geometry.view,
+            column_source,
+            water_view,
+        },
+    })
 }
 fn key_read(r: &mut Reader<'_>) -> Result<HeightKey, WireError> {
     let key = HeightKey {

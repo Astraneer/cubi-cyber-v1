@@ -1,6 +1,7 @@
 //! Worker-only SSE selection over public height certificates. Unknown error is
 //! kept explicit. Capacity can limit requested quality, never protected geometry.
 use super::*;
+use crate::height_neighbors::ancestor_neighbour;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Projection {
@@ -143,7 +144,21 @@ pub struct SelectionQuality {
     pub maximum_error_pixels: f64,
     pub sse_refinements: u64,
 }
-pub(super) fn seam_error_q1024(heights: &[i32; 289]) -> u64 {
+fn fully_near(certificate: Certificate, volume: Option<[[i32; 3]; 2]>) -> bool {
+    let Some([min, max]) = volume else {
+        return false;
+    };
+    let Some(b) = render_key(certificate.key).bounds() else {
+        return false;
+    };
+    b[0] >= i64::from(min[0]) * 16
+        && b[1] >= i64::from(min[2]) * 16
+        && b[2] <= i64::from(max[0]) * 16
+        && b[3] <= i64::from(max[2]) * 16
+        && i64::from(certificate.bound.min_height) > i64::from(min[1]) * 16
+        && i64::from(certificate.bound.max_height) <= i64::from(max[1]) * 16
+}
+pub fn seam_error_q1024(heights: &[i32; 289]) -> u64 {
     let mut maximum = 0;
     for i in (1..16).step_by(2) {
         for (a, b, c) in [
@@ -186,27 +201,51 @@ fn balance_from(
     work: &mut PlanWork,
     pending: &mut Vec<HeightTileKey>,
 ) -> Result<(), Error> {
+    let mut indices = tiles
+        .iter()
+        .enumerate()
+        .map(|(i, tile)| (tile.key, i))
+        .collect::<BTreeMap<_, _>>();
     while let Some(key) = pending.pop() {
-        if !tiles.iter().any(|tile| tile.key == key) {
+        if !indices.contains_key(&key) {
             continue;
         }
-        for index in 0..tiles.len() {
-            if work.adjacency_tests + work.seam_tests >= MAX_PLAN_PAIRS {
-                return Err(Error::Capacity);
-            }
-            work.adjacency_tests += 1;
-            let coarse = tiles[index].key;
-            if coarse.level > key.level + 1 && adjacent(key, coarse) {
-                if tiles.len() + 3 > maximum {
+        let mut neighbour = None;
+        'search: for level in key.level + 2..=render::height_tile::MAX_LEVEL {
+            for edge in 0..4 {
+                if work.adjacency_tests + work.seam_tests >= MAX_PLAN_PAIRS {
                     return Err(Error::Capacity);
                 }
-                split(tiles, index);
-                work.refinements += 1;
-                work.base_nodes += 4;
-                pending.push(key);
-                pending.extend(children(coarse));
-                break;
+                work.adjacency_tests += 1;
+                let Some(coarse) = ancestor_neighbour(key, edge, level) else {
+                    continue;
+                };
+                if let Some(&index) = indices.get(&coarse) {
+                    neighbour = Some((coarse, index));
+                    break 'search;
+                }
             }
+        }
+        if let Some((coarse, index)) = neighbour {
+            if tiles.len() + 3 > maximum {
+                return Err(Error::Capacity);
+            }
+            indices.remove(&coarse);
+            tiles.swap_remove(index);
+            if let Some(moved) = tiles.get(index) {
+                indices.insert(moved.key, index);
+            }
+            for child in children(coarse) {
+                indices.insert(child, tiles.len());
+                tiles.push(PlannedHeightTile {
+                    key: child,
+                    seams: 0,
+                });
+                pending.push(child);
+            }
+            work.refinements += 1;
+            work.base_nodes += 4;
+            pending.push(key);
         }
     }
     Ok(())
@@ -219,8 +258,10 @@ pub(super) fn execute_sse(task: &PlanTask, projection: Projection) -> Result<Pla
         task.camera[1].div_euclid(span),
     ];
     let mut tiles = Vec::with_capacity(task.config.max_tiles);
-    for z in center[1] - 2..center[1] + 2 {
-        for x in center[0] - 2..center[0] + 2 {
+    // Five roots per axis retain two full root spans in both directions at
+    // every camera position inside its root bin, including its last page.
+    for z in center[1] - 2..center[1] + 3 {
+        for x in center[0] - 2..center[0] + 3 {
             let key = HeightTileKey {
                 space: task.space,
                 level: task.config.horizon_level,
@@ -231,14 +272,23 @@ pub(super) fn execute_sse(task: &PlanTask, projection: Projection) -> Result<Pla
             tiles.push(PlannedHeightTile { key, seams: 0 });
         }
     }
-    let near = [
-        (task.camera[0] - task.near_radius) * 16,
-        (task.camera[1] - task.near_radius) * 16,
-        (task.camera[0] + task.near_radius + 1) * 16,
-        (task.camera[1] + task.near_radius + 1) * 16,
-    ];
+    let near = if let Some([min, max]) = task.config.near_volume {
+        [
+            i64::from(min[0]) * 16,
+            i64::from(min[2]) * 16,
+            i64::from(max[0]) * 16,
+            i64::from(max[2]) * 16,
+        ]
+    } else {
+        [
+            (task.camera[0] - task.near_radius) * 16,
+            (task.camera[1] - task.near_radius) * 16,
+            (task.camera[0] + task.near_radius + 1) * 16,
+            (task.camera[1] + task.near_radius + 1) * 16,
+        ]
+    };
     let mut work = PlanWork {
-        base_nodes: 16,
+        base_nodes: 25,
         ..PlanWork::default()
     };
     // Protection and the whole near cutout are mandatory, regardless of SSE.
@@ -246,7 +296,7 @@ pub(super) fn execute_sse(task: &PlanTask, projection: Projection) -> Result<Pla
         let mut action = None;
         for (i, tile) in tiles.iter().enumerate() {
             let b = tile.key.bounds().ok_or(Error::Plan)?;
-            if contains(near, b) {
+            if task.config.near_volume.is_none() && contains(near, b) {
                 action = Some((i, false));
                 break;
             }
@@ -279,6 +329,19 @@ pub(super) fn execute_sse(task: &PlanTask, projection: Projection) -> Result<Pla
         .iter()
         .map(|c| (c.key, *c))
         .collect::<BTreeMap<_, _>>();
+    let mut previously_split = BTreeSet::new();
+    for key in &task.previous {
+        let mut key = *key;
+        while key.level < task.config.horizon_level {
+            key = HeightTileKey {
+                level: key.level + 1,
+                x: key.x.div_euclid(2),
+                z: key.z.div_euclid(2),
+                ..key
+            };
+            previously_split.insert(key);
+        }
+    }
     let mut quality = SelectionQuality::default();
     let mut blocked = BTreeSet::new();
     loop {
@@ -291,20 +354,16 @@ pub(super) fn execute_sse(task: &PlanTask, projection: Projection) -> Result<Pla
             let Some(certificate) = certificates.get(&wire_key(tile.key)) else {
                 continue;
             };
-            if !projection.could_be_visible(*certificate) {
+            if fully_near(*certificate, task.config.near_volume)
+                || !projection.could_be_visible(*certificate)
+            {
                 continue;
             }
-            let b = tile.key.bounds().ok_or(Error::Plan)?;
-            let previously_split = task.previous.iter().any(|key| {
-                key.space == tile.key.space
-                    && key.level < tile.key.level
-                    && key.bounds().is_some_and(|p| contains(b, p))
-            });
             let threshold = projection.target_pixels
-                + if previously_split {
+                + if previously_split.contains(&tile.key) {
                     -projection.hysteresis_pixels
                 } else {
-                    projection.hysteresis_pixels
+                    0.
                 };
             let pixels = projection.error_pixels(*certificate);
             let score = pixels / threshold;
@@ -339,7 +398,9 @@ pub(super) fn execute_sse(task: &PlanTask, projection: Projection) -> Result<Pla
     let mut exact_leaves = Vec::new();
     for tile in &tiles {
         if let Some(certificate) = certificates.get(&wire_key(tile.key)) {
-            if !projection.could_be_visible(*certificate) {
+            if fully_near(*certificate, task.config.near_volume)
+                || !projection.could_be_visible(*certificate)
+            {
                 continue;
             }
             let pixels = projection.error_pixels(*certificate);
@@ -364,8 +425,8 @@ pub(super) fn execute_sse(task: &PlanTask, projection: Projection) -> Result<Pla
             outer_bounds_pages: [
                 (center[0] - 2) * span,
                 (center[1] - 2) * span,
-                (center[0] + 2) * span,
-                (center[1] + 2) * span,
+                (center[0] + 3) * span,
+                (center[1] + 3) * span,
             ],
         },
         work,
@@ -374,32 +435,23 @@ pub(super) fn execute_sse(task: &PlanTask, projection: Projection) -> Result<Pla
     })
 }
 fn set_seams(tiles: &mut [PlannedHeightTile], work: &mut PlanWork) -> Result<(), Error> {
-    for i in 0..tiles.len() {
-        for j in i + 1..tiles.len() {
-            if work.adjacency_tests + work.seam_tests >= MAX_PLAN_PAIRS {
-                return Err(Error::Capacity);
+    let keys = tiles.iter().map(|tile| tile.key).collect::<BTreeSet<_>>();
+    for tile in tiles {
+        tile.seams = 0;
+        for level in tile.key.level + 1..=render::height_tile::MAX_LEVEL {
+            for edge in 0..4 {
+                if work.adjacency_tests + work.seam_tests >= MAX_PLAN_PAIRS {
+                    return Err(Error::Capacity);
+                }
+                work.seam_tests += 1;
+                if ancestor_neighbour(tile.key, edge, level).is_some_and(|key| keys.contains(&key))
+                {
+                    if level != tile.key.level + 1 {
+                        return Err(Error::Plan);
+                    }
+                    tile.seams |= 1 << edge;
+                }
             }
-            work.seam_tests += 1;
-            let a = tiles[i].key;
-            let b = tiles[j].key;
-            if !adjacent(a, b) || a.level == b.level {
-                continue;
-            }
-            if a.level.abs_diff(b.level) != 1 {
-                return Err(Error::Plan);
-            }
-            let (fine, coarse) = if a.level < b.level { (i, b) } else { (j, a) };
-            let f = tiles[fine].key.bounds().ok_or(Error::Plan)?;
-            let c = coarse.bounds().ok_or(Error::Plan)?;
-            tiles[fine].seams |= if f[0] == c[2] {
-                1
-            } else if f[2] == c[0] {
-                2
-            } else if f[1] == c[3] {
-                4
-            } else {
-                8
-            };
         }
     }
     Ok(())
@@ -408,6 +460,113 @@ fn set_seams(tiles: &mut [PlannedHeightTile], work: &mut PlanWork) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dyadic_balance_and_seams_match_independent_all_pairs_for_negative_and_positive_cells() {
+        for seed in 1..=16u64 {
+            let mut random = seed;
+            let mut tiles = (-2..2)
+                .flat_map(|z| {
+                    (-2..2).map(move |x| PlannedHeightTile {
+                        key: HeightTileKey {
+                            space: 7,
+                            level: 5,
+                            x,
+                            z,
+                        },
+                        seams: 0,
+                    })
+                })
+                .collect::<Vec<_>>();
+            for _ in 0..64 {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let index = (random as usize) % tiles.len();
+                if tiles[index].key.level > 0 {
+                    split(&mut tiles, index);
+                }
+            }
+            let mut work = PlanWork::default();
+            balance(&mut tiles, 4096, &mut work).unwrap();
+            set_seams(&mut tiles, &mut work).unwrap();
+            let mut area = 0i64;
+            for (i, tile) in tiles.iter().enumerate() {
+                let b = tile.key.bounds().unwrap();
+                area += (b[2] - b[0]) * (b[3] - b[1]);
+                let mut expected = 0;
+                for (j, other) in tiles.iter().enumerate() {
+                    if i == j {
+                        continue;
+                    }
+                    let o = other.key.bounds().unwrap();
+                    assert!(!intersects(b, o));
+                    if adjacent(tile.key, other.key) {
+                        assert!(tile.key.level.abs_diff(other.key.level) <= 1);
+                        if other.key.level > tile.key.level {
+                            expected |= if b[0] == o[2] {
+                                1
+                            } else if b[2] == o[0] {
+                                2
+                            } else if b[1] == o[3] {
+                                4
+                            } else {
+                                8
+                            };
+                        }
+                    }
+                }
+                assert_eq!(tile.seams, expected, "seed{seed}tile{:?}", tile.key);
+            }
+            assert_eq!(area, 2048 * 2048);
+            assert!(work.adjacency_tests + work.seam_tests < 100_000);
+        }
+    }
+    #[test]
+    fn doubling_unknown_horizon_adds_a_bounded_ring_of_planning_work() {
+        let mut counts = Vec::new();
+        for level in [8, 9, 10] {
+            let mut t = task();
+            t.config.horizon_level = level;
+            t.near_radius = 2;
+            let result = t.execute().unwrap();
+            counts.push((
+                result.plan.tiles.len(),
+                result.work.adjacency_tests + result.work.seam_tests,
+            ));
+        }
+        for pair in counts.windows(2) {
+            assert!(pair[1].0 <= pair[0].0 + 64, "{counts:?}");
+            assert!(pair[1].1 < pair[0].1 * 3 / 2, "{counts:?}");
+        }
+    }
+    #[test]
+    fn horizon_radius_is_retained_at_both_ends_of_every_camera_bin() {
+        for level in [8u8, 9, 10] {
+            let span = 1i64 << level;
+            for camera in [[0, 0], [span - 1, span - 1], [-1, -1], [-span, -span]] {
+                let mut t = task();
+                t.config.horizon_level = level;
+                t.camera = camera;
+                t.near_radius = 2;
+                let plan = t.execute().unwrap();
+                let b = plan.plan.outer_bounds_pages;
+                assert!(camera[0] - b[0] >= 2 * span && b[2] - camera[0] >= 2 * span);
+                assert!(camera[1] - b[1] >= 2 * span && b[3] - camera[1] >= 2 * span);
+                let area = plan
+                    .plan
+                    .tiles
+                    .iter()
+                    .map(|tile| {
+                        let b = tile.key.bounds().unwrap();
+                        (b[2] - b[0]) * (b[3] - b[1])
+                    })
+                    .sum::<i64>();
+                assert_eq!(
+                    area,
+                    ((5 * span) * (5 * span) - 25) * 256,
+                    "only the true5x5 near cutout may be missing"
+                );
+            }
+        }
+    }
     fn projection() -> Projection {
         Projection {
             eye_min: [0., 10000., 0.],
@@ -471,13 +630,13 @@ mod tests {
     #[test]
     fn hysteresis_uses_the_previous_branch_and_does_not_toggle_inside_the_band() {
         let mut t = task();
-        t.certificates.push(certificate(10.));
+        t.certificates.push(certificate(9.));
         assert!(
             has_root(&t.execute().unwrap()),
-            "a coarse node remains coarse below12px"
+            "a coarse node remains coarse below the10px maximum"
         );
         let mut t = task();
-        t.certificates.push(certificate(10.));
+        t.certificates.push(certificate(9.));
         t.previous.push(children(render_key(root()))[0]);
         assert!(
             !has_root(&t.execute().unwrap()),
@@ -491,7 +650,7 @@ mod tests {
             "coarsen only after crossing the lower threshold"
         );
         let mut t = task();
-        t.certificates.push(certificate(14.));
+        t.certificates.push(certificate(11.));
         assert!(
             !has_root(&t.execute().unwrap()),
             "refine only after crossing the upper threshold"
@@ -505,7 +664,7 @@ mod tests {
             unknown.plan.tiles.len() as u64
         );
         let mut t = task();
-        t.config.max_tiles = 32;
+        t.config.max_tiles = 64;
         for z in -2..2 {
             for x in -2..2 {
                 t.certificates.push(Certificate {
@@ -522,7 +681,7 @@ mod tests {
         }
         let result = t.execute().unwrap();
         assert!(result.quality.capacity_limited);
-        assert!(result.plan.tiles.len() <= 32);
+        assert!(result.plan.tiles.len() <= 64);
         let mut area = 0i64;
         for (i, a) in result.plan.tiles.iter().enumerate() {
             let ab = a.key.bounds().unwrap();
@@ -537,7 +696,7 @@ mod tests {
         }
         assert_eq!(
             area,
-            256 * 256 - 16 * 16,
+            320 * 320 - 16 * 16,
             "only the exact near page is cut out"
         );
     }
@@ -618,6 +777,45 @@ mod tests {
         malformed.certificates.push(invalid);
         let bytes = encode_background_task(&BackgroundTask::Plan(Box::new(malformed))).unwrap();
         assert!(execute_background_request(&bytes, || false).is_err());
+    }
+    #[test]
+    fn maximum_plan_metadata_packet_is_bounded_and_worker_decodes_the_larger_profile() {
+        let mut t = task();
+        for x in 0..net::height::MAX_SOURCES {
+            let key = HeightKey {
+                space: 0,
+                level: 0,
+                x: x as i32,
+                z: 0,
+            };
+            t.certificates.push(Certificate {
+                key,
+                bound: net::height::HeightErrorBound {
+                    max_error_q1024: 0,
+                    min_height: 0,
+                    max_height: 0,
+                },
+                seam_error_q1024: 0,
+                exact_replacement: false,
+            });
+            if x < net::height::MAX_TILES {
+                t.previous.push(render_key(key));
+                t.refine.push(key);
+            }
+        }
+        let bytes = encode_background_task(&BackgroundTask::Plan(Box::new(t))).unwrap();
+        assert!(bytes.len() > 180_000 && bytes.len() <= MAX_BACKGROUND_BYTES);
+        let result = execute_background_request(&bytes, || false).unwrap();
+        let BackgroundResult::Plan(Ok(plan)) = decode_background_result(&result).unwrap() else {
+            panic!("maximum metadata plan must execute");
+        };
+        assert!(plan.plan.tiles.len() <= net::height::MAX_TILES);
+        let mut oversized = bytes;
+        oversized.resize(MAX_BACKGROUND_BYTES + 1, 0);
+        assert_eq!(
+            execute_background_request(&oversized, || false),
+            Err(WireError::Length)
+        );
     }
     #[test]
     fn offscreen_bounds_do_not_consume_refinement_but_viewport_margin_keeps_intersections() {
@@ -703,7 +901,11 @@ mod tests {
         for seed in [1, 1337] {
             let generator = terrain_gen::Generator::new(terrain_gen::TerrainSeed(seed));
             let mut t = task();
-            t.config = Config::default();
+            t.config = Config {
+                max_tiles: 512,
+                max_sources: 2048,
+                ..Config::default()
+            };
             t.near_radius = 2;
             let tan = libm::tan(70f64.to_radians() * 0.5);
             let projection = Projection {
@@ -842,5 +1044,71 @@ mod tests {
                 quality.leaf_limited
             );
         }
+    }
+    #[test]
+    fn three_dimensional_near_cover_retains_full_height_area_and_worker_snapshot() {
+        for vertical in [[-4, -1], [0, 3], [4, 7], [20, 23]] {
+            let mut direct = task();
+            let volume = [[1, vertical[0], 1], [4, vertical[1], 4]];
+            direct.config.near_volume = Some(volume);
+            let plan = direct.execute().unwrap();
+            let area = plan
+                .plan
+                .tiles
+                .iter()
+                .map(|tile| {
+                    let b = tile.key.bounds().unwrap();
+                    (b[2] - b[0]) * (b[3] - b[1])
+                })
+                .sum::<i64>();
+            assert_eq!(
+                area,
+                25 * 64 * 64,
+                "3D masking must retain far surfaces outside the near Y volume"
+            );
+            let mut worker = task();
+            worker.config.near_volume = Some(volume);
+            let request = encode_background_task(&BackgroundTask::Plan(Box::new(worker))).unwrap();
+            let reply = execute_background_request(&request, || false).unwrap();
+            let BackgroundResult::Plan(Ok(roundtrip)) = decode_background_result(&reply).unwrap()
+            else {
+                panic!("plan result")
+            };
+            assert_eq!(roundtrip.plan.tiles, plan.plan.tiles);
+            assert_eq!(roundtrip.work.near_tiles_removed, 0);
+        }
+        let c = Certificate {
+            key: HeightKey {
+                space: 0,
+                level: 0,
+                x: 1,
+                z: 1,
+            },
+            bound: net::height::HeightErrorBound {
+                max_error_q1024: 1024,
+                min_height: 1,
+                max_height: 10,
+            },
+            seam_error_q1024: 0,
+            exact_replacement: false,
+        };
+        assert!(fully_near(c, Some([[1, 0, 1], [2, 1, 2]])));
+        assert!(
+            !fully_near(c, Some([[1, 4, 1], [2, 7, 2]])),
+            "flight must not exclude lower terrain from quality"
+        );
+        assert!(
+            !fully_near(
+                Certificate {
+                    bound: net::height::HeightErrorBound {
+                        min_height: 0,
+                        ..c.bound
+                    },
+                    ..c
+                },
+                Some([[1, 0, 1], [2, 1, 2]])
+            ),
+            "top at lower boundary belongs to the page below"
+        );
     }
 }

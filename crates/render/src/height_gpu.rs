@@ -55,6 +55,17 @@ pub struct HeightGpuWork {
     pub camera_upload_bytes: u64,
     pub pipeline_compilations: u32,
 }
+/// Shared public sources for a separately prepared directional-shadow pass.
+/// Enabled descriptor flags select the committed front; primary visibility is
+/// deliberately absent so another camera cannot overwrite the color draw list.
+pub struct HeightShadowSource<'a> {
+    pub headers: &'a wgpu::Buffer,
+    pub payload: &'a wgpu::Buffer,
+    pub near_cover: &'a wgpu::Buffer,
+    pub max_tiles: u32,
+    pub atlas_layers: u32,
+    pub revision: u64,
+}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 struct TileGpu {
@@ -90,6 +101,7 @@ impl Default for TileGpu {
     }
 }
 pub struct HeightGpu {
+    near_cover: crate::near_cover::NearCoverGpu,
     config: HeightGpuConfig,
     headers: wgpu::Buffer,
     payload: wgpu::Buffer,
@@ -98,6 +110,10 @@ pub struct HeightGpu {
     bind: wgpu::BindGroup,
     cull_bind: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
+    near_pipeline: Option<wgpu::RenderPipeline>,
+    near_active: bool,
+    sample_count: u32,
+    ambient_mrt: bool,
     reset: wgpu::ComputePipeline,
     cull: wgpu::ComputePipeline,
     slots: Vec<Slot>,
@@ -167,12 +183,12 @@ impl HeightGpu {
         );
         let visible = buffer(
             "GPU visible height tiles",
-            u64::from(config.max_tiles) * 4,
+            u64::from(config.max_tiles) * 8,
             wgpu::BufferUsages::STORAGE,
         );
         let indirect = buffer(
-            "one height grid indirect draw",
-            16,
+            "height pixel and sample grid indirect draws",
+            32,
             wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::INDIRECT
                 | wgpu::BufferUsages::COPY_SRC,
@@ -181,10 +197,11 @@ impl HeightGpu {
         let f = wgpu::ShaderStages::FRAGMENT;
         let c = wgpu::ShaderStages::COMPUTE;
         let mut entries = vec![
-            buffer_layout(0, v, true, true),
+            buffer_layout(0, v | f, true, true),
             buffer_layout(1, v, false, true),
             buffer_layout(2, v, false, true),
             buffer_layout(3, v, false, true),
+            buffer_layout(21, f, false, true),
             texture_layout(4, f, wgpu::TextureSampleType::Float { filterable: true }),
             wgpu::BindGroupLayoutEntry {
                 binding: 5,
@@ -219,9 +236,12 @@ impl HeightGpu {
                 buffer_layout(1, c, false, true),
                 buffer_layout(2, c, false, false),
                 buffer_layout(3, c, false, false),
+                buffer_layout(21, c, false, true),
             ],
         });
+        let near_cover = crate::near_cover::NearCoverGpu::new(device);
         let mut entries = vec![
+            buffer_binding(21, near_cover.buffer()),
             buffer_binding(0, &camera),
             buffer_binding(1, &headers),
             buffer_binding(2, &payload),
@@ -264,18 +284,13 @@ impl HeightGpu {
                 buffer_binding(1, &headers),
                 buffer_binding(2, &visible),
                 buffer_binding(3, &indirect),
+                buffer_binding(21, near_cover.buffer()),
             ],
         });
-        let source = crate::atmosphere::surface_shader(
-            include_str!("height_grid.wgsl"),
+        let source = shader_source(
             shadows.is_some(),
             atmosphere.is_some(),
-            false,
-            if shadows.is_some() {
-                "return vec3(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.));"
-            } else {
-                "return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.));"
-            },
+            geometry.ambient_mrt,
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("implicit stitched height grid"),
@@ -286,43 +301,87 @@ impl HeightGpu {
             bind_group_layouts: &[&layout],
             push_constant_ranges: &[],
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("actual public height tiles HDR MSAA4"),
-            layout: Some(&pl),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vertex"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::GreaterEqual,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: sample_count,
-                ..Default::default()
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fragment"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-            cache: None,
-        });
+        let make_pipeline = |shader: &wgpu::ShaderModule, label: &'static str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vertex"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::GreaterEqual,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    ..Default::default()
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fragment"),
+                    compilation_options: Default::default(),
+                    targets: &crate::ambient_mrt::targets(None, geometry.ambient_mrt),
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let pipeline = make_pipeline(&shader, "actual public height tiles HDR");
+        // Only active3D cuts need sample-frequency world positions. Preserve
+        // pixel-frequency shading and exact legacy pixels when no cut exists.
+        let near_pipeline = {
+            let source = shader_source(
+                shadows.is_some(),
+                atmosphere.is_some(),
+                geometry.ambient_mrt,
+            )
+            .replace(
+                "let slot=visible[ii];",
+                "let slot=visible[ii+camera.params.x];",
+            );
+            let source = if sample_count > 1 {
+                // The near mask is a per-sample ownership decision. Keep the
+                // sample index live through a dynamic, prepared sample-count
+                // guard as well as requesting sample-qualified interpolation.
+                assert!(source.contains("@fragment fn fragment(input:Out)"));
+                assert!(
+                    source.contains(
+                        "{let texel=textureSample(atlas,texels,input.uv,i32(input.layer));"
+                    )
+                );
+                source.replace(
+                    "@location(2)world:vec3<f32>",
+                    "@location(2)@interpolate(perspective,sample)world:vec3<f32>",
+                ).replace(
+                    "@fragment fn fragment(input:Out)",
+                    "@fragment fn fragment(input:Out,@builtin(sample_index)sample:u32)",
+                ).replace(
+                    "{let texel=textureSample(atlas,texels,input.uv,i32(input.layer));",
+                    "{if sample>=camera.reserved.x{discard;}let texel=textureSample(atlas,texels,input.uv,i32(input.layer));",
+                )
+            } else {
+                source
+            };
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("sample-exact3D near coverage"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            Some(make_pipeline(
+                &shader,
+                "height with sample-exact3D near coverage",
+            ))
+        };
+        let pipeline_count = 3 + u32::from(near_pipeline.is_some());
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("height frustum compaction"),
             source: wgpu::ShaderSource::Wgsl(include_str!("height_cull.wgsl").into()),
@@ -345,6 +404,7 @@ impl HeightGpu {
         let reset = compute("reset");
         let cull = compute("cull");
         Ok(Self {
+            near_cover,
             config,
             headers,
             payload,
@@ -353,6 +413,10 @@ impl HeightGpu {
             bind,
             cull_bind,
             pipeline,
+            near_pipeline,
+            near_active: false,
+            sample_count,
+            ambient_mrt: geometry.ambient_mrt,
             reset,
             cull,
             slots: vec![Slot::default(); config.max_tiles as usize],
@@ -361,7 +425,7 @@ impl HeightGpu {
             revision: 0,
             last: None,
             work: HeightGpuWork {
-                pipeline_compilations: 3,
+                pipeline_compilations: pipeline_count,
                 ..HeightGpuWork::default()
             },
         })
@@ -654,6 +718,24 @@ impl HeightGpu {
         self.work.header_uploads += changed as u32;
         Ok(bytes)
     }
+    pub fn update_near_cover(
+        &mut self,
+        queue: &wgpu::Queue,
+        intended: Option<[[i32; 3]; 2]>,
+        extras: &[[i32; 3]],
+        origin: [i64; 3],
+        budget: &mut UploadBudget,
+    ) -> Result<u64, crate::near_cover::Error> {
+        let bytes = self
+            .near_cover
+            .upload(queue, intended, extras, origin, budget)?;
+        self.near_active = intended.is_some() || !extras.is_empty();
+        if bytes != 0 {
+            self.revision = self.revision.wrapping_add(1);
+            self.work.upload_bytes += bytes;
+        }
+        Ok(bytes)
+    }
     pub fn prepare_frame(
         &mut self,
         queue: &wgpu::Queue,
@@ -677,7 +759,7 @@ impl HeightGpu {
             bytemuck::bytes_of(&CameraGpu {
                 view_projection: camera.view_projection,
                 params: [self.config.max_tiles, 0, 0, 0],
-                reserved: [0; 4],
+                reserved: [self.sample_count, 0, 0, 0],
             }),
         );
         {
@@ -698,17 +780,36 @@ impl HeightGpu {
             ..HeightGpuWork::default()
         })
     }
+    pub fn ambient_mrt(&self) -> bool {
+        self.ambient_mrt
+    }
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> u32 {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind, &[]);
         pass.draw_indirect(&self.indirect, 0);
-        1
+        if self.near_active {
+            pass.set_pipeline(self.near_pipeline.as_ref().expect("prepared near pipeline"));
+            pass.draw_indirect(&self.indirect, 16);
+            2
+        } else {
+            1
+        }
     }
     pub fn indirect_buffer(&self) -> &wgpu::Buffer {
         &self.indirect
     }
     pub fn payload_buffer(&self) -> &wgpu::Buffer {
         &self.payload
+    }
+    pub fn shadow_source(&self) -> HeightShadowSource<'_> {
+        HeightShadowSource {
+            headers: &self.headers,
+            payload: &self.payload,
+            near_cover: self.near_cover.buffer(),
+            max_tiles: self.config.max_tiles,
+            atlas_layers: self.config.atlas_layers,
+            revision: self.revision,
+        }
     }
     pub fn take_work(&mut self) -> HeightGpuWork {
         std::mem::take(&mut self.work)
@@ -794,6 +895,40 @@ fn texture_layout(
         count: None,
     }
 }
+pub fn shader_source(shadows: bool, atmosphere: bool, ambient_mrt: bool) -> String {
+    let source = crate::atmosphere::surface_shader(
+        include_str!("height_grid.wgsl"),
+        shadows,
+        atmosphere,
+        false,
+        if shadows {
+            "return vec3(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.));"
+        } else {
+            "return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.));"
+        },
+    );
+
+    let source = format!("{}\n{}", crate::near_cover::SHADER, source);
+    if !ambient_mrt {
+        return source;
+    }
+    let signature = "@fragment fn fragment(input:Out)->@location(0)vec4<f32>";
+    let color =
+        "return vec4(texel.rgb*input.tint*illumination(input.world,normalize(input.normal)),1.);";
+    assert!(source.contains(signature) && source.contains(color));
+    let source=source.replace(signature,"@fragment fn fragment(input:Out)->HeightAmbientOutput").replace(color,"return HeightAmbientOutput(vec4(texel.rgb*input.tint*illumination(input.world,normalize(input.normal)),1.),vec4(texel.rgb*input.tint*height_ambient(normalize(input.normal)),1.));");
+    let ambient = if atmosphere {
+        "atmosphere_diffuse(normal)"
+    } else if shadows {
+        "vec3(0.15)"
+    } else {
+        "vec3(0.65)"
+    };
+    format!(
+        "{source}\nstruct HeightAmbientOutput{{@location(0)color:vec4<f32>,@location(1)ambient:vec4<f32>}};\nfn height_ambient(normal:vec3<f32>)->vec3<f32>{{return {ambient};}}"
+    )
+}
+
 fn buffer_binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,

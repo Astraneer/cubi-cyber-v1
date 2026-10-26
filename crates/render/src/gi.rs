@@ -742,6 +742,11 @@ impl GiGpu {
     pub fn probe_buffer(&self) -> &wgpu::Buffer {
         &self.probes
     }
+    /// Existing reflected-source voxels, used read-only to keep a model
+    /// receiver in an Unknown cell from borrowing nearby probe radiance.
+    pub fn voxel_buffer(&self) -> &wgpu::Buffer {
+        &self.world
+    }
     pub fn frame_graph(&self) -> crate::gpu_time::PassGraph<2> {
         self.timer.graph()
     }

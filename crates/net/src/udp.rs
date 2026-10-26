@@ -51,6 +51,7 @@ pub struct Counters {
     pub retransmitted_bytes: u64,
     pub rejected: u64,
     pub peak_reassembly_bytes: usize,
+    pub discarded_unreliable_assemblies: u64,
 }
 pub struct Receive {
     pub frames: Vec<Vec<u8>>,
@@ -59,8 +60,16 @@ pub struct Receive {
 
 struct Pending {
     frame: Vec<u8>,
+    created: u64,
     last_sent: u64,
     retries: u8,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpiredMessage {
+    pub message_id: u64,
+    pub frame_bytes: usize,
+    pub age_ms: u64,
+    pub retries: u8,
 }
 struct Assembly {
     chunks: Vec<Option<Vec<u8>>>,
@@ -81,6 +90,7 @@ pub struct Channel {
     pending_bytes: usize,
     reassembly_bytes: usize,
     counters: Counters,
+    last_expired: Option<ExpiredMessage>,
 }
 
 impl Channel {
@@ -116,6 +126,7 @@ impl Channel {
             pending_bytes: 0,
             reassembly_bytes: 0,
             counters: Counters::default(),
+            last_expired: None,
         }
     }
     pub fn counters(&self) -> Counters {
@@ -123,6 +134,9 @@ impl Channel {
     }
     pub fn pending_messages(&self) -> usize {
         self.pending.len()
+    }
+    pub fn last_expired(&self) -> Option<ExpiredMessage> {
+        self.last_expired
     }
 
     fn packet(
@@ -201,6 +215,7 @@ impl Channel {
                 id,
                 Pending {
                     frame,
+                    created: now_ms,
                     last_sent: now_ms,
                     retries: 0,
                 },
@@ -271,7 +286,8 @@ impl Channel {
         }
         self.expire_assemblies(now_ms);
         if !self.assembling.contains_key(&id) {
-            if self.assembling.len() >= self.limits.maximum_messages {
+            if self.assembling.len() >= self.limits.maximum_messages && !self.discard_unreliable(id)
+            {
                 return Err(UdpError::Capacity);
             }
             self.assembling.insert(
@@ -284,20 +300,28 @@ impl Channel {
                 },
             );
         }
-        let assembly = self.assembling.get_mut(&id).expect("inserted");
+        let assembly = self.assembling.get(&id).expect("inserted");
         if assembly.chunks.len() != total || assembly.reliable != (flags == 1) {
             return Err(UdpError::Invalid);
         }
         if assembly.chunks[index].is_none() {
-            if length
+            if assembly.bytes + length > MAX_FRAME_BYTES {
+                return Err(UdpError::Capacity);
+            }
+            while length
                 > self
                     .limits
                     .maximum_bytes
                     .saturating_sub(self.reassembly_bytes)
-                || assembly.bytes + length > MAX_FRAME_BYTES
             {
-                return Err(UdpError::Capacity);
+                if !self.discard_unreliable(id) {
+                    return Err(UdpError::Capacity);
+                }
             }
+            let assembly = self
+                .assembling
+                .get_mut(&id)
+                .expect("retained incoming assembly");
             assembly.chunks[index] = Some(packet[HEADER..end].to_vec());
             assembly.bytes += length;
             self.reassembly_bytes += length;
@@ -306,6 +330,7 @@ impl Channel {
                 .peak_reassembly_bytes
                 .max(self.reassembly_bytes);
         }
+        let assembly = self.assembling.get(&id).expect("retained assembly");
         if assembly.chunks.iter().any(Option::is_none) {
             return Ok(Receive {
                 frames: Vec::new(),
@@ -332,6 +357,26 @@ impl Channel {
             replies,
         })
     }
+    fn discard_unreliable(&mut self, incoming: u64) -> bool {
+        // Fragment loss leaves old snapshots incomplete for the full assembly
+        // lifetime. They must not occupy every slot and expire a reliable action
+        // whose resend deadline is shorter than that lifetime. Reliable partials
+        // are retained; all limits and authentication checks remain unchanged.
+        let candidate = self
+            .assembling
+            .iter()
+            .filter(|(id, a)| **id != incoming && !a.reliable)
+            .min_by_key(|(id, a)| (a.created, **id))
+            .map(|(&id, _)| id);
+        if let Some(id) = candidate {
+            let old = self.assembling.remove(&id).expect("selected assembly");
+            self.reassembly_bytes -= old.bytes;
+            self.counters.discarded_unreliable_assemblies += 1;
+            true
+        } else {
+            false
+        }
+    }
     fn expire_assemblies(&mut self, now_ms: u64) {
         self.assembling.retain(|_, assembly| {
             if now_ms.saturating_sub(assembly.created) > self.limits.maximum_age_ms {
@@ -357,6 +402,12 @@ impl Channel {
             let mut pending = self.pending.remove(&id).expect("pending");
             if pending.retries >= self.limits.maximum_retries {
                 self.pending_bytes -= pending.frame.len();
+                self.last_expired = Some(ExpiredMessage {
+                    message_id: id,
+                    frame_bytes: pending.frame.len(),
+                    age_ms: now_ms.saturating_sub(pending.created),
+                    retries: pending.retries,
+                });
                 return Err(UdpError::Expired);
             }
             let retry = self.fragments(id, &pending.frame, true)?;

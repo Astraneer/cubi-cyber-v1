@@ -3,7 +3,7 @@ use server::ServerConfig;
 use server::transport::RunningServer;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() {
     if let Err(error) = run() {
@@ -64,7 +64,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     print!("{public_addresses}");
     if let Some(millis) = run_millis {
-        std::thread::sleep(Duration::from_millis(millis));
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(millis) && !runtime.is_finished() {
+            std::thread::park_timeout(Duration::from_millis(100));
+        }
         let counters = runtime.stop()?;
         println!(
             "received_datagrams={} sent_datagrams={} queue_overflows={}",
@@ -72,7 +75,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         loop {
-            std::thread::park_timeout(Duration::from_secs(30));
+            if runtime.is_finished() {
+                runtime.stop()?;
+                return Err("authority worker exited unexpectedly; see bounded diagnostics".into());
+            }
+            std::thread::park_timeout(Duration::from_millis(200));
         }
     }
     Ok(())

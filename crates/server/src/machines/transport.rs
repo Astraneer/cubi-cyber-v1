@@ -2,6 +2,8 @@
 //! changed packet is published with its source/recipient world transaction.
 use super::*;
 pub const MAX_PACKET_PATH: usize = 128;
+pub const MAX_ROUTE_NODES: usize = 4096;
+pub const MAX_ROUTE_CANDIDATES: usize = 16_384;
 pub const MAX_TRANSPORT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TRANSPORT_DELTA_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

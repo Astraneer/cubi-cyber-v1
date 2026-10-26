@@ -3,11 +3,16 @@
 #![forbid(unsafe_code)]
 
 mod actor;
+mod audio_cue;
 pub mod block_loot;
 mod chat;
+pub mod cold_projection;
+pub mod cold_projection_owner;
 pub mod entities;
+pub mod far_water;
 mod geometry;
 pub mod height_authority;
+pub mod height_heads;
 pub mod height_index;
 pub mod height_migration;
 mod height_stream;
@@ -15,9 +20,14 @@ pub mod height_tile;
 mod light_owner;
 mod light_stream;
 pub mod lighting;
+mod load_metrics;
 pub mod lod;
+mod machine_owner;
+pub mod public_projection;
+pub use load_metrics::{LoadMetrics, QueueLoad};
 pub mod machines;
 mod migration_owner;
+mod mob_action_owner;
 mod mob_owner;
 pub mod mob_spawn;
 pub mod natural;
@@ -28,6 +38,7 @@ pub mod presence;
 pub mod props;
 mod props_stream;
 mod raw_sources;
+mod raw_views;
 mod runtime;
 pub mod survival;
 mod tool_owner;
@@ -93,6 +104,15 @@ impl ServerConfig {
         }
     }
 }
+/// Sanitized first-failure provenance. No cells, credentials, seed, item
+/// attributes or user text enter this diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FailureReason {
+    pub operation: &'static str,
+    pub detail: Option<&'static str>,
+    pub source_file: &'static str,
+    pub source_line: u32,
+}
 #[derive(Debug)]
 pub enum ServerError {
     Io(std::io::Error),
@@ -133,10 +153,20 @@ impl Outgoing {
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServerCounters {
+    pub audio_cues_sent: u64,
+    pub audio_cues_clipped: u64,
+    pub audio_cues_not_recorded: u64,
     pub ticks: u64,
     pub input_steps: u64,
     pub committed_transactions: u64,
     pub durable_batches: u64,
+    /// Final encoded runtime bytes cloned into an in-flight durable batch.
+    pub runtime_handoff_bytes: u64,
+    /// Encoded runtime input bytes actually replayed by the canonical owner.
+    pub runtime_replay_input_bytes: u64,
+    pub checkpoint_requests: u64,
+    /// Final runtime snapshot records, excluding World snapshot payloads.
+    pub checkpoint_runtime_bytes: u64,
     pub storage_stalls: u64,
     pub rejected_messages: u64,
     pub protocol_rejections: u64,
@@ -147,6 +177,10 @@ pub struct ServerCounters {
     pub inbox_high_water: usize,
     pub view_cells: u64,
     pub visibility_segments: u64,
+    pub visibility_rays: u64,
+    pub visibility_source_probes: u64,
+    pub visibility_cell_reads: u64,
+    pub view_copy_bytes: u64,
     pub summary_cells: u64,
     pub rejected_transactions: u64,
     pub geometry_submitted: u64,
@@ -154,6 +188,7 @@ pub struct ServerCounters {
     pub geometry_discarded: u64,
     pub geometry_cells: u64,
     pub geometry_tint_samples: u64,
+    pub geometry_public_witness_bytes: u64,
     pub geometry_held_peak: usize,
     pub items_imported: u64,
     pub item_steps: u64,
@@ -169,10 +204,15 @@ pub struct ServerCounters {
     pub random_tick_sections: u64,
     pub random_tick_reads: u64,
     pub machine_events: u64,
+    pub machine_prepared: u64,
+    pub machine_unknown: u64,
+    pub machine_deferred: u64,
+    pub machine_copy_bytes: u64,
     pub machine_steps: u64,
     pub machine_reads: u64,
     pub machine_transfers: u64,
     pub height_submitted: u64,
+    pub height_public_witness_bytes: u64,
     pub height_published: u64,
     pub height_discarded: u64,
     pub topology_completed: u64,
@@ -247,10 +287,10 @@ struct Peer {
     history: ViewHistory,
     pages: BTreeSet<PageId>,
     page_requests: VecDeque<(PageId, bool)>,
+    raw_view: raw_views::ObserverViews,
     summaries: VecDeque<PageId>,
     geometry_requests: VecDeque<(PageId, Option<Version>)>,
     geometry_subscriptions: BTreeMap<PageId, Version>,
-    geometry_view: u64,
     geometry_views: BTreeMap<PageId, u64>,
     height_requests: VecDeque<(net::height::HeightKey, Option<u64>)>,
     height_subscriptions: BTreeMap<net::height::HeightKey, u64>,
@@ -258,6 +298,8 @@ struct Peer {
     last_view_position: [f64; 3],
     roster_revision: Option<u64>,
     entities: Option<entities::replication::EntityHistory>,
+    entity_pending_revision: Option<u64>,
+    entity_attempt_tick: Option<Tick>,
 }
 struct Pending {
     ticket: u64,
@@ -293,9 +335,12 @@ pub struct Server {
     spawn: [f64; 3],
     generation: Option<Generation>,
     geometry: geometry::GeometryWorker,
+    far_water: far_water::Owner,
     height_worker: height_stream::HeightWorker,
+    height_heads: height_heads::HeightHeads,
     height_migration: Option<migration_owner::LegacyMigration>,
     failed: bool,
+    failure: Option<FailureReason>,
     counters: ServerCounters,
     recent_changes: VecDeque<WorldChange>,
     drop_seed: u64,
@@ -308,6 +353,8 @@ pub struct Server {
     raw_sources: raw_sources::RawSources,
     props_stream: props_stream::PropsStream,
     packet_stream: packet_stream::Owner,
+    tool_boundary_tick: Option<Tick>,
+    tool_boundary_active: bool,
     presence: presence::Presence,
     staged_chats: Vec<presence::ChatReservation>,
     now_ms: u64,
@@ -315,6 +362,47 @@ pub struct Server {
 }
 
 impl Server {
+    pub fn failure_reason(&self) -> Option<FailureReason> {
+        self.failure
+    }
+    #[track_caller]
+    fn fail(&mut self, operation: &'static str) {
+        self.failed = true;
+        let at = std::panic::Location::caller();
+        self.failure.get_or_insert(FailureReason {
+            operation,
+            detail: None,
+            source_file: at.file(),
+            source_line: at.line(),
+        });
+    }
+    #[track_caller]
+    fn fail_error(&mut self, operation: &'static str, error: &ServerError) {
+        let already_failed = self.failed;
+        self.fail(operation);
+        if !already_failed
+            && let ServerError::Invalid(detail) = error
+            && let Some(reason) = self.failure.as_mut()
+        {
+            reason.detail = Some(detail);
+        }
+    }
+    #[track_caller]
+    fn fail_storage(&mut self, operation: &'static str, error: &save::SaveError) {
+        let already_failed = self.failed;
+        self.fail(operation);
+        if !already_failed && let Some(reason) = self.failure.as_mut() {
+            reason.detail = Some(match error {
+                save::SaveError::Invalid(s) | save::SaveError::Bounds(s) => s,
+                save::SaveError::Io(_) => "storage I/O",
+                save::SaveError::UnsupportedVersion(_) => "unsupported storage schema",
+                save::SaveError::Checksum => "storage checksum",
+                save::SaveError::AlreadyOpen => "storage already open",
+                save::SaveError::Poisoned => "storage poisoned",
+                save::SaveError::MissingBase => "storage missing base",
+            });
+        }
+    }
     pub fn open(config: ServerConfig) -> Result<Self, ServerError> {
         Self::open_with_world(config, World::new(rules::properties, 1024))
     }
@@ -474,9 +562,16 @@ impl Server {
             None
         };
         let geometry = geometry::GeometryWorker::new(
-            generator.terrain().clone(),
+            generator.clone(),
             config.geometry_result_delay_ticks,
+            config.generation_enabled,
         )?;
+        let far_water = far_water::Owner::new(
+            generator.terrain().clone(),
+            MAX_CONNECTIONS,
+            height_stream::MAX_GEOMETRY,
+        )
+        .map_err(|_| ServerError::Invalid("far water worker"))?;
         let mut config = config;
         config.public_seed = public_seed;
         let owner = load_owner(&config.data_dir, &identities)?;
@@ -533,9 +628,13 @@ impl Server {
             spawn,
             generation,
             geometry,
+            far_water,
             height_worker,
+            height_heads: height_heads::HeightHeads::new(height_heads::Limits::default())
+                .map_err(|_| ServerError::Invalid("public height source ledger"))?,
             height_migration,
             failed: false,
+            failure: None,
             counters: ServerCounters::default(),
             recent_changes: VecDeque::new(),
             drop_seed,
@@ -548,6 +647,8 @@ impl Server {
             raw_sources,
             props_stream: props_stream::PropsStream::default(),
             packet_stream: packet_stream::Owner::new(),
+            tool_boundary_tick: None,
+            tool_boundary_active: false,
             presence,
             staged_chats: Vec::new(),
             now_ms: 0,
@@ -614,6 +715,12 @@ impl Server {
         self.peers.remove(&connection);
         self.light_stream.forget_peer(connection);
         self.packet_stream.forget_peer(connection);
+        self.far_water.forget_peer(connection);
+        self.geometry.forget_peer(connection);
+        self.height_heads.forget_peer(connection);
+        if let Some(owner) = &mut self.geometry.projection {
+            owner.forget_raw_peer(connection);
+        }
         self.inbox.retain(|(c, _, _)| *c != connection);
     }
     pub fn handle(
@@ -667,43 +774,57 @@ impl Server {
             self.counters.storage_stalls += 1;
             return output;
         }
+        // A large active actor cohort can fill the WAL before 200 ticks.
+        // Check after every durable microbatch, retaining half the hard cap
+        // as headroom for bounded migration/phase records before a checkpoint.
+        if self.writer.wal_bytes() >= save::MAX_WAL_BYTES / 2 && self.request_checkpoint() {
+            return output;
+        }
+        match self.finish_machine_phase() {
+            Ok(true) => return output,
+            Ok(false) => {}
+            Err(error) => {
+                self.fail_error("finish_machine_phase", &error);
+                return output;
+            }
+        }
         match self.poll_height_migration() {
             Ok(true) => return output,
             Ok(false) => {}
-            Err(_) => {
-                self.failed = true;
+            Err(error) => {
+                self.fail_error("poll_height_migration", &error);
                 return output;
             }
         }
         match self.reconcile_topology() {
             Ok(true) => return output,
             Ok(false) => {}
-            Err(_) => {
-                self.failed = true;
+            Err(error) => {
+                self.fail_error("reconcile_topology", &error);
                 return output;
             }
         }
         match self.finish_mob_phase() {
             Ok(true) => return output,
             Ok(false) => {}
-            Err(_) => {
-                self.failed = true;
+            Err(error) => {
+                self.fail_error("finish_mob_phase", &error);
                 return output;
             }
         }
         match self.finish_natural() {
             Ok(true) => return output,
             Ok(false) => {}
-            Err(_) => {
-                self.failed = true;
+            Err(error) => {
+                self.fail_error("finish_natural", &error);
                 return output;
             }
         }
         match self.import_items() {
             Ok(true) => return output,
             Ok(false) => {}
-            Err(_) => {
-                self.failed = true;
+            Err(error) => {
+                self.fail_error("import_items", &error);
                 return output;
             }
         }
@@ -713,6 +834,16 @@ impl Server {
         }
         if now_ms < self.next_tick_at {
             return output;
+        }
+        // Connector configuration is a durable boundary before this tick's
+        // recipe/resource phase, never a reason to omit a simulation tick.
+        match self.finish_block_tool_boundary() {
+            Ok(true) => return output,
+            Ok(false) => {}
+            Err(error) => {
+                self.fail_error("finish_block_tool_boundary", &error);
+                return output;
+            }
         }
         self.next_tick_at = now_ms.saturating_add(TICK_MILLIS);
         self.tick.0 = self.tick.0.saturating_add(1);
@@ -789,8 +920,16 @@ impl Server {
                     let inside_spawn = peer.space == SpaceId(0)
                         && self.protected([position.x, position.y, position.z], Role::Player);
                     if runtime::tick_health(&mut peer, outcome.fall_damage, inside_spawn).is_err() {
-                        self.failed = true;
+                        self.fail("tick");
                         return output;
+                    }
+                    if let Err(reason) = self.clear_owned_death(&mut peer, &mut batch) {
+                        if reason == RejectReason::Capacity {
+                            self.counters.mob_deferred += 1;
+                        } else {
+                            self.fail("tick");
+                            return output;
+                        }
                     }
                 }
                 // An absent sequence never becomes an invented movement input.
@@ -806,7 +945,12 @@ impl Server {
                     peer.next_action_to_start = next;
                 }
                 let id = ActionId(peer.next_action_to_start);
-                if let Some((action, aim)) = peer.actions.remove(&id) {
+                let connector_boundary = peer.actions.get(&id).is_some_and(|(action, _)| {
+                    matches!(action, Action::UseBlockTool { expected, .. } if matches!(expected.id(),
+                        rules::ids::UNIVERSAL_CABLE | rules::ids::LOGISTICAL_TRANSPORTER |
+                        rules::ids::MECHANICAL_PIPE | rules::ids::PRESSURIZED_TUBE))
+                });
+                if !connector_boundary && let Some((action, aim)) = peer.actions.remove(&id) {
                     if let Some([yaw, pitch]) = aim {
                         peer.player.yaw = yaw.rem_euclid(360.0);
                         peer.player.pitch = pitch;
@@ -823,48 +967,42 @@ impl Server {
                 }
                 self.advance_mining(connection, &mut peer, &mut batch, &mut deferred);
                 if self.maintain_window(&mut peer, &mut batch).is_err() {
-                    self.failed = true;
+                    self.fail("tick");
                     return output;
                 }
                 let saved = match runtime::capture_peer(&peer) {
                     Ok(saved) => saved,
                     Err(_) => {
-                        self.failed = true;
+                        self.fail("tick");
                         return output;
                     }
                 };
                 self.saved_players.insert(peer.identity, saved.clone());
-                batch.players.push(saved);
+                if let Some(old) = batch
+                    .players
+                    .iter_mut()
+                    .find(|p| p.state.identity == saved.state.identity)
+                {
+                    *old = saved;
+                } else {
+                    batch.players.push(saved);
+                }
             }
             if !self.identities[&peer.identity].banned {
                 self.peers.insert(connection, peer);
+            } else {
+                self.disconnect(connection);
             }
         }
-        let machine_spawns = match self.tick_machines(&mut batch) {
-            Ok(spawns) => spawns,
-            Err(_) => {
-                self.failed = true;
+        let machine_step = match self.tick_machines(&mut batch) {
+            Ok(step) => step,
+            Err(error) => {
+                self.fail_error("tick_machines", &error);
                 return output;
             }
         };
-        if self.tick_survival(&mut batch).is_err() {
-            self.failed = true;
-            return output;
-        }
-        if self.tick_items(&mut batch, machine_spawns).is_err() {
-            self.failed = true;
-            return output;
-        }
-        if self.tick_mobs(&mut batch).is_err() {
-            self.failed = true;
-            return output;
-        }
-        if self.tick_lighting(&mut batch).is_err() {
-            self.failed = true;
-            return output;
-        }
-        if self.schedule_natural().is_err() {
-            self.failed = true;
+        if let Err(error) = self.finish_machine_portion(&mut batch, machine_step) {
+            self.fail_error("finish_machine_portion", &error);
             return output;
         }
         if !batch.is_empty() {
@@ -880,11 +1018,14 @@ impl Server {
         let mut output = Vec::new();
         while let Ok(completion) = self.writer.try_complete() {
             let Some(pending) = self.pending.take() else {
-                self.failed = true;
+                self.fail("finish_durability");
                 break;
             };
+            if let Err(error) = &completion.result {
+                self.fail_storage("durable_write", error);
+            }
             if completion.ticket != pending.ticket || completion.result.is_err() {
-                self.failed = true;
+                self.fail("finish_durability");
                 output.extend(self.peers.keys().map(|c| {
                     Outgoing::reliable(*c, ServerMessage::Error(RejectReason::StorageUnavailable))
                 }));
@@ -901,21 +1042,37 @@ impl Server {
                 }
                 continue;
             }
-            if self.runtimes.replay(&pending.runtimes).is_err()
-                || self.runtimes.committed_changes(&pending.changes).is_err()
-                || self.lighting.acknowledge(&mut self.world).is_err()
-                || self.observe_lights(&pending.changes).is_err()
-            {
-                self.failed = true;
+            self.counters.runtime_replay_input_bytes += pending
+                .runtimes
+                .iter()
+                .map(|r| r.payload.len() as u64)
+                .sum::<u64>();
+            if let Err(error) = self.runtimes.replay(&pending.runtimes) {
+                self.fail_error("durable_runtime_replay", &error);
                 break;
             }
-            if self.observe_packets(&pending.changes).is_err() {
-                self.failed = true;
+            if let Err(error) = self.runtimes.committed_changes(&pending.changes) {
+                self.fail_error("durable_runtime_observe", &error);
+                break;
+            }
+            if let Err(error) = self.lighting.acknowledge(&mut self.world) {
+                self.fail_error("durable_lighting_ack", &error);
+                break;
+            }
+            if let Err(error) = self.observe_lights(&pending.changes) {
+                self.fail_error("durable_light_stream", &error);
+                break;
+            }
+            if let Err(error) = self.observe_packets(&pending.changes) {
+                self.fail_error("durable_packet_stream", &error);
                 break;
             }
             self.raw_sources.observe(&pending.changes);
+            output.extend(self.publish_audio_cues(&pending.changes));
             self.observe_natural(&pending.changes);
             self.observe_props(&pending.changes);
+            self.far_water.observe(&pending.changes, self.tick);
+            self.geometry.observe(&pending.changes, self.tick);
             self.counters.durable_batches += 1;
             if pending.changes.iter().any(|c| !c.cells.is_empty()) {
                 self.refresh_heights();
@@ -960,7 +1117,7 @@ impl Server {
                 }
             }
             if self.synchronize_presence().is_err() {
-                self.failed = true;
+                self.fail("finish_durability");
                 break;
             }
             // Bootstrap must precede authenticated/public session frames on
@@ -1038,7 +1195,7 @@ impl Server {
                             &peer.inventory,
                             &self.runtimes.payloads,
                         ) else {
-                            self.failed = true;
+                            self.fail("finish_durability");
                             return Vec::new();
                         };
                         output.push(Outgoing::reliable(
@@ -1092,6 +1249,11 @@ impl Server {
         let ticket = self.next_ticket;
         self.next_ticket += 1;
         let changes = batch.changes.clone();
+        self.counters.runtime_handoff_bytes += batch
+            .runtimes
+            .iter()
+            .map(|r| r.payload.len() as u64)
+            .sum::<u64>();
         let runtimes = batch.runtimes.clone();
         let chats = std::mem::take(&mut self.staged_chats);
         if self
@@ -1102,7 +1264,7 @@ impl Server {
             for permit in chats {
                 self.presence.cancel_chat(permit);
             }
-            self.failed = true;
+            self.fail("submit_batch");
             return;
         }
         self.pending = Some(Pending {
@@ -1123,10 +1285,13 @@ impl Server {
         let runtimes = match self.runtimes.snapshots() {
             Ok(records) => records,
             Err(_) => {
-                self.failed = true;
+                self.fail("request_checkpoint");
                 return false;
             }
         };
+        self.counters.checkpoint_requests += 1;
+        self.counters.checkpoint_runtime_bytes +=
+            runtimes.iter().map(|r| r.payload.len() as u64).sum::<u64>();
         let metadata = SnapshotMetadata {
             server_tick: self.tick,
             public_seed: self.config.public_seed,
@@ -1297,6 +1462,27 @@ impl Server {
                     }
                 }
             }
+            ClientMessage::RequestWater(request) => {
+                if !far_water::allowed(
+                    &self.world,
+                    self.runtimes.height.index(),
+                    self.geometry.projection.as_ref(),
+                    &self.height_heads,
+                    connection,
+                    peer,
+                    request,
+                ) || self
+                    .far_water
+                    .request(connection, request, self.tick)
+                    .is_err()
+                {
+                    out.push(Outgoing::reliable(
+                        connection,
+                        ServerMessage::WaterUnavailable(request.page),
+                    ));
+                }
+            }
+            ClientMessage::ForgetWater(page) => self.far_water.forget(connection, page),
             message @ (ClientMessage::RequestHeight { .. }
             | ClientMessage::RequestExactHeight { .. }) => {
                 let (key, mut known, exact) = match message {
@@ -1366,11 +1552,15 @@ impl Server {
             }
             ClientMessage::ForgetLight(page) => self.light_stream.forget(connection, page),
             ClientMessage::ForgetHeight(key) => {
+                self.height_heads.forget(connection, key);
+                self.far_water.forget_column(connection, key);
                 peer.height_subscriptions.remove(&key);
                 peer.height_exact.remove(&key);
                 peer.height_requests.retain(|(k, _)| *k != key);
             }
             ClientMessage::ForgetGeometry(page) => {
+                self.far_water.forget(connection, page);
+                self.geometry.forget(connection, page);
                 peer.geometry_subscriptions.remove(&page);
                 peer.geometry_views.remove(&page);
                 peer.geometry_requests.retain(|(p, _)| *p != page);
@@ -1390,8 +1580,21 @@ impl Server {
                 }
             },
             ClientMessage::Entities(request) => {
-                if let Some(history) = peer.entities.as_mut() {
-                    history.request(request);
+                if let Some(history) = peer.entities.as_mut()
+                    && history.request(request)
+                {
+                    match request {
+                        net::entities::EntityRequest::Ack { revision }
+                            if peer.entity_pending_revision == Some(revision) =>
+                        {
+                            peer.entity_pending_revision = None;
+                        }
+                        net::entities::EntityRequest::Full { .. } => {
+                            peer.entity_pending_revision = None;
+                            peer.entity_attempt_tick = None;
+                        }
+                        _ => {}
+                    }
                 }
             }
             ClientMessage::Ping(n) => {
@@ -1439,11 +1642,11 @@ impl Server {
                     return;
                 }
                 let Ok(id) = random::<16>() else {
-                    self.failed = true;
+                    self.fail("hello");
                     return;
                 };
                 let Ok(raw_token) = random::<32>() else {
-                    self.failed = true;
+                    self.fail("hello");
                     return;
                 };
                 let token = SecretToken::new(raw_token);
@@ -1497,7 +1700,7 @@ impl Server {
             .map(|(c, _)| *c)
             .collect();
         for old in previous {
-            self.peers.remove(&old);
+            self.disconnect(old);
             out.push(Outgoing::reliable(
                 old,
                 ServerMessage::Error(RejectReason::Unauthorized),
@@ -1509,7 +1712,7 @@ impl Server {
             match actor::restore_living(saved, allow_debug) {
                 Ok(living) => living,
                 Err(_) => {
-                    self.failed = true;
+                    self.fail("hello");
                     return;
                 }
             }
@@ -1531,7 +1734,7 @@ impl Server {
             .get(&identity.id)
             .map_or(SpaceId(0), |p| p.state.space);
         let Ok(session_bytes) = random::<8>() else {
-            self.failed = true;
+            self.fail("hello");
             return;
         };
         let session = u64::from_le_bytes(session_bytes).max(1);
@@ -1544,7 +1747,7 @@ impl Server {
             Some(saved) => match rules::survival::Inventory::decode(&saved.inventory) {
                 Ok(inv) => inv,
                 Err(_) => {
-                    self.failed = true;
+                    self.fail("hello");
                     return;
                 }
             },
@@ -1578,7 +1781,7 @@ impl Server {
             match actor::capture_living(identity.id, space, 0, &player, &health, &combat) {
                 Ok(saved) => saved,
                 Err(_) => {
-                    self.failed = true;
+                    self.fail("hello");
                     return;
                 }
             };
@@ -1589,7 +1792,7 @@ impl Server {
         let window = match window_owner::initial(&saved.window, &inventory) {
             Ok(window) => window,
             Err(_) => {
-                self.failed = true;
+                self.fail("hello");
                 return;
             }
         };
@@ -1629,10 +1832,10 @@ impl Server {
                 history: ViewHistory::new(MAX_AOI_PAGES, 8),
                 pages: BTreeSet::new(),
                 page_requests: VecDeque::new(),
+                raw_view: raw_views::ObserverViews::default(),
                 summaries: VecDeque::new(),
                 geometry_requests: VecDeque::new(),
                 geometry_subscriptions: BTreeMap::new(),
-                geometry_view: 0,
                 geometry_views: BTreeMap::new(),
                 height_requests: VecDeque::new(),
                 height_subscriptions: BTreeMap::new(),
@@ -1640,6 +1843,8 @@ impl Server {
                 last_view_position: position,
                 roster_revision: None,
                 entities: None,
+                entity_pending_revision: None,
+                entity_attempt_tick: None,
             },
         );
         out.push(Outgoing::reliable(
@@ -1695,6 +1900,28 @@ impl Server {
         batch: &mut Batch,
         out: &mut Vec<Outgoing>,
     ) {
+        if !peer.health.alive()
+            && !matches!(
+                &action,
+                Action::Respawn | Action::Chat(_) | Action::Command(_) | Action::StopMining
+            )
+        {
+            self.terminal(
+                connection,
+                peer.identity,
+                reply(
+                    id,
+                    ActionStatus::Rejected(RejectReason::Unauthorized),
+                    None,
+                    self.world.version(),
+                    None,
+                    None,
+                ),
+                batch,
+                out,
+            );
+            return;
+        }
         if let Action::SelectSlot(slot) = action {
             let status = if peer.inventory.select(usize::from(slot)).is_ok() {
                 ActionStatus::Accepted
@@ -1749,6 +1976,54 @@ impl Server {
             Action::SelectSlot(_) | Action::PlaceOwned { .. } => unreachable!("handled above"),
             Action::CycleToolMode { back, inventory } => {
                 if let Err(reason) = self.cycle_tool_mode(peer, back, inventory, batch) {
+                    status = ActionStatus::Rejected(reason);
+                }
+            }
+            Action::UseBlockTool {
+                position: target,
+                expected,
+                sneaking,
+                inventory,
+            } => {
+                position = Some(target);
+                match self.use_block_tool(
+                    peer,
+                    tool_owner::BlockTool {
+                        id,
+                        position: target,
+                        expected,
+                        sneaking,
+                        inventory,
+                    },
+                    batch,
+                ) {
+                    Ok(tx) => {
+                        transaction = tx;
+                        if let CellRead::Known(actual) = self.world.read(target) {
+                            cell = Some(actual);
+                        }
+                    }
+                    Err(reason) => status = ActionStatus::Rejected(reason),
+                }
+            }
+            Action::AttackEntity { target, inventory }
+            | Action::UseEntity { target, inventory } => {
+                let use_entity = matches!(action, Action::UseEntity { .. });
+                if let Err(reason) = self.entity_action(
+                    peer,
+                    mob_action_owner::EntityAction {
+                        id,
+                        target,
+                        inventory,
+                        use_entity,
+                    },
+                    batch,
+                ) {
+                    status = ActionStatus::Rejected(reason);
+                }
+            }
+            Action::Respawn => {
+                if let Err(reason) = self.respawn(peer, batch) {
                     status = ActionStatus::Rejected(reason);
                 }
             }
@@ -2079,6 +2354,26 @@ impl Server {
         batch: &mut Batch,
         out: &mut Vec<Outgoing>,
     ) {
+        if !peer.health.alive() {
+            if let Some(mining) = peer.mining.take() {
+                self.terminal(
+                    connection,
+                    peer.identity,
+                    reply(
+                        mining.id,
+                        ActionStatus::Rejected(RejectReason::Canceled),
+                        None,
+                        self.world.version(),
+                        Some(mining.position),
+                        None,
+                    ),
+                    batch,
+                    out,
+                );
+            }
+            peer.interaction.mining.cancel();
+            return;
+        }
         let Some(mining) = peer.mining.as_ref() else {
             let _ = peer.interaction.tick_owned_break(
                 &self.world,
@@ -2401,6 +2696,7 @@ impl Server {
                 peer.player
                     .teleport(p)
                     .map_err(|_| RejectReason::Protocol)?;
+                peer.raw_view.invalidate_observer();
                 Ok(None)
             }
             ["/ban", name] | ["/unban", name] | ["/op", name] | ["/deop", name] => {
@@ -2445,7 +2741,7 @@ impl Server {
                         .map(|(c, _)| *c)
                         .collect();
                     for connection in connections {
-                        self.peers.remove(&connection);
+                        self.disconnect(connection);
                         out.push(Outgoing::reliable(
                             connection,
                             ServerMessage::Error(RejectReason::Banned),
@@ -2519,6 +2815,7 @@ impl Server {
         for connection in connections {
             let mut peer = self.peers.remove(&connection).expect("listed");
             if peer.ready {
+                peer.raw_view.begin_tick(self.tick);
                 let evicted: Vec<_> = peer
                     .pages
                     .iter()
@@ -2529,6 +2826,8 @@ impl Server {
                     peer.pages.remove(&page);
                     peer.history.remove(page);
                     self.light_stream.forget(connection, page);
+                    peer.raw_view.forget(page);
+                    self.raw_projection_forget(connection, page);
                 }
                 // Revisit visible pages when the eye moves. This is required for
                 // visibility-only reveals even if their world versions are equal.
@@ -2541,23 +2840,25 @@ impl Server {
                     peer.last_view_position = peer.player.pos;
                 }
                 for _ in 0..2 {
-                    let Some((page, force)) = peer.page_requests.pop_front() else {
+                    let Some((page, force)) = peer
+                        .raw_view
+                        .pending_request()
+                        .or_else(|| peer.page_requests.pop_front())
+                    else {
                         break;
                     };
                     if !self.in_aoi(&peer, page, peer.pages.contains(&page))
                         || peer.pages.len() >= MAX_AOI_PAGES && !peer.pages.contains(&page)
                     {
+                        peer.raw_view.forget(page);
+                        self.raw_projection_forget(connection, page);
                         output.push(Outgoing::reliable(
                             connection,
                             ServerMessage::PageUnavailable(page),
                         ));
                         continue;
                     }
-                    if let Some(data) = self.world.page(page) {
-                        let Some(raw_source) = self.raw_sources.source(page) else {
-                            self.failed = true;
-                            break;
-                        };
+                    if self.world.page(page).is_some() {
                         if page.space != peer.space
                             && let Some(record) = self.world.space(page.space)
                         {
@@ -2570,23 +2871,30 @@ impl Server {
                                 },
                             ));
                         }
-                        let (cells, work) = visibility::sanitize(
-                            &self.world,
-                            page,
-                            data.cells(),
-                            &peer.player,
-                            peer.space,
-                        );
-                        self.counters.view_cells += work.cells;
-                        self.counters.visibility_segments += work.segments;
+                        let Some((raw_source, cells, force)) =
+                            self.build_raw_view(connection, &mut peer, page, force)
+                        else {
+                            if !peer.page_requests.iter().any(|(p, _)| *p == page) {
+                                peer.page_requests.push_back((page, force));
+                            }
+                            if peer.raw_view.pending_request().is_some() {
+                                break;
+                            }
+                            continue;
+                        };
                         if let Ok(Some(update)) = peer.history.build(page, raw_source, cells, force)
                         {
                             output
                                 .push(Outgoing::reliable(connection, ServerMessage::Page(update)));
                             self.counters.page_images += 1;
                         }
+                        if let Some(latest) = peer.history.latest_page(page) {
+                            peer.raw_view.admit(page, latest.version, raw_source);
+                        }
                         peer.pages.insert(page);
                     } else {
+                        peer.raw_view.forget(page);
+                        self.raw_projection_forget(connection, page);
                         self.request_generation(page);
                         output.push(Outgoing::reliable(
                             connection,
@@ -2599,25 +2907,13 @@ impl Server {
                         .observer_page(&peer, page.space)
                         .is_some_and(|center| net::aoi_contains(center, page, 1024, 1024, false))
                     {
-                        if let Some(data) = self.world.page(page) {
-                            let (cells, work) = visibility::sanitize(
-                                &self.world,
-                                page,
-                                data.cells(),
-                                &peer.player,
-                                peer.space,
-                            );
-                            self.counters.view_cells += work.cells;
-                            self.counters.visibility_segments += work.segments;
-                            self.counters.summary_cells += core_types::PAGE_VOLUME as u64;
+                        if let Some(summary) = self.public_summary(connection, &peer, page) {
                             output.push(Outgoing::reliable(
                                 connection,
-                                ServerMessage::Summary(visibility::summary(
-                                    page,
-                                    geometry::source_version(data),
-                                    &cells,
-                                )),
+                                ServerMessage::Summary(summary),
                             ));
+                        } else if page.space == SpaceId(0) && (0..8).contains(&page.y) {
+                            peer.summaries.push_back(page);
                         } else {
                             output.push(Outgoing::reliable(
                                 connection,
@@ -2636,6 +2932,7 @@ impl Server {
         }
         output.extend(self.publish_geometry());
         output.extend(self.publish_heights());
+        output.extend(self.publish_far_water());
         output.extend(self.publish_lights());
         output.extend(self.publish_props());
         output.extend(self.publish_packets());

@@ -25,6 +25,9 @@ const CHANNELS: ChannelMask = ChannelMask(
 trait SourceRead {
     fn read(&self, position: BlockPos) -> CellRead;
     fn light(&self, position: BlockPos) -> Option<world::LightSample>;
+    fn has_tints(&self) -> bool {
+        true
+    }
 }
 impl SourceRead for World {
     fn read(&self, position: BlockPos) -> CellRead {
@@ -129,6 +132,7 @@ pub enum GiSourceError {
     StaleInput,
     Revision,
     Cancelled,
+    MissingTint,
     Gi(GiError),
 }
 impl std::fmt::Display for GiSourceError {
@@ -175,12 +179,39 @@ pub struct GiSourceBuilder {
     max_pages: usize,
     revision: u64,
     directional: Option<DirectionalScratch>,
+    require_tints: bool,
+    attempt_work: SourceWork,
 }
 struct DirectionalScratch {
     page: Box<[GiSurface; 4096]>,
     updates: Vec<SurfaceUpdate>,
 }
 impl GiSourceBuilder {
+    /// Owner-thread updates are restricted to a small certified dirty union.
+    /// A missing/mismatched certificate must be rebuilt on a worker.
+    pub fn can_update_small(
+        &self,
+        world: &World,
+        page: PageId,
+        epoch: u64,
+        gi: &GiGpu,
+        max_owners: u32,
+    ) -> Result<bool, GiSourceError> {
+        let Some(entry) = self.entries.get(&page) else {
+            return Ok(false);
+        };
+        if entry.epoch != epoch
+            || gi.source_page_version([page.x, page.y, page.z])? != Some(entry.revision)
+        {
+            return Ok(false);
+        }
+        if world.matches_inputs(&entry.inputs) {
+            return Ok(true);
+        }
+        Ok(!entry.force_full
+            && entry.versions == input_pages(page)?.map(|p| world.page_version(p))
+            && entry.dirty.iter().map(|v| v.count_ones()).sum::<u32>() <= max_owners)
+    }
     pub fn new(albedo: GiAlbedo, max_pages: usize) -> Result<Self, GiSourceError> {
         if max_pages == 0 || max_pages > 8192 {
             return Err(GiSourceError::Capacity);
@@ -194,6 +225,8 @@ impl GiSourceBuilder {
             max_pages,
             revision: 0,
             directional: None,
+            require_tints: false,
+            attempt_work: SourceWork::default(),
         })
     }
     /// Allocate the optional face source only during client loading.
@@ -230,6 +263,11 @@ impl GiSourceBuilder {
     }
     pub fn retained_pages(&self) -> usize {
         self.entries.len()
+    }
+    /// Includes actual classification reads from an upload refusal or missing
+    /// tint, so failed/retried owner work cannot disappear from telemetry.
+    pub fn take_attempt_work(&mut self) -> SourceWork {
+        std::mem::take(&mut self.attempt_work)
     }
     pub fn page_revision(&self, page: PageId) -> Option<u64> {
         self.entries.get(&page).map(|entry| entry.revision)
@@ -340,6 +378,7 @@ impl GiSourceBuilder {
         read_budget: &mut SourceBudget,
         upload_budget: &mut UploadBudget,
     ) -> Result<SourceWork, GiSourceError> {
+        self.attempt_work = SourceWork::default();
         if page.space != core_types::SpaceId(0) {
             return Err(GiSourceError::InvalidPage);
         }
@@ -405,12 +444,17 @@ impl GiSourceBuilder {
                     bits &= bits - 1;
                     let local = LocalIdx::new(index).expect("owner mask index");
                     let (x, _, z) = local.xyz();
-                    let (value, surface) = self.sample_voxel(
+                    let sampled = self.sample_voxel(
                         world,
                         position_of(page, local)?,
                         tints[usize::from(x) + 16 * usize::from(z)],
                         &mut work,
-                    )?;
+                    );
+                    self.attempt_work = work;
+                    if sampled.is_err() {
+                        read_budget.remaining_world_reads -= work.world_reads;
+                    }
+                    let (value, surface) = sampled?;
                     self.updates.push(CellUpdate {
                         local: index,
                         value,
@@ -498,12 +542,10 @@ impl GiSourceBuilder {
         read_budget: &mut SourceBudget,
         upload_budget: &mut UploadBudget,
     ) -> Result<SourceWork, GiSourceError> {
-        let tints = std::array::from_fn(|index| {
-            scene
-                .biome_tint(page, (index % 16) as u8, (index / 16) as u8)
-                .unwrap_or(u16::MAX)
-        });
-        self.update_page(
+        let cached = scene.cached_biome_tints(page);
+        let tints = cached.copied().unwrap_or([u16::MAX; 256]);
+        self.require_tints = cached.is_none();
+        let result = self.update_page(
             scene.world(),
             page,
             &tints,
@@ -513,7 +555,9 @@ impl GiSourceBuilder {
             tick,
             read_budget,
             upload_budget,
-        )
+        );
+        self.require_tints = false;
+        result
     }
     fn bake(
         &mut self,
@@ -531,24 +575,37 @@ impl GiSourceBuilder {
         cancel: impl Fn() -> bool,
     ) -> Result<SourceWork, GiSourceError> {
         let mut work = SourceWork::default();
+        self.bake_into(world, page, tints, cancel, &mut work)?;
+        Ok(work)
+    }
+    fn bake_into(
+        &mut self,
+        world: &impl SourceRead,
+        page: PageId,
+        tints: &[u16; 256],
+        cancel: impl Fn() -> bool,
+        work: &mut SourceWork,
+    ) -> Result<(), GiSourceError> {
         for index in 0..4096 {
             if index % 64 == 0 && cancel() {
                 return Err(GiSourceError::Cancelled);
             }
             let local = LocalIdx::new(index as u16).expect("page index");
             let (x, _, z) = local.xyz();
-            let (value, surface) = self.sample_voxel(
+            let sampled = self.sample_voxel(
                 world,
                 position_of(page, local)?,
                 tints[usize::from(x) + 16 * usize::from(z)],
-                &mut work,
-            )?;
+                work,
+            );
+            self.attempt_work = *work;
+            let (value, surface) = sampled?;
             self.scratch[index] = value;
             if let Some(directional) = &mut self.directional {
                 directional.page[index] = surface;
             }
         }
-        Ok(work)
+        Ok(())
     }
     fn sample_voxel(
         &self,
@@ -609,6 +666,11 @@ impl GiSourceBuilder {
                 continue;
             }
             let light = world.light(neighbor).ok_or(GiSourceError::StaleInput)?;
+            if (self.require_tints || !world.has_tints())
+                && material.tint_faces & (1 << (face as u8)) != 0
+            {
+                return Err(GiSourceError::MissingTint);
+            }
             let albedo = self.albedo.face(&material, face)?;
             if self.directional.is_some() {
                 surface = surface

@@ -16,4 +16,4 @@ struct Out{@builtin(position)position:vec4<f32>,@location(0)uv:vec2<f32>,@locati
 }
 fn illumination(world:vec3<f32>,normal:vec3<f32>)->vec3<f32>{// ILLUMINATION
 }
-@fragment fn fragment(input:Out)->@location(0)vec4<f32>{let texel=textureSample(atlas,texels,input.uv,i32(input.layer));return vec4(texel.rgb*input.tint*illumination(input.world,normalize(input.normal)),1.);}
+@fragment fn fragment(input:Out)->@location(0)vec4<f32>{let texel=textureSample(atlas,texels,input.uv,i32(input.layer));if covered_by_near(input.world-normalize(input.normal)*0.0001){discard;}return vec4(texel.rgb*input.tint*illumination(input.world,normalize(input.normal)),1.);}

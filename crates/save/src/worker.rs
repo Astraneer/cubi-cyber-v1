@@ -1,6 +1,10 @@
 //! File IO and checkpoint flattening execute outside the foreground world owner.
 use crate::*;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::thread::JoinHandle;
 use world::persistence::Checkpoint;
 
@@ -36,6 +40,7 @@ pub struct Completion {
 }
 
 pub struct SaveWorker {
+    wal_bytes: Arc<AtomicU64>,
     requests: Option<SyncSender<WriteRequest>>,
     responses: Option<Receiver<Completion>>,
     thread: Option<JoinHandle<()>>,
@@ -47,12 +52,14 @@ impl SaveWorker {
         }
         let (requests, input) = mpsc::sync_channel(capacity);
         let (output, responses) = mpsc::sync_channel(capacity);
+        let wal_bytes = Arc::new(AtomicU64::new(store.wal_bytes()?));
+        let published_bytes = Arc::clone(&wal_bytes);
         let thread = std::thread::Builder::new()
             .name("cubi-save".into())
             .spawn(move || {
                 let mut failed = false;
                 while let Ok(request) = input.recv() {
-                    let (ticket, result) = match request {
+                    let (ticket, mut result) = match request {
                         WriteRequest::Batch { ticket, batch } => (
                             ticket,
                             if failed {
@@ -91,6 +98,12 @@ impl SaveWorker {
                             },
                         ),
                     };
+                    if result.is_ok() {
+                        match store.wal_bytes() {
+                            Ok(bytes) => published_bytes.store(bytes, Ordering::Release),
+                            Err(error) => result = Err(error),
+                        }
+                    }
                     failed |= result.is_err();
                     // On graceful/drop shutdown the receiver may be gone. Already
                     // queued writes are still drained, but no unconfirmed ACK exists.
@@ -98,10 +111,15 @@ impl SaveWorker {
                 }
             })?;
         Ok(Self {
+            wal_bytes,
             requests: Some(requests),
             responses: Some(responses),
             thread: Some(thread),
         })
+    }
+    /// Last successfully durable writer frontier; no foreground filesystem IO.
+    pub fn wal_bytes(&self) -> u64 {
+        self.wal_bytes.load(Ordering::Acquire)
     }
     pub fn try_submit(&self, request: WriteRequest) -> Result<(), Box<TrySendError<WriteRequest>>> {
         self.requests

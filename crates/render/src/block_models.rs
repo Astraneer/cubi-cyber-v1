@@ -266,7 +266,7 @@ impl BlockModelsGpu {
         config: BlockConfig,
         shadows: Option<&ShadowGpu>,
     ) -> Result<Self, BlockError> {
-        Self::new_prepared(device, queue, geometry, config, shadows, None)
+        Self::new_prepared(device, queue, geometry, config, shadows, None, None)
     }
     /// Prepare shared atmospheric lighting once during loading.
     pub fn new_with_atmosphere(
@@ -277,8 +277,37 @@ impl BlockModelsGpu {
         shadows: Option<&ShadowGpu>,
         atmosphere: &crate::atmosphere::AtmosphereGpu,
     ) -> Result<Self, BlockError> {
-        Self::new_prepared(device, queue, geometry, config, shadows, Some(atmosphere))
+        Self::new_prepared(
+            device,
+            queue,
+            geometry,
+            config,
+            shadows,
+            Some(atmosphere),
+            None,
+        )
     }
+    /// Shared optional GI receiver, prepared once before drawing any instances.
+    pub fn new_with_lighting(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        geometry: TerrainGeometry<'_>,
+        config: BlockConfig,
+        shadows: Option<&ShadowGpu>,
+        atmosphere: &crate::atmosphere::AtmosphereGpu,
+        gi: Option<&crate::gi::GiGpu>,
+    ) -> Result<Self, BlockError> {
+        Self::new_prepared(
+            device,
+            queue,
+            geometry,
+            config,
+            shadows,
+            Some(atmosphere),
+            gi,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
     fn new_prepared(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -286,9 +315,11 @@ impl BlockModelsGpu {
         config: BlockConfig,
         shadows: Option<&ShadowGpu>,
         atmosphere: Option<&crate::atmosphere::AtmosphereGpu>,
+        gi: Option<&crate::gi::GiGpu>,
     ) -> Result<Self, BlockError> {
         let sample_count = geometry.sample_count;
         if config.max_instances == 0
+            || (gi.is_some() && atmosphere.is_none())
             || config.atlas_layers < 185
             || u64::from(config.max_instances) * 64
                 > u64::from(device.limits().max_storage_buffer_binding_size)
@@ -373,9 +404,18 @@ impl BlockModelsGpu {
         if atmosphere.is_some() {
             entries.push(buffer_layout(20, f, false, true));
         }
+        if gi.is_some() {
+            crate::gi_model::layout(&mut entries);
+        }
         let render_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("static block atlas layout"),
             entries: &entries,
+        });
+        let dummy_footprint = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("inactive color cull footprint binding"),
+            size: 256,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
         });
         let cull_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("static block cull layout"),
@@ -385,6 +425,7 @@ impl BlockModelsGpu {
                 buffer_layout(2, c, false, false),
                 buffer_layout(3, c, false, false),
                 buffer_layout(4, c, false, true),
+                buffer_layout(5, c, false, false),
             ],
         });
         let make_bind = |layout: &wgpu::BindGroupLayout,
@@ -421,13 +462,19 @@ impl BlockModelsGpu {
             if lighting && let Some(atmosphere) = atmosphere {
                 entries.push(buffer_binding(20, atmosphere.lighting_buffer()));
             }
+            if lighting && let Some(gi) = gi {
+                crate::gi_model::bindings(&mut entries, gi);
+            }
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("static block draw tables"),
                 layout,
                 entries: &entries,
             })
         };
-        let make_cull = |camera: &wgpu::Buffer, visible: &wgpu::Buffer, indirect: &wgpu::Buffer| {
+        let make_cull = |camera: &wgpu::Buffer,
+                         visible: &wgpu::Buffer,
+                         indirect: &wgpu::Buffer,
+                         cascade: Option<usize>| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("static block cull tables"),
                 layout: &cull_layout,
@@ -437,32 +484,56 @@ impl BlockModelsGpu {
                     buffer_binding(2, visible),
                     buffer_binding(3, indirect),
                     buffer_binding(4, &ranges),
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: cascade
+                            .and_then(|i| shadows.and_then(|s| s.footprint_binding(i)))
+                            .unwrap_or_else(|| dummy_footprint.as_entire_binding()),
+                    },
                 ],
             })
         };
         let bind = make_bind(&render_layout, &camera, &visible, true);
-        let cull_bind = make_cull(&camera, &visible, &indirect);
-        let source = crate::atmosphere::surface_shader(
-            &include_str!("block_models.wgsl")
-                .replace("// PORTS", include_str!("block_ports.wgsl")),
+        let cull_bind = make_cull(&camera, &visible, &indirect, None);
+        let source = shader_source_with_ambient(
             shadows.is_some(),
             atmosphere.is_some(),
-            true,
-            if shadows.is_some() {
-                "return light.rgb+vec3(light.a*(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.)));"
-            } else {
-                "return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.));"
-            },
-        );
+            gi.is_some(),
+            geometry.ambient_mrt,
+        )?;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("GPU static block poses"),
             source: wgpu::ShaderSource::Wgsl(source.clone().into()),
         });
-        let pipeline = render_pipeline(device, &render_layout, &shader, false, false, sample_count);
-        let glass = render_pipeline(device, &render_layout, &shader, false, true, sample_count);
+        let pipeline = render_pipeline(
+            device,
+            &render_layout,
+            &shader,
+            false,
+            false,
+            sample_count,
+            geometry.ambient_mrt,
+        );
+        let glass = render_pipeline(
+            device,
+            &render_layout,
+            &shader,
+            false,
+            true,
+            sample_count,
+            geometry.ambient_mrt,
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("GPU static block frustum buckets"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("block_models_cull.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}\n{}",
+                    crate::shadows::footprint::COMMON,
+                    crate::shadows::footprint::MODEL,
+                    include_str!("block_models_cull.wgsl")
+                )
+                .into(),
+            ),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("block model compute"),
@@ -512,7 +583,7 @@ impl BlockModelsGpu {
             });
             let binds = std::array::from_fn(|i| make_bind(&layout, &cameras[i], &visible, false));
             let cull_binds =
-                std::array::from_fn(|i| make_cull(&cull_cameras[i], &visible, &indirect));
+                std::array::from_fn(|i| make_cull(&cull_cameras[i], &visible, &indirect, Some(i)));
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("same block pose for shadows"),
                 source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -523,7 +594,15 @@ impl BlockModelsGpu {
                 binds,
                 cull_binds,
                 indirect,
-                pipeline: render_pipeline(device, &layout, &shader, true, false, sample_count),
+                pipeline: render_pipeline(
+                    device,
+                    &layout,
+                    &shader,
+                    true,
+                    false,
+                    sample_count,
+                    false,
+                ),
             })
         } else {
             None
@@ -958,7 +1037,39 @@ impl DynamicShadowCaster for BlockModelsGpu {
         ShadowPrepareWork {
             dispatches: 2,
             upload_bytes: 192,
+            bounds_complete: false,
         }
+    }
+    fn prepare_shadow_sparse(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        cascade: usize,
+        camera: Camera,
+        resolution: u32,
+    ) -> ShadowPrepareWork {
+        let mut work = self.prepare_shadow_region(
+            queue,
+            encoder,
+            cascade,
+            camera,
+            ShadowRect::full(resolution),
+            resolution,
+        );
+        if work.dispatches != 0 {
+            let shadow = self
+                .shadow
+                .as_ref()
+                .expect("prepared model shadow resources");
+            queue.write_buffer(
+                &shadow.cull_cameras[cascade],
+                80,
+                bytemuck::bytes_of(&[resolution, 1u32, 0, 0]),
+            );
+            work.upload_bytes += 16;
+        }
+        work.bounds_complete = true;
+        work
     }
     fn draw_shadow(&self, pass: &mut wgpu::RenderPass<'_>, cascade: usize) -> u32 {
         let Some(s) = &self.shadow else { return 0 };
@@ -984,21 +1095,19 @@ fn render_pipeline(
     shadow: bool,
     glass: bool,
     sample_count: u32,
+    ambient_mrt: bool,
 ) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("static block vertex pulling"),
         bind_group_layouts: &[layout],
         push_constant_ranges: &[],
     });
-    let color_targets = [Some(wgpu::ColorTargetState {
-        format: wgpu::TextureFormat::Rgba16Float,
-        blend: if glass || sample_count == 1 {
-            Some(wgpu::BlendState::ALPHA_BLENDING)
-        } else {
-            None
-        },
-        write_mask: wgpu::ColorWrites::ALL,
-    })];
+    let blend = if glass || sample_count == 1 {
+        Some(wgpu::BlendState::ALPHA_BLENDING)
+    } else {
+        None
+    };
+    let color_targets = crate::ambient_mrt::targets(blend, ambient_mrt);
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("static blocks immutable model pipeline"),
         layout: Some(&layout),
@@ -1083,6 +1192,45 @@ fn buffer_binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'
         resource: buffer.as_entire_binding(),
     }
 }
+/// Loading/tooling source generated by the exact constructor path.
+pub fn shader_source(shadows: bool, atmosphere: bool, gi: bool) -> Result<String, BlockError> {
+    if gi && !atmosphere {
+        return Err(BlockError::InvalidConfig);
+    }
+    let source = crate::atmosphere::surface_shader(
+        &include_str!("block_models.wgsl").replace("// PORTS", include_str!("block_ports.wgsl")),
+        shadows,
+        atmosphere,
+        true,
+        if shadows {
+            "return light.rgb+vec3(light.a*(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.)));"
+        } else {
+            "return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.));"
+        },
+    );
+    let source = if gi {
+        crate::gi_model::shader(source)
+    } else {
+        source
+    };
+    Ok(source)
+}
+
+/// Exact optional MRT constructor source for independent backend oracles.
+pub fn shader_source_with_ambient(
+    shadows: bool,
+    atmosphere: bool,
+    gi: bool,
+    ambient: bool,
+) -> Result<String, BlockError> {
+    let source = shader_source(shadows, atmosphere, gi)?;
+    Ok(if ambient {
+        crate::ambient_mrt::block(&source, shadows, atmosphere, gi)
+    } else {
+        source
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

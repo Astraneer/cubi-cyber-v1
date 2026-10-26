@@ -22,6 +22,15 @@ use std::ops::{Deref, DerefMut};
 
 pub const TICKS_PER_SECOND: u32 = 20;
 pub const TICK_SECONDS: f64 = 1.0 / TICKS_PER_SECOND as f64;
+/// Shared aim calculation. Keep f32 angle conversion before libm's f64 trig so
+/// pointer targeting and the movement owner use identical numeric operations.
+pub fn look_direction(yaw: f32, pitch: f32) -> [f64; 3] {
+    let f = (pitch * (std::f32::consts::PI / 180.0)) as f64;
+    let g = (-yaw * (std::f32::consts::PI / 180.0)) as f64;
+    let (h, i) = (libm::cos(g), libm::sin(g));
+    let (j, k) = (libm::cos(f), libm::sin(f));
+    [i * j, -k, h * j]
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum GameMode {

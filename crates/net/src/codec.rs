@@ -424,6 +424,48 @@ pub fn encode_client(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
                     out.u16(inventory.damage);
                     out.u64(inventory.payload);
                 }
+                Action::AttackEntity { target, inventory }
+                | Action::UseEntity { target, inventory } => {
+                    if *target == 0
+                        || inventory.selected >= 9
+                        || (inventory.payload != 0 && inventory.count != 1)
+                    {
+                        return Err(CodecError::InvalidBounds);
+                    }
+                    out.byte(if matches!(action, Action::UseEntity { .. }) {
+                        15
+                    } else {
+                        9
+                    });
+                    out.u64(*target);
+                    out.u64(inventory.revision);
+                    out.byte(inventory.selected);
+                    out.u16(inventory.item);
+                    out.u16(inventory.count);
+                    out.u16(inventory.damage);
+                    out.u64(inventory.payload);
+                }
+                Action::Respawn => out.byte(20),
+                Action::UseBlockTool {
+                    position,
+                    expected,
+                    sneaking,
+                    inventory,
+                } => {
+                    if inventory.selected >= 9 || (inventory.payload != 0 && inventory.count != 1) {
+                        return Err(CodecError::InvalidBounds);
+                    }
+                    out.byte(21);
+                    out.position(*position);
+                    out.u32(expected.raw());
+                    out.bool(*sneaking);
+                    out.u64(inventory.revision);
+                    out.byte(inventory.selected);
+                    out.u16(inventory.item);
+                    out.u16(inventory.count);
+                    out.u16(inventory.damage);
+                    out.u64(inventory.payload);
+                }
                 Action::Chat(text) => {
                     if !presence::valid_chat(text) {
                         return Err(CodecError::InvalidBounds);
@@ -539,6 +581,17 @@ pub fn encode_client(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
         }
         ClientMessage::ForgetGeometry(page) => {
             out.byte(8);
+            out.page(*page);
+        }
+        ClientMessage::RequestWater(request) => {
+            out.byte(19);
+            write_blob(
+                &mut out,
+                &water::encode_request(*request).map_err(|_| CodecError::InvalidBounds)?,
+            );
+        }
+        ClientMessage::ForgetWater(page) => {
+            out.byte(20);
             out.page(*page);
         }
         ClientMessage::Ping(value) => {
@@ -675,6 +728,51 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
                     }
                     Action::CycleToolMode { back, inventory }
                 }
+                tag @ (9 | 15) => {
+                    let target = input.u64()?;
+                    let inventory = InventoryGuard {
+                        revision: input.u64()?,
+                        selected: input.byte()?,
+                        item: input.u16()?,
+                        count: input.u16()?,
+                        damage: input.u16()?,
+                        payload: input.u64()?,
+                    };
+                    if target == 0
+                        || inventory.selected >= 9
+                        || (inventory.payload != 0 && inventory.count != 1)
+                    {
+                        return Err(CodecError::InvalidBounds);
+                    }
+                    if tag == 9 {
+                        Action::AttackEntity { target, inventory }
+                    } else {
+                        Action::UseEntity { target, inventory }
+                    }
+                }
+                20 => Action::Respawn,
+                21 => {
+                    let position = input.position()?;
+                    let expected = Cell::from_raw(input.u32()?);
+                    let sneaking = input.bool()?;
+                    let inventory = InventoryGuard {
+                        revision: input.u64()?,
+                        selected: input.byte()?,
+                        item: input.u16()?,
+                        count: input.u16()?,
+                        damage: input.u16()?,
+                        payload: input.u64()?,
+                    };
+                    if inventory.selected >= 9 || (inventory.payload != 0 && inventory.count != 1) {
+                        return Err(CodecError::InvalidBounds);
+                    }
+                    Action::UseBlockTool {
+                        position,
+                        expected,
+                        sneaking,
+                        inventory,
+                    }
+                }
                 8 => {
                     let text = input.string(presence::MAX_CHAT_BYTES)?;
                     if !presence::valid_chat(&text) {
@@ -726,6 +824,11 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
             ClientMessage::RequestGeometry { page, known }
         }
         8 => ClientMessage::ForgetGeometry(input.page()?),
+        19 => ClientMessage::RequestWater(
+            water::decode_request(read_blob(&mut input, water::MAX_REQUEST_BYTES)?)
+                .map_err(|_| CodecError::InvalidBounds)?,
+        ),
+        20 => ClientMessage::ForgetWater(input.page()?),
         tag @ (12 | 18) => {
             let key = read_height_key(&mut input)?;
             if tag == 18 && key.level != 0 {
@@ -968,6 +1071,24 @@ pub fn encode_server(message: &ServerMessage) -> Result<Vec<u8>, CodecError> {
         ServerMessage::GeometryUnavailable(page) => {
             out.byte(14);
             out.page(*page);
+        }
+        ServerMessage::WaterHalo(halo) => {
+            out.byte(25);
+            write_blob(
+                &mut out,
+                &water::encode(halo).map_err(|_| CodecError::InvalidBounds)?,
+            );
+        }
+        ServerMessage::WaterUnavailable(page) => {
+            out.byte(26);
+            out.page(*page);
+        }
+        ServerMessage::AudioCue(cue) => {
+            out.byte(27);
+            write_blob(
+                &mut out,
+                &cue.encode().map_err(|_| CodecError::InvalidBounds)?,
+            );
         }
         ServerMessage::Players { tick, players } => {
             if players.len() > 64 {
@@ -1300,6 +1421,15 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, CodecError> {
             )?)
             .map_err(|_| CodecError::InvalidBounds)?,
         )),
+        25 => ServerMessage::WaterHalo(
+            water::decode(read_blob(&mut input, water::MAX_BYTES)?)
+                .map_err(|_| CodecError::InvalidBounds)?,
+        ),
+        26 => ServerMessage::WaterUnavailable(input.page()?),
+        27 => ServerMessage::AudioCue(
+            audio_cue::Cue::decode(read_blob(&mut input, 64)?)
+                .map_err(|_| CodecError::InvalidBounds)?,
+        ),
         _ => return Err(CodecError::InvalidEnum),
     };
     finish(input)?;

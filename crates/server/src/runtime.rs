@@ -389,8 +389,7 @@ impl Runtimes {
     }
 }
 pub(crate) fn player_entity(id: PlayerId) -> EntityId {
-    let hash = blake3::derive_key("cubi authoritative player entity v1", &id.0);
-    EntityId(u64::from_le_bytes(hash[..8].try_into().expect("hash prefix")).max(1))
+    EntityId(net::player_entity_id(id))
 }
 impl Server {
     /// Import is a durable microbatch at the current tick, before the20Hz gate.
@@ -458,6 +457,27 @@ impl Server {
         if self.runtimes.items.entities().active_len() == 0 && spawns.is_empty() {
             return Ok(());
         }
+        let pending_rows =
+            if let Some(record) = batch.runtimes.iter().find(|r| r.kind == RUNTIME_ITEMS) {
+                let delta = entities::items::ItemDelta::decode(&record.payload, MAX_ITEMS)
+                    .map_err(|_| ServerError::Invalid("pending owned item rows"))?;
+                self.runtimes
+                    .items
+                    .spawn_capacity(&delta)
+                    .map_err(|_| ServerError::Invalid("pending owned item guards"))?;
+                delta
+                    .patches
+                    .into_iter()
+                    .map(|p| match (p.before, p.after) {
+                        (None, Some(row)) => Ok(row),
+                        _ => Err(ServerError::Invalid(
+                            "only detached spawns precede item physics",
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
+            };
         let mut identities = BTreeMap::new();
         let mut players = Vec::new();
         for peer in self.peers.values().filter(|p| p.ready) {
@@ -504,7 +524,7 @@ impl Server {
         let delta = self
             .runtimes
             .items
-            .extend_spawn(plan.delta, spawns, true)
+            .extend_spawn(plan.delta, pending_rows.into_iter().chain(spawns), true)
             .map_err(|_| ServerError::Invalid("machine item spawn guard/capacity"))?;
         let payload = delta
             .encode()
@@ -531,10 +551,15 @@ impl Server {
         }
         self.counters.item_steps += plan.work.entities;
         self.counters.item_pickups += plan.work.picked_items;
-        batch.runtimes.push(RuntimeRecord {
+        let record = RuntimeRecord {
             kind: RUNTIME_ITEMS,
             payload,
-        });
+        };
+        if let Some(old) = batch.runtimes.iter_mut().find(|r| r.kind == RUNTIME_ITEMS) {
+            *old = record;
+        } else {
+            batch.runtimes.push(record);
+        }
         Ok(())
     }
 }
@@ -611,9 +636,16 @@ pub(super) fn tick_health(
 impl Server {
     pub(super) fn publish_entities(&mut self) -> Vec<Outgoing> {
         let mut output = Vec::new();
+        if self.mob_owner.due {
+            return output;
+        }
         let mobs = self.runtimes.mobs.entities();
         let items = self.runtimes.items.entities();
         for (connection, peer) in self.peers.iter_mut().filter(|(_, p)| p.ready) {
+            if peer.entity_pending_revision.is_some() || peer.entity_attempt_tick == Some(self.tick)
+            {
+                continue;
+            }
             if peer.entities.is_none() {
                 if mobs.is_empty() && items.is_empty() {
                     continue;
@@ -625,12 +657,13 @@ impl Server {
                 ) {
                     Ok(history) => peer.entities = Some(history),
                     Err(_) => {
-                        self.failed = true;
+                        self.fail("publish_entities");
                         break;
                     }
                 }
             }
             let history = peer.entities.as_mut().expect("initialized history");
+            peer.entity_attempt_tick = Some(self.tick);
             let interest = entities::replication::Interest {
                 space: peer.space,
                 center: peer.player.pos,
@@ -647,6 +680,7 @@ impl Server {
                     self.counters.entity_buckets += work.buckets;
                     self.counters.entity_poses += work.poses;
                     if let Some(frame) = frame {
+                        peer.entity_pending_revision = Some(frame.revision);
                         self.counters.entity_frames += 1;
                         output.push(Outgoing::reliable(
                             *connection,
@@ -671,18 +705,7 @@ impl Server {
         }
         // Only external writes wake an idle furnace. Its own last burn/component
         // update must not turn a deliberately sleeping furnace into a full scan.
-        for component in batch.changes.iter().flat_map(|c| &c.components) {
-            if component
-                .after
-                .as_ref()
-                .is_some_and(|r| r.data.kind == survival::FURNACE_COMPONENT)
-            {
-                events.insert(
-                    Event::Furnace(component.id),
-                    Tick(self.tick.0.saturating_add(1)),
-                );
-            }
-        }
+        self.component_survival_wakes(batch, &mut events);
         let cell_edits = batch.changes.iter().any(|c| !c.cells.is_empty());
         if self.runtimes.survival.is_empty() && events.is_empty() && !cell_edits {
             return Ok(());
@@ -703,64 +726,7 @@ impl Server {
                     .map_err(|_| ServerError::Invalid("survival phase transaction"))?,
             );
         }
-        let mut positions = BTreeSet::new();
-        for cell in batch.changes.iter().flat_map(|c| &c.cells) {
-            let (x, y, z) = cell.index.xyz();
-            let p = BlockPos {
-                space: cell.page.space,
-                x: cell
-                    .page
-                    .x
-                    .checked_mul(16)
-                    .and_then(|v| v.checked_add(i32::from(x)))
-                    .ok_or(ServerError::Invalid("cell x bound"))?,
-                y: cell
-                    .page
-                    .y
-                    .checked_mul(16)
-                    .and_then(|v| v.checked_add(i32::from(y)))
-                    .ok_or(ServerError::Invalid("cell y bound"))?,
-                z: cell
-                    .page
-                    .z
-                    .checked_mul(16)
-                    .and_then(|v| v.checked_add(i32::from(z)))
-                    .ok_or(ServerError::Invalid("cell z bound"))?,
-            };
-            for d in [
-                [0, 0, 0],
-                [-1, 0, 0],
-                [1, 0, 0],
-                [0, -1, 0],
-                [0, 1, 0],
-                [0, 0, -1],
-                [0, 0, 1],
-            ] {
-                if let (Some(x), Some(y), Some(z)) = (
-                    p.x.checked_add(d[0]),
-                    p.y.checked_add(d[1]),
-                    p.z.checked_add(d[2]),
-                ) {
-                    positions.insert(BlockPos {
-                        space: p.space,
-                        x,
-                        y,
-                        z,
-                    });
-                }
-            }
-        }
-        for position in positions {
-            self.counters.survival_wake_reads += 1;
-            if let CellRead::Known(cell) = self.world.read(position)
-                && let Some(fluid) = rules::survival::fluid::fluid(cell)
-            {
-                events.insert(
-                    Event::Fluid(position, fluid.liquid),
-                    Tick(self.tick.0.saturating_add(fluid.liquid.delay())),
-                );
-            }
-        }
+        self.cell_survival_wakes(batch, &mut events)?;
         let delta = self
             .runtimes
             .survival
@@ -874,10 +840,18 @@ impl Server {
     pub(super) fn tick_machines(
         &mut self,
         batch: &mut Batch,
-    ) -> Result<Vec<rules::entities::item::ItemEntity>, ServerError> {
-        self.refresh_active_sections()?;
+    ) -> Result<machine_owner::MachineTick, ServerError> {
+        let continuing = self.runtimes.machines.owner_pending();
+        // A socket may close during a held logical tick. Complete its captured
+        // cohort against the same activity/topology view; apply AOI changes at
+        // the next boundary instead of invalidating an in-flight ready cursor.
+        if !continuing {
+            self.refresh_active_sections()?;
+        }
         let mut activity = Vec::new();
-        if !self.runtimes.machine_activity_initialized {
+        if continuing {
+            // No new external activity belongs to this durable cohort.
+        } else if !self.runtimes.machine_activity_initialized {
             activity.extend(
                 self.runtimes
                     .machines
@@ -892,13 +866,16 @@ impl Server {
                     .map(|p| (*p, self.runtimes.active_sections.contains(p))),
             );
         }
-        let bootstrap: Vec<_> = self
-            .runtimes
-            .topology_bootstrap
-            .iter()
-            .take(64)
-            .copied()
-            .collect();
+        let bootstrap: Vec<_> = if continuing {
+            Vec::new()
+        } else {
+            self.runtimes
+                .topology_bootstrap
+                .iter()
+                .take(64)
+                .copied()
+                .collect()
+        };
         let mut topology: BTreeSet<_> = bootstrap.iter().copied().collect();
         let endpoint = |id: u16| {
             matches!(
@@ -933,7 +910,11 @@ impl Server {
             }
         }
         let topology: Vec<_> = topology.into_iter().collect();
-        let mut changed: BTreeSet<_> = self.runtimes.machine_bootstrap.iter().copied().collect();
+        let mut changed: BTreeSet<_> = if continuing {
+            BTreeSet::new()
+        } else {
+            self.runtimes.machine_bootstrap.iter().copied().collect()
+        };
         for c in batch.changes.iter().flat_map(|c| &c.components) {
             if c.before
                 .as_ref()
@@ -947,11 +928,12 @@ impl Server {
         }
         if self.runtimes.machines.event_count() == 0
             && !self.runtimes.machines.transport_due(self.tick)
+            && !self.runtimes.machines.owner_pending()
             && changed.is_empty()
             && topology.is_empty()
             && activity.is_empty()
         {
-            return Ok(Vec::new());
+            return Ok(machine_owner::MachineTick::idle());
         }
         let pending = self
             .payload_delta(batch)
@@ -968,6 +950,17 @@ impl Server {
         };
         let active_sections = &self.runtimes.active_sections;
         let active = |p: BlockPos| active_sections.contains(&p.page());
+        let item_capacity = batch
+            .runtimes
+            .iter()
+            .find(|r| r.kind == RUNTIME_ITEMS)
+            .map(|r| entities::items::ItemDelta::decode(&r.payload, MAX_ITEMS))
+            .transpose()
+            .map_err(|_| ServerError::Invalid("pending machine item capacity"))?
+            .map(|delta| self.runtimes.items.spawn_capacity(&delta))
+            .transpose()
+            .map_err(|_| ServerError::Invalid("pending machine item guards"))?
+            .unwrap_or_else(|| MAX_ITEMS.saturating_sub(self.runtimes.items.entities().len()));
         let mut plan = self
             .runtimes
             .machines
@@ -981,11 +974,11 @@ impl Server {
                 &topology,
                 self.tick,
                 machines::Budget {
-                    item_spawns: MAX_ITEMS.saturating_sub(self.runtimes.items.entities().len()),
+                    item_spawns: item_capacity,
                     ..machines::Budget::default()
                 },
             )
-            .map_err(|_| ServerError::Invalid("machine phase planning"))?;
+            .map_err(machine_phase_error)?;
         // Admission precedes every World write. A full item store or payload
         // ledger leaves packets and source inventories intact for a later tick.
         let spawn_delta = self
@@ -1034,6 +1027,7 @@ impl Server {
             .machines
             .validate(&self.world, &plan)
             .map_err(|_| ServerError::Invalid("machine phase guard"))?;
+        let complete = plan.owner_complete();
         for tx in plan.transactions {
             batch.changes.push(
                 self.world
@@ -1056,10 +1050,16 @@ impl Server {
         }
         Self::stage_payloads(batch, payload_record);
         self.counters.machine_events += plan.work.events;
+        self.counters.machine_prepared += plan.work.prepared;
+        self.counters.machine_unknown += plan.work.unknown;
+        self.counters.machine_deferred += plan.work.deferred;
+        self.counters.machine_copy_bytes += plan.work.bytes;
         self.counters.machine_steps += plan.work.machines;
         self.counters.machine_reads += plan.work.reads;
         self.counters.machine_transfers += plan.work.transfers;
-        self.runtimes.machine_bootstrap.clear();
+        if !continuing {
+            self.runtimes.machine_bootstrap.clear();
+        }
         for p in bootstrap {
             self.runtimes.topology_bootstrap.remove(&p);
         }
@@ -1070,7 +1070,19 @@ impl Server {
             self.runtimes.machine_activity_initialized = true;
             self.runtimes.machine_activity_revision = self.runtimes.sections_revision;
         }
-        Ok(plan.item_spawns)
+        Ok(machine_owner::MachineTick {
+            spawns: plan.item_spawns,
+            complete,
+        })
+    }
+}
+
+fn machine_phase_error(error: machines::MachineError) -> ServerError {
+    match error {
+        machines::MachineError::RouteCapacity => {
+            ServerError::Invalid("machine route exceeds fixed search capacity")
+        }
+        _ => ServerError::Invalid("machine phase planning"),
     }
 }
 

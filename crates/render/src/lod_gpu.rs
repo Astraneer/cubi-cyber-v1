@@ -5,12 +5,21 @@ use crate::{
     lod::{MaskedRayProxy, PublicVoxel, SurfaceKind},
     shadows::ShadowGpu,
     terrain_gpu::{Camera, TerrainGeometry, UploadBudget},
+    terrain_mesh::{
+        CellMaterial, Face, MAX_PAGE_QUADS, MeshClass, MeshScratch, PageHalo, PageMesh,
+        QuadDescriptor, mesh_page,
+    },
 };
 use bytemuck::{Pod, Zeroable};
 use std::collections::BTreeMap;
 const OCCUPANCY_WORDS: usize = 128;
 const INDEX_OFFSET: usize = 161;
 const OBJECT_BYTES: u64 = 256;
+const PAYLOAD_HEADER_BYTES: usize = 36;
+const MAX_PAYLOAD_WORDS: usize = INDEX_OFFSET + 1536 + 8192 + MAX_PAGE_QUADS * 4;
+pub const MAX_PROXY_PAYLOAD_BYTES: usize = PAYLOAD_HEADER_BYTES + MAX_PAYLOAD_WORDS * 4;
+pub const MAX_PUBLIC_BYTES: usize = MAX_PROXY_PAYLOAD_BYTES;
+pub const MAX_RETAINED_BYTES: usize = std::mem::size_of::<ProxyPayload>() + MAX_PAYLOAD_WORDS * 4;
 pub const MAX_DDA_STEPS: u32 = 46;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProxyError {
@@ -38,6 +47,9 @@ pub struct ProxyPayload {
     index_bits: u32,
     occupied: u32,
     palette_len: u32,
+    quad_offset: u32,
+    quad_count: u32,
+    classes: u32,
 }
 impl ProxyPayload {
     /// Run in a background task. No registry, generator or authoritative cells
@@ -47,6 +59,8 @@ impl ProxyPayload {
         let mut palette = Vec::new();
         let mut lookup = BTreeMap::new();
         let mut indices = Vec::new();
+        let mut halo = PageHalo::filled(0);
+        let mut classes = 0u32;
         for y in 0..16u8 {
             for z in 0..16u8 {
                 for x in 0..16u8 {
@@ -69,6 +83,8 @@ impl ProxyPayload {
                                 index
                             });
                             indices.push(palette_index);
+                            halo.set(x as i8, y as i8, z as i8, palette_index + 1);
+                            classes |= 1 << kind as u32;
                         }
                     }
                 }
@@ -81,7 +97,38 @@ impl ProxyPayload {
         };
         let index_words = (indices.len() * bits as usize).div_ceil(32);
         let palette_offset = INDEX_OFFSET + index_words;
-        let mut words = vec![0; palette_offset + palette.len() * 2];
+        let quad_offset = palette_offset + palette.len() * 2;
+        let mut mesh = PageMesh::default();
+        if classes & 2 != 0 {
+            mesh_page(
+                &halo,
+                |raw| {
+                    if raw == 0 {
+                        return CellMaterial::EMPTY;
+                    }
+                    let PublicVoxel::Solid {
+                        material,
+                        tint,
+                        kind,
+                    } = palette[raw as usize - 1]
+                    else {
+                        unreachable!("occupied palette")
+                    };
+                    let mut result = CellMaterial::opaque(material);
+                    result.tint = tint;
+                    if kind == SurfaceKind::Cutout {
+                        result.class = MeshClass::Cutout;
+                        result.occludes = false;
+                        result.casts_ao = false;
+                    }
+                    result
+                },
+                &mut MeshScratch::new(),
+                &mut mesh,
+            );
+        }
+        let quad_count = mesh.cutout.len();
+        let mut words = vec![0; quad_offset + quad_count * 4];
         words[..128].copy_from_slice(&occupied);
         let mut rank = 0u32;
         for word in 0..65 {
@@ -110,25 +157,35 @@ impl ProxyPayload {
                 words[palette_offset + i * 2 + 1] = tint;
             }
         }
+        for (index, quad) in mesh.cutout.iter().enumerate() {
+            words[quad_offset + index * 4..quad_offset + index * 4 + 4]
+                .copy_from_slice(&quad.words);
+        }
         Ok(Self {
             words,
             palette_offset: palette_offset as u32,
             index_bits: bits,
             occupied: indices.len() as u32,
             palette_len: palette.len() as u32,
+            quad_offset: quad_offset as u32,
+            quad_count: quad_count as u32,
+            classes,
         })
     }
     /// Bounded browser-worker result. The decoder checks every rank/index before
     /// constructing storage accepted by the GPU; no meshing runs on the owner.
     pub fn encode_public(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(24 + self.words.len() * 4);
-        bytes.extend_from_slice(b"PXP1");
+        let mut bytes = Vec::with_capacity(PAYLOAD_HEADER_BYTES + self.words.len() * 4);
+        bytes.extend_from_slice(b"PXP2");
         for value in [
             self.words.len() as u32,
             self.palette_offset,
             self.index_bits,
             self.occupied,
             self.palette_len,
+            self.quad_offset,
+            self.quad_count,
+            self.classes,
         ] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
@@ -138,9 +195,9 @@ impl ProxyPayload {
         bytes
     }
     pub fn decode_public(bytes: &[u8], atlas_layers: u32) -> Result<Self, ProxyError> {
-        if bytes.len() < 24
-            || bytes.len() > 24 + 10000 * 4
-            || &bytes[..4] != b"PXP1"
+        if bytes.len() < PAYLOAD_HEADER_BYTES
+            || bytes.len() > MAX_PROXY_PAYLOAD_BYTES
+            || &bytes[..4] != b"PXP2"
             || atlas_layers == 0
             || atlas_layers > 256
         {
@@ -153,7 +210,10 @@ impl ProxyPayload {
         let bits = read(12);
         let occupied = read(16);
         let palette_len = read(20);
-        if count > 10000
+        let quad_offset = read(24) as usize;
+        let quad_count = read(28);
+        let classes = read(32);
+        if count > MAX_PAYLOAD_WORDS
             || occupied > 4096
             || palette_len > occupied
             || bits > 12
@@ -163,17 +223,20 @@ impl ProxyPayload {
                 } else {
                     32 - (palette_len - 1).leading_zeros()
                 }
-            || bytes.len() != 24 + count * 4
+            || quad_count as usize > MAX_PAGE_QUADS
+            || classes > 3
+            || bytes.len() != PAYLOAD_HEADER_BYTES + count * 4
         {
             return Err(ProxyError::InvalidMaterial);
         }
         let index_words = (occupied as usize * bits as usize).div_ceil(32);
         if palette_offset as usize != INDEX_OFFSET + index_words
-            || count != INDEX_OFFSET + index_words + palette_len as usize * 2
+            || quad_offset != INDEX_OFFSET + index_words + palette_len as usize * 2
+            || count != quad_offset + quad_count as usize * 4
         {
             return Err(ProxyError::InvalidMaterial);
         }
-        let word = |index: usize| read(24 + index * 4);
+        let word = |index: usize| read(PAYLOAD_HEADER_BYTES + index * 4);
         let mut rank = 0u32;
         for index in 0..=64 {
             if ((word(128 + index / 2) >> ((index % 2) * 16)) & 65535) != rank {
@@ -186,11 +249,54 @@ impl ProxyPayload {
         if rank != occupied || word(160) >> 16 != 0 || ((occupied == 0) != (palette_len == 0)) {
             return Err(ProxyError::InvalidMaterial);
         }
+        let mut expected_classes = 0u32;
+        let mut cutout_materials = [0u32; 8];
         for index in 0..palette_len as usize {
             let info = word(palette_offset as usize + index * 2);
             if info & 65535 >= atlas_layers || info >> 16 > 1 {
                 return Err(ProxyError::InvalidMaterial);
             }
+            expected_classes |= 1 << (info >> 16);
+            if info >> 16 == 1 {
+                let material = info & 65535;
+                cutout_materials[material as usize / 32] |= 1 << (material % 32);
+            }
+        }
+        if classes != expected_classes || (classes & 2 == 0 && quad_count != 0) {
+            return Err(ProxyError::InvalidMaterial);
+        }
+        for index in 0..quad_count as usize {
+            let base = quad_offset + index * 4;
+            let bits = word(base);
+            let detail = word(base + 1);
+            let material = (detail & 65535) as u16;
+            let Some(face) = Face::from_index(((bits >> 15) & 7) as u8) else {
+                return Err(ProxyError::InvalidMaterial);
+            };
+            if bits >> 26 != 0
+                || detail >> 26 != 0
+                || word(base + 3) != 0
+                || u32::from(material) >= atlas_layers
+                || cutout_materials[usize::from(material) / 32] & (1 << (material % 32)) == 0
+            {
+                return Err(ProxyError::InvalidMaterial);
+            }
+            QuadDescriptor::new(
+                [
+                    (bits & 31) as u8,
+                    ((bits >> 5) & 31) as u8,
+                    ((bits >> 10) & 31) as u8,
+                ],
+                face,
+                [
+                    (((bits >> 18) & 15) + 1) as u8,
+                    (((bits >> 22) & 15) + 1) as u8,
+                ],
+                material,
+                std::array::from_fn(|i| ((detail >> (16 + i * 2)) & 3) as u8),
+                word(base + 2),
+            )
+            .map_err(|_| ProxyError::InvalidMaterial)?;
         }
         if bits > 0 {
             let mask = (1u32 << bits) - 1;
@@ -215,6 +321,9 @@ impl ProxyPayload {
             index_bits: bits,
             occupied,
             palette_len,
+            quad_offset: quad_offset as u32,
+            quad_count,
+            classes,
         })
     }
     pub fn materials_within(&self, atlas_layers: u32) -> bool {
@@ -233,6 +342,9 @@ impl ProxyPayload {
     }
     pub fn palette_len(&self) -> u32 {
         self.palette_len
+    }
+    pub fn cutout_quads(&self) -> u32 {
+        self.quad_count
     }
     pub fn voxel(&self, position: [u8; 3]) -> PublicVoxel {
         let index = usize::from(position[0])
@@ -346,18 +458,39 @@ pub struct ProxyWork {
     pub objects_considered: u32,
     pub camera_upload_bytes: u64,
 }
+/// Public proxy resources for an independent directional-shadow camera. Active
+/// object flags already reflect atomic front/near publication. Player-camera
+/// visibility and indirect buffers are intentionally excluded.
+pub struct ProxyShadowSource<'a> {
+    pub objects: &'a wgpu::Buffer,
+    pub payload: &'a wgpu::Buffer,
+    pub colors: &'a wgpu::TextureView,
+    pub sampler: &'a wgpu::Sampler,
+    pub materials: &'a wgpu::Buffer,
+    pub max_objects: u32,
+    pub max_payload_words: u32,
+    pub atlas_layers: u32,
+    pub revision: u64,
+}
 pub struct LodProxyGpu {
     config: ProxyConfig,
     model_staging: Vec<(u32, ObjectGpu)>,
     objects: wgpu::Buffer,
     payload: wgpu::Buffer,
+    shadow_colors: wgpu::TextureView,
+    shadow_sampler: wgpu::Sampler,
+    shadow_materials: wgpu::Buffer,
     visible: wgpu::Buffer,
+    cutout_visible: wgpu::Buffer,
     indirect: wgpu::Buffer,
     camera: wgpu::Buffer,
     counters: Option<wgpu::Buffer>,
     render_bind: wgpu::BindGroup,
+    cutout_bind: wgpu::BindGroup,
     cull_bind: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
+    cutout_pipeline: wgpu::RenderPipeline,
+    ambient_mrt: bool,
     reset: wgpu::ComputePipeline,
     cull: wgpu::ComputePipeline,
     slots: Vec<Slot>,
@@ -399,7 +532,7 @@ impl LodProxyGpu {
         let sample_count = geometry.sample_count;
         let limits = device.limits();
         if config.max_objects == 0
-            || config.max_payload_words == 0
+            || config.max_payload_words < 4
             || config.atlas_layers == 0
             || u64::from(config.max_payload_words) * 4
                 > u64::from(limits.max_storage_buffer_binding_size)
@@ -431,9 +564,14 @@ impl LodProxyGpu {
             u64::from(config.max_objects) * 4,
             wgpu::BufferUsages::STORAGE,
         );
+        let cutout_visible = buffer(
+            "GPU visible public Cutout quads",
+            u64::from(config.max_payload_words / 4) * 8,
+            wgpu::BufferUsages::STORAGE,
+        );
         let indirect = buffer(
             "one indirect LOD proxy draw",
-            16,
+            32,
             wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::INDIRECT
                 | wgpu::BufferUsages::COPY_SRC,
@@ -458,7 +596,7 @@ impl LodProxyGpu {
         let mut render_entries = vec![
             buffer_layout(0, v | f, true, true),
             buffer_layout(1, v | f, false, true),
-            buffer_layout(2, f, false, true),
+            buffer_layout(2, v | f, false, true),
             buffer_layout(3, v, false, true),
             texture_layout(4, f, wgpu::TextureSampleType::Float { filterable: true }),
             texture_layout(5, f, wgpu::TextureSampleType::Float { filterable: true }),
@@ -499,6 +637,7 @@ impl LodProxyGpu {
                 buffer_layout(1, c, false, true),
                 buffer_layout(2, c, false, false),
                 buffer_layout(3, c, false, false),
+                buffer_layout(4, c, false, false),
             ],
         });
         let mut entries = vec![
@@ -544,6 +683,22 @@ impl LodProxyGpu {
             layout: &render_layout,
             entries: &entries,
         });
+        let cutout_entries: Vec<_> = entries
+            .iter()
+            .map(|entry| wgpu::BindGroupEntry {
+                binding: entry.binding,
+                resource: if entry.binding == 3 {
+                    cutout_visible.as_entire_binding()
+                } else {
+                    entry.resource.clone()
+                },
+            })
+            .collect();
+        let cutout_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("public ordinary Cutout quad sources"),
+            layout: &render_layout,
+            entries: &cutout_entries,
+        });
         let cull_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("LOD independent visibility"),
             layout: &cull_layout,
@@ -552,33 +707,14 @@ impl LodProxyGpu {
                 buffer_binding(1, &objects),
                 buffer_binding(2, &visible),
                 buffer_binding(3, &indirect),
+                buffer_binding(4, &cutout_visible),
             ],
         });
-        let source = include_str!("lod_proxy.wgsl")
-            .replace(
-                "// INSTRUMENTATION",
-                if config.instrument {
-                    COUNTERS
-                } else {
-                    NO_COUNTERS
-                },
-            )
-            .replace("// LIGHTING", "// SHADOWS");
-        let source = if atmosphere.is_some() {
-            source.replace("// ILLUMINATION", "let light=object.light;// ILLUMINATION")
-        } else {
-            source
-        };
-        let source = crate::atmosphere::surface_shader(
-            &source,
+        let source = shader_source(
             shadows.is_some(),
             atmosphere.is_some(),
-            true,
-            if shadows.is_some() {
-                "return object.light.rgb+vec3(object.light.a*(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.0)));"
-            } else {
-                "return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.0));"
-            },
+            geometry.ambient_mrt,
+            config.instrument,
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("bounded masked LOD traversal"),
@@ -611,18 +747,60 @@ impl LodProxyGpu {
             }),
             multisample: wgpu::MultisampleState {
                 count: sample_count,
-                alpha_to_coverage_enabled: sample_count > 1,
+                alpha_to_coverage_enabled: false,
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fragment"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &crate::ambient_mrt::targets(None, geometry.ambient_mrt),
+            }),
+            multiview: None,
+            cache: None,
+        });
+        let cutout_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("public pixel-rate Cutout quads with hardware A2C"),
+            source: wgpu::ShaderSource::Wgsl(
+                cutout_shader_source(
+                    shadows.is_some(),
+                    atmosphere.is_some(),
+                    geometry.ambient_mrt,
+                )
+                .into(),
+            ),
+        });
+        let cutout_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("public ordinary Cutout quad HDR"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &cutout_shader,
+                entry_point: Some("vertex"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                alpha_to_coverage_enabled: sample_count > 1,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &cutout_shader,
+                entry_point: Some("fragment"),
+                compilation_options: Default::default(),
+                targets: &crate::ambient_mrt::targets(None, geometry.ambient_mrt),
             }),
             multiview: None,
             cache: None,
@@ -667,13 +845,20 @@ impl LodProxyGpu {
             model_staging: Vec::with_capacity(config.max_objects as usize),
             objects,
             payload,
+            shadow_colors: geometry.colors.clone(),
+            shadow_sampler: geometry.sampler.clone(),
+            shadow_materials: geometry.materials.clone(),
             visible,
+            cutout_visible,
             indirect,
             camera,
             counters,
             render_bind,
+            cutout_bind,
             cull_bind,
             pipeline,
+            cutout_pipeline,
+            ambient_mrt: geometry.ambient_mrt,
             reset,
             cull,
             slots,
@@ -685,7 +870,7 @@ impl LodProxyGpu {
             revision: 0,
             last_frame: None,
             work: ProxyWork {
-                pipeline_compilations: 3,
+                pipeline_compilations: 4,
                 ..ProxyWork::default()
             },
         })
@@ -767,7 +952,17 @@ impl LodProxyGpu {
                 u32::from(payload.occupied > 0),
             ],
             light,
-            reserved: [[0; 4]; 4],
+            reserved: [
+                [
+                    payload.classes,
+                    span.start + payload.quad_offset,
+                    payload.quad_count,
+                    0,
+                ],
+                [0; 4],
+                [0; 4],
+                [0; 4],
+            ],
         };
         queue.write_buffer(
             &self.payload,
@@ -1040,11 +1235,17 @@ impl LodProxyGpu {
             ..ProxyWork::default()
         })
     }
+    pub fn ambient_mrt(&self) -> bool {
+        self.ambient_mrt
+    }
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> u32 {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.render_bind, &[]);
         pass.draw_indirect(&self.indirect, 0);
-        1
+        pass.set_pipeline(&self.cutout_pipeline);
+        pass.set_bind_group(0, &self.cutout_bind, &[]);
+        pass.draw_indirect(&self.indirect, 16);
+        2
     }
     pub fn counter_buffer(&self) -> Option<&wgpu::Buffer> {
         self.counters.as_ref()
@@ -1057,6 +1258,24 @@ impl LodProxyGpu {
     }
     pub fn visible_buffer(&self) -> &wgpu::Buffer {
         &self.visible
+    }
+    /// Primary-camera quad compaction, for diagnostics only. Shadow cameras must
+    /// build their own list from the shared payload/object descriptors.
+    pub fn cutout_visible_buffer(&self) -> &wgpu::Buffer {
+        &self.cutout_visible
+    }
+    pub fn shadow_source(&self) -> ProxyShadowSource<'_> {
+        ProxyShadowSource {
+            objects: &self.objects,
+            payload: &self.payload,
+            colors: &self.shadow_colors,
+            sampler: &self.shadow_sampler,
+            materials: &self.shadow_materials,
+            max_objects: self.config.max_objects,
+            max_payload_words: self.config.max_payload_words,
+            atlas_layers: self.config.atlas_layers,
+            revision: self.revision,
+        }
     }
 }
 fn buffer_layout(
@@ -1096,6 +1315,101 @@ fn texture_layout(
         count: None,
     }
 }
+pub fn shader_source(
+    shadows: bool,
+    atmosphere: bool,
+    ambient_mrt: bool,
+    instrument: bool,
+) -> String {
+    let source = include_str!("lod_proxy.wgsl")
+        .replace(
+            "// INSTRUMENTATION",
+            if instrument { COUNTERS } else { NO_COUNTERS },
+        )
+        .replace("// LIGHTING", "// SHADOWS");
+    let source = if atmosphere {
+        source.replace("// ILLUMINATION", "let light=object.light;// ILLUMINATION")
+    } else {
+        source
+    };
+    let source = crate::atmosphere::surface_shader(
+        &source,
+        shadows,
+        atmosphere,
+        true,
+        if shadows {
+            "return object.light.rgb+vec3(object.light.a*(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.0)));"
+        } else {
+            "return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.0));"
+        },
+    );
+
+    if !ambient_mrt {
+        return source;
+    }
+    let output = "struct FragmentOut{@location(0)color:vec4<f32>,@builtin(frag_depth)depth:f32};";
+    let color = "out.depth=clip.z/clip.w;";
+    assert!(source.contains(output) && source.contains(color));
+    let source=source.replace(output,"struct FragmentOut{@location(0)color:vec4<f32>,@builtin(frag_depth)depth:f32,@location(1)ambient:vec4<f32>};")
+        .replace(color,"out.ambient=vec4(select(texel.rgb*tinted*proxy_ambient(object,world.xyz,world_normal),vec3(0.),kind==2u),out.color.a);out.depth=clip.z/clip.w;")
+        .replace("return FragmentOut(vec4(0.,0.,0.,1.),-1.);","return FragmentOut(vec4(0.,0.,0.,1.),-1.,vec4(0.0));");
+    let ambient = if atmosphere {
+        "object.light.rgb+object.light.a*atmosphere_diffuse(normal)"
+    } else if shadows {
+        "object.light.rgb+vec3(object.light.a*0.15)"
+    } else {
+        "vec3(0.65)"
+    };
+    format!(
+        "{source}\nfn proxy_ambient(object:Object,world:vec3<f32>,normal:vec3<f32>)->vec3<f32>{{return {ambient};}}"
+    )
+}
+
+pub fn cutout_shader_source(shadows: bool, atmosphere: bool, ambient_mrt: bool) -> String {
+    let source = include_str!("lod_cutout.wgsl");
+    let source = if atmosphere {
+        source.replace("// ILLUMINATION", "let light=object.light;// ILLUMINATION")
+    } else {
+        source.into()
+    };
+    let source = crate::atmosphere::surface_shader(
+        &source,
+        shadows,
+        atmosphere,
+        true,
+        if shadows {
+            "return object.light.rgb+vec3(object.light.a*(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.0)));"
+        } else {
+            "return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.0));"
+        },
+    );
+    let ambient = if atmosphere {
+        "object.light.rgb+object.light.a*atmosphere_diffuse(normal)"
+    } else if shadows {
+        "object.light.rgb+vec3(object.light.a*0.15)"
+    } else {
+        "vec3(0.65)"
+    };
+    source
+        .replace("// AMBIENT", &format!("return {ambient};"))
+        .replace(
+            "// OUTPUT",
+            if ambient_mrt {
+                "struct CutoutOutput{@location(0)color:vec4<f32>,@location(1)ambient:vec4<f32>};"
+            } else {
+                "struct CutoutOutput{@location(0)color:vec4<f32>};"
+            },
+        )
+        .replace(
+            "// RETURN",
+            if ambient_mrt {
+                "return CutoutOutput(vec4(color,texel.a),vec4(albedo*indirect,texel.a));"
+            } else {
+                "return CutoutOutput(vec4(color,texel.a));"
+            },
+        )
+}
+
 fn buffer_binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,

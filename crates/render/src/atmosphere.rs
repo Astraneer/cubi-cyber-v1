@@ -667,6 +667,18 @@ impl AtmosphereGpu {
 
 /// Draws the same physical sky-view LUT into the MSAA4 HDR terrain graph.
 /// Construct during loading; the LUT owner encodes optical updates before this draw.
+pub fn sky_shader_source(ambient_mrt: bool) -> String {
+    let source = include_str!("atmosphere_sky.wgsl");
+    if !ambient_mrt {
+        return source.to_owned();
+    }
+    let signature = "@fragment fn fragment(input:SkyVertex)->@location(0)vec4<f32>";
+    assert!(source.contains(signature));
+    format!(
+        "{}\nstruct SkyAmbientOutput{{@location(0)color:vec4<f32>,@location(1)ambient:vec4<f32>}};\n@fragment fn fragment(input:SkyVertex)->SkyAmbientOutput{{return SkyAmbientOutput(sky_color(input),vec4(0.));}}",
+        source.replace(signature, "fn sky_color(input:SkyVertex)->vec4<f32>")
+    )
+}
 pub struct AtmosphereSkyGpu {
     pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
@@ -681,6 +693,14 @@ impl AtmosphereSkyGpu {
         device: &wgpu::Device,
         sky_view: &wgpu::TextureView,
         sample_count: u32,
+    ) -> Self {
+        Self::new_with_samples_and_ambient(device, sky_view, sample_count, false)
+    }
+    pub fn new_with_samples_and_ambient(
+        device: &wgpu::Device,
+        sky_view: &wgpu::TextureView,
+        sample_count: u32,
+        ambient_mrt: bool,
     ) -> Self {
         assert!(matches!(sample_count, 1 | 4));
         let camera = device.create_buffer(&wgpu::BufferDescriptor {
@@ -753,7 +773,7 @@ impl AtmosphereSkyGpu {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shared LUT sky radiance"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("atmosphere_sky.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(sky_shader_source(ambient_mrt).into()),
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("physical atmosphere MSAA4 HDR"),
@@ -780,11 +800,7 @@ impl AtmosphereSkyGpu {
                 module: &shader,
                 entry_point: Some("fragment"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &crate::ambient_mrt::targets(None, ambient_mrt),
             }),
             multiview: None,
             cache: None,

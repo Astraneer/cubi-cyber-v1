@@ -43,6 +43,9 @@ impl Owner {
             query: vec![EntityId(0); MAX_MOBS],
         }
     }
+    pub(super) fn remaining(&self) -> usize {
+        self.remaining
+    }
     pub(super) fn pending_count(&self) -> usize {
         self.pending.len()
     }
@@ -58,12 +61,12 @@ impl Owner {
     }
 }
 #[derive(Clone, Copy)]
-struct DropOrigin {
-    actor: EntityId,
-    action: u64,
-    space: SpaceId,
-    position: [f64; 3],
-    delay: u16,
+pub(super) struct DropOrigin {
+    pub(super) actor: EntityId,
+    pub(super) action: u64,
+    pub(super) space: SpaceId,
+    pub(super) position: [f64; 3],
+    pub(super) delay: u16,
 }
 struct Living {
     health: Health,
@@ -154,7 +157,7 @@ impl Server {
         self.mob_owner.initialized = true;
         Ok(())
     }
-    fn mob_item(
+    pub(super) fn mob_item(
         &self,
         origin: DropOrigin,
         ordinal: usize,
@@ -240,6 +243,7 @@ impl Server {
                     &players,
                     entities::Budget {
                         actors: selected,
+                        sky_darkness: mob_spawn::ambient_darkness(self.tick.0 % 24000),
                         ..entities::Budget::default()
                     },
                 )
@@ -507,6 +511,7 @@ impl Server {
         self.counters.mob_cell_reads += work.queries;
         self.counters.mob_waiting += work.waiting_world;
         self.counters.mob_drops += rows.len() as u64;
+        self.counters.audio_cues_not_recorded += work.audio_cues_clipped;
         if let Some(payload) = encoded {
             batch.runtimes.push(save::RuntimeRecord {
                 kind: save::RUNTIME_MOBS,

@@ -273,6 +273,7 @@ struct HiZ {
 /// Consumers must compact their own visibility rather than reuse the player's culled list.
 pub struct TerrainGeometry<'a> {
     pub sample_count: u32,
+    pub ambient_mrt: bool,
     pub objects: &'a wgpu::Buffer,
     pub quads: &'a wgpu::Buffer,
     pub materials: &'a wgpu::Buffer,
@@ -332,6 +333,7 @@ pub struct TerrainGpu {
     hiz_base_pipeline: Option<wgpu::ComputePipeline>,
     hiz_reduce_pipeline: Option<wgpu::ComputePipeline>,
     targets: Targets,
+    ambient: Option<(wgpu::Texture, wgpu::TextureView)>,
     hiz: Option<HiZ>,
     slots: Vec<Slot>,
     free_slots: Vec<u32>,
@@ -599,6 +601,7 @@ impl TerrainGpu {
             false,
             false,
             sample_count,
+            false,
         );
         let cutout_pipeline = terrain_pipeline(
             device,
@@ -608,6 +611,7 @@ impl TerrainGpu {
             false,
             false,
             sample_count,
+            false,
         );
         let masked_opaque_pipeline = terrain_pipeline(
             device,
@@ -617,6 +621,7 @@ impl TerrainGpu {
             false,
             true,
             sample_count,
+            false,
         );
         let masked_cutout_pipeline = terrain_pipeline(
             device,
@@ -626,6 +631,7 @@ impl TerrainGpu {
             false,
             true,
             sample_count,
+            false,
         );
         let depth_pipeline = config.occlusion.then(|| {
             terrain_pipeline(
@@ -636,6 +642,7 @@ impl TerrainGpu {
                 true,
                 false,
                 sample_count,
+                false,
             )
         });
         let masked_depth_pipeline = config.occlusion.then(|| {
@@ -647,6 +654,7 @@ impl TerrainGpu {
                 true,
                 true,
                 sample_count,
+                false,
             )
         });
         let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -887,6 +895,7 @@ impl TerrainGpu {
             hiz_base_pipeline,
             hiz_reduce_pipeline,
             targets,
+            ambient: None,
             hiz,
             slots: (0..config.max_pages)
                 .map(|_| Slot {
@@ -1050,11 +1059,14 @@ impl TerrainGpu {
             }
             self.lighting_bindings = Some(materials::LightingBindings::new(shadows, lights, gi));
         }
-        self.atmosphere_sky = Some(crate::atmosphere::AtmosphereSkyGpu::new_with_samples(
-            device,
-            atmosphere.sky_view(),
-            self.sample_count,
-        ));
+        self.atmosphere_sky = Some(
+            crate::atmosphere::AtmosphereSkyGpu::new_with_samples_and_ambient(
+                device,
+                atmosphere.sky_view(),
+                self.sample_count,
+                self.ambient.is_some(),
+            ),
+        );
         self.atmosphere_lighting = Some(atmosphere.lighting_buffer().clone());
         self.work.record(telemetry::WorkCounts {
             pipeline_compilations: 1,
@@ -1067,6 +1079,7 @@ impl TerrainGpu {
     pub fn geometry(&self) -> TerrainGeometry<'_> {
         TerrainGeometry {
             sample_count: self.sample_count,
+            ambient_mrt: self.ambient.is_some(),
             objects: &self.objects,
             quads: &self.quads,
             materials: &self.materials,
@@ -1111,6 +1124,37 @@ impl TerrainGpu {
         Ok(())
     }
 
+    /// Select a second signed ambient radiance-difference output before sky/model preparation or frames.
+    pub fn prepare_ambient_mrt(&mut self, device: &wgpu::Device) -> Result<(), TerrainError> {
+        if self.last_render.is_some() || (self.ambient.is_none() && self.atmosphere_sky.is_some()) {
+            return Err(TerrainError::LatePreparation);
+        }
+        if self.ambient.is_none() {
+            self.ambient = Some(create_ambient(
+                device,
+                self.width,
+                self.height,
+                self.sample_count,
+            ));
+            self.sky_pipeline = make_ambient_sky(device, self.sample_count);
+            self.work.record(telemetry::WorkCounts {
+                pipeline_compilations: 1,
+                ..telemetry::WorkCounts::ZERO
+            });
+            self.rebuild_material_pipelines(device);
+        }
+        Ok(())
+    }
+    pub fn ambient_msaa_view(&self) -> Option<&wgpu::TextureView> {
+        self.ambient.as_ref().map(|pair| &pair.1)
+    }
+    pub fn ambient_target_bytes(&self) -> u64 {
+        u64::from(self.ambient.is_some())
+            * u64::from(self.width)
+            * u64::from(self.height)
+            * u64::from(self.sample_count)
+            * 8
+    }
     pub fn scene_color_msaa_view(&self) -> Option<&wgpu::TextureView> {
         self.targets.sampled.then_some(&self.targets.color)
     }
@@ -2162,6 +2206,9 @@ impl TerrainGpu {
             )),
             _ => None,
         };
+        if self.ambient.is_some() {
+            self.ambient = Some(create_ambient(device, width, height, self.sample_count));
+        }
         self.width = width;
         self.height = height;
         self.last_camera = None;
@@ -2347,21 +2394,34 @@ impl TerrainGpu {
             work.draw_calls += 2;
         }
         {
+            let mut attachments = [None, None];
+            attachments[0] = Some(wgpu::RenderPassColorAttachment {
+                view: &self.targets.color,
+                depth_slice: None,
+                resolve_target: (self.sample_count > 1).then_some(&self.targets.resolved),
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: if output.is_none() || self.sample_count == 1 {
+                        wgpu::StoreOp::Store
+                    } else {
+                        wgpu::StoreOp::Discard
+                    },
+                },
+            });
+            if let Some((_, view)) = &self.ambient {
+                attachments[1] = Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                });
+            }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("HDR sky and terrain MSAA4"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.targets.color,
-                    depth_slice: None,
-                    resolve_target: (self.sample_count > 1).then_some(&self.targets.resolved),
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: if output.is_none() || self.sample_count == 1 {
-                            wgpu::StoreOp::Store
-                        } else {
-                            wgpu::StoreOp::Discard
-                        },
-                    },
-                })],
+                color_attachments: &attachments[..if self.ambient.is_some() { 2 } else { 1 }],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.targets.depth,
                     depth_ops: Some(wgpu::Operations {
@@ -2769,6 +2829,7 @@ fn depth_state(write: bool, compare: wgpu::CompareFunction) -> wgpu::DepthStenci
         bias: Default::default(),
     }
 }
+#[allow(clippy::too_many_arguments)] // Loading selects depth/cutout/mask and independent MSAA/MRT output profiles.
 fn terrain_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -2777,7 +2838,9 @@ fn terrain_pipeline(
     depth_only: bool,
     masked: bool,
     sample_count: u32,
+    ambient_mrt: bool,
 ) -> wgpu::RenderPipeline {
+    let color_targets = crate::ambient_mrt::targets(None, ambient_mrt);
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(if depth_only {
             "reverse-Z opaque prepass"
@@ -2814,15 +2877,7 @@ fn terrain_pipeline(
                 "fragment"
             }),
             compilation_options: Default::default(),
-            targets: if depth_only {
-                &[]
-            } else {
-                &[Some(wgpu::ColorTargetState {
-                    format: HDR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })]
-            },
+            targets: if depth_only { &[] } else { &color_targets },
         }),
         multiview: None,
         cache: None,
@@ -3346,6 +3401,79 @@ fn atlas_downsample(source: &AtlasMip, layers: u32) -> Result<AtlasMip, String> 
         }
     }
     Ok(output)
+}
+
+fn create_ambient(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    samples: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("signed removable ambient MRT"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: samples,
+        dimension: wgpu::TextureDimension::D2,
+        format: HDR_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
+}
+
+fn make_ambient_sky(device: &wgpu::Device, samples: u32) -> wgpu::RenderPipeline {
+    let source = include_str!("sky.wgsl")
+        .replace(
+            "fn fragment_hdr_sky(input: VertexOutput) -> @location(0) vec4<f32>",
+            "fn fragment_hdr_sky(input: VertexOutput) -> AmbientOutput",
+        )
+        .replace(
+            "return vec4<f32>(sky_linear(input.uv), 0.0);",
+            "return AmbientOutput(vec4<f32>(sky_linear(input.uv),0.0),vec4(0.0));",
+        );
+    let source = format!(
+        "struct AmbientOutput{{@location(0)color:vec4<f32>,@location(1)ambient:vec4<f32>}};\n{source}"
+    );
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("unchanged fallback sky with zero ambient delta"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[],
+        push_constant_ranges: &[],
+    });
+    let targets = crate::ambient_mrt::targets(None, true);
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("fallback sky optional ambient MRT"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vertex"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: Default::default(),
+        depth_stencil: Some(depth_state(false, wgpu::CompareFunction::Always)),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fragment_hdr_sky"),
+            compilation_options: Default::default(),
+            targets: &targets,
+        }),
+        multiview: None,
+        cache: None,
+    })
 }
 
 #[cfg(test)]

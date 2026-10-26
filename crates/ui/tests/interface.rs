@@ -384,3 +384,103 @@ fn actual_software_gpu_renders_pixel_font_menu_and_retains_static_geometry() {
         println!("UI_GPU_OK glyph_pixels={white} static_uploads=0");
     });
 }
+#[test]
+fn personal_time_buttons_persist_without_mutating_authority() {
+    let atlas = atlas::UiAtlas::load().unwrap();
+    let mut ui = UiApp::new().unwrap();
+    let snapshot = Snapshot {
+        connected: true,
+        inventory_revision: 71,
+        ..Snapshot::default()
+    };
+    ui.set_snapshot(snapshot.clone()).unwrap();
+    ui.open(Screen::Crossroads);
+    let mut paint = PaintList::default();
+    for (widget, choice, personal) in [
+        (Widget::Day, 1, app::PersonalTime::Day),
+        (Widget::Night, 2, app::PersonalTime::Night),
+        (Widget::ServerTime, 0, app::PersonalTime::Server),
+    ] {
+        ui.paint(&atlas, &mut paint, 780, 437);
+        drain(&mut ui);
+        click(&mut ui, widget);
+        assert_eq!(ui.settings.get(settings::Setting::ViewTime), choice);
+        assert_eq!(ui.personal_time, personal);
+        assert!(ui.snapshot == snapshot);
+        assert_eq!(drain(&mut ui), vec![Intent::PersonalTime(personal)]);
+        let mut restored = UiApp::new().unwrap();
+        restored.load_preferences(&ui.encode_preferences()).unwrap();
+        assert_eq!(restored.personal_time, personal);
+        assert_eq!(restored.settings.get(settings::Setting::ViewTime), choice);
+    }
+}
+#[test]
+fn respawn_waits_for_authoritative_living_snapshot() {
+    let atlas = atlas::UiAtlas::load().unwrap();
+    let mut ui = UiApp::new().unwrap();
+    let dead = Snapshot {
+        connected: true,
+        hp: 0,
+        inventory_revision: 19,
+        ..Snapshot::default()
+    };
+    ui.set_snapshot(dead.clone()).unwrap();
+    assert_eq!(ui.screen, Screen::Death);
+    let mut paint = PaintList::default();
+    ui.paint(&atlas, &mut paint, 780, 437);
+    drain(&mut ui);
+    click(&mut ui, Widget::Respawn);
+    assert_eq!(drain(&mut ui), vec![Intent::Respawn]);
+    assert_eq!(ui.screen, Screen::Death);
+    assert!(ui.snapshot == dead);
+    ui.key("Escape", true, Modifiers::default());
+    assert_eq!(ui.screen, Screen::Death);
+    ui.key("KeyE", true, Modifiers::default());
+    assert_eq!(ui.screen, Screen::Death);
+    assert!(
+        !drain(&mut ui)
+            .iter()
+            .any(|intent| matches!(intent, Intent::OpenInventory))
+    );
+    ui.set_snapshot(dead).unwrap();
+    assert_eq!(ui.screen, Screen::Death);
+    ui.set_snapshot(Snapshot {
+        connected: true,
+        hp: 20,
+        inventory_revision: 20,
+        ..Snapshot::default()
+    })
+    .unwrap();
+    assert_eq!(ui.screen, Screen::Game);
+}
+#[test]
+fn loading_captures_profile_shortcuts_until_completion_and_can_cancel() {
+    let mut ui = UiApp::new().unwrap();
+    let atlas = atlas::UiAtlas::load().unwrap();
+    let mut paint = PaintList::default();
+    ui.open(Screen::Settings(settings::Section::Graphics));
+    ui.paint(&atlas, &mut paint, 780, 437);
+    let old_control = ui.hit(Widget::Setting(settings::Setting::Msaa)).unwrap();
+    ui.open(Screen::Loading);
+    assert!(ui.hit(Widget::Setting(settings::Setting::Msaa)).is_none());
+    drain(&mut ui);
+    ui.click(
+        old_control.x + old_control.w / 2.,
+        old_control.y + old_control.h / 2.,
+        false,
+        Modifiers::default(),
+    );
+    assert!(
+        drain(&mut ui).is_empty(),
+        "stale pre-loading hit cannot schedule another preparation"
+    );
+    drain(&mut ui);
+    for code in ["F10", "KeyE", "KeyT", "Digit1", "KeyW"] {
+        assert!(ui.key(code, true, Modifiers::default()));
+        assert_eq!(ui.screen, Screen::Loading);
+        assert!(drain(&mut ui).is_empty());
+    }
+    ui.key("Escape", true, Modifiers::default());
+    assert_eq!(drain(&mut ui), vec![Intent::Disconnect]);
+    assert_eq!(ui.screen, Screen::Loading);
+}

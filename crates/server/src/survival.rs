@@ -303,7 +303,6 @@ impl SurvivalRuntime {
             oldest_overdue: self.oldest_overdue(now),
             ..Work::default()
         };
-        let mut reserved = 0u64;
         for (&key, &event) in self.events.range(..=(now, u64::MAX)).take(budget.events) {
             let reserve = match event.event {
                 Event::Fluid(..) => 2048,
@@ -314,12 +313,14 @@ impl SurvivalRuntime {
                 Event::Fluid(..) => 48,
                 _ => 1,
             };
-            if reserved.saturating_add(reserve) > budget.cells
+            // Reserve the entire next event before starting it, then refund
+            // unused reads. Stable fluid sources must not consume the maximum
+            // hardening/wake cost of events which actually change neighbors.
+            if stage.reads.get().saturating_add(reserve) > budget.cells
                 || stage.cells.len().saturating_add(writes) > budget.writes
             {
                 break;
             }
-            reserved += reserve;
             consumed.push(key);
             work.events += 1;
             let result = match event.event {
@@ -626,7 +627,10 @@ impl<'a, P: Fn(BlockPos) -> bool> Stage<'a, P> {
         let plan = farm::random_tick(
             |coords| self.read(position(p.space, coords)),
             [p.x, p.y, p.z],
-            light.sky.max(light.block),
+            light
+                .sky
+                .saturating_sub(crate::mob_spawn::ambient_darkness(now.0 % 24000))
+                .max(light.block),
             roll,
         )?;
         work.reads += u64::from(plan.reads);

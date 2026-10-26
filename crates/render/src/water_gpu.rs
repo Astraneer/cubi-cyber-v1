@@ -187,6 +187,7 @@ struct Slot {
     span: Option<Span>,
     generation: u32,
     allocated: bool,
+    enabled: bool,
     references: u32,
     model: [[f32; 4]; 4],
 }
@@ -228,7 +229,11 @@ pub struct WaterGpu {
     last_cull: Option<(Camera, u64)>,
     last_snapshot: Option<(Camera, u64)>,
     work: WaterWork,
-    timer: crate::gpu_time::GpuPassTimer<3>,
+    timer: crate::gpu_time::GpuPassTimer<4>,
+    normal_texture: Option<wgpu::Texture>,
+    normal_foam: Option<wgpu::TextureView>,
+    reflection: Option<crate::water_reflection::WaterReflectionGpu>,
+    flag_scratch: Vec<(u32, bool)>,
 }
 impl WaterGpu {
     pub fn new(
@@ -392,6 +397,17 @@ impl WaterGpu {
         };
         let msaa = msaa_texture.create_view(&Default::default());
         let resolved_view = resolved.create_view(&Default::default());
+        let normal_texture = (config.reflection_steps > 0).then(|| {
+            texture(
+                "water optional deferred reflection normal foam",
+                wgpu::TextureFormat::Rgba16Float,
+                sample_count,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            )
+        });
+        let normal_foam = normal_texture
+            .as_ref()
+            .map(|t| t.create_view(&Default::default()));
         let v = wgpu::ShaderStages::VERTEX;
         let f = wgpu::ShaderStages::FRAGMENT;
         let c = wgpu::ShaderStages::COMPUTE;
@@ -564,17 +580,33 @@ impl WaterGpu {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some(if background {
-                        "background_fragment"
-                    } else {
-                        "fragment"
+                    entry_point: Some(match (background, config.reflection_steps > 0) {
+                        (true, true) => "background_fragment_with_normal",
+                        (true, false) => "background_fragment",
+                        (false, true) => "fragment_with_normal",
+                        (false, false) => "fragment",
                     }),
                     compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
+                    targets: if config.reflection_steps > 0 {
+                        &[
+                            Some(wgpu::ColorTargetState {
+                                format: wgpu::TextureFormat::Rgba16Float,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                            Some(wgpu::ColorTargetState {
+                                format: wgpu::TextureFormat::Rgba16Float,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                        ]
+                    } else {
+                        &[Some(wgpu::ColorTargetState {
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })]
+                    },
                 }),
                 multiview: None,
                 cache: None,
@@ -623,6 +655,43 @@ impl WaterGpu {
             compilation_options: Default::default(),
             cache: None,
         });
+        let mut reflection = if let Some(normal) = &normal_foam {
+            Some(
+                crate::water_reflection::WaterReflectionGpu::new(
+                    device,
+                    queue,
+                    sample_count,
+                    width,
+                    height,
+                    crate::water_reflection::ReflectionConfig {
+                        steps: config.reflection_steps,
+                        max_distance: config.reflection_distance,
+                        tolerance: config.reflection_tolerance,
+                    },
+                    crate::water_reflection::ReflectionInputs {
+                        params: &uniform,
+                        water_color: &msaa,
+                        water_depth: &depth,
+                        normal_foam: normal,
+                        opaque_color: &opaque,
+                        opaque_depth: inputs.depth_msaa,
+                        sky: inputs.sky,
+                        statistics: config.instrument.then_some(&statistics),
+                    },
+                    &mut UploadBudget::new(16),
+                )
+                .map_err(|_| WaterError::InvalidConfig)?,
+            )
+        } else {
+            None
+        };
+        if sample_count == 4
+            && let Some(reflection) = &mut reflection
+        {
+            reflection
+                .alias_resolve(&resolved)
+                .map_err(|_| WaterError::InvalidConfig)?;
+        }
         Ok(Self {
             sample_count,
             config,
@@ -656,11 +725,15 @@ impl WaterGpu {
             depth,
             resolved,
             resolved_view,
+            normal_texture,
+            normal_foam,
+            reflection,
             slots: vec![
                 Slot {
                     span: None,
                     generation: 0,
                     allocated: false,
+                    enabled: false,
                     references: 0,
                     model: [[0.; 4]; 4]
                 };
@@ -681,9 +754,11 @@ impl WaterGpu {
                 "physical water pass timestamps",
             ),
             work: WaterWork {
-                pipeline_compilations: 5,
+                pipeline_compilations: 5 + u32::from(config.reflection_steps > 0),
+                upload_bytes: u64::from(config.reflection_steps > 0) * 16,
                 ..WaterWork::default()
             },
+            flag_scratch: Vec::with_capacity(config.max_objects as usize),
         })
     }
     pub fn upload_object(
@@ -691,6 +766,27 @@ impl WaterGpu {
         queue: &wgpu::Queue,
         handle: Option<WaterHandle>,
         model: [[f32; 4]; 4],
+        budget: &mut UploadBudget,
+    ) -> Result<WaterHandle, WaterError> {
+        self.upload_object_state(queue, handle, model, None, budget)
+    }
+    /// Stage geometry while its replacement height/opaque cover is incomplete.
+    /// A retained inactive handle stays hidden after a later range-budget retry.
+    pub fn upload_object_inactive(
+        &mut self,
+        queue: &wgpu::Queue,
+        handle: Option<WaterHandle>,
+        model: [[f32; 4]; 4],
+        budget: &mut UploadBudget,
+    ) -> Result<WaterHandle, WaterError> {
+        self.upload_object_state(queue, handle, model, Some(false), budget)
+    }
+    fn upload_object_state(
+        &mut self,
+        queue: &wgpu::Queue,
+        handle: Option<WaterHandle>,
+        model: [[f32; 4]; 4],
+        enabled: Option<bool>,
         budget: &mut UploadBudget,
     ) -> Result<WaterHandle, WaterError> {
         if model.iter().flatten().any(|v| !v.is_finite())
@@ -708,7 +804,8 @@ impl WaterGpu {
             *self.free.last().ok_or(WaterError::Capacity)?
         };
         let old = self.slots[slot as usize];
-        if old.allocated && old.model == model {
+        let enabled = enabled.unwrap_or(!old.allocated || old.enabled);
+        if old.allocated && old.model == model && old.enabled == enabled {
             return Ok(handle.expect("existing object"));
         }
         if budget.remaining_bytes < 80 {
@@ -729,7 +826,7 @@ impl WaterGpu {
                 model,
                 metadata: [
                     generation,
-                    1,
+                    u32::from(enabled),
                     old.span.map_or(0, |s| s.start),
                     old.references,
                 ],
@@ -739,6 +836,7 @@ impl WaterGpu {
             span: old.span,
             generation,
             allocated: true,
+            enabled,
             references: old.references,
             model,
         };
@@ -747,6 +845,63 @@ impl WaterGpu {
         self.work.upload_bytes += 80;
         self.work.object_uploads += 1;
         Ok(WaterHandle { slot, generation })
+    }
+    /// Atomic publication preflight for a staged cover: every handle and the
+    /// complete upload allowance are checked before any flag is written.
+    /// Duplicate handles are rejected, including contradictory enable values.
+    pub fn set_enabled_batch(
+        &mut self,
+        queue: &wgpu::Queue,
+        changes: &[(WaterHandle, bool)],
+        budget: &mut UploadBudget,
+    ) -> Result<u64, WaterError> {
+        let bytes = self.enabled_batch_upload_bytes(changes)?;
+        if budget.remaining_bytes < bytes {
+            return Err(WaterError::UploadBudget);
+        }
+        for &(slot, enabled) in &self.flag_scratch {
+            let object = &mut self.slots[slot as usize];
+            if object.enabled != enabled {
+                queue.write_buffer(
+                    &self.objects,
+                    u64::from(slot) * 80 + 68,
+                    bytemuck::bytes_of(&u32::from(enabled)),
+                );
+                object.enabled = enabled;
+            }
+        }
+        if bytes > 0 {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        budget.remaining_bytes -= bytes;
+        self.work.upload_bytes += bytes;
+        Ok(bytes)
+    }
+    /// Combine this exact preflight with the height/opaque cover preflight
+    /// before publishing any member of a cross-renderer cover transaction.
+    pub fn enabled_batch_upload_bytes(
+        &mut self,
+        changes: &[(WaterHandle, bool)],
+    ) -> Result<u64, WaterError> {
+        if changes.len() > self.config.max_objects as usize {
+            return Err(WaterError::InvalidState);
+        }
+        self.flag_scratch.clear();
+        for &(handle, enabled) in changes {
+            self.checked(handle)?;
+            self.flag_scratch.push((handle.slot, enabled));
+        }
+        self.flag_scratch.sort_unstable_by_key(|&(slot, _)| slot);
+        if self.flag_scratch.windows(2).any(|p| p[0].0 == p[1].0) {
+            return Err(WaterError::InvalidState);
+        }
+        let count = self
+            .flag_scratch
+            .iter()
+            .filter(|&&(slot, enabled)| self.slots[slot as usize].enabled != enabled)
+            .count();
+        let bytes = count as u64 * 4;
+        Ok(bytes)
     }
     fn checked(&self, h: WaterHandle) -> Result<&Slot, WaterError> {
         self.slots
@@ -769,6 +924,7 @@ impl WaterGpu {
         queue.write_buffer(&self.objects, u64::from(h.slot) * 80 + 68, &[0; 4]);
         let s = &mut self.slots[h.slot as usize];
         s.allocated = false;
+        s.enabled = false;
         if s.generation < u32::MAX {
             self.free.push(h.slot)
         }
@@ -1041,6 +1197,41 @@ impl WaterGpu {
         };
         let msaa = msaa_texture.create_view(&Default::default());
         let resolved_view = resolved.create_view(&Default::default());
+        let normal_texture = self.normal_texture.as_ref().map(|_| {
+            texture(
+                "resized optional water reflection normal foam",
+                wgpu::TextureFormat::Rgba16Float,
+                sample_count,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            )
+        });
+        let normal_foam = normal_texture
+            .as_ref()
+            .map(|t| t.create_view(&Default::default()));
+        if let (Some(reflection), Some(normal)) = (&mut self.reflection, &normal_foam) {
+            reflection
+                .resize_inputs(
+                    device,
+                    width,
+                    height,
+                    crate::water_reflection::ReflectionInputs {
+                        params: &self.uniform,
+                        water_color: &msaa,
+                        water_depth: &depth,
+                        normal_foam: normal,
+                        opaque_color: &opaque,
+                        opaque_depth: inputs.depth_msaa,
+                        sky: inputs.sky,
+                        statistics: self.config.instrument.then_some(&self.statistics),
+                    },
+                )
+                .map_err(|_| WaterError::InvalidConfig)?;
+            if sample_count == 4 {
+                reflection
+                    .alias_resolve(&resolved)
+                    .map_err(|_| WaterError::InvalidConfig)?;
+            }
+        }
         let tex = |binding, view| wgpu::BindGroupEntry {
             binding,
             resource: wgpu::BindingResource::TextureView(view),
@@ -1092,6 +1283,8 @@ impl WaterGpu {
         self.depth = depth;
         self.resolved = resolved;
         self.resolved_view = resolved_view;
+        self.normal_texture = normal_texture;
+        self.normal_foam = normal_foam;
         self.bind = bind;
         self.snapshot_bind = snapshot_bind;
         self.invalidate();
@@ -1114,16 +1307,18 @@ impl WaterGpu {
     pub fn needs_redraw(&self, state: WaterState) -> bool {
         self.last != Some((state, self.revision))
     }
-    /// Conservative global bound includes both triangles and arbitrary surface overdraw.
+    /// One fullscreen trace per output sample; independent of quad overdraw.
     pub fn worst_reflection_steps(&self) -> u64 {
-        if !self.surface_enabled {
-            return 0;
-        }
-        u64::from(self.width)
-            * u64::from(self.height)
-            * 8
-            * u64::from(self.config.reflection_steps)
-            * self.active_quad_count() as u64
+        self.reflection
+            .as_ref()
+            .map_or(0, |r| r.worst_work().max_steps)
+    }
+    /// Actual extra steady targets. MSAA4 reuses the surface's old resolve.
+    pub fn reflection_target_bytes(&self) -> u64 {
+        self.reflection.as_ref().map_or(0, |reflection| {
+            reflection.target_bytes()
+                + u64::from(self.width) * u64::from(self.height) * u64::from(self.sample_count) * 8
+        })
     }
     pub fn pending_work(&self, state: WaterState) -> Result<WaterWork, WaterError> {
         if state
@@ -1148,8 +1343,11 @@ impl WaterGpu {
         let cull = self.last_cull != Some((state.camera, self.revision));
         Ok(WaterWork {
             upload_bytes: 256,
-            passes: 1 + u32::from(snapshot) + u32::from(cull),
-            draws: 2,
+            passes: 1
+                + u32::from(snapshot)
+                + u32::from(cull)
+                + u32::from(self.reflection.is_some()),
+            draws: 2 + u32::from(self.reflection.is_some()),
             cull_dispatches: 2 * u32::from(cull),
             snapshot_pixels: if snapshot {
                 u64::from(self.width) * u64::from(self.height)
@@ -1238,7 +1436,7 @@ impl WaterGpu {
                 self.config.max_objects,
             ],
             quality: [
-                self.config.reflection_steps,
+                0, // The optional fullscreen pass traces once per water sample.
                 u32::from(state.underwater),
                 self.config.reflection_distance.to_bits(),
                 u32::from(self.arena.is_some()),
@@ -1296,17 +1494,36 @@ impl WaterGpu {
             encoder.clear_buffer(&self.statistics, 0, None)
         }
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("physical water after opaque MSAA, before clouds"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            let attachments = [
+                Some(wgpu::RenderPassColorAttachment {
                     view: &self.msaa,
                     depth_slice: None,
-                    resolve_target: (self.sample_count > 1).then_some(&self.resolved_view),
+                    resolve_target: (self.sample_count > 1 && self.reflection.is_none())
+                        .then_some(&self.resolved_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
-                })],
+                }),
+                self.normal_foam
+                    .as_ref()
+                    .map(|view| wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+            ];
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("physical water after opaque MSAA, before clouds"),
+                color_attachments: if self.reflection.is_some() {
+                    &attachments
+                } else {
+                    &attachments[..1]
+                },
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth,
                     depth_ops: Some(wgpu::Operations {
@@ -1324,12 +1541,19 @@ impl WaterGpu {
             pass.set_pipeline(&self.pipeline);
             pass.draw_indirect(&self.indirect, 0);
         }
+        if let Some(reflection) = &self.reflection {
+            let reflected = reflection
+                .encode(encoder, max_reflection_steps, self.timer.render(4))
+                .map_err(|_| WaterError::WorkBudget)?;
+            work.passes += reflected.passes;
+            work.draws += reflected.draws;
+        }
         self.timer.finish(encoder);
         budget.remaining_bytes -= 256;
         self.last = Some((state, self.revision));
         Ok(work)
     }
-    pub fn graph(&self) -> crate::gpu_time::PassGraph<3> {
+    pub fn graph(&self) -> crate::gpu_time::PassGraph<4> {
         self.timer.graph()
     }
     pub fn timestamp_buffer(&self) -> Option<(&wgpu::Buffer, f32)> {
@@ -1344,16 +1568,22 @@ impl WaterGpu {
         self.timer.copy_into(encoder, destination, offset)
     }
     pub fn color_msaa(&self) -> &wgpu::TextureView {
-        &self.msaa
+        self.reflection
+            .as_ref()
+            .map_or(&self.msaa, |r| r.color_msaa())
     }
     pub fn depth_msaa(&self) -> &wgpu::TextureView {
         &self.depth
     }
     pub fn resolved_view(&self) -> &wgpu::TextureView {
-        &self.resolved_view
+        self.reflection
+            .as_ref()
+            .map_or(&self.resolved_view, |r| r.resolved_view())
     }
     pub fn resolved_texture(&self) -> &wgpu::Texture {
-        &self.resolved
+        self.reflection
+            .as_ref()
+            .map_or(&self.resolved, |r| r.resolved_texture())
     }
     pub fn statistics_buffer(&self) -> &wgpu::Buffer {
         &self.statistics

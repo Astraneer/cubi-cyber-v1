@@ -14,10 +14,12 @@ use render::terrain_gpu::{
 use sim::{CameraMode, Keys, Permissions, Player, WorldQuery};
 use std::collections::{BTreeMap, VecDeque};
 use world::CellRead;
+mod clock;
 mod entities;
 pub mod environment;
 pub mod horizon;
 mod horizon_runtime;
+mod settings;
 pub use horizon_runtime::HorizonJobStats;
 mod lighting;
 pub mod props;
@@ -109,6 +111,8 @@ pub struct SettingsApplication {
     /// Requested graphics controls whose backend is not attached yet. They must
     /// not be shown as effective quality choices merely because they are saved.
     pub pending_render: u32,
+    /// Resource/pipeline choices needing the existing asynchronous loading path.
+    pub reload_required: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -149,6 +153,9 @@ struct PreparedEnvironment {
     queue: wgpu::Queue,
     width: u32,
     height: u32,
+    cloud_quality: i32,
+    gi_quality: i32,
+    reflection_quality: i32,
 }
 impl CameraParameters {
     fn projection(self, width: u32, height: u32) -> Camera {
@@ -175,6 +182,9 @@ pub struct ClientView {
     horizon: Option<Box<horizon_runtime::PreparedHorizon>>,
     frame_upload_remaining: u64,
     frame_delta_seconds: f32,
+    clock: clock::ClockState,
+    requested_settings: Option<ui::settings::Settings>,
+    render_scale: u32,
     player: Player,
     movement_replay: Box<sim::replay::Recorder>,
     replay_time_ns: u64,
@@ -201,6 +211,7 @@ pub struct ClientView {
     rendered_edit_revision: u64,
     keys: [bool; 13],
     place_pressed: bool,
+    place_sneaking: bool,
     remote_controls: VecDeque<InputKey>,
     remote_tool_modes: VecDeque<bool>,
     remote_look: Option<[f32; 2]>,
@@ -233,6 +244,11 @@ pub struct ClientView {
     view_bob: bool,
     cached_world_version: Version,
     cached_upload_bytes: u64,
+    observed_world_version: Version,
+    observed_upload_bytes: u64,
+    encoded_shadows: bool,
+    encoded_terrain: bool,
+    cached_presentation_available: bool,
     force_redraw: bool,
 }
 
@@ -271,6 +287,9 @@ impl ClientView {
             horizon: None,
             frame_upload_remaining: 0,
             frame_delta_seconds: 1. / 60.,
+            clock: Default::default(),
+            requested_settings: None,
+            render_scale: 100,
             player: Player::new([
                 f64::from(config.center.x) + 0.5,
                 f64::from(config.center.y),
@@ -306,6 +325,7 @@ impl ClientView {
             rendered_edit_revision: 0,
             keys: [false; 13],
             place_pressed: false,
+            place_sneaking: false,
             remote_controls: VecDeque::with_capacity(32),
             remote_tool_modes: VecDeque::with_capacity(32),
             remote_look: None,
@@ -338,6 +358,11 @@ impl ClientView {
             view_bob: false,
             cached_world_version: Version(0),
             cached_upload_bytes: 0,
+            observed_world_version: Version(0),
+            observed_upload_bytes: 0,
+            encoded_shadows: false,
+            encoded_terrain: false,
+            cached_presentation_available: false,
             force_redraw: true,
         })
     }
@@ -368,6 +393,28 @@ impl ClientView {
     }
     pub fn render_sample_count(&self) -> u32 {
         self.renderer.geometry().sample_count
+    }
+    pub fn exposure_compensation(&self) -> Option<f32> {
+        self.environment
+            .as_ref()
+            .map(|environment| environment.owner.gpu.post().compensation())
+    }
+    pub fn gi_prepared(&self) -> bool {
+        self.environment
+            .as_ref()
+            .is_some_and(|environment| environment.owner.gpu.gi().is_some())
+    }
+    pub fn replace_material_albedo(
+        &mut self,
+        atlas: &render::terrain_gpu::AtlasImage,
+    ) -> Result<(), String> {
+        if let Some(environment) = &mut self.environment {
+            environment
+                .owner
+                .replace_albedo(atlas)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
     /// Attach the CPU light owner and all GPU pipelines during loading. Callers
     /// choose the standalone sky proof or the remote Unknown-is-dark policy.
@@ -440,7 +487,7 @@ impl ClientView {
         {
             return Err("prepare lighting with dynamic model casters before entities".into());
         }
-        let entities = ViewEntities::prepare_with_source(
+        let entities = ViewEntities::prepare_with_source_and_gi(
             device,
             queue,
             &self.renderer,
@@ -450,6 +497,9 @@ impl ClientView {
             self.environment
                 .as_ref()
                 .map(|environment| environment.owner.gpu.atmosphere()),
+            self.environment
+                .as_ref()
+                .and_then(|environment| environment.owner.gpu.gi()),
             self.lighting
                 .as_ref()
                 .is_some_and(|lighting| lighting.stats.authoritative_source),
@@ -659,6 +709,26 @@ impl ClientView {
         {
             return Err("environment must be prepared once during loading".into());
         }
+        let cloud_quality = profile
+            .graphics
+            .clouds
+            .map_or(0, |cloud| match cloud.quality {
+                render::cloud_gpu::CloudQuality::LayerA => 1,
+                render::cloud_gpu::CloudQuality::VolumeB => 2,
+            });
+        let gi_quality = profile
+            .graphics
+            .gi
+            .map_or(0, |gi| if gi.rays_per_probe == 64 { 2 } else { 1 });
+        let reflection_quality =
+            profile
+                .graphics
+                .water
+                .map_or(0, |water| match water.reflection_steps {
+                    0 => 0,
+                    32 => 1,
+                    _ => 2,
+                });
         let eye = self.camera_parameters().eye;
         let mut owner = ViewEnvironment::prepare(
             device,
@@ -685,6 +755,9 @@ impl ClientView {
             queue: queue.clone(),
             width,
             height,
+            cloud_quality,
+            gi_quality,
+            reflection_quality,
         }));
         self.invalidate();
         Ok(())
@@ -699,6 +772,64 @@ impl ClientView {
             .as_deref_mut()
             .map(|environment| &mut environment.owner)
     }
+    pub fn take_gi_source_task(
+        &mut self,
+    ) -> Result<Option<jobs::Dispatch<crate::gi_source::GiBakeTask>>, String> {
+        self.environment.as_mut().map_or(Ok(None), |environment| {
+            environment
+                .owner
+                .take_source_task(self.tick)
+                .map_err(|error| error.to_string())
+        })
+    }
+    pub fn encode_gi_source_task(
+        &mut self,
+        task: &jobs::Dispatch<crate::gi_source::GiBakeTask>,
+    ) -> Result<Vec<u8>, String> {
+        let bytes = self
+            .environment
+            .as_mut()
+            .ok_or("GI environment not prepared")?
+            .owner
+            .encode_source_task(task)
+            .map_err(|error| error.to_string())?;
+        self.retained_foreground_work.record(telemetry::WorkCounts {
+            cells_scanned: task.payload.wire_samples(),
+            ..telemetry::WorkCounts::ZERO
+        });
+        Ok(bytes)
+    }
+    pub fn requeue_gi_source_task(
+        &mut self,
+        task: jobs::Dispatch<crate::gi_source::GiBakeTask>,
+    ) -> Result<(), String> {
+        self.environment
+            .as_mut()
+            .ok_or("GI environment not prepared")?
+            .owner
+            .requeue_source_task(task)
+            .map_err(|error| error.to_string())
+    }
+    pub fn complete_gi_source_bytes(
+        &mut self,
+        id: jobs::JobId,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        self.environment
+            .as_mut()
+            .ok_or("GI environment not prepared")?
+            .owner
+            .complete_source_bytes(id, bytes)
+            .map_err(|error| error.to_string())
+    }
+    pub fn fail_gi_source_task(&mut self, id: jobs::JobId) -> Result<(), String> {
+        self.environment
+            .as_mut()
+            .ok_or("GI environment not prepared")?
+            .owner
+            .fail_source_task(id)
+            .map_err(|error| error.to_string())
+    }
     /// Uses only the timing nodes encoded for this submitted image. In
     /// particular, a post-only image never copies a previous terrain query.
     pub fn encode_gpu_capture(
@@ -708,9 +839,13 @@ impl ClientView {
         frame: u64,
     ) -> Option<crate::capture::CaptureTicket> {
         let shadows = self
-            .lighting
-            .as_ref()
-            .and_then(|lighting| lighting.owner.shadows().timing_source());
+            .encoded_shadows
+            .then(|| {
+                self.lighting
+                    .as_ref()
+                    .and_then(|lighting| lighting.owner.shadows().timing_source())
+            })
+            .flatten();
         if let Some(environment) = &self.environment {
             capture.encode_sources(
                 environment
@@ -723,19 +858,29 @@ impl ClientView {
                 encoder,
                 frame,
             )
-        } else {
+        } else if self.encoded_terrain {
             capture.encode_terrain_and(&self.renderer, shadows.as_slice(), encoder, frame)
+        } else {
+            capture.encode_sources(shadows, encoder, frame)
         }
     }
     fn environment_state(&self, eye: [f32; 3]) -> render::environment_gpu::EnvironmentState {
-        ViewEnvironment::state(
+        let clock = self.sun_clock();
+        let mut state = ViewEnvironment::state(
             eye,
-            (self.tick.0 as f64 * sim::TICK_SECONDS + self.accumulator) as f32,
+            clock.map_or(
+                (self.tick.0 as f64 * sim::TICK_SECONDS + self.accumulator) as f32,
+                |clock| clock.animation_seconds,
+            ),
             self.frame_delta_seconds,
             self.tick,
-            lighting::SUN,
+            clock.map_or(lighting::SUN, |clock| clock.sun_direction),
             self.player.eye_water,
-        )
+        );
+        if let Some(clock) = clock {
+            state.sun_intensity = clock.sun_intensity;
+        }
+        state
     }
     /// Install public interpolated records without scanning the world. Returns
     /// false while this loading profile has no entity renderer attached.
@@ -757,26 +902,6 @@ impl ClientView {
         });
         Ok(true)
     }
-    pub fn apply_settings(&mut self, settings: &ui::settings::Settings) -> SettingsApplication {
-        use ui::settings::{Section, Setting};
-        let fov = settings.get(Setting::Fov) as f32;
-        let bob = settings.get(Setting::Bob) != 0;
-        if self.field_of_view != fov || self.view_bob != bob {
-            self.field_of_view = fov;
-            self.view_bob = bob;
-            self.invalidate();
-        }
-        let mut pending_render = 0;
-        for setting in ui::settings::SCHEMA {
-            if setting.section == Section::Graphics && setting.id != Setting::Fov {
-                pending_render |= 1 << setting.id as u32;
-            }
-        }
-        SettingsApplication {
-            applied: (1 << Setting::Fov as u32) | (1 << Setting::Bob as u32),
-            pending_render,
-        }
-    }
     fn lighting_center(&self) -> [f32; 3] {
         if self.active {
             self.player.pos.map(|value| value as f32)
@@ -788,6 +913,14 @@ impl ClientView {
 
     pub fn set_key(&mut self, key: InputKey, down: bool) {
         self.set_key_inner(key, down, None);
+    }
+    /// Capture the actual pointer modifier before keyup/transport sampling.
+    pub fn set_place_key(&mut self, down: bool, sneaking: bool) {
+        let rising = down && !self.keys[InputKey::Place as usize];
+        self.set_key(InputKey::Place, down);
+        if rising {
+            self.place_sneaking = sneaking;
+        }
     }
     /// Physical Shift is independent of the player's rebindable Sneak action.
     pub fn set_tool_mode_key(&mut self, down: bool, back: bool) {
@@ -804,6 +937,7 @@ impl ClientView {
         }
         if key == InputKey::Place {
             self.place_pressed = true;
+            self.place_sneaking = self.keys[InputKey::Sneak as usize];
         }
         if self.authoritative_remote() && key == InputKey::ToolMode {
             if self.active && self.remote_tool_modes.len() < 32 {
@@ -848,6 +982,7 @@ impl ClientView {
     pub fn clear_keys(&mut self) {
         self.keys.fill(false);
         self.place_pressed = false;
+        self.place_sneaking = false;
     }
     pub fn input_buttons(&self) -> u32 {
         self.keys
@@ -1037,6 +1172,25 @@ impl ClientView {
                 ..telemetry::WorkCounts::ZERO
             });
         }
+        self.advance_horizon_cpu()?;
+        let source_camera = self
+            .environment
+            .as_ref()
+            .filter(|environment| environment.owner.gpu.gi().is_some())
+            .map(|environment| {
+                let parameters = self.camera_parameters();
+                (
+                    parameters.eye,
+                    parameters.projection(environment.width, environment.height),
+                )
+            });
+        if let (Some(environment), Some((eye, camera))) = (&mut self.environment, source_camera) {
+            let stats = environment
+                .owner
+                .phase(&mut self.scene, eye, &camera, self.tick)
+                .map_err(|error| error.to_string())?;
+            self.record_environment_work(stats, 0);
+        }
         Ok(())
     }
     fn preflight_edit(&self, position: BlockPos) -> bool {
@@ -1210,12 +1364,35 @@ impl ClientView {
         self.interactions.rolled_back();
         Ok(true)
     }
+    pub fn render_scale(&self) -> u32 {
+        self.render_scale
+    }
+    pub fn render_extent(&self) -> [u32; 2] {
+        self.renderer.extent()
+    }
+    /// Surface/UI dimensions stay native. Prepared HDR/depth/environment targets
+    /// use the selected scale; existing final Post expands them to the surface.
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) -> Result<(), String> {
-        self.invalidate();
         if width == 0 || height == 0 {
             return Ok(());
         }
+        let scale = if self.environment.is_some() {
+            self.requested_settings.as_ref().map_or(100, |settings| {
+                settings.get(ui::settings::Setting::Scale) as u32
+            })
+        } else {
+            100
+        };
+        if !(85..=100).contains(&scale) {
+            return Err("render scale must be85..100 percent".into());
+        }
+        let scaled = |axis: u32| (u64::from(axis) * u64::from(scale)).div_ceil(100) as u32;
+        let [render_width, render_height] = [scaled(width), scaled(height)];
+        self.invalidate();
         if let Some(environment) = &mut self.environment {
+            if environment.width != render_width || environment.height != render_height {
+                self.cached_presentation_available = false;
+            }
             let mut budget = UploadBudget::new(16 * 1024 * 1024);
             let before = budget.remaining_bytes;
             environment
@@ -1224,22 +1401,31 @@ impl ClientView {
                     device,
                     &environment.queue,
                     &mut self.renderer,
-                    width,
-                    height,
+                    render_width,
+                    render_height,
                     &mut budget,
                 )
                 .map_err(|error| error.to_string())?;
-            environment.width = width;
-            environment.height = height;
+            environment
+                .owner
+                .gpu
+                .post_mut()
+                .set_output_extent(width, height)
+                .map_err(|error| error.to_string())?;
+            environment.width = render_width;
+            environment.height = render_height;
             self.retained_foreground_work.record(telemetry::WorkCounts {
                 upload_bytes: before - budget.remaining_bytes,
                 ..telemetry::WorkCounts::ZERO
             });
+            self.render_scale = scale;
             Ok(())
         } else {
             self.renderer
                 .resize(device, width, height)
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            self.render_scale = 100;
+            Ok(())
         }
     }
     fn refresh_patches(&mut self) -> Result<(), String> {
@@ -1367,6 +1553,7 @@ impl ClientView {
         budget: &mut UploadBudget,
     ) -> Result<(), String> {
         let before = budget.remaining_bytes;
+        self.flush_post_settings(queue, budget)?;
         // Keep one allowance for the complete frame. Small environment/camera
         // uniforms cannot be starved behind a ready terrain replacement.
         let environment_reserve = budget.remaining_bytes.min(4096);
@@ -1741,6 +1928,7 @@ impl ClientView {
             self.record_props_work(work);
         }
         let near_ready = self.near_meshes_ready();
+        let far_water_ready = self.far_water_guard_ready();
         if let (Some(water), Some(environment)) = (&mut self.water, &mut self.environment) {
             let gpu = environment
                 .owner
@@ -1764,7 +1952,10 @@ impl ClientView {
             environment
                 .owner
                 .gpu
-                .set_water_cover_ready(&mut self.renderer, stats.ready && near_ready)
+                .set_water_cover_ready(
+                    &mut self.renderer,
+                    stats.ready && near_ready && far_water_ready,
+                )
                 .map_err(|error| error.to_string())?;
         }
         if let (Some(environment), Some((eye, camera))) = (&mut self.environment, source_camera) {
@@ -1774,11 +1965,7 @@ impl ClientView {
                 .pump(queue, &mut self.scene, eye, &camera, self.tick, budget)
                 .map_err(|error| error.to_string())?;
             let bytes = before - budget.remaining_bytes;
-            self.retained_foreground_work.record(telemetry::WorkCounts {
-                cells_scanned: work.source_reads,
-                upload_bytes: bytes,
-                ..telemetry::WorkCounts::ZERO
-            });
+            self.record_environment_work(work, bytes);
             if bytes != 0 {
                 self.renderer.invalidate();
             }
@@ -1789,6 +1976,17 @@ impl ClientView {
             .upload_bytes_total
             .saturating_add(before - budget.remaining_bytes);
         Ok(())
+    }
+    fn record_environment_work(&mut self, stats: EnvironmentStats, upload_bytes: u64) {
+        self.retained_worker_work.record(telemetry::WorkCounts {
+            cells_scanned: stats.source_worker_reads,
+            ..telemetry::WorkCounts::ZERO
+        });
+        self.retained_foreground_work.record(telemetry::WorkCounts {
+            cells_scanned: stats.source_reads + u64::from(stats.probe_visibility_samples),
+            upload_bytes,
+            ..telemetry::WorkCounts::ZERO
+        });
     }
     fn upload_page_links(
         &mut self,
@@ -1931,8 +2129,8 @@ impl ClientView {
             || self
                 .renderer
                 .needs_redraw(&camera, CullingMode::FrustumAndHiZ)
-            || self.cached_world_version != self.scene.world().version()
-            || self.cached_upload_bytes != self.upload_bytes_total
+            || self.observed_world_version != self.scene.world().version()
+            || self.observed_upload_bytes != self.upload_bytes_total
             || self
                 .lighting
                 .as_ref()
@@ -1950,6 +2148,43 @@ impl ClientView {
     pub fn invalidate(&mut self) {
         self.force_redraw = true;
     }
+    /// A UI-only presentation reuses the last complete HDR image. Its original
+    /// camera/world/edit stamps stay intact; pending world work is still dirty.
+    pub fn encode_cached_present(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        output: &wgpu::TextureView,
+    ) -> Result<bool, String> {
+        self.encoded_shadows = false;
+        self.encoded_terrain = false;
+        let Some(environment) = &mut self.environment else {
+            return Ok(false);
+        };
+        let encoded = environment
+            .owner
+            .encode_cached_present(encoder, output)
+            .map_err(|error| error.to_string())?
+            .is_some();
+        if encoded {
+            self.frame_pipeline_compilations = 0;
+        }
+        self.cached_presentation_available = encoded;
+        Ok(encoded)
+    }
+    pub fn has_cached_present(&self) -> bool {
+        self.cached_presentation_available && self.environment.is_some()
+    }
+    /// Menu-only changes use the same upload allowance and existing Post
+    /// resources; world/source queues remain retained for the next scene frame.
+    pub fn upload_cached_settings(
+        &mut self,
+        queue: &wgpu::Queue,
+        budget: &mut UploadBudget,
+    ) -> Result<(), String> {
+        self.flush_post_settings(queue, budget)?;
+        self.frame_upload_remaining = budget.remaining_bytes;
+        Ok(())
+    }
     pub fn encode(
         &mut self,
         queue: &wgpu::Queue,
@@ -1963,8 +2198,48 @@ impl ClientView {
                 "frame uniform upload allowance unavailable; run upload_ready first".into(),
             );
         }
+        self.encoded_shadows = false;
+        self.encoded_terrain = false;
+        if !self.near_far_join_ready() {
+            if self.encode_cached_present(encoder, output)? {
+                return Ok(TerrainFrameWork::default());
+            }
+            // A resized/initial target has no prior HDR. A real clear keeps
+            // Loading/UI valid without exposing a partially joined scene.
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("pending near/far join Loading clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: output,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.02,
+                            g: 0.025,
+                            b: 0.03,
+                            a: 1.,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            return Ok(TerrainFrameWork::default());
+        }
         let parameters = self.camera_parameters();
         let camera = parameters.projection(width, height);
+        let sun = self
+            .sun_clock()
+            .map_or(lighting::SUN, |clock| clock.sun_direction);
+        if let (Some(clock), Some(environment)) = (self.sun_clock(), &mut self.environment) {
+            environment
+                .owner
+                .gpu
+                .set_celestial_clock(clock.moon_phase, clock.rotation_radians)
+                .map_err(|error| error.to_string())?;
+        }
         if self.renderer.material_pack_revision().is_some() {
             let bytes = self
                 .renderer
@@ -1974,25 +2249,41 @@ impl ClientView {
         }
         let center = self.lighting_center();
         if let Some(lighting) = &mut self.lighting {
+            self.encoded_shadows = true;
             let work = if let (Some(entities), Some(props)) = (&mut self.entities, &mut self.props)
             {
                 let mut pair = render::shadows::ShadowCasterPair {
                     first: &mut entities.gpu,
                     second: &mut props.gpu,
                 };
-                lighting.encode_models(queue, encoder, &mut self.renderer, center, &mut pair)
-            } else if let Some(props) = &mut self.props {
-                lighting.encode_models(queue, encoder, &mut self.renderer, center, &mut props.gpu)
-            } else if let Some(entities) = &mut self.entities {
-                lighting.encode_models(
+                lighting.encode_models_with_sun(
                     queue,
                     encoder,
                     &mut self.renderer,
                     center,
+                    sun,
+                    &mut pair,
+                )
+            } else if let Some(props) = &mut self.props {
+                lighting.encode_models_with_sun(
+                    queue,
+                    encoder,
+                    &mut self.renderer,
+                    center,
+                    sun,
+                    &mut props.gpu,
+                )
+            } else if let Some(entities) = &mut self.entities {
+                lighting.encode_models_with_sun(
+                    queue,
+                    encoder,
+                    &mut self.renderer,
+                    center,
+                    sun,
                     &mut entities.gpu,
                 )
             } else {
-                lighting.encode(queue, encoder, &mut self.renderer, center)
+                lighting.encode_with_sun(queue, encoder, &mut self.renderer, center, sun)
             }
             .map_err(|error| error.to_string())?;
             self.frame_upload_remaining -= work.uniform_upload_bytes;
@@ -2031,7 +2322,13 @@ impl ClientView {
         if scene_needed && let Some(horizon) = &mut self.horizon {
             horizon
                 .owner
-                .prepare_camera(queue, encoder, camera, parameters.eye, height)
+                .prepare_camera_extent(
+                    queue,
+                    encoder,
+                    camera,
+                    parameters.eye,
+                    self.renderer.extent(),
+                )
                 .map_err(|error| error.to_string())?;
             let h = horizon.owner.height.take_work();
             let p = horizon.owner.proxies.take_work();
@@ -2113,14 +2410,17 @@ impl ClientView {
             self.props_content_encoded = props_encoded.get();
             self.props_frames += u64::from(self.props_content_encoded);
         }
-        self.self_model_rendered = self.entities.as_ref().map_or_else(
-            || {
-                self.self_uploaded_pose.is_some_and(|pose| pose.visible)
-                    && self.self_handles.iter().all(Option::is_some)
-            },
-            |entities| entities.stats.primary_visible,
-        );
-        if self.edit_shell.dirty_pages().next().is_none()
+        if scene_needed {
+            self.self_model_rendered = self.entities.as_ref().map_or_else(
+                || {
+                    self.self_uploaded_pose.is_some_and(|pose| pose.visible)
+                        && self.self_handles.iter().all(Option::is_some)
+                },
+                |entities| entities.stats.primary_visible,
+            );
+        }
+        if scene_needed
+            && self.edit_shell.dirty_pages().next().is_none()
             && self.pending_patches.is_empty()
             && self.is_ready()
             && let Some(since) = self.edit_pending_since.take()
@@ -2130,13 +2430,23 @@ impl ClientView {
                 .edit_max_visible_frames
                 .max(self.terrain_frames.saturating_add(1).saturating_sub(since));
         }
-        self.cached_camera = Some(camera);
-        self.cached_world_version = self.scene.world().version();
-        self.cached_upload_bytes = self.upload_bytes_total;
-        self.force_redraw = false;
-        if work.passes != 0 && self.resident.values().any(|p| p.quads != 0) {
-            self.terrain_frames += 1;
+        if scene_needed {
+            self.encoded_terrain = work.passes != 0;
+            self.cached_presentation_available = self.environment.is_some();
+            self.cached_camera = Some(camera);
+            self.cached_world_version = self.scene.world().version();
+            self.cached_upload_bytes = self.upload_bytes_total;
+            if work.passes != 0 && self.resident.values().any(|p| p.quads != 0) {
+                self.terrain_frames += 1;
+            }
         }
+        // A normal graph may conclude that an outside-near metadata change
+        // needs only Post. Observe it for scheduling without relabelling the
+        // retained HDR camera/world as newly rendered. A join/menu hold above
+        // deliberately leaves both the scheduling and presentation dirtiness.
+        self.observed_world_version = self.scene.world().version();
+        self.observed_upload_bytes = self.upload_bytes_total;
+        self.force_redraw = false;
         let measured = self.renderer.take_work();
         self.retained_gpu_work.record(measured);
         self.frame_pipeline_compilations = measured.pipeline_compilations;
@@ -2200,8 +2510,47 @@ impl ClientView {
     pub const fn last_frame_work_details(&self) -> FrameWorkDetails {
         self.last_frame_work_details
     }
+    /// CPU-derived inputs and same-budget uploads required before the first
+    /// expensive scene encode. Shadow/content presentation deliberately follows
+    /// this gate, so an initial Loading clear cannot make the world ready.
+    pub fn initial_scene_inputs_ready(&self) -> bool {
+        self.near_far_join_ready()
+            && self.near_meshes_ready()
+            && self.scene.is_ready()
+            && self.props.as_ref().is_none_or(|props| props.stats.ready)
+    }
+    /// A real cheap Loading frame, with no scene/content/timestamp publication.
+    pub fn encode_loading_clear(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        output: &wgpu::TextureView,
+    ) {
+        self.encoded_shadows = false;
+        self.encoded_terrain = false;
+        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("initial CPU inputs Loading clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: output,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.02,
+                        g: 0.025,
+                        b: 0.03,
+                        a: 1.,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+    }
     pub fn is_ready(&self) -> bool {
-        self.near_meshes_ready()
+        self.near_far_join_ready()
+            && self.near_meshes_ready()
             && self
                 .lighting
                 .as_ref()

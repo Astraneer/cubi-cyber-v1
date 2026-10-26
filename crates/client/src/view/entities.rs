@@ -75,12 +75,31 @@ impl ViewEntities {
         atmosphere: Option<&render::atmosphere::AtmosphereGpu>,
         authoritative_light: bool,
     ) -> Result<Self, EntityError> {
+        Self::prepare_with_source_and_gi(
+            device,
+            queue,
+            terrain,
+            shadows,
+            atmosphere,
+            None,
+            authoritative_light,
+        )
+    }
+    pub fn prepare_with_source_and_gi(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        terrain: &TerrainGpu,
+        shadows: Option<&ShadowGpu>,
+        atmosphere: Option<&render::atmosphere::AtmosphereGpu>,
+        gi: Option<&render::gi::GiGpu>,
+        authoritative_light: bool,
+    ) -> Result<Self, EntityError> {
         let sprites =
             ui::atlas::ItemSprites::load().map_err(|error| EntityError::Assets(error.into()))?;
         let atlas = render::entity_models::item_atlas(&sprites.rgba, sprites.layers)
             .map_err(EntityError::Assets)?;
         let mut gpu = match atmosphere {
-            Some(atmosphere) => EntityGpu::new_with_environment(
+            Some(atmosphere) => EntityGpu::new_with_lighting(
                 device,
                 queue,
                 terrain.geometry(),
@@ -88,6 +107,7 @@ impl ViewEntities {
                 shadows,
                 Some(&atlas),
                 atmosphere,
+                gi,
             ),
             None => EntityGpu::new_with_items(
                 device,

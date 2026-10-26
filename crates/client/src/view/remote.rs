@@ -11,6 +11,7 @@ pub struct RemoteInput {
     pub pitch: f32,
     pub placing: bool,
     pub place_pressed: bool,
+    pub place_sneaking: bool,
 }
 impl ClientView {
     pub fn authoritative_remote(&self) -> bool {
@@ -41,6 +42,7 @@ impl ClientView {
             pitch,
             placing: self.keys[InputKey::Place as usize],
             place_pressed: self.place_pressed,
+            place_sneaking: self.place_sneaking,
         }
     }
     /// A short mouse click survives keyup and one transport sampling boundary.
@@ -48,6 +50,7 @@ impl ClientView {
     pub fn take_remote_input(&mut self) -> RemoteInput {
         let input = self.remote_input();
         self.place_pressed = false;
+        self.place_sneaking = false;
         input
     }
     pub fn take_remote_control(&mut self) -> Option<InputKey> {

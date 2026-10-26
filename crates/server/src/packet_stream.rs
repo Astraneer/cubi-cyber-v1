@@ -301,8 +301,8 @@ impl Server {
                         state.queue.push_back(dirty);
                     }
                     Err(_) => {
-                        self.failed = true;
                         state.pages.insert(dirty.page, page);
+                        self.fail("publish_packets");
                         return output;
                     }
                 }

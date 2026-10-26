@@ -3,6 +3,8 @@ use crate::terrain_gpu::{Camera, TerrainGeometry};
 use bytemuck::{Pod, Zeroable};
 #[path = "shadow_damage.rs"]
 mod damage;
+#[path = "shadow_footprint.rs"]
+pub(crate) mod footprint;
 pub(crate) use damage::ShadowDamageTracker;
 
 pub const CASCADES: usize = 3;
@@ -16,6 +18,10 @@ pub struct ShadowConfig {
     pub sun_step_radians: f32,
     /// Separate combined target is allocated only when moving model shadows are enabled.
     pub dynamic_casters: bool,
+    /// GPU old/new caster bounds restrict clears without changing projection.
+    pub projected_bounds: bool,
+    pub enabled: bool,
+    pub active_cascades: u32,
 }
 impl Default for ShadowConfig {
     fn default() -> Self {
@@ -26,7 +32,30 @@ impl Default for ShadowConfig {
             max_updates_per_frame: 1,
             sun_step_radians: std::f32::consts::PI / 720.,
             dynamic_casters: false,
+            projected_bounds: false,
+            enabled: true,
+            active_cascades: 3,
         }
+    }
+}
+impl ShadowConfig {
+    pub fn with_resolution(mut self, resolution: u32) -> Result<Self, ShadowError> {
+        if resolution == 0 || !resolution.is_power_of_two() {
+            return Err(ShadowError::InvalidConfig);
+        }
+        self.resolution = resolution;
+        Ok(self)
+    }
+    pub fn with_cascades(mut self, cascades: u32) -> Result<Self, ShadowError> {
+        if !(1..=CASCADES as u32).contains(&cascades) {
+            return Err(ShadowError::InvalidConfig);
+        }
+        self.active_cascades = cascades;
+        Ok(self)
+    }
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,11 +108,17 @@ impl ShadowRect {
         self.width as u64 * self.height as u64
     }
 }
+const DIRTY_SUN: u8 = 1;
+const DIRTY_VIEW: u8 = 2;
+const DIRTY_GEOMETRY: u8 = 4;
+const DIRTY_INITIAL: u8 = 8;
+const DIRTY_FORCE_FULL: u8 = 16;
 #[derive(Clone, Copy, Debug)]
 struct Cascade {
     committed: Option<Camera>,
     desired: Camera,
     dirty: Option<ShadowRect>,
+    dirty_causes: u8,
     age: u64,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -96,6 +131,11 @@ pub struct ShadowWork {
     pub dynamic_restore_pixels: u64,
     pub dynamic_restore_draws: u32,
     pub dynamic_damage_bounds: u64,
+    /// Area is GPU-reduced; read footprint metrics after completion for exact pixels.
+    pub gpu_clear_mask: u32,
+    pub gpu_restore_mask: u32,
+    pub footprint_dispatches: u32,
+    pub metadata_copy_bytes: u64,
     pub clear_pixels: u64,
     pub caster_dispatches: u32,
     pub draw_calls: u32,
@@ -119,6 +159,7 @@ pub struct CascadeUpdate {
     pub cascade: usize,
     pub camera: Camera,
     pub rect: ShadowRect,
+    pub force_full: bool,
 }
 
 pub struct ShadowCache {
@@ -135,6 +176,7 @@ impl ShadowCache {
             committed: None,
             desired: stable_camera(config, index, center, sun),
             dirty: Some(ShadowRect::full(config.resolution)),
+            dirty_causes: DIRTY_INITIAL,
             age: 0,
         });
         Ok(Self {
@@ -147,6 +189,31 @@ impl ShadowCache {
     pub fn config(&self) -> ShadowConfig {
         self.config
     }
+    fn active(&self) -> &[Cascade] {
+        &self.cascades[..if self.config.enabled {
+            self.config.active_cascades as usize
+        } else {
+            0
+        }]
+    }
+    pub fn set_visibility(&mut self, enabled: bool, cascades: u32) -> Result<bool, ShadowError> {
+        if !(1..=CASCADES as u32).contains(&cascades) {
+            return Err(ShadowError::InvalidConfig);
+        }
+        if self.config.enabled == enabled && self.config.active_cascades == cascades {
+            return Ok(false);
+        }
+        let old = self.active().len();
+        self.config.enabled = enabled;
+        self.config.active_cascades = cascades;
+        for index in old..self.active().len() {
+            let layer = &mut self.cascades[index];
+            layer.dirty = Some(ShadowRect::full(self.config.resolution));
+            layer.dirty_causes |= DIRTY_GEOMETRY;
+            layer.age = self.frame;
+        }
+        Ok(true)
+    }
     pub fn sampling(&self) -> ShadowSampling {
         ShadowSampling {
             matrices: std::array::from_fn(|i| {
@@ -158,7 +225,7 @@ impl ShadowCache {
             desired_matrices: std::array::from_fn(|i| self.cascades[i].desired.view_projection),
             sun: [self.sun[0], self.sun[1], self.sun[2], 0.00005],
             params: [
-                self.cascades.iter().enumerate().fold(0, |bits, (i, c)| {
+                self.active().iter().enumerate().fold(0, |bits, (i, c)| {
                     bits | if c.committed.is_some() { 1 << i } else { 0 }
                 }),
                 self.config.resolution,
@@ -173,15 +240,23 @@ impl ShadowCache {
         validate(self.config, center, sun)?;
         self.frame = self.frame.saturating_add(1);
         let sun = stepped_sun(sun, self.config.sun_step_radians);
-        let sun_changed = sun != self.sun;
+        let old_sun = self.sun;
+        let sun_changed = sun != old_sun;
         self.sun = sun;
         for (i, cascade) in self.cascades.iter_mut().enumerate() {
+            let view_changed = stable_camera(self.config, i, center, old_sun) != cascade.desired;
             let desired = stable_camera(self.config, i, center, sun);
             if cascade.desired != desired || sun_changed {
                 if cascade.dirty.is_none() {
                     cascade.age = self.frame;
                 }
                 cascade.desired = desired;
+                if sun_changed {
+                    cascade.dirty_causes |= DIRTY_SUN;
+                }
+                if view_changed {
+                    cascade.dirty_causes |= DIRTY_VIEW;
+                }
                 cascade.dirty = Some(ShadowRect::full(self.config.resolution));
             }
         }
@@ -196,6 +271,7 @@ impl ShadowCache {
                     cascade.age = self.frame;
                 }
                 cascade.dirty = Some(cascade.dirty.map_or(rect, |old| old.union(rect)));
+                cascade.dirty_causes |= DIRTY_GEOMETRY;
             }
         }
     }
@@ -205,13 +281,21 @@ impl ShadowCache {
                 c.age = self.frame;
             }
             c.dirty = Some(ShadowRect::full(self.config.resolution));
+            c.dirty_causes |= DIRTY_GEOMETRY | DIRTY_FORCE_FULL;
         }
     }
+    /// Every layer has a coherent committed image. Ongoing Sun-only refresh
+    /// does not revoke it; initial, recenter and geometry work still do.
+    pub fn presentation_ready(&self) -> bool {
+        self.active().iter().all(|c| {
+            c.committed.is_some() && (c.dirty.is_none() || c.dirty_causes & !DIRTY_SUN == 0)
+        })
+    }
     pub fn pending(&self) -> u32 {
-        self.cascades.iter().filter(|c| c.dirty.is_some()).count() as u32
+        self.active().iter().filter(|c| c.dirty.is_some()).count() as u32
     }
     pub fn oldest_age(&self) -> u64 {
-        self.cascades
+        self.active()
             .iter()
             .filter(|c| c.dirty.is_some())
             .map(|c| self.frame.saturating_sub(c.age))
@@ -222,7 +306,7 @@ impl ShadowCache {
     /// distant shadows when an actor keeps changing the near cascade.
     pub fn next_update(&self) -> Option<CascadeUpdate> {
         let index = self
-            .cascades
+            .active()
             .iter()
             .enumerate()
             .filter(|(_, c)| c.dirty.is_some())
@@ -233,6 +317,7 @@ impl ShadowCache {
             cascade: index,
             camera: c.desired,
             rect: c.dirty?,
+            force_full: c.dirty_causes & DIRTY_FORCE_FULL != 0,
         })
     }
     pub fn commit(&mut self, update: CascadeUpdate) {
@@ -240,11 +325,13 @@ impl ShadowCache {
         if c.desired == update.camera && c.dirty == Some(update.rect) {
             c.committed = Some(update.camera);
             c.dirty = None;
+            c.dirty_causes = 0;
         }
     }
 }
 fn validate(config: ShadowConfig, center: [f32; 3], sun: [f32; 3]) -> Result<(), ShadowError> {
-    if config.resolution == 0
+    if !(1..=CASCADES as u32).contains(&config.active_cascades)
+        || config.resolution == 0
         || !config.resolution.is_power_of_two()
         || config.max_updates_per_frame == 0
         || config.max_updates_per_frame > 3
@@ -365,6 +452,7 @@ fn project_bounds(camera: Camera, bounds: WorldBounds, resolution: u32) -> Optio
 pub struct ShadowPrepareWork {
     pub dispatches: u32,
     pub upload_bytes: u64,
+    pub bounds_complete: bool,
 }
 pub trait DynamicShadowCaster {
     fn available(&self) -> bool;
@@ -395,7 +483,26 @@ pub trait DynamicShadowCaster {
         ShadowPrepareWork {
             dispatches: self.prepare_shadow(queue, encoder, cascade, camera),
             upload_bytes: 0,
+            bounds_complete: false,
         }
+    }
+    /// Optional GPU footprint collection. Unsupported casters restore a full layer.
+    fn prepare_shadow_sparse(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        cascade: usize,
+        camera: Camera,
+        resolution: u32,
+    ) -> ShadowPrepareWork {
+        self.prepare_shadow_region(
+            queue,
+            encoder,
+            cascade,
+            camera,
+            ShadowRect::full(resolution),
+            resolution,
+        )
     }
     fn prepare_shadow(
         &mut self,
@@ -459,6 +566,27 @@ impl DynamicShadowCaster for ShadowCasterPair<'_> {
         ShadowPrepareWork {
             dispatches: a.dispatches + b.dispatches,
             upload_bytes: a.upload_bytes + b.upload_bytes,
+            bounds_complete: a.bounds_complete && b.bounds_complete,
+        }
+    }
+    fn prepare_shadow_sparse(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        cascade: usize,
+        camera: Camera,
+        resolution: u32,
+    ) -> ShadowPrepareWork {
+        let a = self
+            .first
+            .prepare_shadow_sparse(queue, encoder, cascade, camera, resolution);
+        let b = self
+            .second
+            .prepare_shadow_sparse(queue, encoder, cascade, camera, resolution);
+        ShadowPrepareWork {
+            dispatches: a.dispatches + b.dispatches,
+            upload_bytes: a.upload_bytes + b.upload_bytes,
+            bounds_complete: a.bounds_complete && b.bounds_complete,
         }
     }
     fn prepare_shadow(
@@ -473,6 +601,40 @@ impl DynamicShadowCaster for ShadowCasterPair<'_> {
     }
     fn draw_shadow(&self, pass: &mut wgpu::RenderPass<'_>, cascade: usize) -> u32 {
         self.first.draw_shadow(pass, cascade) + self.second.draw_shadow(pass, cascade)
+    }
+}
+struct NoModelCaster;
+impl DynamicShadowCaster for NoModelCaster {
+    fn available(&self) -> bool {
+        true
+    }
+    fn shadow_revision(&self) -> u64 {
+        0
+    }
+    fn prepare_shadow(
+        &mut self,
+        _: &wgpu::Queue,
+        _: &mut wgpu::CommandEncoder,
+        _: usize,
+        _: Camera,
+    ) -> u32 {
+        0
+    }
+    fn prepare_shadow_sparse(
+        &mut self,
+        _: &wgpu::Queue,
+        _: &mut wgpu::CommandEncoder,
+        _: usize,
+        _: Camera,
+        _: u32,
+    ) -> ShadowPrepareWork {
+        ShadowPrepareWork {
+            bounds_complete: true,
+            ..Default::default()
+        }
+    }
+    fn draw_shadow(&self, _: &mut wgpu::RenderPass<'_>, _: usize) -> u32 {
+        0
     }
 }
 struct CombinedDepth {
@@ -507,11 +669,15 @@ pub struct ShadowGpu {
     max_pages: u32,
     max_quads: u32,
     sampling_dirty: bool,
+    visibility_dirty: bool,
     combined: Option<CombinedDepth>,
     last_dynamic: Option<DynamicStamp>,
     timer: crate::gpu_time::GpuPassTimer<9>,
     total_timer: crate::gpu_time::GpuGraphTimer,
     last_static_rects: [Option<ShadowRect>; CASCADES],
+    footprints: Option<footprint::Footprints>,
+    clear_binds: Option<[wgpu::BindGroup; CASCADES]>,
+    last_force_full_mask: u32,
 }
 impl ShadowGpu {
     pub fn new(
@@ -587,6 +753,16 @@ impl ShadowGpu {
                 "shadow dirty-rectangle cull camera",
                 96,
                 wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            )
+        });
+        let footprints = config.projected_bounds.then(|| {
+            footprint::Footprints::new(
+                device,
+                queue,
+                geometry.objects,
+                &cameras,
+                geometry.max_pages,
+                config.resolution,
             )
         });
         let visible = make_buffer(
@@ -764,13 +940,40 @@ impl ShadowGpu {
         };
         let reset = make_compute("reset");
         let cull = make_compute("frustum");
+        let footprint_entry = |binding| storage_entry(binding, vertex, binding == 0, true);
+        let clear_layout = footprints.as_ref().map(|_| {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("GPU footprint clear inputs"),
+                entries: &[footprint_entry(0), footprint_entry(1)],
+            })
+        });
+        let clear_binds = clear_layout.as_ref().map(|layout| {
+            std::array::from_fn(|i| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("GPU footprint clear rectangle"),
+                    layout,
+                    entries: &[
+                        buffer_entry(0, &cameras[i]),
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: footprints.as_ref().unwrap().binding(i),
+                        },
+                    ],
+                })
+            })
+        });
+        let clear_source = if footprints.is_some() {
+            format!("{}\n{}", footprint::COMMON, SPARSE_RECT_SHADER)
+        } else {
+            CLEAR_SHADER.to_owned()
+        };
         let clear_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scissored reverse-depth cache clear"),
-            source: wgpu::ShaderSource::Wgsl(CLEAR_SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(clear_source.into()),
         });
         let empty_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadow clear layout"),
-            bind_group_layouts: &[],
+            bind_group_layouts: &clear_layout.iter().collect::<Vec<_>>(),
             push_constant_ranges: &[],
         });
         let clear = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -796,33 +999,57 @@ impl ShadowGpu {
             cache: None,
         });
         let combined = config.dynamic_casters.then(|| {
+            let mut entries = vec![wgpu::BindGroupLayoutEntry {
+                binding: if footprints.is_some() { 2 } else { 0 },
+                visibility: fragment,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }];
+            if footprints.is_some() {
+                entries.extend([footprint_entry(0), footprint_entry(1)]);
+            }
             let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("localized combined-depth restore source"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                }],
+                entries: &entries,
             });
             let restore_binds = std::array::from_fn(|i| {
+                let mut entries = vec![wgpu::BindGroupEntry {
+                    binding: if footprints.is_some() { 2 } else { 0 },
+                    resource: wgpu::BindingResource::TextureView(&layers[i]),
+                }];
+                if let Some(fp) = &footprints {
+                    entries.extend([
+                        buffer_entry(0, &cameras[i]),
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: fp.binding(i),
+                        },
+                    ]);
+                }
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("static layer for combined restore"),
                     layout: &layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&layers[i]),
-                    }],
+                    entries: &entries,
                 })
             });
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("scissored static depth restore"),
                 source: wgpu::ShaderSource::Wgsl(
-                    format!("{CLEAR_SHADER}\n{RESTORE_SHADER}").into(),
+                    if footprints.is_some() {
+                        format!(
+                            "{}\n{}\n{}",
+                            footprint::COMMON,
+                            SPARSE_RECT_SHADER,
+                            RESTORE_SHADER.replace("binding(0)", "binding(2)")
+                        )
+                    } else {
+                        format!("{CLEAR_SHADER}\n{RESTORE_SHADER}")
+                    }
+                    .into(),
                 ),
             });
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -835,7 +1062,11 @@ impl ShadowGpu {
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some("vertex"),
+                    entry_point: Some(if footprints.is_some() {
+                        "restore_vertex"
+                    } else {
+                        "vertex"
+                    }),
                     compilation_options: Default::default(),
                     buffers: &[],
                 },
@@ -914,9 +1145,13 @@ impl ShadowGpu {
             max_pages: geometry.max_pages,
             max_quads: geometry.max_quads,
             sampling_dirty: false,
+            visibility_dirty: false,
             combined,
             last_dynamic: None,
             last_static_rects: [None; CASCADES],
+            footprints,
+            clear_binds,
+            last_force_full_mask: 0,
             total_timer: crate::gpu_time::GpuGraphTimer::new(
                 device,
                 queue,
@@ -932,10 +1167,37 @@ impl ShadowGpu {
     /// Depth, clear, reset and cull plus an optional combined restore pipeline,
     /// all created during loading.
     pub const fn startup_pipeline_compilations(&self) -> u32 {
-        4 + self.combined.is_some() as u32
+        4 + self.combined.is_some() as u32 + if self.footprints.is_some() { 5 } else { 0 }
+    }
+    pub(crate) fn footprint_binding(&self, cascade: usize) -> Option<wgpu::BindingResource<'_>> {
+        self.footprints.as_ref().map(|fp| fp.binding(cascade))
+    }
+    /// GPU records contain exact clear/restore areas at byte96 of each256-byte cascade.
+    pub fn footprint_metrics_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.footprints.as_ref().map(|fp| &fp.buffer)
     }
     pub fn cache(&self) -> &ShadowCache {
         &self.cache
+    }
+    /// Hot metadata change; shaders/pipelines/textures remain prepared. Encoding
+    /// publishes the mask and restores newly enabled layers before readiness.
+    pub fn set_visibility(&mut self, enabled: bool, cascades: u32) -> Result<bool, ShadowError> {
+        let changed = self.cache.set_visibility(enabled, cascades)?;
+        self.sampling_dirty |= changed;
+        self.visibility_dirty |= changed;
+        Ok(changed)
+    }
+    pub fn presentation_ready(&self) -> bool {
+        !self.visibility_dirty && self.cache.presentation_ready()
+    }
+    pub fn needs_work(&self) -> bool {
+        self.sampling_dirty || self.cache.pending() != 0
+    }
+    pub fn enabled(&self) -> bool {
+        self.cache.config.enabled
+    }
+    pub fn active_cascades(&self) -> u32 {
+        self.cache.config.active_cascades
     }
     pub fn sampling_buffer(&self) -> &wgpu::Buffer {
         &self.sampling
@@ -1025,6 +1287,12 @@ impl ShadowGpu {
             self.total_timer.start(encoder);
         }
         let mut work = self.encode_static(queue, encoder);
+        if self.footprints.is_some() {
+            self.encode_sparse_dynamic(queue, encoder, caster, &mut work);
+            self.total_timer.finish(encoder);
+            self.timer.finish(encoder);
+            return Ok(work);
+        }
         let sampling = self.cache.sampling();
         let revision = caster.shadow_key();
         let config = self.cache.config;
@@ -1111,11 +1379,90 @@ impl ShadowGpu {
         self.timer.finish(encoder);
         Ok(work)
     }
+    fn encode_sparse_dynamic(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        caster: &mut impl DynamicShadowCaster,
+        work: &mut ShadowWork,
+    ) {
+        let sampling = self.cache.sampling();
+        let revision = caster.shadow_key();
+        let fp = self.footprints.as_ref().expect("GPU footprint mode");
+        let combined = self.combined.as_ref().expect("combined target");
+        for cascade in 0..CASCADES {
+            let bit = 1 << cascade;
+            if sampling.params[0] & bit == 0 {
+                continue;
+            }
+            let changed = self.last_dynamic.as_ref().is_none_or(|old| {
+                old.valid & bit == 0
+                    || old.revision != revision
+                    || old.matrices[cascade] != sampling.matrices[cascade]
+            });
+            if !changed && work.static_updated_mask & bit == 0 {
+                continue;
+            }
+            self.total_timer.start(encoder);
+            if work.static_updated_mask & bit == 0 {
+                fp.seed_combined(encoder, cascade);
+                work.footprint_dispatches += 1;
+            }
+            let prepared = caster.prepare_shadow_sparse(
+                queue,
+                encoder,
+                cascade,
+                Camera {
+                    view_projection: sampling.matrices[cascade],
+                },
+                self.cache.config.resolution,
+            );
+            work.dynamic_cull_dispatches += prepared.dispatches;
+            work.uniform_upload_bytes += prepared.upload_bytes;
+            fp.combined_bounds(
+                encoder,
+                cascade,
+                prepared.bounds_complete && self.last_force_full_mask & bit == 0,
+            );
+            work.footprint_dispatches += 1;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("GPU old/new footprint restore and current model depth"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &combined.layers[cascade],
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: self.timer.render(3),
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&combined.restore);
+            pass.set_bind_group(0, &combined.restore_binds[cascade], &[]);
+            pass.draw(0..6, 0..1);
+            work.gpu_restore_mask |= bit;
+            work.dynamic_restore_draws += 1;
+            work.dynamic_draw_calls += caster.draw_shadow(&mut pass, cascade);
+        }
+        caster.commit_shadow_damage();
+        self.last_dynamic = Some(DynamicStamp {
+            revision,
+            matrices: sampling.matrices,
+            valid: sampling.params[0],
+        });
+    }
     pub fn encode(
         &mut self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
     ) -> ShadowWork {
+        if self.footprints.is_some() && self.combined.is_some() {
+            return self
+                .encode_dynamic(queue, encoder, &mut NoModelCaster)
+                .expect("prepared combined target");
+        }
         self.timer.begin();
         self.total_timer.begin_frame();
         if self.cache.pending() != 0 || self.last_dynamic.is_some() {
@@ -1171,6 +1518,7 @@ impl ShadowGpu {
     ) -> ShadowWork {
         let mut work = ShadowWork::default();
         self.last_static_rects.fill(None);
+        self.last_force_full_mask = 0;
         for _ in 0..self.cache.config.max_updates_per_frame {
             let Some(update) = self.cache.next_update() else {
                 break;
@@ -1193,8 +1541,22 @@ impl ShadowGpu {
                 0,
                 bytemuck::bytes_of(&camera),
             );
+            if let Some(fp) = &self.footprints {
+                if update.force_full {
+                    fp.mark_static_full(encoder, update.cascade);
+                    work.metadata_copy_bytes += 32;
+                    self.last_force_full_mask |= 1 << update.cascade;
+                }
+                fp.static_bounds(encoder, update.cascade);
+                work.footprint_dispatches += 3;
+            }
             let cull_camera = CameraUniform {
-                matrix: crop_camera(update.camera, update.rect, config.resolution).view_projection,
+                matrix: if self.footprints.is_some() {
+                    update.camera
+                } else {
+                    crop_camera(update.camera, update.rect, config.resolution)
+                }
+                .view_projection,
                 ..camera
             };
             queue.write_buffer(
@@ -1228,10 +1590,17 @@ impl ShadowGpu {
                     timestamp_writes: self.timer.render(2),
                     occlusion_query_set: None,
                 });
-                let rect = update.rect;
+                let rect = if self.footprints.is_some() {
+                    ShadowRect::full(config.resolution)
+                } else {
+                    update.rect
+                };
                 pass.set_scissor_rect(rect.x, rect.y, rect.width, rect.height);
                 pass.set_pipeline(&self.clear);
-                pass.draw(0..3, 0..1);
+                if let Some(binds) = &self.clear_binds {
+                    pass.set_bind_group(0, &binds[update.cascade], &[]);
+                }
+                pass.draw(0..if self.footprints.is_some() { 6 } else { 3 }, 0..1);
                 pass.set_pipeline(&self.depth);
                 pass.set_bind_group(0, &self.render_binds[update.cascade], &[]);
                 for bucket in [0, 1, 3, 4] {
@@ -1243,7 +1612,11 @@ impl ShadowGpu {
             self.sampling_dirty = true;
             work.cascade_updates += 1;
             work.static_updated_mask |= 1 << update.cascade;
-            work.clear_pixels += update.rect.pixels();
+            if self.footprints.is_some() {
+                work.gpu_clear_mask |= 1 << update.cascade;
+            } else {
+                work.clear_pixels += update.rect.pixels();
+            }
             work.caster_dispatches += 2;
             work.draw_calls += 5;
             work.uniform_upload_bytes += 192;
@@ -1256,6 +1629,7 @@ impl ShadowGpu {
             );
             work.uniform_upload_bytes += std::mem::size_of::<ShadowSampling>() as u64;
             self.sampling_dirty = false;
+            self.visibility_dirty = false;
         }
         work.pending_cascades = self.cache.pending();
         work.oldest_age_frames = self.cache.oldest_age();
@@ -1268,6 +1642,18 @@ const SHADOW_FRAGMENT: &str = r#"
     if edited_owner(input) {discard;}
     if input.bucket==1u {let alpha=textureSampleGrad(colors,texels,input.uv,i32(materials[input.material].x),du,dv).a;if alpha<0.5 {discard;}}
 }
+"#;
+const SPARSE_RECT_SHADER: &str = r#"
+struct RectCamera {matrix:mat4x4<f32>,viewport:vec4<f32>,params:vec4<u32>};
+@group(0)@binding(0)var<uniform>rect_camera:RectCamera;
+@group(0)@binding(1)var<storage,read>rect_footprint:ShadowFootprintRead;
+fn rect_vertex(r:vec4<u32>,i:u32)->vec4<f32>{
+    let corners=array<vec2<u32>,6>(vec2(0u,0u),vec2(1u,0u),vec2(0u,1u),vec2(0u,1u),vec2(1u,0u),vec2(1u,1u));
+    let pixel=select(r.xy,r.zw,corners[i]!=vec2(0u));
+    let uv=vec2<f32>(pixel)/rect_camera.viewport.xy;return vec4(uv.x*2.-1.,1.-uv.y*2.,0.,1.);
+}
+@vertex fn vertex(@builtin(vertex_index)i:u32)->@builtin(position)vec4<f32>{return rect_vertex(rect_footprint.static_draw,i);}
+@vertex fn restore_vertex(@builtin(vertex_index)i:u32)->@builtin(position)vec4<f32>{return rect_vertex(rect_footprint.combined_draw,i);}
 "#;
 const RESTORE_SHADER: &str = r#"
 @group(0)@binding(0)var static_depth:texture_depth_2d;
@@ -1321,6 +1707,79 @@ mod tests {
     fn drain(cache: &mut ShadowCache) {
         while let Some(update) = cache.next_update() {
             cache.commit(update);
+        }
+    }
+    #[test]
+    fn runtime_mask_controls_only_active_layers_and_reenable_requires_current_coverage() {
+        let mut c = ShadowCache::new(config(), [0.; 3], [0.3, 0.8, 0.2]).unwrap();
+        drain(&mut c);
+        assert_eq!(c.sampling().params[0], 7);
+        assert!(c.set_visibility(false, 3).unwrap());
+        c.update_view([10.; 3], [0.4, 0.8, 0.2]).unwrap();
+        assert_eq!(c.pending(), 0);
+        assert_eq!(c.sampling().params[0], 0);
+        assert!(c.presentation_ready());
+        assert!(c.next_update().is_none());
+        assert!(c.set_visibility(true, 1).unwrap());
+        assert_eq!(c.pending(), 1);
+        assert!(!c.presentation_ready());
+        drain(&mut c);
+        assert_eq!(c.sampling().params[0], 1);
+        assert!(c.presentation_ready());
+        assert!(c.set_visibility(true, 2).unwrap());
+        assert_eq!(c.pending(), 1);
+        assert!(!c.presentation_ready());
+        drain(&mut c);
+        assert_eq!(c.sampling().params[0], 3);
+        assert!(c.set_visibility(true, 3).unwrap());
+        drain(&mut c);
+        assert_eq!(c.sampling().params[0], 7);
+        let before = c.sampling().params;
+        assert!(c.set_visibility(true, 0).is_err());
+        assert!(c.set_visibility(true, 4).is_err());
+        assert_eq!(c.sampling().params, before);
+        assert!(!c.set_visibility(true, 3).unwrap());
+        assert!(config().with_resolution(0).is_err());
+        assert!(config().with_resolution(1000).is_err());
+        assert!(config().with_cascades(4).is_err());
+        assert_eq!(
+            config()
+                .with_resolution(512)
+                .unwrap()
+                .with_cascades(1)
+                .unwrap()
+                .with_enabled(false)
+                .resolution,
+            512
+        );
+    }
+    #[test]
+    fn presentation_allows_only_coherent_sun_refresh_not_initial_geometry_or_recenter() {
+        let mut c = ShadowCache::new(config(), [0.; 3], [0.35, 0.8, 0.2]).unwrap();
+        assert!(!c.presentation_ready());
+        drain(&mut c);
+        assert!(c.presentation_ready());
+        c.update_view([0.; 3], [0.36, 0.8, 0.2]).unwrap();
+        assert_eq!(c.pending(), 3);
+        assert!(c.presentation_ready());
+        c.invalidate_bounds(WorldBounds {
+            min: [0.; 3],
+            max: [1.; 3],
+        });
+        assert!(!c.presentation_ready());
+        drain(&mut c);
+        assert!(c.presentation_ready());
+        c.update_view([1., 0., 0.], [0.36, 0.8, 0.2]).unwrap();
+        assert!(!c.presentation_ready());
+        drain(&mut c);
+        assert!(c.presentation_ready());
+        for frame in 0..32 {
+            c.update_view([1., 0., 0.], [0.36 + frame as f32 * 0.002, 0.8, 0.2])
+                .unwrap();
+            assert!(c.presentation_ready());
+            if let Some(u) = c.next_update() {
+                c.commit(u);
+            }
         }
     }
     #[test]

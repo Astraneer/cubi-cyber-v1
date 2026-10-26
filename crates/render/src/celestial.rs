@@ -92,6 +92,18 @@ fn normalized(v: [f32; 3]) -> Option<[f32; 3]> {
     let length = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     (length.is_finite() && length > 1e-6).then(|| v.map(|v| v / length))
 }
+pub fn shader_source(ambient_mrt: bool) -> String {
+    let source = include_str!("celestial.wgsl");
+    if !ambient_mrt {
+        return source.to_owned();
+    }
+    let signature = "@fragment fn fragment(input:Out)->@location(0)vec4<f32>";
+    assert!(source.contains(signature));
+    format!(
+        "{}\nstruct CelestialAmbientOutput{{@location(0)color:vec4<f32>,@location(1)ambient:vec4<f32>}};\n@fragment fn fragment(input:Out)->CelestialAmbientOutput{{return CelestialAmbientOutput(celestial_color(input),vec4(0.));}}",
+        source.replace(signature, "fn celestial_color(input:Out)->vec4<f32>")
+    )
+}
 impl CelestialGpu {
     fn canonical_state(&self, mut state: CelestialState) -> CelestialState {
         if self.config.stars == 0 || state.sun[1] >= -0.08 || state.star_radiance == 0.0 {
@@ -119,6 +131,25 @@ impl CelestialGpu {
         config: CelestialConfig,
         budget: &mut UploadBudget,
         sample_count: u32,
+    ) -> Result<Self, CelestialError> {
+        Self::new_with_samples_and_ambient(
+            device,
+            queue,
+            atmosphere,
+            config,
+            budget,
+            sample_count,
+            false,
+        )
+    }
+    pub fn new_with_samples_and_ambient(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        atmosphere: &AtmosphereGpu,
+        config: CelestialConfig,
+        budget: &mut UploadBudget,
+        sample_count: u32,
+        ambient_mrt: bool,
     ) -> Result<Self, CelestialError> {
         if !matches!(sample_count, 1 | 4) {
             return Err(CelestialError::InvalidConfig);
@@ -243,7 +274,7 @@ impl CelestialGpu {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("original celestial disk and star shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("celestial.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source(ambient_mrt).into()),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("celestial HDR pipeline"),
@@ -278,9 +309,8 @@ impl CelestialGpu {
                 module: &shader,
                 entry_point: Some("fragment"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: Some(wgpu::BlendState {
+                targets: &crate::ambient_mrt::targets(
+                    Some(wgpu::BlendState {
                         color: wgpu::BlendComponent {
                             src_factor: wgpu::BlendFactor::One,
                             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
@@ -292,8 +322,8 @@ impl CelestialGpu {
                             operation: wgpu::BlendOperation::Add,
                         },
                     }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                    ambient_mrt,
+                ),
             }),
             multiview: None,
             cache: None,

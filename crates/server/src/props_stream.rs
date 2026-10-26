@@ -180,7 +180,7 @@ impl Server {
                     continue;
                 };
                 let Some(next) = state.next.checked_add(1) else {
-                    self.failed = true;
+                    self.fail("publish_props");
                     return Vec::new();
                 };
                 let stamp = props::Stamp {

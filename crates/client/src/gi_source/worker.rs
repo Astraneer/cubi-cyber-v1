@@ -43,6 +43,7 @@ impl InputPage {
 struct SnapshotRead {
     ids: [PageId; 7],
     pages: [Option<InputPage>; 7],
+    tints_known: bool,
 }
 impl SnapshotRead {
     fn page(&self, id: PageId) -> Option<&InputPage> {
@@ -53,6 +54,9 @@ impl SnapshotRead {
     }
 }
 impl SourceRead for SnapshotRead {
+    fn has_tints(&self) -> bool {
+        self.tints_known
+    }
     fn read(&self, position: BlockPos) -> CellRead {
         self.page(position.page()).map_or(CellRead::Unknown, |p| {
             CellRead::Known(p.cell(position.local_index()))
@@ -83,6 +87,7 @@ pub struct GiBakedData {
 }
 pub struct BuiltGiSource {
     pub id: u64,
+    pub work: SourceWork,
     page: PageId,
     inputs: [PageInput; 7],
     epoch: u64,
@@ -111,16 +116,26 @@ impl GiBakeTask {
                 page: Box::new([GiSurface::EMPTY; 4096]),
                 updates: Vec::new(),
             }),
+            require_tints: false,
+            attempt_work: SourceWork::default(),
         };
+        let mut work = SourceWork::default();
         let result = builder
-            .bake_from(&self.snapshot, self.stamp.page, &self.tints, cancel)
-            .map(|work| GiBakedData {
+            .bake_into(
+                &self.snapshot,
+                self.stamp.page,
+                &self.tints,
+                cancel,
+                &mut work,
+            )
+            .map(|()| GiBakedData {
                 voxels: builder.scratch,
                 surfaces: builder.directional.map(|s| s.page),
                 work,
             });
         BuiltGiSource {
             id: self.stamp.id,
+            work,
             page: self.stamp.page,
             inputs: self.stamp.inputs,
             epoch: self.stamp.epoch,
@@ -138,6 +153,16 @@ impl GiSourceBuilder {
         epoch: u64,
         id: u64,
     ) -> Result<GiBakeTask, GiSourceError> {
+        self.capture_full_optional(world, page, Some(tints), epoch, id)
+    }
+    pub fn capture_full_optional(
+        &self,
+        world: &World,
+        page: PageId,
+        tints: Option<Box<[u16; 256]>>,
+        epoch: u64,
+        id: u64,
+    ) -> Result<GiBakeTask, GiSourceError> {
         if page.space != core_types::SpaceId(0) || id == 0 || id >= 1 << 63 {
             return Err(GiSourceError::InvalidPage);
         }
@@ -145,6 +170,7 @@ impl GiSourceBuilder {
             return Err(GiSourceError::InvalidMaterial);
         }
         let ids = input_pages(page)?;
+        let tints_known = tints.is_some();
         Ok(GiBakeTask {
             stamp: GiBakeStamp {
                 id,
@@ -156,10 +182,11 @@ impl GiSourceBuilder {
                 sky: self.sky_ambient,
                 directional: self.directional.is_some(),
             },
-            tints,
+            tints: tints.unwrap_or_else(|| Box::new([u16::MAX; 256])),
             snapshot: SnapshotRead {
                 ids,
                 pages: ids.map(|p| world.snapshot(p).map(InputPage::Native)),
+                tints_known,
             },
         })
     }
@@ -342,7 +369,10 @@ impl GiBakeTask {
         for version in self.stamp.versions {
             u64w(&mut out, version.0);
         }
-        u32w(&mut out, u32::from(self.stamp.directional));
+        u32w(
+            &mut out,
+            u32::from(self.stamp.directional) | (u32::from(self.snapshot.tints_known) << 1),
+        );
         for value in self.stamp.sky {
             u32w(&mut out, value.to_bits());
         }
@@ -401,11 +431,12 @@ impl GiBakeTask {
         for version in &mut versions {
             *version = Version(r.u64()?);
         }
-        let directional = match r.u32()? {
-            0 => false,
-            1 => true,
-            _ => return Err(GiWireError::Metadata),
-        };
+        let flags = r.u32()?;
+        if flags > 3 {
+            return Err(GiWireError::Metadata);
+        }
+        let directional = flags & 1 != 0;
+        let tints_known = flags & 2 != 0;
         let mut sky = [0.; 3];
         for channel in &mut sky {
             *channel = r.float()?;
@@ -479,6 +510,7 @@ impl GiBakeTask {
             snapshot: SnapshotRead {
                 ids: input_pages(page).map_err(|_| GiWireError::Metadata)?,
                 pages,
+                tints_known,
             },
         })
     }
@@ -498,6 +530,14 @@ impl BuiltGiSource {
         for input in self.inputs {
             u64w(&mut out, input.version.0);
         }
+        for value in [
+            self.work.world_reads,
+            u64::from(self.work.opaque_voxels),
+            u64::from(self.work.reflected_faces),
+            u64::from(self.work.unknown_neighbors),
+        ] {
+            u64w(&mut out, value);
+        }
         let data = match &self.result {
             Ok(data) => {
                 out.push(0);
@@ -507,20 +547,16 @@ impl BuiltGiSource {
                 out.push(1);
                 return Ok(out);
             }
+            Err(GiSourceError::MissingTint) => {
+                out.push(3);
+                return Ok(out);
+            }
             Err(_) => {
                 out.push(2);
                 return Ok(out);
             }
         };
         out.push(u8::from(data.surfaces.is_some()));
-        for value in [
-            data.work.world_reads,
-            u64::from(data.work.opaque_voxels),
-            u64::from(data.work.reflected_faces),
-            u64::from(data.work.unknown_neighbors),
-        ] {
-            u64w(&mut out, value);
-        }
         for voxel in data.voxels.iter() {
             u32w(&mut out, voxel.packed());
         }
@@ -551,12 +587,27 @@ impl BuiltGiSource {
         if id == 0 || id >= 1 << 63 || page.space != core_types::SpaceId(0) {
             return Err(GiWireError::Metadata);
         }
+        let reads = r.u64()?;
+        let opaque = r.u64()?;
+        let faces = r.u64()?;
+        let unknown = r.u64()?;
+        if reads > 4096 * 7 || opaque > 4096 || faces > 4096 * 6 || unknown > 4096 * 6 {
+            return Err(GiWireError::Work);
+        }
+        let work = SourceWork {
+            world_reads: reads,
+            opaque_voxels: opaque as u32,
+            reflected_faces: faces as u32,
+            unknown_neighbors: unknown as u32,
+            ..Default::default()
+        };
         let status = r.byte()?;
         if status != 0 {
             r.end()?;
             let error = match status {
                 1 => GiSourceError::Cancelled,
                 2 => GiSourceError::InvalidMaterial,
+                3 => GiSourceError::MissingTint,
                 _ => return Err(GiWireError::Metadata),
             };
             return Ok(Self {
@@ -564,6 +615,7 @@ impl BuiltGiSource {
                 page,
                 inputs,
                 epoch,
+                work,
                 result: Err(error),
             });
         }
@@ -572,13 +624,6 @@ impl BuiltGiSource {
             1 => true,
             _ => return Err(GiWireError::Metadata),
         };
-        let reads = r.u64()?;
-        let opaque = r.u64()?;
-        let faces = r.u64()?;
-        let unknown = r.u64()?;
-        if reads > 4096 * 7 || opaque > 4096 || faces > 4096 * 6 || unknown > 4096 * 6 {
-            return Err(GiWireError::Work);
-        }
         let mut voxels = Box::new([GiVoxel::UNKNOWN; 4096]);
         for voxel in voxels.iter_mut() {
             *voxel = GiVoxel::from_packed(r.u32()?).ok_or(GiWireError::Cell)?;
@@ -602,6 +647,7 @@ impl BuiltGiSource {
             page,
             inputs,
             epoch,
+            work,
             result: Ok(GiBakedData {
                 voxels,
                 surfaces,
@@ -688,6 +734,46 @@ mod tests {
         }
         world.commit(tx).unwrap();
         world
+    }
+    #[test]
+    fn missing_biome_tint_fails_only_tinted_faces_and_preserves_executed_work() {
+        let mut world = world();
+        let builder = builder(true);
+        let page = point(8, 8, 8).page();
+        let stone = builder
+            .capture_full_optional(&world, page, None, 0, 1)
+            .unwrap()
+            .execute(|| false);
+        assert!(
+            stone.result.is_ok(),
+            "untinted material does not need fabricated biome data"
+        );
+        let mut tx = world::Transaction::new(Tick(2), SpaceId(0));
+        tx.set_cell(point(8, 8, 8), Cell::from_parts(rules::ids::GRASS, 0));
+        world.commit(tx).unwrap();
+        let task = builder
+            .capture_full_optional(&world, page, None, 0, 2)
+            .unwrap();
+        let response = execute_gi_request(&task.encode().unwrap(), || false).unwrap();
+        let blocked = BuiltGiSource::decode(&response).unwrap();
+        assert_eq!(blocked.result.err(), Some(GiSourceError::MissingTint));
+        assert!(
+            blocked.work.world_reads > 0,
+            "failed partial classification remains visible in counters"
+        );
+        let ready = builder
+            .capture_full_optional(&world, page, Some(Box::new([0x07e0; 256])), 0, 3)
+            .unwrap()
+            .execute(|| false);
+        assert!(ready.result.is_ok());
+        let data = ready.result.unwrap();
+        let surface = data.surfaces.unwrap();
+        let top = surface[usize::from(point(8, 8, 8).local_index().get())].words()[2];
+        assert_eq!(
+            top & 0xffffff,
+            0x00ff00,
+            "top uses the supplied green RGB565 tint"
+        );
     }
     #[test]
     fn immutable_full_bake_and_both_wire_directions_preserve_exact_face_sources() {

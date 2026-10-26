@@ -39,9 +39,13 @@ pub struct ProductUi {
     pub layer: UiLayer,
     audio: Option<NativeScene>,
     bridge: UiBridge,
+    intent_sender: client::ui_bridge::sender::IntentSender,
+    pub quality: client::ui_bridge::quality::QualityBridge,
+    quality_now_ms: u64,
     sounds: client::audio_bridge::PredictionSounds,
     block_sounds: client::audio_bridge::ConfirmedBlockSounds,
     entity_sounds: client::audio_bridge::EntitySounds,
+    causal_sounds: client::audio_bridge::CausalSounds,
     machine_sounds: client::audio_bridge::MachineSounds,
     commands: VecDeque<Command>,
     requests: VecDeque<net::ActionId>,
@@ -55,6 +59,12 @@ pub struct ProductUi {
     last_aim: Option<(Option<[i32; 3]>, u16)>,
     last_world_diagnostic: Option<(usize, usize, bool, Option<u8>)>,
     last_light_diagnostic: Option<(bool, usize, usize, u32, u64)>,
+    last_time_diagnostic: Option<(i32, bool, u32, i32)>,
+    last_render_diagnostic: Option<(u32, [u32; 2])>,
+    last_props_diagnostic: Option<(bool, usize, usize, usize, bool)>,
+    last_quality_diagnostic: Option<(u64, u64, u64, u64)>,
+    last_settings_diagnostic: Option<[u32; 3]>,
+    intent_waiting: bool,
     audio_samples: u64,
     resource_epoch: u64,
 }
@@ -100,13 +110,18 @@ impl ProductUi {
                 None
             }
         };
+        let quality = client::ui_bridge::quality::QualityBridge::new(&layer.app.settings);
         let mut result = Box::new(Self {
             layer,
             audio,
             bridge: UiBridge::default(),
+            intent_sender: Default::default(),
+            quality,
+            quality_now_ms: 0,
             sounds: Default::default(),
             block_sounds: Default::default(),
             entity_sounds: Default::default(),
+            causal_sounds: Default::default(),
             machine_sounds: Default::default(),
             commands: VecDeque::with_capacity(8),
             requests: VecDeque::with_capacity(128),
@@ -120,6 +135,12 @@ impl ProductUi {
             last_aim: None,
             last_world_diagnostic: None,
             last_light_diagnostic: None,
+            last_time_diagnostic: None,
+            last_render_diagnostic: None,
+            last_props_diagnostic: None,
+            last_quality_diagnostic: None,
+            last_settings_diagnostic: None,
+            intent_waiting: false,
             audio_samples: 0,
             resource_epoch: 0,
         });
@@ -207,15 +228,58 @@ impl ProductUi {
     }
     pub fn painted(&self) {
         if self.diagnostics {
+            use ui::{app::Widget, settings::Setting};
+            for hit in self.layer.app.hits().iter().filter(|hit| {
+                matches!(
+                    hit.widget,
+                    Widget::Settings
+                        | Widget::Crossroads
+                        | Widget::Day
+                        | Widget::Night
+                        | Widget::ServerTime
+                        | Widget::Back
+                        | Widget::Respawn
+                        | Widget::Setting(
+                            Setting::ViewTime
+                                | Setting::Msaa
+                                | Setting::Scale
+                                | Setting::Exposure
+                                | Setting::Clouds
+                                | Setting::Gi
+                                | Setting::Reflections
+                                | Setting::Ssao
+                                | Setting::Horizon
+                        )
+                )
+            }) {
+                println!(
+                    "NATIVE_UI_WIDGET name={:?} x={} y={} width={} height={}",
+                    hit.widget, hit.rect.x, hit.rect.y, hit.rect.w, hit.rect.h
+                );
+            }
             println!(
-                "NATIVE_UI_PAINTED screen={:?} window={:016x} tab={} debug={} revision={} window_revision={}",
+                "NATIVE_UI_SAVED_EFFECTS clouds={} gi={} reflections={} ssao={} horizon={}",
+                self.layer.app.settings.get(Setting::Clouds),
+                self.layer.app.settings.get(Setting::Gi),
+                self.layer.app.settings.get(Setting::Reflections),
+                self.layer.app.settings.get(Setting::Ssao),
+                self.layer.app.settings.get(Setting::Horizon)
+            );
+            println!(
+                "NATIVE_UI_PAINTED screen={:?} window={:016x} tab={} debug={} focus={:?} revision={} window_revision={}",
                 self.layer.app.screen,
                 self.layer.app.snapshot.window_id,
                 self.layer.app.player_list,
                 self.layer.app.show_debug,
+                self.layer.app.focus,
                 self.layer.app.revision(),
                 self.layer.app.snapshot.window_revision
             );
+        }
+    }
+    pub fn report_cpu_continuation(&self, count: u64) {
+        if self.diagnostics && (count == 1 || count.is_multiple_of(60)) {
+            println!("NATIVE_UI_CPU_CONTINUATION total={count}");
         }
     }
     pub fn presentation(&self) -> Option<impl FnOnce() + Send + 'static> {
@@ -237,6 +301,9 @@ impl ProductUi {
         if self.commands.len() < 8 {
             self.commands.push_back(command);
         }
+    }
+    pub fn settings_target(&self) -> &ui::settings::Settings {
+        self.quality.target()
     }
     pub fn save_preferences(&mut self) {
         let bytes = self.layer.app.encode_preferences();
@@ -290,12 +357,17 @@ impl ProductUi {
         }
     }
     pub fn connecting(&mut self) {
+        self.intent_sender.clear();
+        self.intent_waiting = false;
         self.ready_world = false;
         self.layer.app.set_status("Ожидание ответа мира…");
         self.layer.app.open(Screen::Loading);
         self.report_state();
     }
     pub fn disconnected(&mut self, message: &str) {
+        self.intent_sender.clear();
+        self.intent_waiting = false;
+        self.quality.cancel_pending(self.quality_now_ms);
         if let Some(audio) = &mut self.audio {
             self.machine_sounds.clear(|command| {
                 if let client::audio_bridge::MachineCommand::Stop(emitter) = command {
@@ -314,15 +386,103 @@ impl ProductUi {
         self.bridge = UiBridge::default();
         self.sounds = Default::default();
         self.entity_sounds.clear();
+        self.causal_sounds.clear();
         self.layer.app.clear_chat();
         let _ = self.layer.app.set_snapshot(Snapshot::default());
         self.layer.app.open(Screen::Welcome);
         self.layer.app.set_status(message);
         self.report_state();
     }
+    pub fn sync_quality(&mut self, view: &mut ClientView, now_ms: u64, benchmark: bool) {
+        self.quality_now_ms = now_ms;
+        if let Some(request) = self
+            .quality
+            .advance(&self.layer.app, view, now_ms, benchmark)
+        {
+            if view.settings_application().reload_required != 0 {
+                self.command(Command::Connect {
+                    address: self.layer.app.address.clone(),
+                    name: self.layer.app.name.clone(),
+                });
+                self.connecting();
+                let _ = self
+                    .quality
+                    .advance(&self.layer.app, view, now_ms, benchmark);
+            } else {
+                let _ = request;
+            }
+        }
+        self.layer.app.set_quality(self.quality.hud());
+        if self.diagnostics {
+            let stats = self.quality.runtime.stats();
+            let stamp = (stats.windows, stats.proposals, stats.applied, stats.failed);
+            if self.last_quality_diagnostic != Some(stamp) {
+                println!(
+                    "NATIVE_UI_QUALITY windows={} proposals={} applied={} failed={} measured_savings={} gpu_p95_us={} frame_p95_us={} pending={:?}",
+                    stats.windows,
+                    stats.proposals,
+                    stats.applied,
+                    stats.failed,
+                    stats.measured_savings,
+                    stats.gpu_p95_us,
+                    stats.frame_p95_us,
+                    self.quality
+                        .runtime
+                        .pending()
+                        .map(|request| request.reduction.setting)
+                );
+                self.last_quality_diagnostic = Some(stamp);
+            }
+        }
+    }
     pub fn sync(&mut self, network: &Connection, view: &ClientView) -> Result<(), String> {
+        let receipt = view.settings_application();
+        self.layer.app.set_pending_settings(
+            receipt.pending_render & !(1 << ui::settings::Setting::Hold60 as u32),
+        );
+        self.layer.app.set_reload_settings(receipt.reload_required);
         self.block_sounds.observe(network);
         if self.diagnostics {
+            let settings_stamp = [
+                receipt.applied,
+                receipt.pending_render,
+                receipt.reload_required,
+            ];
+            if self.last_settings_diagnostic != Some(settings_stamp) {
+                println!(
+                    "NATIVE_UI_SETTINGS applied={} pending={} reload={}",
+                    settings_stamp[0], settings_stamp[1], settings_stamp[2]
+                );
+                self.last_settings_diagnostic = Some(settings_stamp);
+            }
+            let render = (view.render_scale(), view.render_extent());
+            if self.last_render_diagnostic != Some(render) {
+                println!(
+                    "NATIVE_UI_RENDER scale={} width={} height={}",
+                    render.0, render.1[0], render.1[1]
+                );
+                self.last_render_diagnostic = Some(render);
+            }
+            let clock = view.sun_clock();
+            let stamp = (
+                self.layer.app.settings.get(ui::settings::Setting::ViewTime),
+                clock.is_some(),
+                view.render_sample_count(),
+                view.exposure_compensation()
+                    .map_or(0, |gain| (gain * 100.).round() as i32),
+            );
+            if self.last_time_diagnostic != Some(stamp) {
+                println!(
+                    "NATIVE_UI_TIME choice={} known={} samples={} exposure_percent={} time_of_day={:?} sun_y={:?}",
+                    stamp.0,
+                    stamp.1,
+                    stamp.2,
+                    stamp.3,
+                    clock.map(|clock| clock.time_of_day),
+                    clock.map(|clock| clock.sun_direction[1])
+                );
+                self.last_time_diagnostic = Some(stamp);
+            }
             if let Some(light) = view.lighting_stats() {
                 let stamp = (
                     light.ready,
@@ -340,6 +500,29 @@ impl ProductUi {
                 }
             }
             let stats = view.stats();
+            if let (Some(props), Some(source)) = (view.props_stats(), view.props_source()) {
+                let stamp = (
+                    props.ready,
+                    props.pending_records,
+                    props.pending_jobs,
+                    stats.resident_pages,
+                    view.initial_scene_inputs_ready(),
+                );
+                if self.last_props_diagnostic != Some(stamp) {
+                    println!(
+                        "NATIVE_UI_DERIVED ready={} full_mesh_ready={} resident_pages={} meshes_published={} queued_meshes={} running_meshes={} inputs_ready={} props={props:?} source={:?}",
+                        stats.ready,
+                        stats.full_mesh_ready,
+                        stats.resident_pages,
+                        stats.meshes_published,
+                        stats.queued_jobs,
+                        stats.running_jobs,
+                        stamp.4,
+                        source.stats(view.scene.world())
+                    );
+                    self.last_props_diagnostic = Some(stamp);
+                }
+            }
             let position = stats.player_pos;
             let light = view.scene.read_authoritative_light(core_types::BlockPos {
                 space: view.scene.config().center.space,
@@ -404,6 +587,15 @@ impl ProductUi {
             }
             if let Some(player) = network.player() {
                 self.entity_sounds.visit(network, player.eye(1.0), |cue| {
+                    let _ = audio.event_gain(
+                        cue.event,
+                        cue.emitter,
+                        Some(cue.position),
+                        cue.seed,
+                        cue.gain,
+                    );
+                });
+                self.causal_sounds.visit(network, player.eye(1.0), |cue| {
                     let _ = audio.event_gain(
                         cue.event,
                         cue.emitter,
@@ -514,7 +706,7 @@ impl ProductUi {
             }
         }
         for _ in 0..64 {
-            let Some(intent) = self.layer.app.take_intent() else {
+            let Some(intent) = self.intent_sender.take(&mut self.layer.app) else {
                 break;
             };
             match intent {
@@ -523,17 +715,32 @@ impl ProductUi {
                     self.connecting();
                     self.command(Command::Connect { address, name });
                 }
-                Intent::Disconnect => self.command(Command::Disconnect),
+                Intent::Disconnect => {
+                    self.intent_sender.clear();
+                    self.command(Command::Disconnect);
+                }
                 Intent::Quit => self.command(Command::Quit),
                 Intent::BugReport => self.command(Command::BugReport),
                 Intent::PointerCapture(capture) => self.command(Command::Capture(capture)),
                 Intent::SettingsChanged => {
+                    self.quality_now_ms = now;
+                    self.quality.update_saved(&self.layer.app.settings, now);
                     self.apply_sound();
                     self.save_preferences();
                     if let Some(view) = view.as_deref_mut() {
-                        let applied = view.apply_settings(&self.layer.app.settings);
-                        self.layer.app.set_pending_settings(applied.pending_render);
+                        let applied = view.apply_settings(self.quality.target());
+                        self.layer.app.set_pending_settings(
+                            applied.pending_render & !(1 << ui::settings::Setting::Hold60 as u32),
+                        );
+                        self.layer.app.set_reload_settings(applied.reload_required);
                         view.invalidate();
+                        if applied.reload_required != 0 && self.layer.app.snapshot.connected {
+                            self.command(Command::Connect {
+                                address: self.layer.app.address.clone(),
+                                name: self.layer.app.name.clone(),
+                            });
+                            self.connecting();
+                        }
                     }
                 }
                 Intent::SavePreferences => self.save_preferences(),
@@ -559,14 +766,38 @@ impl ProductUi {
                     });
                 }
                 Intent::PersonalTime(_) => {
+                    self.quality_now_ms = now;
+                    self.quality.update_saved(&self.layer.app.settings, now);
+                    self.save_preferences();
                     if let Some(view) = view.as_deref_mut() {
-                        view.invalidate();
+                        let receipt = view.apply_settings(self.quality.target());
+                        self.layer.app.set_pending_settings(
+                            receipt.pending_render & !(1 << ui::settings::Setting::Hold60 as u32),
+                        );
                     }
                 }
                 other => {
                     if let Some(network) = network.as_deref_mut() {
-                        match client::ui_bridge::dispatch(network, other, now) {
+                        if self.diagnostics && !self.intent_waiting {
+                            let (kind, bytes) = match &other {
+                                Intent::Chat(text) => (
+                                    if text.starts_with('/') {
+                                        "command"
+                                    } else {
+                                        "chat"
+                                    },
+                                    text.len(),
+                                ),
+                                _ => ("window_or_slot", 0),
+                            };
+                            println!("NATIVE_UI_INTENT class={kind} bytes={bytes}");
+                        }
+                        match self.intent_sender.send(network, other, now) {
                             Ok(client::ui_bridge::Dispatch::Sent(id)) => {
+                                self.intent_waiting = false;
+                                if self.diagnostics {
+                                    println!("NATIVE_UI_INTENT_SENT id={}", id.0);
+                                }
                                 self.block_sounds.observe(network);
                                 if self.requests.len() == 128 {
                                     self.requests.pop_front();
@@ -576,7 +807,21 @@ impl ProductUi {
                             Ok(client::ui_bridge::Dispatch::Unsupported(_)) => {
                                 self.layer.app.set_status("Действие недоступно в этом окне")
                             }
-                            Err(_) => self.layer.app.set_status("Нет соединения с миром"),
+                            Err(client::network::NetworkError::Capacity) => {
+                                if self.diagnostics && !self.intent_waiting {
+                                    println!("NATIVE_UI_INTENT_WAIT cause=capacity");
+                                }
+                                self.intent_waiting = true;
+                                self.layer.app.set_status("Действие ожидает отправки");
+                                break;
+                            }
+                            Err(error) => {
+                                self.intent_waiting = false;
+                                if self.diagnostics {
+                                    println!("NATIVE_UI_INTENT_ERROR cause={error:?}");
+                                }
+                                self.layer.app.set_status("Не удалось отправить действие");
+                            }
                             _ => {}
                         }
                     }
@@ -731,6 +976,7 @@ fn apply_materials(
     view.renderer_mut()
         .replace_material_pack(device, queue, pack, enabled)
         .map_err(|e| e.to_string())?;
+    view.replace_material_albedo(prepared.atlas())?;
     view.invalidate();
     Ok(())
 }

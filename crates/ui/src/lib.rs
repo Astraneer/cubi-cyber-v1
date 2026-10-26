@@ -10,4 +10,5 @@ pub mod gpu;
 pub mod layer;
 pub mod paint;
 pub mod profiler;
+pub mod quality;
 pub mod settings;

@@ -284,6 +284,7 @@ fn ten_thousand_actual_world_machine_components_add_zero_idle_work_or_allocation
     let mut sleeping = MachineRuntime::restore(
         Config::default(),
         &RuntimeSnapshot {
+            owner: OwnerSnapshot::default(),
             revision: 0,
             next_order: 10_000,
             machines: metadata,

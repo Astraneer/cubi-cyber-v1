@@ -1,11 +1,18 @@
 //! Single-owner machine phases. World components, reservoirs, scheduling and
 //! routed items are planned together; publication belongs to the WAL owner.
+#[path = "machines/barrier.rs"]
+mod barrier;
 #[path = "machines/codec.rs"]
 mod codec;
+#[path = "machines/payload_admission.rs"]
+mod payload_admission;
+pub use barrier::{OwnerSnapshot, OwnerStage, OwnerState};
 #[path = "machines/fixture.rs"]
 mod fixture;
 #[path = "machines/machine_activity.rs"]
 mod machine_activity;
+#[path = "machines/metrics.rs"]
+mod metrics;
 #[path = "machines/owner.rs"]
 mod owner;
 #[path = "machines/phase.rs"]
@@ -99,6 +106,8 @@ impl Default for Budget {
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Work {
+    pub prepared: u64,
+    pub payload_deferred: u64,
     pub events: u64,
     pub machines: u64,
     pub networks: u64,
@@ -118,6 +127,9 @@ pub struct Work {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MachineError {
     Bounds,
+    /// One route exhausted its full production search bound. A fresh portion
+    /// cannot complete it; callers must report capacity, not retry forever.
+    RouteCapacity,
     Unknown,
     Missing,
     Component,
@@ -227,6 +239,7 @@ pub struct RuntimeDelta {
     pub configs: Vec<ConfigPatch>,
     pub transport: Option<transport::TransportDelta>,
     pub topology_queue: Option<crate::topology_queue::Delta>,
+    owner: barrier::OwnerDelta,
 }
 #[must_use = "Commit transactions and RuntimeDelta in the same WAL batch before publishing"]
 pub struct PhasePlan {
@@ -247,10 +260,13 @@ pub struct MachineRuntime {
     config: Config,
     revision: u64,
     next_order: u64,
+    owner: barrier::OwnerBarrier,
     machines: BTreeMap<ComponentId, MachineMeta>,
     positions: BTreeMap<BlockPos, ComponentId>,
     machine_pages: BTreeMap<PageId, BTreeSet<ComponentId>>,
     events: BTreeMap<(Tick, u8, u64), Pending>,
+    event_ages: BTreeMap<Tick, usize>,
+    event_bytes: usize,
     keys: BTreeMap<Event, (Tick, u8, u64)>,
     grids: BTreeMap<SpaceId, Grid>,
     network_orders: BTreeMap<NetworkKey, u64>,
@@ -267,6 +283,7 @@ pub struct MachineRuntime {
 pub struct RuntimeSnapshot {
     pub revision: u64,
     pub next_order: u64,
+    pub owner: OwnerSnapshot,
     pub machines: Vec<MachineMeta>,
     pub events: Vec<Pending>,
     pub grids: Vec<(SpaceId, GridSnapshot)>,
@@ -325,7 +342,9 @@ struct FurnaceChange {
 }
 #[derive(Default)]
 struct Overlay {
-    machines: BTreeMap<ComponentId, MachineChange>,
+    // Event-local overlays usually contain one machine. Keep the large pump
+    // frontier outside BTreeMap's multi-entry node allocation.
+    machines: BTreeMap<ComponentId, Box<MachineChange>>,
     chests: BTreeMap<ComponentId, ChestChange>,
     furnaces: BTreeMap<ComponentId, FurnaceChange>,
     cells: BTreeMap<BlockPos, (Cell, Cell)>,
@@ -337,6 +356,7 @@ struct Overlay {
     packet_count_delta: i64,
     packet_bytes_delta: i64,
     payloads: BTreeMap<rules::item_payload::PayloadId, rules::item_payload::Payload>,
+    payload_bytes: usize,
     item_spawns: Vec<rules::entities::item::ItemEntity>,
     clocks: BTreeMap<PageId, transport::ClockPatch>,
     page_counts: BTreeMap<PageId, i64>,

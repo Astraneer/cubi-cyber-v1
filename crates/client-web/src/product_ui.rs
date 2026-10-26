@@ -27,6 +27,9 @@ pub struct ProductUi {
     pub audio: WebScene,
     imports: BrowserImports,
     bridge: UiBridge,
+    intent_sender: client::ui_bridge::sender::IntentSender,
+    pub quality: client::ui_bridge::quality::QualityBridge,
+    quality_now_ms: u64,
     command: Option<Command>,
     ready_world: bool,
     sequence: u64,
@@ -34,6 +37,7 @@ pub struct ProductUi {
     sounds: client::audio_bridge::PredictionSounds,
     block_sounds: client::audio_bridge::ConfirmedBlockSounds,
     entity_sounds: client::audio_bridge::EntitySounds,
+    causal_sounds: client::audio_bridge::CausalSounds,
     machine_sounds: client::audio_bridge::MachineSounds,
 }
 fn preferences_storage() -> Option<web_sys::Storage> {
@@ -69,11 +73,15 @@ impl ProductUi {
         }
         let prepared = PreparedSounds::prepare(None, None).map_err(js_error)?;
         let audio = WebScene::open(prepared)?;
+        let quality = client::ui_bridge::quality::QualityBridge::new(&layer.app.settings);
         let mut result = Self {
             layer,
             audio,
             imports: BrowserImports::prepare()?,
             bridge: UiBridge::default(),
+            intent_sender: Default::default(),
+            quality,
+            quality_now_ms: 0,
             command: None,
             ready_world: false,
             sequence: 0,
@@ -81,10 +89,14 @@ impl ProductUi {
             sounds: client::audio_bridge::PredictionSounds::default(),
             block_sounds: Default::default(),
             entity_sounds: Default::default(),
+            causal_sounds: Default::default(),
             machine_sounds: Default::default(),
         };
         result.apply_sound()?;
         Ok(result)
+    }
+    pub fn settings_target(&self) -> &ui::settings::Settings {
+        self.quality.target()
     }
     pub fn save_preferences(&self) {
         use std::fmt::Write;
@@ -147,7 +159,33 @@ impl ProductUi {
         }
         captured
     }
+    pub fn sync_quality(&mut self, view: &mut ClientView, now_ms: u64, benchmark: bool) {
+        self.quality_now_ms = now_ms;
+        if let Some(request) = self
+            .quality
+            .advance(&self.layer.app, view, now_ms, benchmark)
+        {
+            if view.settings_application().reload_required != 0 {
+                self.command = Some(Command::Connect {
+                    address: self.layer.app.address.clone(),
+                    name: self.layer.app.name.clone(),
+                });
+                self.connecting();
+                let _ = self
+                    .quality
+                    .advance(&self.layer.app, view, now_ms, benchmark);
+            } else {
+                let _ = request;
+            }
+        }
+        self.layer.app.set_quality(self.quality.hud());
+    }
     pub fn sync(&mut self, network: &Connection, view: &ClientView) -> Result<(), JsValue> {
+        let receipt = view.settings_application();
+        self.layer.app.set_pending_settings(
+            receipt.pending_render & !(1 << ui::settings::Setting::Hold60 as u32),
+        );
+        self.layer.app.set_reload_settings(receipt.reload_required);
         self.block_sounds.observe(network);
         if let (Some(welcome), Some(player), Some(source)) =
             (network.welcome(), network.player(), view.props_source())
@@ -176,6 +214,15 @@ impl ProductUi {
         }
         if let Some(player) = network.player() {
             self.entity_sounds.visit(network, player.eye(1.0), |cue| {
+                let _ = self.audio.event_gain(
+                    cue.event,
+                    cue.emitter,
+                    Some(cue.position),
+                    cue.seed,
+                    cue.gain,
+                );
+            });
+            self.causal_sounds.visit(network, player.eye(1.0), |cue| {
                 let _ = self.audio.event_gain(
                     cue.event,
                     cue.emitter,
@@ -235,11 +282,14 @@ impl ProductUi {
         Ok(())
     }
     pub fn connecting(&mut self) {
+        self.intent_sender.clear();
         self.ready_world = false;
         self.layer.app.set_status("Ожидание ответа мира…");
         self.layer.app.open(Screen::Loading);
     }
     pub fn disconnected(&mut self, message: &str) {
+        self.intent_sender.clear();
+        self.quality.cancel_pending(self.quality_now_ms);
         self.machine_sounds.clear(|command| {
             if let client::audio_bridge::MachineCommand::Stop(emitter) = command {
                 let _ = self.audio.forget_emitter(emitter);
@@ -247,6 +297,7 @@ impl ProductUi {
         });
         self.block_sounds.clear();
         self.entity_sounds.clear();
+        self.causal_sounds.clear();
         self.ready_world = false;
         self.bridge = UiBridge::default();
         self.layer.app.clear_chat();
@@ -331,7 +382,7 @@ impl ProductUi {
             }
         }
         for _ in 0..64 {
-            let Some(intent) = self.layer.app.take_intent() else {
+            let Some(intent) = self.intent_sender.take(&mut self.layer.app) else {
                 break;
             };
             match intent {
@@ -340,7 +391,10 @@ impl ProductUi {
                     self.connecting();
                     self.command = Some(Command::Connect { address, name });
                 }
-                Intent::Disconnect => self.command = Some(Command::Disconnect),
+                Intent::Disconnect => {
+                    self.intent_sender.clear();
+                    self.command = Some(Command::Disconnect);
+                }
                 Intent::Quit => self.command = Some(Command::Quit),
                 Intent::BugReport => self.command = Some(Command::BugReport),
                 Intent::PointerCapture(capture) => {
@@ -355,11 +409,23 @@ impl ProductUi {
                     }
                 }
                 Intent::SettingsChanged => {
+                    self.quality_now_ms = now_ms;
+                    self.quality.update_saved(&self.layer.app.settings, now_ms);
                     self.apply_sound()?;
                     self.save_preferences();
-                    let applied = view.apply_settings(&self.layer.app.settings);
-                    self.layer.app.set_pending_settings(applied.pending_render);
+                    let applied = view.apply_settings(self.quality.target());
+                    self.layer.app.set_pending_settings(
+                        applied.pending_render & !(1 << ui::settings::Setting::Hold60 as u32),
+                    );
+                    self.layer.app.set_reload_settings(applied.reload_required);
                     view.invalidate();
+                    if applied.reload_required != 0 && self.layer.app.snapshot.connected {
+                        self.command = Some(Command::Connect {
+                            address: self.layer.app.address.clone(),
+                            name: self.layer.app.name.clone(),
+                        });
+                        self.connecting();
+                    }
                 }
                 Intent::SavePreferences => self.save_preferences(),
                 Intent::ImportPack => self.imports.choose_pack(),
@@ -374,14 +440,23 @@ impl ProductUi {
                     ),
                     "text/plain;charset=utf-8",
                 )?,
-                Intent::PersonalTime(_) => view.invalidate(),
+                Intent::PersonalTime(_) => {
+                    self.quality_now_ms = now_ms;
+                    self.quality.update_saved(&self.layer.app.settings, now_ms);
+                    self.save_preferences();
+                    let receipt = view.apply_settings(self.quality.target());
+                    self.layer.app.set_pending_settings(
+                        receipt.pending_render & !(1 << ui::settings::Setting::Hold60 as u32),
+                    );
+                }
                 other => {
                     if let Some(socket) = socket.as_deref_mut() {
-                        match client::ui_bridge::dispatch(
-                            socket.session_mut().connection_mut(),
-                            other,
-                            now_ms,
-                        ) {
+                        let dispatched = {
+                            let mut session = socket.session_mut();
+                            self.intent_sender
+                                .send(session.connection_mut(), other, now_ms)
+                        };
+                        match dispatched {
                             Ok(client::ui_bridge::Dispatch::Sent(id)) => {
                                 self.block_sounds.observe(socket.session().connection());
                                 if self.ui_requests.len() == 128 {
@@ -393,10 +468,11 @@ impl ProductUi {
                                 self.layer.app.set_status("Действие недоступно в этом окне")
                             }
                             Ok(client::ui_bridge::Dispatch::Local(_)) => {}
-                            Err(_) => self
-                                .layer
-                                .app
-                                .set_status("Действие ожидает соединения с миром"),
+                            Err(client::network::NetworkError::Capacity) => {
+                                self.layer.app.set_status("Действие ожидает отправки");
+                                break;
+                            }
+                            Err(_) => self.layer.app.set_status("Не удалось отправить действие"),
                         }
                     }
                 }
@@ -439,6 +515,7 @@ pub fn product_ui_stats() -> JsValue {
         let value = js_sys::Object::new();
         let app = &product.layer.app;
         let audio = product.audio.output().work();
+        let quality = product.quality.runtime.stats();
         for (name, text) in [
             ("screen", format!("{:?}", app.screen)),
             ("role", format!("{:?}", app.snapshot.role)),
@@ -471,6 +548,68 @@ pub fn product_ui_stats() -> JsValue {
             ("audioStopped", audio.stopped),
             ("audioAcceptedBlockCues", product.block_sounds.played()),
             ("audioEntityCues", product.entity_sounds.emitted),
+            ("audioCausalCues", product.causal_sounds.emitted),
+            ("audioCausalLost", product.causal_sounds.lost),
+            ("qualityWindows", quality.windows),
+            ("qualityProposals", quality.proposals),
+            ("qualityApplied", quality.applied),
+            ("qualityFailed", quality.failed),
+            ("qualityMeasuredSavings", quality.measured_savings),
+            ("qualityGpuP95Us", u64::from(quality.gpu_p95_us)),
+            ("qualityFrameP95Us", u64::from(quality.frame_p95_us)),
+            (
+                "viewTimeChoice",
+                app.settings.get(ui::settings::Setting::ViewTime) as u64,
+            ),
+            (
+                "requestedScale",
+                app.settings.get(ui::settings::Setting::Scale) as u64,
+            ),
+            ("renderScale", u64::from(state.view.render_scale())),
+            ("renderWidth", u64::from(state.view.render_extent()[0])),
+            ("renderHeight", u64::from(state.view.render_extent()[1])),
+            (
+                "requestedSamples",
+                app.settings.get(ui::settings::Setting::Msaa) as u64,
+            ),
+            (
+                "requestedHorizon",
+                app.settings.get(ui::settings::Setting::Horizon) as u64,
+            ),
+            (
+                "requestedClouds",
+                app.settings.get(ui::settings::Setting::Clouds) as u64,
+            ),
+            (
+                "requestedSsao",
+                app.settings.get(ui::settings::Setting::Ssao) as u64,
+            ),
+            (
+                "requestedGi",
+                app.settings.get(ui::settings::Setting::Gi) as u64,
+            ),
+            (
+                "requestedReflections",
+                app.settings.get(ui::settings::Setting::Reflections) as u64,
+            ),
+            (
+                "settingsApplied",
+                u64::from(
+                    state.view.settings_application().applied
+                        | 1 << ui::settings::Setting::Hold60 as u32,
+                ),
+            ),
+            (
+                "settingsPending",
+                u64::from(
+                    state.view.settings_application().pending_render
+                        & !(1 << ui::settings::Setting::Hold60 as u32),
+                ),
+            ),
+            (
+                "settingsReloadRequired",
+                u64::from(state.view.settings_application().reload_required),
+            ),
         ] {
             let _ = js_sys::Reflect::set(&value, &name.into(), &(number as f64).into());
         }
@@ -484,5 +623,40 @@ pub fn product_ui_stats() -> JsValue {
                 .into(),
         );
         value.into()
+    })
+}
+/// Read-only visible control bounds for accessibility and real-input bots.
+/// This exports no field values and never invokes a UI or world action.
+#[wasm_bindgen]
+pub fn product_ui_widget(name: &str) -> JsValue {
+    super::ACTIVE_VIEW.with(|active| {
+        let Some(state) = active.borrow().as_ref().and_then(std::rc::Weak::upgrade) else {
+            return JsValue::NULL;
+        };
+        let state = state.borrow();
+        let Some(product) = &state.product else {
+            return JsValue::NULL;
+        };
+        let Some(hit) = product
+            .layer
+            .app
+            .hits()
+            .iter()
+            .find(|hit| format!("{:?}", hit.widget) == name)
+        else {
+            return JsValue::NULL;
+        };
+        let sx = state.canvas.client_width().max(1) as f32 / state.config.width as f32;
+        let sy = state.canvas.client_height().max(1) as f32 / state.config.height as f32;
+        let result = js_sys::Array::new();
+        for number in [
+            hit.rect.x * sx,
+            hit.rect.y * sy,
+            hit.rect.w * sx,
+            hit.rect.h * sy,
+        ] {
+            result.push(&number.into());
+        }
+        result.into()
     })
 }

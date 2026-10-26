@@ -328,6 +328,200 @@ fn populate(gpu: &render::Gpu, water: &mut WaterGpu) -> WaterDraw {
     record
 }
 #[test]
+fn staged_object_flags_publish_atomically_and_never_expose_failed_or_reused_ranges() {
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let s = sources(&gpu, true, 0);
+    let mut water = WaterGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        WaterConfig {
+            max_quads: 2,
+            ..config()
+        },
+        SIZE,
+        SIZE,
+        inputs(&s),
+        None,
+    )
+    .unwrap();
+    draw(&gpu, &mut water, state());
+    let opaque = image(&gpu, water.resolved_texture());
+    let white = WaterQuad::new(
+        [0, 0, 16],
+        Face::Up,
+        [16; 2],
+        [1.; 4],
+        [0.; 2],
+        u32::MAX,
+        0.,
+    )
+    .unwrap();
+    let red = WaterQuad::new(
+        [0, 0, 16],
+        Face::Up,
+        [16; 2],
+        [1.; 4],
+        [0.; 2],
+        0xff0000ff,
+        0.,
+    )
+    .unwrap();
+    let old = water
+        .upload_object(
+            &gpu.queue,
+            None,
+            translation([0.; 3]),
+            &mut UploadBudget::new(80),
+        )
+        .unwrap();
+    water
+        .upload_page_quads(&gpu.queue, old, &[white], &mut UploadBudget::new(24))
+        .unwrap();
+    draw(&gpu, &mut water, state());
+    let previous = image(&gpu, water.resolved_texture());
+    assert_ne!(previous, opaque);
+    let staged = water
+        .upload_object_inactive(
+            &gpu.queue,
+            None,
+            translation([0.; 3]),
+            &mut UploadBudget::new(80),
+        )
+        .unwrap();
+    assert!(matches!(
+        water.upload_page_quads(&gpu.queue, staged, &[red, red], &mut UploadBudget::new(40)),
+        Err(WaterError::Capacity)
+    ));
+    water
+        .upload_object(
+            &gpu.queue,
+            Some(staged),
+            translation([0.25, 0., 0.]),
+            &mut UploadBudget::new(80),
+        )
+        .unwrap();
+    draw(&gpu, &mut water, state());
+    assert_eq!(
+        image(&gpu, water.resolved_texture()),
+        previous,
+        "failed staged range and later transform stay hidden"
+    );
+    let revision = water.revision();
+    let mut denied = UploadBudget::new(23);
+    assert!(matches!(
+        water.upload_page_quads(&gpu.queue, staged, &[red], &mut denied),
+        Err(WaterError::UploadBudget)
+    ));
+    assert_eq!((denied.remaining_bytes, water.revision()), (23, revision));
+    water
+        .upload_page_quads(&gpu.queue, staged, &[red], &mut UploadBudget::new(24))
+        .unwrap();
+    draw(&gpu, &mut water, state());
+    assert_eq!(
+        image(&gpu, water.resolved_texture()),
+        previous,
+        "ready replacement is not published early"
+    );
+    let _ = water.take_work();
+    let revision = water.revision();
+    let mut denied = UploadBudget::new(7);
+    assert_eq!(
+        water.set_enabled_batch(&gpu.queue, &[(old, false), (staged, true)], &mut denied),
+        Err(WaterError::UploadBudget)
+    );
+    assert_eq!((denied.remaining_bytes, water.revision()), (7, revision));
+    assert_eq!(
+        water.set_enabled_batch(
+            &gpu.queue,
+            &[(old, false), (old, true)],
+            &mut UploadBudget::new(8)
+        ),
+        Err(WaterError::InvalidState)
+    );
+    draw(&gpu, &mut water, state());
+    assert_eq!(image(&gpu, water.resolved_texture()), previous);
+    assert_eq!(
+        water
+            .set_enabled_batch(
+                &gpu.queue,
+                &[(old, false), (staged, true)],
+                &mut UploadBudget::new(8)
+            )
+            .unwrap(),
+        8
+    );
+    let work = water.take_work();
+    assert_eq!((work.upload_bytes, work.quad_uploads), (8, 0));
+    draw(&gpu, &mut water, state());
+    let replacement = image(&gpu, water.resolved_texture());
+    assert!(
+        replacement
+            .iter()
+            .zip(&previous)
+            .filter(|(a, b)| a != b)
+            .count()
+            > 100
+    );
+    let revision = water.revision();
+    assert_eq!(
+        water
+            .set_enabled_batch(
+                &gpu.queue,
+                &[(old, false), (staged, true)],
+                &mut UploadBudget::new(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(water.revision(), revision);
+    water
+        .upload_page_quads(&gpu.queue, old, &[], &mut UploadBudget::new(8))
+        .unwrap();
+    water
+        .release_object(&gpu.queue, old, &mut UploadBudget::new(4))
+        .unwrap();
+    let reused = water
+        .upload_object_inactive(
+            &gpu.queue,
+            None,
+            translation([0.; 3]),
+            &mut UploadBudget::new(80),
+        )
+        .unwrap();
+    assert_eq!(old.slot, reused.slot);
+    assert!(reused.generation > old.generation);
+    assert_eq!(
+        water.set_enabled_batch(
+            &gpu.queue,
+            &[(staged, false), (old, true)],
+            &mut UploadBudget::new(8)
+        ),
+        Err(WaterError::StaleHandle)
+    );
+    draw(&gpu, &mut water, state());
+    assert_eq!(
+        image(&gpu, water.resolved_texture()),
+        replacement,
+        "stale generation cannot partially hide the current cover"
+    );
+    water
+        .set_enabled_batch(
+            &gpu.queue,
+            &[(staged, false), (reused, true)],
+            &mut UploadBudget::new(8),
+        )
+        .unwrap();
+    draw(&gpu, &mut water, state());
+    assert_eq!(
+        image(&gpu, water.resolved_texture()),
+        opaque,
+        "reused object cannot resurrect retired quad spans"
+    );
+    println!(
+        "M10_STAGED_WATER_GPU_OK inactive_transform_hidden=true capacity_retry_hidden=true denied7B_atomic=true publish8B_noquads=true duplicate_rejected=true stale_batch_atomic=true reused_slot_no_ghost=true"
+    );
+}
+#[test]
 fn physical_absorption_fresnel_match_independent_f64_and_preserve_msaa() {
     pollster::block_on(async {
         let gpu = render::Gpu::request(&render::instance(), None, true)
@@ -783,98 +977,119 @@ fn bounded_ssr_hits_actual_red_wall_certified_by_independent_reflected_rays() {
         let camera =
             Camera::perspective([8., 6., 24.], [8., 0., 8.], [0., 1., 0.], 1., 1., 0.1, 100.);
         let s = reflection_scene(&gpu, camera);
-        let config = WaterConfig {
-            absorption: [0.; 3],
-            reflection_steps: 64,
-            reflection_distance: 32.,
-            reflection_tolerance: 1.2,
-            ..config()
-        };
-        let mut water = WaterGpu::new(
-            &gpu.device,
-            &gpu.queue,
-            config,
-            SIZE,
-            SIZE,
-            inputs(&s),
-            None,
-        )
-        .unwrap();
-        populate(&gpu, &mut water);
-        let current = WaterState {
-            camera,
-            eye: [8., 6., 24.],
-            ..state()
-        };
-        draw(&gpu, &mut water, current);
-        let actual = image(&gpu, water.resolved_texture());
-        let counters = stats(&gpu, &water);
-        assert!(
-            counters[2] > 20,
-            "SSR never sampled known reflected geometry: {counters:?}"
-        );
-        assert!(counters[1] <= counters[0] * 64);
-        let inverse = camera.inverse_view_projection().unwrap();
-        let mut certified = 0;
-        let mut reflected = 0;
-        for y in 0..SIZE {
-            for x in 0..SIZE {
-                let q = transform(
-                    inverse,
-                    [
-                        (f64::from(x) + 0.5) / f64::from(SIZE) * 2. - 1.,
-                        1. - (f64::from(y) + 0.5) / f64::from(SIZE) * 2.,
-                        0.,
-                        1.,
-                    ],
-                );
-                let v = [q[0] / q[3] - 8., q[1] / q[3] - 6., q[2] / q[3] - 24.];
-                let length = (v.iter().map(|x| x * x).sum::<f64>()).sqrt();
-                let ray = v.map(|x| x / length);
-                if ray[1] >= 0. {
-                    continue;
-                }
-                let t = -6. / ray[1];
-                let surface = [8. + ray[0] * t, 0., 24. + ray[2] * t];
-                if surface[0] < 1. || surface[0] > 15. || surface[2] < 1. || surface[2] > 15. {
-                    continue;
-                }
-                let r = [ray[0], -ray[1], ray[2]];
-                if r[2] >= 0. {
-                    continue;
-                }
-                let distance = -surface[2] / r[2];
-                let wall = [surface[0] + r[0] * distance, r[1] * distance, 0.];
-                if distance > 30. || wall[0] < 1. || wall[0] > 15. || wall[1] < 1. || wall[1] > 15.
-                {
-                    continue;
-                }
-                let clip = transform(camera.view_projection, [wall[0], wall[1], wall[2], 1.]);
-                if clip[3] <= 0. {
-                    continue;
-                }
-                let screen = [clip[0] / clip[3] * 0.5 + 0.5, 0.5 - clip[1] / clip[3] * 0.5];
-                if screen
-                    .iter()
-                    .any(|v| *v < 2. / f64::from(SIZE) || *v > 1. - 2. / f64::from(SIZE))
-                {
-                    continue;
-                }
-                certified += 1;
-                if actual[(x + SIZE * y) as usize][0] > 0.005 {
-                    reflected += 1;
+        for (steps, range, tolerance) in [(32, 16., 0.75), (64, 32., 1.2)] {
+            let config = WaterConfig {
+                absorption: [0.; 3],
+                reflection_steps: steps,
+                reflection_distance: range,
+                reflection_tolerance: tolerance,
+                ..config()
+            };
+            let mut water = WaterGpu::new(
+                &gpu.device,
+                &gpu.queue,
+                config,
+                SIZE,
+                SIZE,
+                inputs(&s),
+                None,
+            )
+            .unwrap();
+            populate(&gpu, &mut water);
+            let current = WaterState {
+                camera,
+                eye: [8., 6., 24.],
+                ..state()
+            };
+            draw(&gpu, &mut water, current);
+            let actual = image(&gpu, water.resolved_texture());
+            let counters = stats(&gpu, &water);
+            assert!(
+                counters[2] > 20,
+                "SSR never sampled known reflected geometry: {counters:?}"
+            );
+            assert!(u64::from(counters[1]) <= water.worst_reflection_steps());
+            let inverse = camera.inverse_view_projection().unwrap();
+            let mut certified = 0;
+            let mut reflected = 0;
+            for y in 0..SIZE {
+                for x in 0..SIZE {
+                    let q = transform(
+                        inverse,
+                        [
+                            (f64::from(x) + 0.5) / f64::from(SIZE) * 2. - 1.,
+                            1. - (f64::from(y) + 0.5) / f64::from(SIZE) * 2.,
+                            0.,
+                            1.,
+                        ],
+                    );
+                    let v = [q[0] / q[3] - 8., q[1] / q[3] - 6., q[2] / q[3] - 24.];
+                    let length = (v.iter().map(|x| x * x).sum::<f64>()).sqrt();
+                    let ray = v.map(|x| x / length);
+                    if ray[1] >= 0. {
+                        continue;
+                    }
+                    let t = -6. / ray[1];
+                    let surface = [8. + ray[0] * t, 0., 24. + ray[2] * t];
+                    if surface[0] < 1. || surface[0] > 15. || surface[2] < 1. || surface[2] > 15. {
+                        continue;
+                    }
+                    let r = [ray[0], -ray[1], ray[2]];
+                    if r[2] >= 0. {
+                        continue;
+                    }
+                    let distance = -surface[2] / r[2];
+                    let wall = [surface[0] + r[0] * distance, r[1] * distance, 0.];
+                    if distance > f64::from(config.reflection_distance) - 2.
+                        || wall[0] < 1.
+                        || wall[0] > 15.
+                        || wall[1] < 1.
+                        || wall[1] > 15.
+                    {
+                        continue;
+                    }
+                    let clip = transform(camera.view_projection, [wall[0], wall[1], wall[2], 1.]);
+                    if clip[3] <= 0. {
+                        continue;
+                    }
+                    let screen = [clip[0] / clip[3] * 0.5 + 0.5, 0.5 - clip[1] / clip[3] * 0.5];
+                    if screen
+                        .iter()
+                        .any(|v| *v < 2. / f64::from(SIZE) || *v > 1. - 2. / f64::from(SIZE))
+                    {
+                        continue;
+                    }
+                    certified += 1;
+                    if actual[(x + SIZE * y) as usize][0] > 0.005 {
+                        reflected += 1;
+                    }
                 }
             }
+            assert!(certified > 30);
+            assert!(
+                reflected == certified,
+                "independent reflected wall witnesses missing {reflected}/{certified}"
+            );
+            let _ = water.take_work();
+            water
+                .resize_inputs(&gpu.device, SIZE, SIZE, inputs(&s))
+                .unwrap();
+            let resize_work = water.take_work();
+            assert_eq!(
+                (resize_work.pipeline_compilations, resize_work.upload_bytes),
+                (0, 0)
+            );
+            draw(&gpu, &mut water, current);
+            assert_eq!(
+                image(&gpu, water.resolved_texture()),
+                actual,
+                "resized deferred water input bindings must retain the same image"
+            );
+            println!(
+                "M10 SSR quality steps={steps} range={range} actual wall rays{reflected}/{certified} counters fragments{} steps{} hits{} fallback{} resizeBITWISE=true",
+                counters[0], counters[1], counters[2], counters[3]
+            );
         }
-        assert!(certified > 30);
-        assert!(
-            reflected == certified,
-            "independent reflected wall witnesses missing {reflected}/{certified}"
-        );
-        println!(
-            "M10 SSR actual wall rays{reflected}/{certified} counters fragments{} steps{} hits{} fallback{}",
-            counters[0], counters[1], counters[2], counters[3]
-        );
     });
 }
 fn verify_water_timestamps(gpu: &render::Gpu, water: &WaterGpu) {

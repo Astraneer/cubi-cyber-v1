@@ -10,6 +10,10 @@ use render::{
 };
 #[path = "common/h5_route.rs"]
 mod h5_route;
+#[path = "common/shadow_sparse.rs"]
+mod shadow_sparse;
+#[path = "common/h5_probe.rs"]
+mod signals;
 #[global_allocator]
 static ALLOCATOR: telemetry::CountingAllocator<std::alloc::System> =
     telemetry::CountingAllocator::new(std::alloc::System);

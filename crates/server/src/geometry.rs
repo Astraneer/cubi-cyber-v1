@@ -1,14 +1,10 @@
-//! Bounded worker packing of actual public world geometry. Results publish only
-//! at the durable world frontier and only when their captured source is current.
-use crate::{Outgoing, Server, lod};
-use core_types::{PageId, Version};
+//! Bounded public geometry projection. Canonical far requests use immutable
+//! private-authority workers without creating gameplay World pages.
+use crate::{Outgoing, Server, cold_projection::ColumnKey, cold_projection_owner, lod};
+use core_types::{PageId, Tick, Version};
 use net::{PublicGeometry, PublicSurface, PublicSurfaceKind, ServerMessage};
-use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 use world::Page;
-
 pub(super) fn channels() -> core_types::ChannelMask {
     core_types::ChannelMask::SHAPE
         | core_types::ChannelMask::OPACITY
@@ -17,166 +13,164 @@ pub(super) fn channels() -> core_types::ChannelMask {
 pub(super) fn source_version(page: &Page) -> Version {
     page.channel_version(channels())
 }
-
-type Pool = jobs::NativePool<(PageId, Arc<Page>), (PublicGeometry, u64)>;
+fn canonical(page: PageId) -> bool {
+    page.space.0 == 0 && (0..8).contains(&page.y)
+}
 pub(super) struct GeometryWorker {
-    pool: Pool,
-    inflight: BTreeMap<jobs::JobId, (u64, PageId, Version, core_types::Tick)>,
-    ready: VecDeque<(u64, PublicGeometry, core_types::Tick)>,
+    pub(super) projection: Option<cold_projection_owner::Owner>,
+    allow_cold: bool,
+    projection_due: BTreeMap<(u64, PageId), (Version, Tick)>,
     delay: u64,
-    next_job: u64,
     next_peer: u64,
 }
 impl GeometryWorker {
-    pub(super) fn new(terrain: r#gen::Generator, delay: u8) -> Result<Self, crate::ServerError> {
-        let pool = Pool::new(
-            2,
-            8,
-            move |(page, data), cancel: &jobs::CancellationToken| {
-                if cancel.is_cancelled() {
-                    return Err("cancelled public geometry".into());
-                }
-                let tints = if page.space == core_types::SpaceId(0) {
-                    let mut tints = [0; 256];
-                    for z in 0..16 {
-                        for x in 0..16 {
-                            tints[x + 16 * z] = terrain
-                                .column_info(page.x * 16 + x as i32, page.z * 16 + z as i32)
-                                .tint;
-                        }
-                    }
-                    Some(tints)
-                } else {
-                    None
-                };
-                if cancel.is_cancelled() {
-                    return Err("cancelled public geometry".into());
-                }
-                let packed = lod::geometry_from_page(&data, tints.as_ref());
-                let geometry = PublicGeometry {
-                    page,
-                    source_version: source_version(&data),
-                    view_version: 0,
-                    known: packed.known,
-                    occupied: packed.occupied,
-                    index_bits: packed.index_bits,
-                    indices: packed.indices,
-                    palette: packed
-                        .palette
-                        .into_iter()
-                        .map(|p| PublicSurface {
-                            atlas_layer: p.atlas_layer,
-                            tint: p.tint,
-                            kind: match p.kind {
-                                lod::PublicSurfaceKind::Opaque => PublicSurfaceKind::Opaque,
-                                lod::PublicSurfaceKind::Cutout => PublicSurfaceKind::Cutout,
-                                lod::PublicSurfaceKind::Water => PublicSurfaceKind::Water,
-                            },
-                        })
-                        .collect(),
-                };
-                Ok((geometry, packed.scanned_cells))
+    pub(super) fn new(
+        generator: Arc<gen_authority::ServerGenerator>,
+        delay: u8,
+        cold_enabled: bool,
+    ) -> Result<Self, crate::ServerError> {
+        let limits = cold_projection_owner::Limits {
+            capture: crate::cold_projection::Limits {
+                allow_cold: cold_enabled,
+                ..Default::default()
             },
-        )
-        .map_err(|_| crate::ServerError::Invalid("public geometry worker"))?;
+            ..Default::default()
+        };
+        let projection = Some(
+            cold_projection_owner::Owner::new(generator, limits)
+                .map_err(|_| crate::ServerError::Invalid("cold public projection worker"))?,
+        );
         Ok(Self {
-            pool,
-            inflight: BTreeMap::new(),
-            ready: VecDeque::new(),
+            projection,
+            allow_cold: cold_enabled,
+            projection_due: BTreeMap::new(),
             delay: u64::from(delay),
-            next_job: 1,
             next_peer: 0,
         })
     }
+    pub(super) fn uses_cold(&self, page: PageId) -> bool {
+        self.projection.is_some() && canonical(page)
+    }
+    pub(super) fn projects_missing(&self, page: PageId) -> bool {
+        self.allow_cold && self.uses_cold(page)
+    }
+    pub(super) fn forget(&mut self, connection: u64, page: PageId) {
+        self.projection_due.remove(&(connection, page));
+        if let Some(owner) = &mut self.projection {
+            owner.forget(connection, page);
+        }
+    }
+    pub(super) fn forget_peer(&mut self, connection: u64) {
+        self.projection_due.retain(|(c, _), _| *c != connection);
+        if let Some(owner) = &mut self.projection {
+            owner.forget_peer(connection);
+        }
+    }
+    pub(super) fn observe(&mut self, changes: &[world::WorldChange], now: Tick) {
+        if let Some(owner) = &mut self.projection {
+            owner.observe(changes, now);
+        }
+    }
+}
+fn wire(
+    page: PageId,
+    head: cold_projection_owner::Head,
+    body: &lod::PublicGeometryData,
+) -> PublicGeometry {
+    PublicGeometry {
+        page,
+        source_version: head.source,
+        view_version: head.view,
+        known: body.known,
+        occupied: body.occupied,
+        index_bits: body.index_bits,
+        indices: body.indices.clone(),
+        palette: body
+            .palette
+            .iter()
+            .map(|s| PublicSurface {
+                atlas_layer: s.atlas_layer,
+                tint: s.tint,
+                kind: match s.kind {
+                    lod::PublicSurfaceKind::Opaque => PublicSurfaceKind::Opaque,
+                    lod::PublicSurfaceKind::Cutout => PublicSurfaceKind::Cutout,
+                    lod::PublicSurfaceKind::Water => PublicSurfaceKind::Water,
+                },
+            })
+            .collect(),
+    }
 }
 impl Server {
+    pub fn cold_projection_stats(&self) -> Option<cold_projection_owner::Stats> {
+        self.geometry.projection.as_ref().map(|owner| owner.stats())
+    }
     pub(super) fn publish_geometry(&mut self) -> Vec<Outgoing> {
         let mut output = Vec::new();
-        for _ in 0..2 {
-            if self.geometry.ready.len() >= 8 {
-                break;
+        if self.height_ready()
+            && let Some(owner) = &mut self.geometry.projection
+        {
+            match owner.pump(&self.world, self.runtimes.height.index(), self.tick, 2, 2) {
+                Ok(work) => {
+                    self.counters.geometry_cells += work.geometry_cells;
+                    self.counters.geometry_tint_samples += work.tint_samples;
+                    self.counters.geometry_public_witness_bytes += work.public_witness_bytes;
+                    self.counters.geometry_submitted += work.submitted;
+                    self.counters.geometry_discarded += work.stale + work.failed;
+                }
+                Err(_) => {
+                    self.fail("cold_projection_worker");
+                    return output;
+                }
             }
-            let Some(completion) = self.geometry.pool.try_recv() else {
-                break;
-            };
-            let Some((connection, page, version, submitted)) =
-                self.geometry.inflight.remove(&completion.id)
-            else {
-                continue;
-            };
-            let jobs::JobOutcome::Success((geometry, cells)) = completion.outcome else {
-                continue;
-            };
-            self.counters.geometry_cells += cells;
-            if page.space == core_types::SpaceId(0) {
-                self.counters.geometry_tint_samples += 256;
-            }
-            if geometry.page != page || geometry.source_version != version {
-                self.counters.geometry_discarded += 1;
-                continue;
-            }
-            self.geometry.ready.push_back((
-                connection,
-                geometry,
-                core_types::Tick(submitted.0.saturating_add(self.geometry.delay)),
-            ));
-            self.counters.geometry_held_peak = self
-                .counters
-                .geometry_held_peak
-                .max(self.geometry.ready.len());
         }
-        for _ in 0..2 {
-            let Some(index) = self
+        // Public exterior connectivity may change a centre image after an
+        // edit in another page. Forward completed public-head changes, rather
+        // than relying on the changed authoritative PageId alone.
+        for _ in 0..4 {
+            let Some(page) = self
                 .geometry
-                .ready
-                .iter()
-                .position(|(_, _, due)| *due <= self.tick)
+                .projection
+                .as_mut()
+                .and_then(|owner| owner.take_changed_geometry())
             else {
                 break;
             };
-            let (connection, mut geometry, _) = self
-                .geometry
-                .ready
-                .remove(index)
-                .expect("held result index");
-            let page = geometry.page;
-            let version = geometry.source_version;
-            let Some(peer) = self
-                .peers
-                .get_mut(&connection)
-                .filter(|p| p.ready && p.geometry_subscriptions.contains_key(&page))
-            else {
-                continue;
+            let key = net::height::HeightKey {
+                space: page.space.0,
+                level: 0,
+                x: page.x,
+                z: page.z,
             };
-            if self.world.page(page).is_none()
-                || self.world.input_version(page, channels()) != version
-            {
-                self.counters.geometry_discarded += 1;
-                if !peer.geometry_requests.iter().any(|(p, _)| *p == page) {
+            for peer in self.peers.values_mut().filter(|p| p.ready) {
+                if peer.geometry_subscriptions.contains_key(&page)
+                    && !peer.geometry_requests.iter().any(|(p, _)| *p == page)
+                {
                     peer.geometry_requests.push_back((page, None));
                 }
-                continue;
+                if peer.height_subscriptions.contains_key(&key) {
+                    if let Some((_, known)) =
+                        peer.height_requests.iter_mut().find(|(k, _)| *k == key)
+                    {
+                        *known = None;
+                    } else if peer.height_requests.len() < crate::height_stream::MAX_TILES {
+                        peer.height_requests.push_back((key, None));
+                    }
+                }
             }
-            if peer.geometry_subscriptions.get(&page) == Some(&version)
-                && let Some(view) = peer.geometry_views.get(&page)
-            {
-                geometry.view_version = *view;
-            } else {
-                peer.geometry_view = peer.geometry_view.saturating_add(1);
-                geometry.view_version = peer.geometry_view;
-            }
-            peer.geometry_subscriptions.insert(page, version);
-            peer.geometry_views.insert(page, geometry.view_version);
-            output.push(Outgoing::reliable(
-                connection,
-                ServerMessage::Geometry(Box::new(geometry)),
-            ));
-            self.counters.geometry_published += 1;
         }
-        // A persistent cursor prevents one low connection ID from consuming all
-        // public geometry slots while other peers wait.
+        for _ in 0..4 {
+            let Some(page) = self
+                .geometry
+                .projection
+                .as_mut()
+                .and_then(|owner| owner.take_changed_water())
+            else {
+                break;
+            };
+            self.far_water.wake_projection(page, self.tick);
+        }
         let mut connections: Vec<_> = self.peers.keys().copied().collect();
-        connections.sort_by_key(|connection| (*connection <= self.geometry.next_peer, *connection));
+        connections.sort_by_key(|id| (*id <= self.geometry.next_peer, *id));
         let mut submitted = 0;
         for connection in connections {
             if submitted >= 2 {
@@ -203,65 +197,96 @@ impl Server {
                 ));
                 continue;
             }
-            let Some(snapshot) = self.world.snapshot(page) else {
-                self.request_generation(page);
+            // The bounded exterior policy currently certifies only the
+            // canonical profile. Unsupported spaces/heights stay unavailable;
+            // ore redaction alone cannot authorize enclosed occupancy images.
+            if !canonical(page) {
                 output.push(Outgoing::reliable(
                     connection,
                     ServerMessage::GeometryUnavailable(page),
                 ));
                 continue;
-            };
-            let version = source_version(&snapshot);
-            if known == Some(version) {
-                continue;
             }
-            if self
-                .geometry
-                .inflight
-                .values()
-                .any(|(c, p, v, _)| *c == connection && *p == page && *v == version)
-                || self.geometry.ready.iter().any(|(c, g, _)| {
-                    *c == connection && g.page == page && g.source_version == version
-                })
-            {
-                continue;
-            }
-            let id = jobs::JobId(self.geometry.next_job);
-            self.geometry.next_job = self.geometry.next_job.saturating_add(1);
-            let spec = jobs::JobSpec::derived(
-                jobs::JobKey { page, kind: 62 },
-                jobs::Priority::Normal,
-                jobs::WorkCost {
-                    cells: 4352,
-                    quads: 0,
-                    bytes: 40_000,
-                    rays: 0,
-                },
-                64 * 1024,
-                self.tick,
-            );
-            match self.geometry.pool.try_submit(jobs::Dispatch {
-                id,
-                spec,
-                cancellation: jobs::CancellationToken::new(),
-                payload: (page, snapshot),
-            }) {
-                Ok(()) => {
-                    self.geometry
-                        .inflight
-                        .insert(id, (connection, page, version, self.tick));
-                    self.counters.geometry_submitted += 1;
-                    submitted += 1;
+            if self.geometry.uses_cold(page) {
+                if !self.geometry.allow_cold && self.world.page(page).is_none() {
+                    output.push(Outgoing::reliable(
+                        connection,
+                        ServerMessage::GeometryUnavailable(page),
+                    ));
+                    continue;
                 }
-                Err(_) => {
+                let owner = self.geometry.projection.as_mut().expect("cold owner");
+                if owner.interest(connection, page, self.tick).is_err() {
+                    output.push(Outgoing::reliable(
+                        connection,
+                        ServerMessage::GeometryUnavailable(page),
+                    ));
+                    continue;
+                }
+                if let Some((head, body)) =
+                    owner.geometry(page, &self.world, self.runtimes.height.index())
+                {
+                    if self.geometry.delay != 0 && known != Some(head.source) {
+                        let entry = self
+                            .geometry
+                            .projection_due
+                            .entry((connection, page))
+                            .or_insert((
+                                head.source,
+                                Tick(self.tick.0.saturating_add(self.geometry.delay)),
+                            ));
+                        if entry.0 != head.source {
+                            *entry = (
+                                head.source,
+                                Tick(self.tick.0.saturating_add(self.geometry.delay)),
+                            );
+                        }
+                        if self.tick < entry.1 {
+                            self.peers
+                                .get_mut(&connection)
+                                .expect("listed peer")
+                                .geometry_requests
+                                .push_back((page, known));
+                            submitted += 1;
+                            continue;
+                        }
+                        self.geometry.projection_due.remove(&(connection, page));
+                    }
+                    // A known global public head confirms the same immutable
+                    // source/view even when this connection reused cached bytes.
+                    let peer = self.peers.get_mut(&connection).expect("listed peer");
+                    peer.geometry_subscriptions.insert(page, head.source);
+                    peer.geometry_views.insert(page, head.view);
+                    if known != Some(head.source) {
+                        output.push(Outgoing::reliable(
+                            connection,
+                            ServerMessage::Geometry(Box::new(wire(page, head, &body))),
+                        ));
+                        self.counters.geometry_published += 1;
+                    }
+                } else {
+                    let _ = owner.request(
+                        ColumnKey {
+                            x: page.x,
+                            z: page.z,
+                        },
+                        self.tick,
+                    );
                     self.peers
                         .get_mut(&connection)
                         .expect("listed peer")
                         .geometry_requests
-                        .push_front((page, known));
-                    break;
+                        .push_back((page, known));
                 }
+                submitted += 1;
+                continue;
             }
+            // No unsealed resident fallback exists. A missing certified owner
+            // image remains unavailable, including in generation-disabled saves.
+            output.push(Outgoing::reliable(
+                connection,
+                ServerMessage::GeometryUnavailable(page),
+            ));
         }
         output
     }

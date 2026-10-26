@@ -14,6 +14,9 @@ fn terrain(gpu: &render::Gpu) -> TerrainGpu {
     terrain_samples(gpu, 4)
 }
 fn terrain_samples(gpu: &render::Gpu, sample_count: u32) -> TerrainGpu {
+    terrain_atlas(gpu, sample_count, &AtlasImage::donor().unwrap())
+}
+fn terrain_atlas(gpu: &render::Gpu, sample_count: u32, atlas: &AtlasImage) -> TerrainGpu {
     TerrainGpu::new_with_samples(
         &gpu.device,
         &gpu.queue,
@@ -26,7 +29,7 @@ fn terrain_samples(gpu: &render::Gpu, sample_count: u32) -> TerrainGpu {
             max_quads: 8192,
             occlusion: false,
         },
-        &AtlasImage::donor().unwrap(),
+        atlas,
         sample_count,
     )
     .unwrap()
@@ -355,6 +358,285 @@ fn masked_proxies_sample_mode(sample_count: u32) {
             stats[3],
             payload.payload_bytes()
         );
+    });
+}
+
+#[path = "common/msaa.rs"]
+mod sample_locations;
+
+#[test]
+fn perspective_opaque_proxy_keeps_every_independent_interior_sample_witness() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let offsets = sample_locations::locations(&gpu);
+        for samples in [1, 4] {
+            let mut terrain = terrain_samples(&gpu, samples);
+            let public = PublicPage::from_exposed(|[_, y, _]| {
+                if y == 7 {
+                    PublicVoxel::solid(3, 0xff00ff00)
+                } else {
+                    PublicVoxel::Air
+                }
+            });
+            let source = MaskedRayProxy::from_public_page(
+                &public,
+                render::lod::coarsen_page(&public, 4, true).protection,
+            );
+            let payload = ProxyPayload::from_public(&source, 186).unwrap();
+            let mut lod = LodProxyGpu::new(
+                &gpu.device,
+                &gpu.queue,
+                terrain.geometry(),
+                ProxyConfig {
+                    max_objects: 4,
+                    max_payload_words: 65536,
+                    atlas_layers: 186,
+                    instrument: true,
+                },
+                None,
+            )
+            .unwrap();
+            lod.upload(
+                &gpu.queue,
+                None,
+                1,
+                translation([0., 64., 0.]),
+                [0., 0., 0., 1.],
+                &payload,
+                &mut UploadBudget::new(1_000_000),
+            )
+            .unwrap();
+            let fov = 2. * (32f32 / 142.).atan();
+            let camera = ProxyCamera {
+                camera: Camera::perspective(
+                    [0., 150., 0.],
+                    [0., 8., 0.],
+                    [0., 0., -1.],
+                    fov,
+                    1.,
+                    0.1,
+                    300.,
+                ),
+                eye: [0., 150., 0.],
+                viewport_height: 96,
+                orthographic_direction: None,
+            };
+            let (sky, _) = frame(&gpu, &mut terrain, None, camera);
+            let (actual, work) = frame(&gpu, &mut terrain, Some(&mut lod), camera);
+            let locations: &[[f64; 2]] = if samples == 1 {
+                &[[0.5, 0.5]]
+            } else {
+                &offsets
+            };
+            let mut witnesses = 0;
+            let mut lost = 0;
+            for y in 0..96usize {
+                for x in 0..96usize {
+                    // Independent plane intersection at y72; exclude true outer
+                    // edges so fixed-point raster guards cannot certify a hit.
+                    let inside = locations.iter().all(|offset| {
+                        let wx = (2. * (x as f64 + offset[0]) / 96. - 1.)
+                            * f64::from((fov * 0.5).tan())
+                            * 78.;
+                        let wz = (2. * (y as f64 + offset[1]) / 96. - 1.)
+                            * f64::from((fov * 0.5).tan())
+                            * 78.;
+                        wx > 0.01 && wx < 15.99 && wz > 0.01 && wz < 15.99
+                    });
+                    if inside {
+                        witnesses += 1;
+                        let at = (y * 96 + x) * 4;
+                        lost += usize::from(actual[at..at + 3] == sky[at..at + 3]);
+                    }
+                }
+            }
+            assert!(
+                witnesses > 1000,
+                "constant-sky negative control lacks witnesses"
+            );
+            println!(
+                "perspective control sample{samples} witnesses{witnesses} lost{lost} work{work:?}"
+            );
+            assert_eq!(
+                lost, 0,
+                "perspective opaque proxy lost {lost}/{witnesses} sample{samples} interior witnesses"
+            );
+            assert_eq!(work[3], 0, "DDA step bound exhausted");
+            println!(
+                "perspective sample{samples} plane witnesses{witnesses} lost{lost} rays{}",
+                work[0]
+            );
+        }
+    });
+}
+
+#[test]
+fn mixed_cutout_retains_opaque_background_and_exact_far_plane_coverage() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut rgba = vec![0u8; 16 * 16 * 5 * 4];
+        for (index, texel) in rgba.chunks_exact_mut(4).enumerate() {
+            texel.copy_from_slice(&[255, 0, 255, if index / (16 * 16) == 4 { 128 } else { 255 }]);
+        }
+        let atlas = AtlasImage {
+            tile_size: 16,
+            layers: 5,
+            mips: vec![render::terrain_gpu::AtlasMip {
+                size: 16,
+                rgba,
+                tint_mask: vec![255; 16 * 16 * 5],
+            }],
+        };
+        for samples in [1, 4] {
+            for far in [true, false] {
+                let cell = |[_, y, z]: [u8; 3]| {
+                    if far {
+                        u32::from(z == 15)
+                    } else {
+                        match y {
+                            7 => 1,
+                            8 => 2,
+                            _ => 0,
+                        }
+                    }
+                };
+                let public = PublicPage::from_exposed(|xyz| match cell(xyz) {
+                    1 => PublicVoxel::solid(3, u32::MAX),
+                    2 => PublicVoxel::Solid {
+                        material: 4,
+                        tint: u32::MAX,
+                        kind: SurfaceKind::Cutout,
+                    },
+                    _ => PublicVoxel::Air,
+                });
+                let source = MaskedRayProxy::from_public_page(
+                    &public,
+                    render::lod::coarsen_page(&public, 4, true).protection,
+                );
+                let payload = ProxyPayload::from_public(&source, 5).unwrap();
+                let mut full = terrain_atlas(&gpu, samples, &atlas);
+                let mut actual_terrain = terrain_atlas(&gpu, samples, &atlas);
+                let mut halo = render::terrain_mesh::PageHalo::filled(0);
+                for y in 0..16 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            halo.set(x, y, z, cell([x as u8, y as u8, z as u8]));
+                        }
+                    }
+                }
+                let mut mesh = render::terrain_mesh::PageMesh::default();
+                render::terrain_mesh::mesh_page(
+                    &halo,
+                    |raw| {
+                        if raw == 0 {
+                            return render::terrain_mesh::CellMaterial::EMPTY;
+                        }
+                        let mut material =
+                            render::terrain_mesh::CellMaterial::opaque(if raw == 1 {
+                                3
+                            } else {
+                                4
+                            });
+                        material.casts_ao = false;
+                        if raw == 2 {
+                            material.class = render::terrain_mesh::MeshClass::Cutout;
+                            material.occludes = false;
+                        }
+                        material
+                    },
+                    &mut render::terrain_mesh::MeshScratch::new(),
+                    &mut mesh,
+                );
+                let model = translation(if far { [0., 0., -76.] } else { [0., 64., 0.] });
+                full.upload_page(
+                    &gpu.queue,
+                    None,
+                    1,
+                    model,
+                    &mesh,
+                    &mut UploadBudget::new(1_000_000),
+                )
+                .unwrap();
+                let mut lod = LodProxyGpu::new(
+                    &gpu.device,
+                    &gpu.queue,
+                    actual_terrain.geometry(),
+                    ProxyConfig {
+                        max_objects: 4,
+                        max_payload_words: 65536,
+                        atlas_layers: 5,
+                        instrument: true,
+                    },
+                    None,
+                )
+                .unwrap();
+                lod.upload(
+                    &gpu.queue,
+                    None,
+                    1,
+                    model,
+                    [0., 0., 0., 1.],
+                    &payload,
+                    &mut UploadBudget::new(1_000_000),
+                )
+                .unwrap();
+                let camera = if far {
+                    ProxyCamera {
+                        camera: Camera::orthographic(
+                            [8., 8., 40.],
+                            [8., 8., 8.],
+                            [0., 1., 0.],
+                            8.,
+                            1.,
+                            0.1,
+                            100.,
+                        ),
+                        eye: [8., 8., 40.],
+                        viewport_height: 96,
+                        orthographic_direction: Some([0., 0., -1.]),
+                    }
+                } else {
+                    ProxyCamera {
+                        camera: Camera::perspective(
+                            [0., 150., 0.],
+                            [0., 8., 0.],
+                            [0., 0., -1.],
+                            2. * (32f32 / 142.).atan(),
+                            1.,
+                            0.1,
+                            300.,
+                        ),
+                        eye: [0., 150., 0.],
+                        viewport_height: 96,
+                        orthographic_direction: None,
+                    }
+                };
+                let (expected, _) = frame(&gpu, &mut full, None, camera);
+                let (actual, work) = frame(&gpu, &mut actual_terrain, Some(&mut lod), camera);
+                let mut witnesses = 0;
+                let mut missing = 0;
+                for (expected, actual) in expected.chunks_exact(4).zip(actual.chunks_exact(4)) {
+                    // Both public materials have exactly zero green. Their
+                    // different illumination cannot fake a missing sky sample.
+                    if expected[1] == 0 && expected[0] > 0 {
+                        witnesses += 1;
+                        missing += usize::from(actual[1] != 0);
+                    }
+                }
+                assert!(witnesses > 1000);
+                println!(
+                    "public layered sample{samples} far{far} witnesses{witnesses} missing{missing} work{work:?}"
+                );
+                assert_eq!(
+                    missing, 0,
+                    "sample{samples} far{far} missing opaque background/far-plane coverage"
+                );
+            }
+        }
     });
 }
 

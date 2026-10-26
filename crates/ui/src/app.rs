@@ -48,6 +48,28 @@ pub enum PersonalTime {
     Server,
     Day,
     Night,
+    Dawn,
+    Dusk,
+}
+impl PersonalTime {
+    fn from_setting(value: i32) -> Self {
+        match value {
+            1 => Self::Day,
+            2 => Self::Night,
+            3 => Self::Dawn,
+            4 => Self::Dusk,
+            _ => Self::Server,
+        }
+    }
+    fn setting(self) -> i32 {
+        match self {
+            Self::Server => 0,
+            Self::Day => 1,
+            Self::Night => 2,
+            Self::Dawn => 3,
+            Self::Dusk => 4,
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayerRow {
@@ -173,6 +195,7 @@ pub enum Intent {
         name: String,
     },
     Disconnect,
+    Respawn,
     Quit,
     PointerCapture(bool),
     SettingsChanged,
@@ -235,6 +258,7 @@ pub enum Widget {
     Disconnect,
     Quit,
     Back,
+    Respawn,
     Name,
     Address,
     Section(Section),
@@ -325,7 +349,9 @@ pub struct UiApp {
     scale: f32,
     bookmark_scroll: usize,
     profiler: crate::profiler::ProfilerSnapshot,
+    quality: crate::quality::QualityHud,
     pending_settings: u32,
+    reload_settings: u32,
 }
 impl UiApp {
     pub fn new() -> Result<Self, &'static str> {
@@ -373,11 +399,19 @@ impl UiApp {
             scale: 1.0,
             bookmark_scroll: 0,
             profiler: crate::profiler::ProfilerSnapshot::default(),
+            quality: crate::quality::QualityHud::default(),
             pending_settings: 0,
+            reload_settings: 0,
         })
     }
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+    pub fn uses_cached_background(&self) -> bool {
+        matches!(
+            self.screen,
+            Screen::Pause | Screen::Settings(_) | Screen::Resources | Screen::Crossroads
+        )
     }
     pub fn set_profiler(&mut self, snapshot: crate::profiler::ProfilerSnapshot) {
         if self.profiler != snapshot {
@@ -387,10 +421,24 @@ impl UiApp {
             }
         }
     }
+    pub fn set_quality(&mut self, quality: crate::quality::QualityHud) {
+        if self.quality != quality {
+            self.quality = quality;
+            if self.show_debug {
+                self.dirty();
+            }
+        }
+    }
     pub fn set_pending_settings(&mut self, mask: u32) {
         let mask = mask & ((1u32 << crate::settings::COUNT) - 1);
         if mask != self.pending_settings {
             self.pending_settings = mask;
+            self.dirty();
+        }
+    }
+    pub fn set_reload_settings(&mut self, mask: u32) {
+        if self.reload_settings != mask {
+            self.reload_settings = mask;
             self.dirty();
         }
     }
@@ -411,6 +459,27 @@ impl UiApp {
     }
     pub fn take_intent(&mut self) -> Option<Intent> {
         self.intents.pop_front()
+    }
+    /// Menus, capture release and disconnect remain responsive while a world
+    /// operation is waiting for bounded network admission.
+    pub fn take_local_intent(&mut self) -> Option<Intent> {
+        let index = self.intents.iter().position(|intent| {
+            matches!(
+                intent,
+                Intent::Connect { .. }
+                    | Intent::Disconnect
+                    | Intent::Quit
+                    | Intent::PointerCapture(_)
+                    | Intent::SettingsChanged
+                    | Intent::SavePreferences
+                    | Intent::ImportPack
+                    | Intent::ImportMinecraft
+                    | Intent::OpenCredits
+                    | Intent::BugReport
+                    | Intent::PersonalTime(_)
+            )
+        })?;
+        self.intents.remove(index)
     }
     pub fn status(&self) -> &str {
         &self.status
@@ -493,6 +562,7 @@ impl UiApp {
             return Err("UI profile bounds");
         }
         self.settings = settings;
+        self.personal_time = PersonalTime::from_setting(self.settings.get(Setting::ViewTime));
         self.bindings = bindings;
         self.bookmarks = bookmarks;
         self.name = name.to_owned();
@@ -519,6 +589,11 @@ impl UiApp {
         self.dirty();
     }
     pub fn open(&mut self, screen: Screen) {
+        let screen = if screen == Screen::Game && self.snapshot.connected && self.snapshot.hp == 0 {
+            Screen::Death
+        } else {
+            screen
+        };
         if matches!(screen, Screen::Game | Screen::Pause | Screen::Welcome)
             && matches!(
                 self.screen,
@@ -539,6 +614,7 @@ impl UiApp {
         }
         self.previous = self.screen;
         self.screen = screen;
+        self.hits.clear();
         self.focus = Focus::None;
         self.scroll = 0;
         self.hover = None;
@@ -568,6 +644,8 @@ impl UiApp {
         self.snapshot = snapshot;
         if dead && self.screen != Screen::Death {
             self.open(Screen::Death);
+        } else if !dead && self.screen == Screen::Death && self.snapshot.connected {
+            self.open(Screen::Game);
         }
         self.dirty();
         Ok(())
@@ -714,6 +792,9 @@ impl UiApp {
                 Err(_) => self.status = "Выберите физическую клавишу".into(),
             };
             self.dirty();
+            return true;
+        }
+        if self.screen == Screen::Loading && !matches!(code, "Escape" | "F3" | "F8") {
             return true;
         }
         if code == "Escape" {
@@ -976,6 +1057,7 @@ impl UiApp {
             Widget::Settings => self.open(Screen::Settings(Section::Graphics)),
             Widget::Resources => self.open(Screen::Resources),
             Widget::Disconnect => self.intent(Intent::Disconnect),
+            Widget::Respawn => self.intent(Intent::Respawn),
             Widget::Quit => self.intent(Intent::Quit),
             Widget::Back => self.open(if self.snapshot.connected {
                 Screen::Pause
@@ -991,11 +1073,15 @@ impl UiApp {
             }
             Widget::Preset(preset) => {
                 self.settings.apply_preset(preset);
+                self.personal_time =
+                    PersonalTime::from_setting(self.settings.get(Setting::ViewTime));
                 self.intent(Intent::SettingsChanged);
             }
             Widget::ResetSection => {
                 if let Screen::Settings(section) = self.screen {
                     self.settings.reset_section(section);
+                    self.personal_time =
+                        PersonalTime::from_setting(self.settings.get(Setting::ViewTime));
                     if section == Section::Controls {
                         self.bindings.reset();
                     }
@@ -1022,6 +1108,9 @@ impl UiApp {
                     }
                 };
                 let _ = self.settings.set(id, value);
+                if id == Setting::ViewTime {
+                    self.personal_time = PersonalTime::from_setting(value);
+                }
                 self.intent(Intent::SettingsChanged);
             }
             Widget::Binding(action) => self.focus = Focus::Binding(action),
@@ -1031,14 +1120,23 @@ impl UiApp {
             Widget::Crossroads => self.open(Screen::Crossroads),
             Widget::Day => {
                 self.personal_time = PersonalTime::Day;
+                let _ = self
+                    .settings
+                    .set(Setting::ViewTime, self.personal_time.setting());
                 self.intent(Intent::PersonalTime(self.personal_time));
             }
             Widget::Night => {
                 self.personal_time = PersonalTime::Night;
+                let _ = self
+                    .settings
+                    .set(Setting::ViewTime, self.personal_time.setting());
                 self.intent(Intent::PersonalTime(self.personal_time));
             }
             Widget::ServerTime => {
                 self.personal_time = PersonalTime::Server;
+                let _ = self
+                    .settings
+                    .set(Setting::ViewTime, self.personal_time.setting());
                 self.intent(Intent::PersonalTime(self.personal_time));
             }
             Widget::Slot(slot) => self.intent(Intent::SlotClick {
@@ -1243,8 +1341,14 @@ impl UiApp {
                     p.centered(Rect::new(0.0, h * 0.35, w, 30.0), "Вы погибли", 0xffea8b83);
                     self.button(
                         &mut p,
-                        Widget::Back,
-                        Rect::new(w * 0.5 - 130.0, h * 0.5, 260.0, 34.0),
+                        Widget::Respawn,
+                        Rect::new(w * 0.5 - 130., h * 0.5, 260., 34.),
+                        "Возродиться",
+                    );
+                    self.button(
+                        &mut p,
+                        Widget::Disconnect,
+                        Rect::new(w * 0.5 - 130.0, h * 0.5 + 46., 260.0, 34.0),
                         "Вернуться в меню",
                     );
                 }
@@ -1259,6 +1363,7 @@ impl UiApp {
         }
         if self.show_debug {
             self.profiler.paint(&mut p, w, h);
+            self.quality.paint(&mut p, w, h);
         }
         if !self.snapshot.cursor.is_empty()
             && matches!(
@@ -1290,7 +1395,8 @@ impl UiApp {
                 self.snapshot.cursor,
             );
         }
-        if let Some(item) = self.hovered_item()
+        if self.settings.get(Setting::Hints) != 0
+            && let Some(item) = self.hovered_item()
             && let Some(item) = rules::item(item)
         {
             let mut detail_text = TextBuffer::default();
@@ -1419,7 +1525,22 @@ impl UiApp {
             );
             let mut text = TextBuffer::default();
             let value = self.settings.get(def.id);
-            let _ = write!(text, "{value}");
+            if def.id == Setting::ViewTime {
+                let _ = write!(
+                    text,
+                    "{}",
+                    match value {
+                        0 => "Мир",
+                        1 => "День",
+                        2 => "Ночь",
+                        3 => "Рассвет",
+                        4 => "Закат",
+                        _ => "?",
+                    }
+                );
+            } else {
+                let _ = write!(text, "{value}");
+            }
             if self.pending_settings & (1 << def.id as u32) != 0 {
                 let _ = write!(text, "*");
             }
@@ -1485,7 +1606,11 @@ impl UiApp {
             h - 28.0,
             if section == Section::Graphics && self.pending_settings != 0 && self.status.is_empty()
             {
-                "* сохранено, ещё не применено"
+                if self.reload_settings != 0 {
+                    "* сохранено; применяется при перезагрузке вида"
+                } else {
+                    "* сохранено, ещё не применено"
+                }
             } else {
                 &self.status
             },

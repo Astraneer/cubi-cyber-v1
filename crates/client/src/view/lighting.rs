@@ -28,6 +28,12 @@ pub struct LightingStats {
     pub dynamic_shadow_restore_draws: u64,
     pub shadow_updates: u64,
     pub shadow_texels: u64,
+    /// Sparse areas are measured by the GPU; these are request counts/bounds,
+    /// separate from the CPU-known `shadow_texels` and restore pixel counts.
+    pub shadow_gpu_clear_updates: u64,
+    pub shadow_gpu_restore_updates: u64,
+    pub shadow_gpu_clear_upper_bound: u64,
+    pub shadow_gpu_restore_upper_bound: u64,
     pub pending_shadow_cascades: u32,
     pub pending_cells: usize,
     pub pending_pages: usize,
@@ -154,9 +160,7 @@ impl ViewLighting {
         stats
     }
     pub fn is_ready(&self, scene: &ClientScene) -> bool {
-        self.stats.ready
-            && self.source_pending_pages(scene) == 0
-            && !self.owner.needs_work(scene.world())
+        self.source_pending_pages(scene) == 0 && self.owner.presentation_ready(scene.world())
     }
     fn source_pending_pages(&self, scene: &ClientScene) -> usize {
         if self.stats.authoritative_source {
@@ -198,9 +202,19 @@ impl ViewLighting {
         terrain: &mut TerrainGpu,
         center: [f32; 3],
     ) -> Result<ShadowWork, ClientLightingError> {
+        self.encode_with_sun(queue, encoder, terrain, center, SUN)
+    }
+    pub fn encode_with_sun(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        terrain: &mut TerrainGpu,
+        center: [f32; 3],
+        sun: [f32; 3],
+    ) -> Result<ShadowWork, ClientLightingError> {
         let work = self
             .owner
-            .encode_lighting(queue, encoder, terrain, center, SUN)?;
+            .encode_lighting(queue, encoder, terrain, center, sun)?;
         self.record_shadow(work);
         Ok(work)
     }
@@ -212,13 +226,31 @@ impl ViewLighting {
         center: [f32; 3],
         casters: &mut impl DynamicShadowCaster,
     ) -> Result<ShadowWork, ClientLightingError> {
+        self.encode_models_with_sun(queue, encoder, terrain, center, SUN, casters)
+    }
+    pub fn encode_models_with_sun(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        terrain: &mut TerrainGpu,
+        center: [f32; 3],
+        sun: [f32; 3],
+        casters: &mut impl DynamicShadowCaster,
+    ) -> Result<ShadowWork, ClientLightingError> {
         let work = self
             .owner
-            .encode_lighting_dynamic(queue, encoder, terrain, center, SUN, casters)?;
+            .encode_lighting_dynamic(queue, encoder, terrain, center, sun, casters)?;
         self.record_shadow(work);
         Ok(work)
     }
     fn record_shadow(&mut self, work: ShadowWork) {
+        let clear = u64::from(work.gpu_clear_mask.count_ones());
+        let restore = u64::from(work.gpu_restore_mask.count_ones());
+        let resolution = u64::from(self.owner.shadows().cache().config().resolution);
+        self.stats.shadow_gpu_clear_updates += clear;
+        self.stats.shadow_gpu_restore_updates += restore;
+        self.stats.shadow_gpu_clear_upper_bound += clear * resolution * resolution;
+        self.stats.shadow_gpu_restore_upper_bound += restore * resolution * resolution;
         self.stats.shadow_draws +=
             u64::from(work.draw_calls + work.dynamic_draw_calls + work.dynamic_restore_draws);
         self.stats.static_shadow_draws += u64::from(work.draw_calls);

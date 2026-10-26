@@ -1,23 +1,32 @@
 //! Per-observer wire views. Private ores are never sent before a concrete,
 //! bounded line-of-sight query reaches them; Unknown closes the query.
-use core_types::{Cell, PAGE_VOLUME, PageId, SpaceId, Version};
+#[cfg(test)]
+use core_types::SpaceId;
+use core_types::{BlockPos, Cell, PAGE_VOLUME, PageId, Version};
 use net::FarSummary;
-use sim::{Player, RayResult, WorldQuery};
+#[cfg(test)]
+use sim::Player;
+use sim::RayResult;
+#[cfg(test)]
+use sim::WorldQuery;
+#[cfg(test)]
 use world::World;
+mod pending;
+pub(crate) use pending::{Budget, PendingView};
 
 #[derive(Default)]
 pub(crate) struct ViewWork {
-    pub cells: u64,
     pub segments: u64,
 }
 
-fn private_material(id: u16) -> bool {
+pub(crate) fn private_material(id: u16) -> bool {
     use rules::ids::*;
     matches!(
         id,
         COAL_ORE | IRON_ORE | OSMIUM_ORE | TIN_ORE | COPPER_ORE | GOLD_ORE | REDSTONE_ORE
     )
 }
+#[cfg(test)]
 pub(crate) fn sanitize(
     world: &World,
     page: PageId,
@@ -26,10 +35,7 @@ pub(crate) fn sanitize(
     space: SpaceId,
 ) -> (Box<[Cell; PAGE_VOLUME]>, ViewWork) {
     let eye = observer.eye(1.0);
-    let mut work = ViewWork {
-        cells: PAGE_VOLUME as u64,
-        segments: 0,
-    };
+    let mut work = ViewWork::default();
     for (index, cell) in cells.iter_mut().enumerate() {
         if !private_material(cell.id()) {
             continue;
@@ -59,8 +65,35 @@ pub(crate) fn sanitize(
     }
     (cells, work)
 }
+/// The endpoint may be transparent AIR/fluid. A known unobstructed miss that
+/// reaches its centre is visibility; Unknown on any segment still closes it.
+pub(crate) fn target_visible(
+    query: &impl sim::QueryWorld,
+    target: BlockPos,
+    eye: Option<[f64; 3]>,
+    work: &mut ViewWork,
+) -> bool {
+    let Some(eye) = eye else { return false };
+    let position = [target.x, target.y, target.z];
+    let offset = std::array::from_fn::<_, 3, _>(|axis| f64::from(position[axis]) + 0.5 - eye[axis]);
+    let distance = offset.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if !distance.is_finite() || distance > 64. {
+        return false;
+    }
+    if distance <= f64::EPSILON {
+        return matches!(query.cell(position), world::CellRead::Known(_));
+    }
+    visible_ray(
+        query,
+        eye,
+        offset.map(|v| v / distance),
+        distance + 0.01,
+        position,
+        work,
+    )
+}
 fn visible_ray(
-    query: &WorldQuery<'_>,
+    query: &impl sim::QueryWorld,
     eye: [f64; 3],
     direction: [f64; 3],
     reach: f64,
@@ -81,7 +114,12 @@ fn visible_ray(
         match sim::raycast(query, start, direction, segment) {
             RayResult::Hit(hit) => return hit.cell == target,
             RayResult::Unknown(_) => return false,
-            RayResult::Miss => traveled += segment,
+            RayResult::Miss => {
+                traveled += segment;
+                if traveled >= reach {
+                    return true;
+                }
+            }
         }
     }
     false

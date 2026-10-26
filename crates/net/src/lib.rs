@@ -1,6 +1,7 @@
 //! Bounded protocol, confirmed-base replication and prediction bookkeeping.
 #![forbid(unsafe_code)]
 
+pub mod audio_cue;
 mod codec;
 pub mod commands;
 pub mod emulator;
@@ -12,6 +13,7 @@ pub mod light;
 pub mod machine_packets;
 pub mod presence;
 pub mod props;
+pub mod water;
 pub mod window;
 pub use geometry::{PublicGeometry, PublicSurface, PublicSurfaceKind};
 mod replication;
@@ -32,9 +34,15 @@ pub const MAX_NAME_BYTES: usize = 64;
 pub const MAX_COMMAND_BYTES: usize = 256;
 pub const MAX_PREDICTION_BYTES: usize = 384;
 pub const MAX_COORDINATE: i32 = 30_000_000;
-/// Bounded public geometry interest: 32 near proxies plus up to 28 exact
-/// eight-page height columns. Product traces require at least 176 images.
-pub const MAX_PUBLIC_GEOMETRY_PAGES: usize = 256;
+/// Bounded public geometry interest. Strict 32px production traces require up
+/// to 42 exact eight-page columns plus near proxies (368 images).
+pub const MAX_PUBLIC_GEOMETRY_PAGES: usize = 512;
+/// Public UUID-to-actor mapping shared by targeting and authority. No private
+/// seed, credential or inventory value participates in this identity.
+pub fn player_entity_id(identity: PlayerId) -> u64 {
+    let hash = blake3::derive_key("cubi authoritative player entity v1", &identity.0);
+    u64::from_le_bytes(hash[..8].try_into().expect("hash prefix")).max(1)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SecretToken([u8; 32]);
@@ -162,6 +170,21 @@ pub enum Action {
         back: bool,
         inventory: InventoryGuard,
     },
+    AttackEntity {
+        target: u64,
+        inventory: InventoryGuard,
+    },
+    UseEntity {
+        target: u64,
+        inventory: InventoryGuard,
+    },
+    Respawn,
+    UseBlockTool {
+        position: BlockPos,
+        expected: Cell,
+        sneaking: bool,
+        inventory: InventoryGuard,
+    },
     PlaceOwned {
         position: BlockPos,
         expected: Cell,
@@ -203,6 +226,8 @@ pub enum ClientMessage {
         known: Option<Version>,
     },
     ForgetGeometry(PageId),
+    RequestWater(water::Request),
+    ForgetWater(PageId),
     RequestHeight {
         key: height::HeightKey,
         known: Option<u64>,
@@ -320,6 +345,9 @@ pub enum ServerMessage {
     ItemAttributes(Box<item_attributes::InventoryAttributes>),
     Geometry(Box<PublicGeometry>),
     GeometryUnavailable(PageId),
+    WaterHalo(Box<water::WaterHalo>),
+    WaterUnavailable(PageId),
+    AudioCue(audio_cue::Cue),
     Presence(presence::PresenceServerEvent),
     Entities(Box<entities::EntityFrame>),
     Window(Box<window::WindowSnapshot>),

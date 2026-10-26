@@ -113,8 +113,9 @@ fn public_binding_diagnostics_distinguish_retained_light_from_a_current_certific
     assert!(scene.authoritative_light_version(page()).is_none());
 }
 #[test]
-fn measured_176_public_pages_fit_the_bounded_256_geometry_interest() {
+fn measured_368_public_pages_fit_the_bounded_512_geometry_interest() {
     let mut c = Connection::new(NetworkConfig::default()).unwrap();
+    let mut queued = 0;
     for x in 0..net::MAX_PUBLIC_GEOMETRY_PAGES {
         c.request_geometry(
             PageId {
@@ -124,7 +125,11 @@ fn measured_176_public_pages_fit_the_bounded_256_geometry_interest() {
             0,
         )
         .unwrap();
+        if (x + 1) % 128 == 0 {
+            queued += c.take_outgoing(256).len();
+        }
     }
-    assert!(c.request_geometry(PageId { x: 256, ..page() }, 0).is_err());
-    assert_eq!(c.take_outgoing(256).len(), 256);
+    assert!(c.request_geometry(PageId { x: 512, ..page() }, 0).is_err());
+    queued += c.take_outgoing(256).len();
+    assert_eq!(queued, 512);
 }

@@ -84,3 +84,32 @@ const result=await withBrowser({path:'/water-worker-oracle',width:64,height:64},
 })()`));
 assert.equal(result.length,2);console.log('BROWSER_WATER_WORKERS_OK '+JSON.stringify(result));
 }
+
+{
+const result=await withBrowser({path:'/gi-source-worker-oracle',width:64,height:64},async({evaluate})=>evaluate(`(async()=>{
+ const results=[];
+ for(const transport of ['transfer','shared']) {
+  if(transport==='shared'&&(!crossOriginIsolated||typeof SharedArrayBuffer!=='function'))throw Error('isolated GI SAB unavailable');
+  const worker=new Worker('/workers/jobs.js',{type:'module'});
+  const call=(data,transfer=[])=>new Promise((resolve,reject)=>{let timer=setTimeout(()=>reject(Error('GI source worker deadline')),12000);worker.onmessage=e=>{clearTimeout(timer);resolve(e.data)};worker.onerror=e=>{clearTimeout(timer);reject(Error(e.message))};worker.postMessage(data,transfer)});
+  try {
+   const ready=await call({type:'init',module:location.origin+'/pkg/client_web.js',export:'execute_gi_task'});if(ready.type!=='ready')throw Error(JSON.stringify(ready));
+   const request=new Uint8Array(37919),v=new DataView(request.buffer);let at=0;
+   const u32=n=>{v.setUint32(at,n,true);at+=4},u64=n=>{v.setBigUint64(at,BigInt(n),true);at+=8},f32=n=>{v.setFloat32(at,n,true);at+=4};
+   request.set([67,71,74,49]);at=4;u64(1);for(let i=0;i<4;i++)u32(0);u64(0);for(let i=0;i<14;i++)u64(1);u32(3);for(let i=0;i<3;i++)f32(0);u32(186);for(let i=0;i<186*6;i++)f32(1);for(let i=0;i<256;i++){v.setUint16(at,65535,true);at+=2;}
+   request[at++]=1;const index=8+16*(8+16*8),lights=new Set([index-1,index+1,index-16,index+16,index-256,index+256]);for(let i=0;i<4096;i++)u32(i===index?3:0);for(let i=0;i<4096;i++)u32(lights.has(i)?15<<8:0);for(let i=0;i<6;i++)request[at++]=0;if(at!==request.length)throw Error('GI fixture length '+at);
+   const data=()=>{const payload=transport==='shared'?new SharedArrayBuffer(request.length):new ArrayBuffer(request.length);new Uint8Array(payload).set(request);return {type:'execute',id:'8589934593',transport,payload,control:transport==='shared'?new SharedArrayBuffer(4):undefined,outputLimit:524288}};
+   let task=data(),reply=await call(task,transport==='transfer'?[task.payload]:[]);if(reply.type!=='result'||reply.id!==task.id)throw Error(JSON.stringify(reply));
+   const bytes=new Uint8Array(reply.payload),out=new DataView(reply.payload),reads=Number(out.getBigUint64(92,true)),opaque=Number(out.getBigUint64(100,true)),faces=Number(out.getBigUint64(108,true));
+   if(String.fromCharCode(...bytes.slice(0,4))!=='CGR1'||bytes[124]!==0||bytes[125]!==1||reads!==4102||opaque!==1||faces!==6||bytes.length!==213118)throw Error(JSON.stringify({reads,opaque,faces,responseBytes:bytes.length,status:bytes[124]}));
+   const voxel=out.getUint32(126+index*4,true),surface=126+4096*4+index*48;if(voxel!==0xc0000020)throw Error('GI packed red radiance '+voxel);for(let f=0;f<6;f++)if(out.getUint32(surface+f*8,true)!==0x10ffffff||out.getUint32(surface+f*8+4,true)!==15)throw Error('GI face mismatch '+f);
+   task=data();task.outputLimit=1;const bounded=await call(task,transport==='transfer'?[task.payload]:[]);if(bounded.type!=='error'||!bounded.error.includes('byte limit'))throw Error(JSON.stringify(bounded));
+   task=data();new Uint8Array(task.payload)[0]=0;const invalid=await call(task,transport==='transfer'?[task.payload]:[]);if(invalid.type!=='error'||!invalid.error.includes('Magic'))throw Error(JSON.stringify(invalid));
+   let cancellation=false;if(transport==='shared'){task=data();Atomics.store(new Int32Array(task.control),0,1);const cancelled=await call(task);if(cancelled.type!=='cancelled')throw Error(JSON.stringify(cancelled));cancellation=true;}
+   results.push({transport,requestBytes:request.length,responseBytes:bytes.length,workerReads:reads,opaque,faces,packedRedRadiance:voxel,outputBound:true,invalidMagic:true,cancellation});
+  }finally{worker.terminate()}
+ }
+ return results;
+})()`));
+assert.equal(result.length,2);console.log('BROWSER_GI_SOURCE_WORKERS_OK '+JSON.stringify(result));
+}

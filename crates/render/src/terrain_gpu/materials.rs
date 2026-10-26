@@ -249,6 +249,17 @@ impl TerrainGpu {
         } else {
             source
         };
+        let source = if self.ambient.is_some() {
+            crate::ambient_mrt::terrain(
+                &source,
+                lit,
+                atmosphere,
+                gi,
+                self.local_materials.is_some(),
+            )
+        } else {
+            source
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("prepared terrain optional material variant"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -261,6 +272,7 @@ impl TerrainGpu {
             false,
             false,
             self.sample_count,
+            self.ambient.is_some(),
         );
         self.cutout_pipeline = terrain_pipeline(
             device,
@@ -270,6 +282,7 @@ impl TerrainGpu {
             false,
             false,
             self.sample_count,
+            self.ambient.is_some(),
         );
         self.masked_opaque_pipeline = terrain_pipeline(
             device,
@@ -279,6 +292,7 @@ impl TerrainGpu {
             false,
             true,
             self.sample_count,
+            self.ambient.is_some(),
         );
         self.masked_cutout_pipeline = terrain_pipeline(
             device,
@@ -288,6 +302,7 @@ impl TerrainGpu {
             false,
             true,
             self.sample_count,
+            self.ambient.is_some(),
         );
         if self.config.occlusion {
             self.depth_pipeline = Some(terrain_pipeline(
@@ -298,6 +313,7 @@ impl TerrainGpu {
                 true,
                 false,
                 self.sample_count,
+                self.ambient.is_some(),
             ));
             self.masked_depth_pipeline = Some(terrain_pipeline(
                 device,
@@ -307,6 +323,7 @@ impl TerrainGpu {
                 true,
                 true,
                 self.sample_count,
+                self.ambient.is_some(),
             ));
         }
         self.work.record(telemetry::WorkCounts {

@@ -528,17 +528,10 @@ impl Stage<'_> {
             attempted.push(stack);
             let mut temporary = None;
             if let Some(payload) = payload {
-                let id = payload.id();
-                match self.local.payloads.entry(id) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(payload);
-                        temporary = Some(id);
-                    }
-                    std::collections::btree_map::Entry::Occupied(entry) => {
-                        if entry.get() != &payload {
-                            return Err(MachineError::Encoding);
-                        }
-                    }
+                match self.admit_payload(payload, true)? {
+                    payload_admission::Admission::Full => return Ok(Some(false)),
+                    payload_admission::Admission::Inserted(id) => temporary = Some(id),
+                    payload_admission::Admission::Reused => {}
                 }
             }
             let accepted = self.spawn_packet(
@@ -548,7 +541,7 @@ impl Stage<'_> {
             )?;
             if accepted == 0 {
                 if let Some(id) = temporary {
-                    self.local.payloads.remove(&id);
+                    self.release_payload(id);
                 }
                 continue;
             }

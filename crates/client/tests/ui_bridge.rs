@@ -38,6 +38,73 @@ fn connection() -> Connection {
     network
 }
 #[test]
+fn saturated_network_retains_one_ui_command_without_allocation_or_action_id_loss() {
+    use client::{network::NetworkError, ui_bridge::sender::IntentSender};
+    let mut network = connection();
+    let mut app = UiApp::new().unwrap();
+    let mut sender = IntentSender::default();
+    for x in 0..256 {
+        network
+            .request_summary(core_types::PageId {
+                space: core_types::SpaceId(0),
+                x,
+                y: 0,
+                z: 0,
+            })
+            .unwrap();
+    }
+    assert!(!network.can_queue_action());
+    assert_eq!(
+        sender.send(&mut network, Intent::Chat("/give 9 1".into()), 1),
+        Err(NetworkError::Capacity)
+    );
+    let scope = telemetry::AllocationScope::begin().unwrap();
+    for _ in 0..10_000 {
+        let intent = sender.take(&mut app).expect("blocked command retained");
+        assert_eq!(
+            sender.send(&mut network, intent, 2),
+            Err(NetworkError::Capacity)
+        );
+    }
+    let counts = scope.finish();
+    assert_eq!(counts.allocating_calls(), 0);
+    assert_eq!(counts.dealloc_calls, 0);
+    assert_eq!(network.take_outgoing(256).len(), 256);
+    let intent = sender.take(&mut app).unwrap();
+    assert_eq!(
+        sender.send(&mut network, intent, 3),
+        Ok(Dispatch::Sent(ActionId(1)))
+    );
+    assert!(sender.take(&mut app).is_none());
+    let messages = network.take_outgoing(256);
+    assert_eq!(messages.len(), 1);
+    assert!(
+        matches!(&messages[0], ClientMessage::Action { id: ActionId(1),action: Action::Command(value),.. } if value=="/give 9 1")
+    );
+    // Escape/capture release can pass a blocked world operation. Disconnect
+    // clears the old unsent operation before another authority session starts.
+    for x in 0..256 {
+        network
+            .request_summary(core_types::PageId {
+                space: core_types::SpaceId(0),
+                x,
+                y: 1,
+                z: 0,
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        sender.send(&mut network, Intent::SelectSlot(2), 4),
+        Err(NetworkError::Capacity)
+    );
+    app.open(Screen::Loading);
+    app.key("Escape", true, Modifiers::default());
+    assert_eq!(sender.take(&mut app), Some(Intent::PointerCapture(false)));
+    assert_eq!(sender.take(&mut app), Some(Intent::Disconnect));
+    sender.clear();
+    assert!(sender.take(&mut app).is_none());
+}
+#[test]
 fn menu_and_chat_capture_release_world_keys_and_mouse_settings_are_shared() {
     let mut ui = UiApp::new().unwrap();
     let route = ui_bridge::route_key(&mut ui, "KeyW", true, Modifiers::default());
@@ -129,6 +196,22 @@ fn network_intents_keep_authority_and_unavailable_routes_explicit() {
     assert_eq!(
         ui_bridge::dispatch(&mut network, Intent::ImportPack, 0).unwrap(),
         Dispatch::Local(Intent::ImportPack)
+    );
+    let health_before_respawn = network.player().map(|player| player.health);
+    assert!(matches!(
+        ui_bridge::dispatch(&mut network, Intent::Respawn, 0).unwrap(),
+        Dispatch::Sent(_)
+    ));
+    assert!(network.take_outgoing(10).iter().any(|message| matches!(
+        message,
+        ClientMessage::Action {
+            action: Action::Respawn,
+            ..
+        }
+    )));
+    assert_eq!(
+        network.player().map(|player| player.health),
+        health_before_respawn
     );
     let mut settings = Settings::default();
     settings.set(Setting::Blocks, 25).unwrap();

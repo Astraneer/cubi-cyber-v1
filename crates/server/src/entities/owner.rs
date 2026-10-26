@@ -21,12 +21,25 @@ impl MobRuntime {
         if activity.len() > 1024 || removals.len() > 1024 {
             return Err(EntityError::Capacity);
         }
+        let mut spawns = spawns.into_iter().peekable();
+        if spawns.peek().is_none() && activity.is_empty() && removals.is_empty() {
+            // Ordinary AI/body phases already own their exact patch vector.
+            // Avoid rebuilding large inline Mob before/after records in a tree
+            // just to compose an empty owner extension.
+            delta
+                .patches
+                .sort_unstable_by_key(|p| p.id().expect("validated patch id"));
+            delta
+                .patches
+                .retain(|p| p.before != p.after || p.before_active != p.after_active);
+            return Ok(delta);
+        }
         let mut patches: BTreeMap<_, _> = delta
             .patches
             .into_iter()
             .map(|p| Ok((p.id()?, p)))
             .collect::<Result<_, EntityError>>()?;
-        for (count, (mob, active)) in spawns.into_iter().enumerate() {
+        for (count, (mob, active)) in spawns.enumerate() {
             if count >= 1024 || self.store.get(mob.id).is_some() || patches.contains_key(&mob.id) {
                 return Err(EntityError::DuplicateId);
             }

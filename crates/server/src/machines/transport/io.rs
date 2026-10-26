@@ -272,11 +272,13 @@ impl Stage<'_> {
             nodes: self
                 .budget
                 .route_nodes
-                .saturating_sub(self.work.route_nodes as usize),
+                .saturating_sub(self.work.route_nodes as usize)
+                .min(MAX_ROUTE_NODES),
             candidates: self
                 .budget
                 .endpoints
-                .saturating_sub(self.work.endpoint_queries as usize),
+                .saturating_sub(self.work.endpoint_queries as usize)
+                .min(MAX_ROUTE_CANDIDATES),
         };
         let mut work = RouteWork::default();
         let result = find_route(
@@ -284,7 +286,15 @@ impl Stage<'_> {
         );
         self.work.route_nodes += work.nodes;
         self.work.routes += 1;
-        result
+        if matches!(result, Err(MachineError::Bounds))
+            && (budget.nodes == MAX_ROUTE_NODES && work.nodes >= MAX_ROUTE_NODES as u64
+                || budget.candidates == MAX_ROUTE_CANDIDATES
+                    && work.candidates >= MAX_ROUTE_CANDIDATES as u64)
+        {
+            Err(MachineError::RouteCapacity)
+        } else {
+            result
+        }
     }
     pub(in crate::machines) fn spawn_packet(
         &mut self,

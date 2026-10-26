@@ -14,10 +14,13 @@ impl MachineRuntime {
             config,
             revision: 0,
             next_order: 0,
+            owner: barrier::OwnerBarrier::default(),
             machines: BTreeMap::new(),
             positions: BTreeMap::new(),
             machine_pages: BTreeMap::new(),
             events: BTreeMap::new(),
+            event_ages: BTreeMap::new(),
+            event_bytes: 0,
             keys: BTreeMap::new(),
             grids: BTreeMap::new(),
             network_orders: BTreeMap::new(),
@@ -50,6 +53,7 @@ impl MachineRuntime {
         RuntimeSnapshot {
             revision: self.revision,
             next_order: self.next_order,
+            owner: self.owner.snapshot(),
             transport: self.transport.snapshot(),
             topology_queue: self.topology_queue.snapshot(),
             machines: self.machines.values().copied().collect(),
@@ -100,11 +104,10 @@ impl MachineRuntime {
                 .insert(m.id);
         }
         for &p in &snapshot.events {
-            if runtime.keys.insert(p.event, queue_key(p)).is_some()
-                || runtime.events.insert(queue_key(p), p).is_some()
-            {
+            if runtime.keys.contains_key(&p.event) || runtime.events.contains_key(&queue_key(p)) {
                 return Err(MachineError::Encoding);
             }
+            runtime.insert_pending_indexed(p);
         }
         for (space, grid) in &snapshot.grids {
             if runtime
@@ -187,6 +190,7 @@ impl MachineRuntime {
                 .or_default()
                 .insert(config.position);
         }
+        runtime.owner = barrier::OwnerBarrier::restore(&runtime, &snapshot.owner)?;
         runtime.restore_dirty();
         Ok(runtime)
     }
@@ -211,6 +215,7 @@ impl MachineRuntime {
             configs: Vec::new(),
             transport: None,
             topology_queue: None,
+            owner: self.owner.project().delta(),
         })
     }
     pub fn plan_register(
@@ -346,6 +351,7 @@ impl MachineRuntime {
         Ok(delta)
     }
     pub fn validate_delta(&self, delta: &RuntimeDelta) -> Result<(), MachineError> {
+        self.owner.validate(self, delta)?;
         self.validate_topology_queue(delta)?;
         if let Some(transport) = &delta.transport {
             self.transport.validate(self.config, transport)?;
@@ -518,6 +524,7 @@ impl MachineRuntime {
             self.transport.apply(self.config, transport)?;
         }
         self.acknowledge_topology_queue(delta.topology_queue)?;
+        self.owner.apply(delta.owner);
         self.refresh_dirty(dirty_rechecks);
         for patch in &delta.machines {
             if let Some(before) = patch.before
@@ -547,12 +554,10 @@ impl MachineRuntime {
         }
         for patch in delta.queue {
             if let Some(before) = patch.before {
-                self.events.remove(&queue_key(before));
-                self.keys.remove(&before.event);
+                self.remove_pending_indexed(before.event);
             }
             if let Some(after) = patch.after {
-                self.events.insert(queue_key(after), after);
-                self.keys.insert(after.event, queue_key(after));
+                self.insert_pending_indexed(after);
             }
         }
         for patch in delta.reservoirs {

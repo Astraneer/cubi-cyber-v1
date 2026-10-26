@@ -71,13 +71,14 @@ impl ViewProps {
         };
         let shadows = lighting.map(|lighting| lighting.owner.shadows());
         let mut gpu = if let Some(environment) = environment {
-            BlockModelsGpu::new_with_atmosphere(
+            BlockModelsGpu::new_with_lighting(
                 device,
                 queue,
                 terrain.geometry(),
                 config,
                 shadows,
                 environment.gpu.atmosphere(),
+                environment.gpu.gi(),
             )
         } else {
             BlockModelsGpu::new(device, queue, terrain.geometry(), config, shadows)

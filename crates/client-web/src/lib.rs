@@ -1,10 +1,12 @@
 //! Thin browser surface/input/worker transport. World and camera are shared Rust.
 #![cfg(target_arch = "wasm32")]
+mod browser_gi;
 mod browser_horizon;
 mod browser_network;
 mod browser_props;
 mod browser_water;
 mod generation_worker;
+mod gi_worker;
 mod product_ui;
 mod props_worker;
 mod sky;
@@ -37,7 +39,12 @@ struct BrowserState {
     horizon_workers: Option<browser_horizon::BrowserHorizon>,
     props_workers: Option<browser_props::BrowserProps>,
     water_workers: Option<browser_water::BrowserWater>,
+    gi_workers: Option<browser_gi::BrowserGi>,
     last_ms: f64,
+    pending_cpu_ns: [u64; 2],
+    cpu_continuations: u64,
+    cpu_timer: Option<i32>,
+    cpu_timer_callback: Option<Closure<dyn FnMut()>>,
     resolve: Option<js_sys::Function>,
     reject: Option<js_sys::Function>,
     listeners: Vec<Closure<dyn FnMut(Event)>>,
@@ -63,6 +70,13 @@ struct BrowserState {
     local_materials_layers: usize,
     local_materials_upload_bytes: u64,
 }
+impl Drop for BrowserState {
+    fn drop(&mut self) {
+        if let (Some(window), Some(timer)) = (web_sys::window(), self.cpu_timer.take()) {
+            window.clear_interval_with_handle(timer);
+        }
+    }
+}
 impl BrowserState {
     fn observe_presentations(&mut self) {
         let completion = *self
@@ -73,14 +87,40 @@ impl BrowserState {
     }
     fn stats(&self) -> JsValue {
         let value = stats_object(&self.view);
+        let _ = js_sys::Reflect::set(
+            &value,
+            &"cpuContinuations".into(),
+            &(self.cpu_continuations as f64).into(),
+        );
         let light_pages = self.socket.as_ref().map_or(0, |socket| {
             socket.session().connection().light_replica().len()
         });
+        let receive_counts = self
+            .socket
+            .as_ref()
+            .map_or([0; 2], |socket| socket.receive_counts());
+        for (name, count) in [
+            ("admittedSocketFrames", receive_counts[0]),
+            ("rejectedSocketFrames", receive_counts[1]),
+        ] {
+            let _ = js_sys::Reflect::set(&value, &name.into(), &(count as f64).into());
+        }
         let _ = js_sys::Reflect::set(
             &value,
             &"authoritativeLightPages".into(),
             &(light_pages as f64).into(),
         );
+        let pending = js_sys::Array::new();
+        if let Some(socket) = &self.socket {
+            for binding in socket
+                .session()
+                .pending_light_bindings(&self.view.scene)
+                .take(8)
+            {
+                pending.push(&format!("{binding:?}").into());
+            }
+        }
+        let _ = js_sys::Reflect::set(&value, &"pendingLightBindings".into(), pending.as_ref());
         if let Some(product) = &self.product {
             for (name, item) in [
                 ("uiScreen", format!("{:?}", product.layer.app.screen)),
@@ -197,9 +237,11 @@ impl BrowserState {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.gpu.device, &self.config);
-            self.view
-                .resize(&self.gpu.device, width, height)
-                .map_err(js_error)?;
+            if !self.resetting {
+                self.view
+                    .resize(&self.gpu.device, width, height)
+                    .map_err(js_error)?;
+            }
         }
         Ok(())
     }
@@ -282,19 +324,14 @@ impl BrowserState {
         if let Some(water) = &mut self.water_workers {
             water.pump(&mut self.view)?;
         }
+        if let Some(gi) = &mut self.gi_workers {
+            gi.pump(&mut self.view)?;
+        }
         Ok(())
     }
-    fn draw(&mut self) -> Result<bool, JsValue> {
-        let cpu_start = clock_ms();
-        if let (Some(capture), Some(recorder)) = (&mut self.gpu_capture, &mut self.recorder) {
-            capture.collect(recorder);
-        }
-        self.observe_presentations();
-        let completed_at_edit = u64::from(self.completed_submission.load(Ordering::Acquire));
-        self.resize()?;
-        let now = web_sys::window()
-            .and_then(|w| w.performance())
-            .map_or(self.last_ms, |clock| clock.now());
+    /// Bounded CPU/network/worker progress, with no GPU queue or surface access.
+    fn advance_cpu(&mut self, now: f64) -> Result<(), JsValue> {
+        let started = clock_ms();
         let elapsed = (now - self.last_ms).max(0.0) / 1000.0;
         self.last_ms = now;
         if self.product.is_none()
@@ -319,20 +356,59 @@ impl BrowserState {
                 }
             } else if let Some(product) = &mut self.product {
                 product.sync(socket.session().connection(), &self.view)?;
+                product.sync_quality(&mut self.view, now as u64, false);
             }
         }
         let simulation_end = clock_ms();
-        self.presentation_probe
-            .arm(self.view.edit_revision(), completed_at_edit);
+        self.presentation_probe.arm(
+            self.view.edit_revision(),
+            u64::from(self.completed_submission.load(Ordering::Acquire)),
+        );
         if !self.resetting {
             self.pump()?;
         }
         let jobs_end = clock_ms();
+        let ns = |ms: f64| (ms.max(0.) * 1_000_000.) as u64;
+        self.pending_cpu_ns[0] =
+            self.pending_cpu_ns[0].saturating_add(ns(simulation_end - started));
+        self.pending_cpu_ns[1] =
+            self.pending_cpu_ns[1].saturating_add(ns(jobs_end - simulation_end));
+        Ok(())
+    }
+    fn draw(&mut self) -> Result<bool, JsValue> {
+        let cpu_start = clock_ms();
+        if let (Some(capture), Some(recorder)) = (&mut self.gpu_capture, &mut self.recorder) {
+            capture.collect_with(recorder, |frame, ns, complete| {
+                if let Some(product) = &mut self.product {
+                    product.quality.runtime.complete_gpu(frame, ns, complete);
+                }
+            });
+        }
+        self.observe_presentations();
+        self.resize()?;
+        let now = web_sys::window()
+            .and_then(|w| w.performance())
+            .map_or(self.last_ms, |clock| clock.now());
+        let setup_end = clock_ms();
+        self.advance_cpu(now)?;
+        let jobs_end = clock_ms();
         let can_upload = self.in_flight.load(Ordering::Acquire) < 1;
-        if can_upload {
-            self.view
-                .upload_ready(&self.gpu.queue, &mut UploadBudget::new(2 * 1024 * 1024))
-                .map_err(js_error)?;
+        if can_upload && !self.resetting {
+            let mut upload = UploadBudget::new(2 * 1024 * 1024);
+            if self
+                .product
+                .as_ref()
+                .is_some_and(|product| product.layer.app.uses_cached_background())
+                && self.view.has_cached_present()
+            {
+                self.view
+                    .upload_cached_settings(&self.gpu.queue, &mut upload)
+                    .map_err(js_error)?;
+            } else {
+                self.view
+                    .upload_ready(&self.gpu.queue, &mut upload)
+                    .map_err(js_error)?;
+            }
         }
         let mut ui_changed = false;
         if let Some(product) = &mut self.product {
@@ -377,12 +453,26 @@ impl BrowserState {
         if self.in_flight.load(Ordering::Acquire) >= 1 {
             return Ok(false);
         }
-        let draw_world = self
+        let initial_loading = self
             .product
             .as_ref()
-            .is_none_or(|product| product.layer.app.snapshot.connected);
+            .is_some_and(|product| product.layer.app.screen == ui::app::Screen::Loading)
+            && !self.view.has_cached_present()
+            && !self.view.initial_scene_inputs_ready();
+        let draw_world = !self.resetting
+            && self
+                .product
+                .as_ref()
+                .is_none_or(|product| product.layer.app.snapshot.connected);
+        let cached_background = draw_world
+            && self
+                .product
+                .as_ref()
+                .is_some_and(|product| product.layer.app.uses_cached_background())
+            && self.view.has_cached_present();
         if !(self.ui_pending
             || draw_world
+                && !cached_background
                 && self
                     .view
                     .needs_redraw(self.config.width, self.config.height))
@@ -410,16 +500,25 @@ impl BrowserState {
         if let Some(capture) = &mut self.gpu_capture {
             capture.begin_frame(&mut encoder, self.gpu.queue.get_timestamp_period());
         }
-        if draw_world {
-            self.view
-                .encode(
-                    &self.gpu.queue,
-                    &mut encoder,
-                    &output,
-                    self.config.width,
-                    self.config.height,
-                )
-                .map_err(js_error)?;
+        if initial_loading {
+            self.view.encode_loading_clear(&mut encoder, &output);
+        } else if draw_world {
+            if !(cached_background
+                && self
+                    .view
+                    .encode_cached_present(&mut encoder, &output)
+                    .map_err(js_error)?)
+            {
+                self.view
+                    .encode(
+                        &self.gpu.queue,
+                        &mut encoder,
+                        &output,
+                        self.config.width,
+                        self.config.height,
+                    )
+                    .map_err(js_error)?;
+            }
         } else {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("product menu background"),
@@ -446,7 +545,7 @@ impl BrowserState {
             product.layer.encode(&mut encoder, &output);
         }
         let ticket = self.gpu_capture.as_mut().and_then(|capture| {
-            if draw_world {
+            if draw_world && !initial_loading {
                 self.view
                     .encode_gpu_capture(capture, &mut encoder, u64::from(self.submitted) + 1)
             } else {
@@ -470,20 +569,26 @@ impl BrowserState {
             .ok_or("frame sequence exhausted")?;
         let submitted = self.submitted;
         self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let pending_cpu_ns = std::mem::take(&mut self.pending_cpu_ns);
         if let Some(recorder) = &mut self.recorder {
             let finished = clock_ms();
             let work = self.view.take_frame_work();
             let stats = self.view.stats();
             let ns = |ms: f64| (ms.max(0.0) * 1_000_000.0) as u64;
-            let _ = recorder.record_frame(telemetry::flight::Sample {
+            let sample = telemetry::flight::Sample {
                 frame: u64::from(self.submitted),
                 monotonic_ns: ns(finished),
                 interval_ns: ns(finished - self.last_present_ms),
-                cpu_ns: Some(ns(finished - cpu_start)),
+                cpu_ns: Some(
+                    pending_cpu_ns[0]
+                        .saturating_add(pending_cpu_ns[1])
+                        .saturating_add(ns(setup_end - cpu_start))
+                        .saturating_add(ns(finished - jobs_end)),
+                ),
                 cpu_stages_ns: [
                     None,
-                    Some(ns(simulation_end - cpu_start)),
-                    Some(ns(jobs_end - simulation_end)),
+                    Some(pending_cpu_ns[0]),
+                    Some(pending_cpu_ns[1]),
                     None,
                     Some(ns(upload_end - jobs_end)),
                     Some(ns(encode_end - upload_end)),
@@ -494,7 +599,11 @@ impl BrowserState {
                 queued_jobs: stats.queued_jobs as u32,
                 in_flight: self.in_flight.load(Ordering::Acquire) as u8,
                 ..Default::default()
-            });
+            };
+            if let Some(product) = &mut self.product {
+                product.quality.runtime.record_present(&sample);
+            }
+            let _ = recorder.record_frame(sample);
             self.last_present_ms = finished;
         }
         let in_flight = self.in_flight.clone();
@@ -560,6 +669,9 @@ impl BrowserState {
         }
     }
     fn fail(&mut self, error: JsValue) {
+        if let (Some(window), Some(timer)) = (web_sys::window(), self.cpu_timer.take()) {
+            window.clear_interval_with_handle(timer);
+        }
         web_sys::console::error_1(&error);
         if let Some(document) = web_sys::window().and_then(|window| window.document()) {
             let _ = document
@@ -599,9 +711,12 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                 let mut state = state.borrow_mut();
                 state.connection_epoch = state.connection_epoch.wrapping_add(1);
                 state.socket = None;
-                let fresh = state.view.authoritative_remote()
+                let fresh = !state.resetting
+                    && state.view.environment_stats().is_some()
+                    && state.view.authoritative_remote()
                     && state.view.scene.world().version().0 == 0
-                    && state.running.is_empty();
+                    && state.running.is_empty()
+                    && state.view.settings_application().reload_required == 0;
                 state.resetting = !fresh;
                 (fresh, state.connection_epoch)
             };
@@ -615,7 +730,7 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                     animation_frame().await?;
                     animation_frame().await?;
                     let state = weak.upgrade().ok_or("view released")?;
-                    let (device, queue, format, width, height) = {
+                    let (device, queue, format, width, height, settings) = {
                         let state = state.borrow();
                         (
                             state.gpu.device.clone(),
@@ -623,10 +738,83 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                             state.config.format,
                             state.config.width,
                             state.config.height,
+                            state
+                                .product
+                                .as_ref()
+                                .map(|product| product.settings_target().clone())
+                                .unwrap_or_default(),
                         )
                     };
                     let atlas = AtlasImage::donor().map_err(js_error)?;
-                    let renderer = TerrainGpu::new(
+                    // A real tiny renderer keeps the Loading UI APIs valid while
+                    // the heavy old world is dropped. It is never played/drawn.
+                    let placeholder_renderer = TerrainGpu::new_with_samples(
+                        &device,
+                        &queue,
+                        format,
+                        1,
+                        1,
+                        render::OutputTransfer::ShaderSrgb,
+                        render::terrain_gpu::GpuConfig {
+                            max_pages: 32,
+                            max_quads: 64,
+                            occlusion: false,
+                        },
+                        &atlas,
+                        1,
+                    )
+                    .map_err(js_error)?;
+                    let mut placeholder_config = client::remote::RemoteSession::scene_config();
+                    placeholder_config.horizontal_radius = 0;
+                    placeholder_config.vertical_radius = 0;
+                    // CompactUnit reserves a full page of raster descriptors.
+                    // This empty Loading owner draws no world and retains only
+                    //64 quads until the selected production View is installed.
+                    let placeholder = ClientView::new_with_rasterization(
+                        placeholder_renderer,
+                        placeholder_config,
+                        client::view::NearRasterization::LegacyGreedy,
+                    )
+                    .map_err(js_error)?;
+                    {
+                        let mut borrowed = state.borrow_mut();
+                        if borrowed.connection_epoch != epoch {
+                            return Ok::<_, JsValue>(());
+                        }
+                        {
+                            let BrowserState {
+                                running, workers, ..
+                            } = &mut *borrowed;
+                            for (&id, cancel) in running.iter() {
+                                cancel.cancel();
+                                let _ = workers.cancel(id);
+                            }
+                            running.clear();
+                        }
+                        borrowed.horizon_workers = None;
+                        borrowed.props_workers = None;
+                        borrowed.water_workers = None;
+                        borrowed.gi_workers = None;
+                        borrowed.view = placeholder;
+                        borrowed.local_materials_revision = 0;
+                        borrowed.local_materials_resolution = 0;
+                        borrowed.local_materials_layers = 0;
+                        borrowed.local_materials_upload_bytes = 0;
+                    }
+                    // No heavy replacement allocation overlaps queued references
+                    // to old targets. Waiting yields; CPU/UI remain responsive.
+                    let retired = Arc::new(AtomicU32::new(0));
+                    let completion = retired.clone();
+                    queue.on_submitted_work_done(move || {
+                        completion.store(1, Ordering::Release);
+                    });
+                    while retired.load(Ordering::Acquire) == 0 {
+                        animation_frame().await?;
+                    }
+                    if state.borrow().connection_epoch != epoch {
+                        return Ok::<_, JsValue>(());
+                    }
+                    let renderer = TerrainGpu::new_with_samples(
                         &device,
                         &queue,
                         format,
@@ -635,13 +823,16 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                         render::OutputTransfer::ShaderSrgb,
                         client::view::terrain_gpu_config(),
                         &atlas,
+                        settings.get(ui::settings::Setting::Msaa) as u32,
                     )
                     .map_err(js_error)?;
                     let mut view =
                         ClientView::new(renderer, client::remote::RemoteSession::scene_config())
                             .map_err(js_error)?;
                     animation_frame().await?;
-                    prepare_product_world(&mut view, &device, &queue, width, height, &atlas)?;
+                    prepare_product_world(
+                        &mut view, &device, &queue, width, height, &atlas, &settings,
+                    )?;
                     prepare_material_variant(&mut view, &device, &queue, &atlas)?;
                     let materials = audio::browser::with_local_resources(|local| {
                         client::local_materials::prepare(local, Default::default())
@@ -664,10 +855,17 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                         .water_stats()
                         .map(|_| browser_water::BrowserWater::new(&worker, &module))
                         .transpose()?;
+                    let gi_workers = if view.gi_prepared() {
+                        Some(browser_gi::BrowserGi::new(&worker, &module)?)
+                    } else {
+                        None
+                    };
                     let mut borrowed = state.borrow_mut();
                     if borrowed.connection_epoch != epoch {
                         return Ok::<_, JsValue>(());
                     }
+                    view.resize(&device, borrowed.config.width, borrowed.config.height)
+                        .map_err(js_error)?;
                     borrowed.view = view;
                     if let Some(recorder) = &mut borrowed.recorder {
                         recorder
@@ -685,6 +883,7 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                     borrowed.horizon_workers = Some(horizon_workers);
                     borrowed.props_workers = Some(props_workers);
                     borrowed.water_workers = water_workers;
+                    borrowed.gi_workers = gi_workers;
                     borrowed.running.clear();
                     borrowed.resetting = false;
                     drop(borrowed);
@@ -738,11 +937,15 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                 }
                 if let Some(state) = weak.upgrade() {
                     let mut state = state.borrow_mut();
-                    let colors_ok = match materials {
-                        Ok(materials) => {
-                            apply_local_materials(&mut state, materials, revision).is_ok()
+                    let colors_ok = if state.resetting {
+                        true
+                    } else {
+                        match materials {
+                            Ok(materials) => {
+                                apply_local_materials(&mut state, materials, revision).is_ok()
+                            }
+                            Err(_) => false,
                         }
-                        Err(_) => false,
                     };
                     let Some(product) = &mut state.product else {
                         return;
@@ -765,15 +968,15 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
         product_ui::Command::BugReport => {
             let state = state.borrow();
             if let Some(recorder) = &state.recorder {
-                let seed = state
-                    .socket
+                let session = state.socket.as_ref().map(|socket| socket.session());
+                let seed = session
                     .as_ref()
-                    .and_then(|socket| socket.session().connection().welcome())
+                    .and_then(|session| session.connection().welcome())
                     .map_or(0, |welcome| u64::from(welcome.public_seed));
                 let mut report = recorder.export_json("webgpu", seed, 0, 0);
-                let movement = state.socket.as_ref().map_or_else(
+                let movement = session.as_ref().map_or_else(
                     || state.view.movement_replay(),
-                    |socket| socket.session().connection().movement_replay(),
+                    |session| session.connection().movement_replay(),
                 );
                 let movement_result = movement.append_json(&mut report);
                 report.pop();
@@ -831,6 +1034,10 @@ fn apply_local_materials(
             .renderer_mut()
             .replace_material_pack(&state.gpu.device, &state.gpu.queue, gpu, layers > 0)
             .map_err(|_| render::material_pack::MaterialError::Target)?;
+        state
+            .view
+            .replace_material_albedo(materials.atlas())
+            .map_err(|_| render::material_pack::MaterialError::Target)?;
         (actual_resolution, uploaded)
     } else {
         (0, 0)
@@ -849,15 +1056,22 @@ fn prepare_product_world(
     width: u32,
     height: u32,
     atlas: &AtlasImage,
+    settings: &ui::settings::Settings,
 ) -> Result<(), JsValue> {
+    view.apply_settings(settings);
     view.prepare_lighting(
         device,
         queue,
         client::lighting::ClientLightingConfig {
             source: client::lighting::LightSource::Authoritative,
             shadows: render::shadows::ShadowConfig {
-                resolution: 2048,
+                resolution: settings.get(ui::settings::Setting::ShadowResolution) as u32,
+                enabled: settings.get(ui::settings::Setting::Shadows) != 0,
+                active_cascades: settings.get(ui::settings::Setting::Cascades) as u32,
                 dynamic_casters: true,
+                sun_step_radians: 1e-6,
+                max_updates_per_frame: 3,
+                projected_bounds: true,
                 ..Default::default()
             },
             ..Default::default()
@@ -870,15 +1084,30 @@ fn prepare_product_world(
         width,
         height,
         render::OutputTransfer::ShaderSrgb,
-        client::view::EnvironmentProfile::default(),
+        client::view::EnvironmentProfile::product()
+            .with_quality(
+                settings.get(ui::settings::Setting::Clouds) as u8,
+                settings.get(ui::settings::Setting::Gi) as u8,
+            )
+            .and_then(|profile| {
+                profile.with_reflections(settings.get(ui::settings::Setting::Reflections) as u8)
+            })
+            .and_then(|profile| {
+                profile.with_contact_ao(settings.get(ui::settings::Setting::Ssao) as u8)
+            })
+            .map_err(js_error)?,
         atlas,
     )
     .map_err(js_error)?;
+    view.prepare_water(Default::default()).map_err(js_error)?;
     view.prepare_entities(device, queue).map_err(js_error)?;
     view.prepare_props(device, queue, Default::default())
         .map_err(js_error)?;
     view.prepare_horizon(device, queue, client::view::horizon::Config::default())
         .map_err(js_error)?;
+    view.prepare_far_water(Default::default())
+        .map_err(js_error)?;
+    view.apply_settings(settings);
     Ok(())
 }
 
@@ -917,6 +1146,32 @@ fn connect_socket(state: &Rc<RefCell<BrowserState>>, address: String, name: Stri
 fn stats_object(view: &ClientView) -> JsValue {
     let stats = view.stats();
     let value = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &value,
+        &"exposureGain".into(),
+        &view
+            .exposure_compensation()
+            .map_or(JsValue::NULL, |gain| gain.into()),
+    );
+    if let Some(clock) = view.sun_clock() {
+        for (name, number) in [
+            ("timeOfDay", clock.time_of_day),
+            ("sunY", f64::from(clock.sun_direction[1])),
+            ("moonPhase", f64::from(clock.moon_phase)),
+        ] {
+            let _ = js_sys::Reflect::set(&value, &name.into(), &number.into());
+        }
+        let _ = js_sys::Reflect::set(
+            &value,
+            &"publicClockTick".into(),
+            &clock.public_tick.0.to_string().into(),
+        );
+    }
+    let _ = js_sys::Reflect::set(
+        &value,
+        &"sunClockKnown".into(),
+        &view.sun_clock().is_some().into(),
+    );
     let horizon = view.horizon_stats().unwrap_or_default();
     let props = view.props_stats().unwrap_or_default();
     let jobs = view.horizon_job_stats().unwrap_or_default();
@@ -1052,6 +1307,9 @@ fn stats_object(view: &ClientView) -> JsValue {
         let _ = js_sys::Reflect::set(&value, &name.into(), &flag.into());
     }
     for (name, number) in [
+        ("renderScale", f64::from(view.render_scale())),
+        ("renderWidth", f64::from(view.render_extent()[0])),
+        ("renderHeight", f64::from(view.render_extent()[1])),
         ("residentPages", stats.resident_pages as f64),
         ("residentQuads", stats.resident_quads as f64),
         ("terrainFrames", stats.terrain_frames as f64),
@@ -1092,7 +1350,7 @@ fn stats_object(view: &ClientView) -> JsValue {
             "framePipelineCompilations",
             stats.frame_pipeline_compilations as f64,
         ),
-        ("sampleCount", f64::from(render::MSAA_SAMPLES)),
+        ("sampleCount", f64::from(view.render_sample_count())),
     ] {
         let _ = js_sys::Reflect::set(&value, &name.into(), &number.into());
     }
@@ -1102,6 +1360,7 @@ fn stats_object(view: &ClientView) -> JsValue {
         ("playerSpawned", stats.player_spawned),
         ("selfModelRendered", stats.self_model_rendered),
         ("fullMeshReady", stats.full_mesh_ready),
+        ("initialSceneInputsReady", view.initial_scene_inputs_ready()),
         ("flying", stats.flying),
         ("noclip", stats.noclip),
         ("onGround", stats.on_ground),
@@ -1110,6 +1369,11 @@ fn stats_object(view: &ClientView) -> JsValue {
     ] {
         let _ = js_sys::Reflect::set(&value, &name.into(), &flag.into());
     }
+    let extent = js_sys::Array::new();
+    for dimension in view.render_extent() {
+        extent.push(&dimension.into());
+    }
+    let _ = js_sys::Reflect::set(&value, &"renderExtent".into(), &extent);
     let position = js_sys::Array::new();
     for coordinate in stats.player_pos {
         position.push(&coordinate.into());
@@ -1367,15 +1631,13 @@ fn install_input(state: &Rc<RefCell<BrowserState>>) -> Result<(), JsValue> {
             if !locked {
                 state.borrow().canvas.request_pointer_lock();
                 state.borrow_mut().view.activate_player();
+            } else if event.button() == 2 {
+                state
+                    .borrow_mut()
+                    .view
+                    .set_place_key(true, event.shift_key());
             } else {
-                state.borrow_mut().view.set_key(
-                    if event.button() == 2 {
-                        InputKey::Place
-                    } else {
-                        InputKey::Attack
-                    },
-                    true,
-                );
+                state.borrow_mut().view.set_key(InputKey::Attack, true);
             }
         }
     })?;
@@ -1439,6 +1701,35 @@ async fn animation_frame() -> Result<(), JsValue> {
         }
     });
     JsFuture::from(promise).await.map(|_| ())
+}
+fn install_cpu_continuation(state: &Rc<RefCell<BrowserState>>) -> Result<(), JsValue> {
+    let weak = Rc::downgrade(state);
+    let callback = Closure::wrap(Box::new(move || {
+        let Some(owner) = weak.upgrade() else {
+            return;
+        };
+        {
+            let mut state = owner.borrow_mut();
+            if state.resetting || state.socket.is_none() || clock_ms() - state.last_ms < 8. {
+                return;
+            }
+            state.cpu_continuations = state.cpu_continuations.saturating_add(1);
+            if let Err(error) = state.advance_cpu(clock_ms()) {
+                state.fail(error);
+            }
+        }
+        process_product_commands(&owner);
+    }) as Box<dyn FnMut()>);
+    let timer = web_sys::window()
+        .ok_or("window unavailable")?
+        .set_interval_with_callback_and_timeout_and_arguments_0(
+            callback.as_ref().unchecked_ref(),
+            16,
+        )?;
+    let mut state = state.borrow_mut();
+    state.cpu_timer = Some(timer);
+    state.cpu_timer_callback = Some(callback);
+    Ok(())
 }
 fn animate(state: Rc<RefCell<BrowserState>>) -> Result<(), JsValue> {
     let callback: AnimationCallback = Rc::new(RefCell::new(None));
@@ -1551,9 +1842,17 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
     };
     if let Some(product) = &mut product {
         animation_frame().await?;
-        prepare_product_world(&mut view, &gpu.device, &gpu.queue, width, height, &atlas)?;
+        prepare_product_world(
+            &mut view,
+            &gpu.device,
+            &gpu.queue,
+            width,
+            height,
+            &atlas,
+            product.settings_target(),
+        )?;
         prepare_material_variant(&mut view, &gpu.device, &gpu.queue, &atlas)?;
-        let applied = view.apply_settings(&product.layer.app.settings);
+        let applied = view.apply_settings(product.settings_target());
         product
             .layer
             .app
@@ -1621,6 +1920,11 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
         .water_stats()
         .map(|_| browser_water::BrowserWater::new(&worker_url, &module_url))
         .transpose()?;
+    let gi_workers = if view.gi_prepared() {
+        Some(browser_gi::BrowserGi::new(&worker_url, &module_url)?)
+    } else {
+        None
+    };
     let mut resolve_fn = None;
     let mut reject_fn = None;
     let ready = js_sys::Promise::new(&mut |resolve, reject| {
@@ -1638,7 +1942,12 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
         horizon_workers,
         props_workers,
         water_workers,
+        gi_workers,
         last_ms: window.performance().map_or(0.0, |p| p.now()),
+        pending_cpu_ns: [0; 2],
+        cpu_continuations: 0,
+        cpu_timer: None,
+        cpu_timer_callback: None,
         resolve: resolve_fn,
         reject: reject_fn,
         listeners: Vec::new(),
@@ -1668,6 +1977,9 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
     }));
     ACTIVE_VIEW.with(|active| *active.borrow_mut() = Some(Rc::downgrade(&state)));
     install_input(&state)?;
+    if !diagnostic {
+        install_cpu_continuation(&state)?;
+    }
     animate(state)?;
     JsFuture::from(ready).await
 }

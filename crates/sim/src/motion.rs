@@ -885,10 +885,6 @@ impl Motion {
     }
 
     pub(crate) fn look(&self) -> [f64; 3] {
-        let f = (self.pitch * (std::f32::consts::PI / 180.0)) as f64;
-        let g = (-self.yaw * (std::f32::consts::PI / 180.0)) as f64;
-        let (h, i) = (libm::cos(g), libm::sin(g));
-        let (j, k) = (libm::cos(f), libm::sin(f));
-        [i * j, -k, h * j]
+        crate::look_direction(self.yaw, self.pitch)
     }
 }

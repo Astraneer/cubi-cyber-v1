@@ -2,9 +2,11 @@
 //! bounded net frames here; only confirmed, sanitized pages enter its world view.
 //! Rendering integration consumes `take_page_updates` at the scene owner boundary.
 pub mod audio;
+pub mod audio_cues;
 pub mod entities;
 pub mod machine_packets;
 pub mod presence;
+pub mod water;
 pub mod window;
 use core_types::{BlockPos, Cell, PageId, SpaceId, SpaceTransform, Tick, Version};
 use net::{
@@ -28,6 +30,9 @@ pub struct NetworkConfig {
     pub maximum_pages: usize,
     pub near_radius: u16,
     pub retain_radius: u16,
+    /// Optional vertical bounds. None preserves the original cubic interest.
+    pub near_vertical_radius: Option<u16>,
+    pub retain_vertical_radius: Option<u16>,
     pub input_lead_ticks: u64,
     pub simulation_steps_per_poll: u16,
 }
@@ -37,12 +42,44 @@ impl Default for NetworkConfig {
             maximum_pages: 64,
             near_radius: 1,
             retain_radius: 2,
+            near_vertical_radius: None,
+            retain_vertical_radius: None,
             input_lead_ticks: 6,
             simulation_steps_per_poll: 32,
         }
     }
 }
 impl NetworkConfig {
+    pub fn interest_radii(self, retained: bool) -> [u16; 3] {
+        let horizontal = if retained {
+            self.retain_radius
+        } else {
+            self.near_radius
+        };
+        let vertical = if retained {
+            self.retain_vertical_radius
+        } else {
+            self.near_vertical_radius
+        }
+        .unwrap_or(horizontal);
+        [horizontal, vertical, horizontal]
+    }
+    pub fn requested_pages(self) -> usize {
+        self.interest_radii(false)
+            .into_iter()
+            .map(|radius| 2 * usize::from(radius) + 1)
+            .fold(1, usize::saturating_mul)
+    }
+    pub(crate) fn contains(self, center: PageId, page: PageId, retained: bool) -> bool {
+        center.space == page.space
+            && [center.x, center.y, center.z]
+                .into_iter()
+                .zip([page.x, page.y, page.z])
+                .zip(self.interest_radii(retained))
+                .all(|((center, page), radius)| {
+                    (i64::from(center) - i64::from(page)).abs() <= i64::from(radius)
+                })
+    }
     /// 3³ visible pages plus the one-page meshing halo require5³ confirmed pages.
     pub fn remote_scene() -> Self {
         Self {
@@ -144,6 +181,7 @@ pub struct Connection {
     remote_tick: Tick,
     inventory: Option<rules::survival::Inventory>,
     item_attributes: Option<net::item_attributes::InventoryAttributes>,
+    audio_cues: Box<audio_cues::AudioCues>,
     presence: presence::PresenceCache,
     window: window::WindowCache,
     entities: entities::EntityReplica,
@@ -157,6 +195,7 @@ pub struct Connection {
     height_interest: BTreeMap<net::height::HeightKey, (Option<u64>, u64, bool)>,
     height_exact: BTreeSet<net::height::HeightKey>,
     height_updates: VecDeque<Box<net::height::HeightTile>>,
+    water: water::WaterState,
     lights: net::light::Replica,
     light_updates: VecDeque<net::light::Update>,
     props: BTreeMap<PageId, std::sync::Arc<net::props::Frame>>,
@@ -169,14 +208,17 @@ impl Connection {
     pub fn new(config: NetworkConfig) -> Result<Self, NetworkError> {
         if config.maximum_pages == 0
             || config.maximum_pages > 256
-            || config.near_radius > 2
+            || config.near_radius > 3
             || config.retain_radius < config.near_radius
             || config.retain_radius > 4
+            || config.interest_radii(false)[1] > 3
+            || config.interest_radii(false)[1] > config.interest_radii(true)[1]
+            || config.interest_radii(true)[1] > 4
             || config.input_lead_ticks == 0
             || config.input_lead_ticks > 32
             || config.simulation_steps_per_poll == 0
             || config.simulation_steps_per_poll > 64
-            || (2 * usize::from(config.near_radius) + 1).pow(3) > config.maximum_pages
+            || config.requested_pages() > config.maximum_pages
         {
             return Err(NetworkError::Capacity);
         }
@@ -221,6 +263,7 @@ impl Connection {
             remote_tick: Tick(0),
             inventory: None,
             item_attributes: None,
+            audio_cues: Box::new(audio_cues::AudioCues::default()),
             presence: presence::PresenceCache::new(),
             window: window::WindowCache::default(),
             entities: entities::EntityReplica::new(net::entities::MAX_ENTITIES)
@@ -235,6 +278,7 @@ impl Connection {
             height_interest: BTreeMap::new(),
             height_exact: BTreeSet::new(),
             height_updates: VecDeque::new(),
+            water: water::WaterState::default(),
             lights: net::light::Replica::new(config.maximum_pages)
                 .map_err(|_| NetworkError::Capacity)?,
             light_updates: VecDeque::new(),
@@ -350,6 +394,9 @@ impl Connection {
                 .is_some_and(|i| i.revision() == a.inventory_revision)
         })
     }
+    pub fn audio_cues(&self) -> &audio_cues::AudioCues {
+        &self.audio_cues
+    }
     pub fn predicted_inventory(&self) -> Option<rules::survival::Inventory> {
         let mut inventory = self.inventory?;
         let creative = self
@@ -430,7 +477,9 @@ impl Connection {
             return self.request_height_exact(key, now_ms);
         }
         key.validate().map_err(|_| NetworkError::Protocol)?;
-        if !self.height_interest.contains_key(&key) && self.height_interest.len() >= 512 {
+        if !self.height_interest.contains_key(&key)
+            && self.height_interest.len() >= net::height::MAX_TILES
+        {
             return Err(NetworkError::Capacity);
         }
         let known = self.height_interest.get(&key).and_then(|i| i.0);
@@ -450,7 +499,9 @@ impl Connection {
         if key.level != 0 {
             return Err(NetworkError::Protocol);
         }
-        if !self.height_interest.contains_key(&key) && self.height_interest.len() >= 512 {
+        if !self.height_interest.contains_key(&key)
+            && self.height_interest.len() >= net::height::MAX_TILES
+        {
             return Err(NetworkError::Capacity);
         }
         // Representation promotion keeps the source stamp, so a source-only
@@ -635,10 +686,18 @@ impl Connection {
         // ACKs describe retained public state, so a newer ACK supersedes an
         // unsent older one. A slow render/loading frame never builds an ACK log.
         let same = |old: &ClientMessage| match (old, &message) {
+            (
+                ClientMessage::Action { id: a, .. } | ClientMessage::AimedAction { id: a, .. },
+                ClientMessage::Action { id: b, .. } | ClientMessage::AimedAction { id: b, .. },
+            ) => a == b,
             (ClientMessage::AckPage { page: a, .. }, ClientMessage::AckPage { page: b, .. }) => {
                 a == b
             }
             (ClientMessage::RequestLight(a), ClientMessage::RequestLight(b)) => a.page == b.page,
+            (ClientMessage::RequestWater(a), ClientMessage::RequestWater(b)) => a.page == b.page,
+            (ClientMessage::RequestWater(a), ClientMessage::ForgetWater(b)) => a.page == *b,
+            (ClientMessage::ForgetWater(a), ClientMessage::RequestWater(b)) => *a == b.page,
+            (ClientMessage::ForgetWater(a), ClientMessage::ForgetWater(b)) => a == b,
             (ClientMessage::MachinePackets(a), ClientMessage::MachinePackets(b)) => {
                 a.page() == b.page()
             }
@@ -657,6 +716,14 @@ impl Connection {
         };
         if let Some(old) = self.outbox.iter_mut().find(|old| same(old)) {
             let replace = match (&*old, &message) {
+                (
+                    ClientMessage::Entities(net::entities::EntityRequest::Full { .. }),
+                    ClientMessage::Entities(net::entities::EntityRequest::Ack { .. }),
+                ) => false,
+                (
+                    ClientMessage::Entities(net::entities::EntityRequest::Ack { revision: a }),
+                    ClientMessage::Entities(net::entities::EntityRequest::Ack { revision: b }),
+                ) => b >= a,
                 (ClientMessage::RequestExactHeight { .. }, ClientMessage::RequestHeight { .. }) => {
                     false
                 }
@@ -679,6 +746,20 @@ impl Connection {
                 }
                 (ClientMessage::RequestLight(a), ClientMessage::RequestLight(b)) => {
                     b.cell_view >= a.cell_view
+                }
+                (ClientMessage::RequestWater(a), ClientMessage::RequestWater(b)) => {
+                    if a.geometry_source == b.geometry_source
+                        && a.geometry_view == b.geometry_view
+                        && a.column_source == b.column_source
+                    {
+                        match (a.acknowledged, b.acknowledged) {
+                            (None, Some(_)) => false,
+                            (Some(a), Some(b)) => b >= a,
+                            _ => true,
+                        }
+                    } else {
+                        b.geometry_view >= a.geometry_view && b.column_source >= a.column_source
+                    }
                 }
                 _ => true,
             };
@@ -738,6 +819,11 @@ impl Connection {
     pub fn receive(&mut self, message: ServerMessage, now_ms: u64) -> Result<(), NetworkError> {
         self.note_replay_time(now_ms);
         match message {
+            ServerMessage::AudioCue(cue) => {
+                self.audio_cues
+                    .push(cue)
+                    .map_err(|_| NetworkError::Protocol)?;
+            }
             ServerMessage::ItemAttributes(attributes) => {
                 attributes.validate().map_err(|_| NetworkError::Protocol)?;
                 if self
@@ -795,6 +881,7 @@ impl Connection {
                 self.visual_tick = welcome.tick;
                 self.visual_received_at = now_ms;
                 self.presence.reset(welcome.identity);
+                *self.audio_cues = audio_cues::AudioCues::default();
                 self.welcome = Some(welcome);
                 self.handshake = None;
             }
@@ -951,6 +1038,11 @@ impl Connection {
             ServerMessage::Action(reply) => {
                 self.overlay.reply(reply);
                 self.overlay.retire_applied(&self.replica);
+                // An authoritative terminal reply makes every unsent retry
+                // redundant. Retire only this ID; other actions keep FIFO order.
+                if !matches!(reply.status, ActionStatus::Pending) {
+                    self.outbox.retain(|message| !matches!(message,ClientMessage::Action{id,..}|ClientMessage::AimedAction{id,..} if *id==reply.id));
+                }
                 match reply.status {
                     ActionStatus::Pending => {}
                     ActionStatus::Accepted => {
@@ -1172,7 +1264,7 @@ impl Connection {
                 if let Some(interest) = self.height_interest.get_mut(&tile.key)
                     && interest.0.is_none_or(|old| tile.source >= old)
                 {
-                    if self.height_updates.len() >= 512
+                    if self.height_updates.len() >= net::height::MAX_TILES
                         && !self.height_updates.iter().any(|t| t.key == tile.key)
                     {
                         return Err(NetworkError::Capacity);
@@ -1193,6 +1285,8 @@ impl Connection {
                     interest.2 = false;
                 }
             }
+            ServerMessage::WaterHalo(halo) => self.receive_water(halo, now_ms)?,
+            ServerMessage::WaterUnavailable(page) => self.water_unavailable(page, now_ms),
             ServerMessage::MachinePackets(frame) => {
                 let page = frame.page;
                 if !self.interest.contains_key(&page) {
@@ -1270,6 +1364,14 @@ impl Connection {
                     .map_err(|_| NetworkError::Protocol)?;
             }
             ServerMessage::Entities(frame) => {
+                if self.outbox.len() == MAX_OUTBOX
+                    && !self
+                        .outbox
+                        .iter()
+                        .any(|m| matches!(m, ClientMessage::Entities(_)))
+                {
+                    return Err(NetworkError::Capacity);
+                }
                 let request = match self
                     .entities
                     .apply(*frame)
@@ -1518,6 +1620,83 @@ impl Connection {
             now_ms,
         )
     }
+    pub fn interact_entity(
+        &mut self,
+        target: u64,
+        use_entity: bool,
+        now_ms: u64,
+        yaw: f32,
+        pitch: f32,
+    ) -> Result<ActionId, NetworkError> {
+        let inventory = self
+            .predicted_inventory()
+            .ok_or(NetworkError::NotConnected)?;
+        let held = inventory.hand();
+        let inventory = net::InventoryGuard {
+            revision: inventory.revision(),
+            selected: inventory.selected() as u8,
+            item: held.item(),
+            count: held.count(),
+            damage: held.damage(),
+            payload: held.payload().map_or(0, |id| id.0),
+        };
+        let action = if use_entity {
+            Action::UseEntity { target, inventory }
+        } else {
+            Action::AttackEntity { target, inventory }
+        };
+        self.aimed_action(action, false, now_ms, yaw, pitch)
+    }
+    pub fn use_block_tool(
+        &mut self,
+        hit: sim::BlockHit,
+        sneaking: bool,
+        now_ms: u64,
+        aim: [f32; 2],
+    ) -> Result<ActionId, NetworkError> {
+        let inventory = self
+            .predicted_inventory()
+            .ok_or(NetworkError::NotConnected)?;
+        let held = inventory.hand();
+        let space = self
+            .welcome
+            .as_ref()
+            .ok_or(NetworkError::NotConnected)?
+            .player
+            .space;
+        self.aimed_action(
+            Action::UseBlockTool {
+                position: BlockPos {
+                    space,
+                    x: hit.cell[0],
+                    y: hit.cell[1],
+                    z: hit.cell[2],
+                },
+                expected: hit.block,
+                sneaking,
+                inventory: net::InventoryGuard {
+                    revision: inventory.revision(),
+                    selected: inventory.selected() as u8,
+                    item: held.item(),
+                    count: held.count(),
+                    damage: held.damage(),
+                    payload: held.payload().map_or(0, |id| id.0),
+                },
+            },
+            false,
+            now_ms,
+            aim[0],
+            aim[1],
+        )
+    }
+    /// Read-only admission for a retained UI intent. The action itself still
+    /// validates and reserves the same queues atomically when it is enqueued.
+    pub fn can_queue_action(&self) -> bool {
+        self.welcome.is_some()
+            && self.actions.len() < MAX_ACTIONS
+            && self.outbox.len() < MAX_OUTBOX
+            && self.next_action < u64::MAX
+    }
     pub fn action_pending(&self, id: ActionId) -> bool {
         self.actions.contains_key(&id)
     }
@@ -1605,6 +1784,7 @@ impl Connection {
         Ok(id)
     }
     pub fn poll(&mut self, now_ms: u64) -> Result<(), NetworkError> {
+        self.poll_water(now_ms)?;
         self.note_replay_time(now_ms);
         if let Some(hello) = &self.handshake
             && now_ms.saturating_sub(self.last_hello) >= 250
@@ -1687,15 +1867,7 @@ impl Connection {
         let evict: Vec<_> = self
             .interest
             .keys()
-            .filter(|page| {
-                !net::aoi_contains(
-                    center,
-                    **page,
-                    self.config.near_radius,
-                    self.config.retain_radius,
-                    true,
-                )
-            })
+            .filter(|page| !self.config.contains(center, **page, true))
             .copied()
             .collect();
         let removals = evict
@@ -1715,11 +1887,11 @@ impl Connection {
             }
             self.counters.evicted_pages += 1;
         }
-        let r = i32::from(self.config.near_radius);
+        let [horizontal, vertical, _] = self.config.interest_radii(false).map(i32::from);
         let mut candidates = Vec::new();
-        for y in -r..=r {
-            for z in -r..=r {
-                for x in -r..=r {
+        for y in -vertical..=vertical {
+            for z in -horizontal..=horizontal {
+                for x in -horizontal..=horizontal {
                     let page = PageId {
                         x: center.x + x,
                         y: center.y + y,
@@ -1739,15 +1911,7 @@ impl Connection {
             let mut retained: Vec<_> = self
                 .interest
                 .keys()
-                .filter(|page| {
-                    !net::aoi_contains(
-                        center,
-                        **page,
-                        self.config.near_radius,
-                        self.config.near_radius,
-                        false,
-                    )
-                })
+                .filter(|page| !self.config.contains(center, **page, false))
                 .copied()
                 .collect();
             retained.sort_by_key(|page| {
@@ -1818,5 +1982,29 @@ fn action_message(id: ActionId, action: Action, aim: Option<[f32; 2]>) -> Client
         }
     } else {
         ClientMessage::Action { id, action }
+    }
+}
+
+#[cfg(test)]
+mod entity_repair_credit_tests {
+    use super::*;
+    #[test]
+    fn late_ack_never_overwrites_an_unsent_full_entity_repair() {
+        let mut c = Connection::new(NetworkConfig::default()).unwrap();
+        c.queue(ClientMessage::Entities(
+            net::entities::EntityRequest::Full { have: Some(1) },
+        ))
+        .unwrap();
+        c.queue(ClientMessage::Entities(net::entities::EntityRequest::Ack {
+            revision: 2,
+        }))
+        .unwrap();
+        let outgoing = c.take_outgoing(256);
+        assert!(matches!(
+            outgoing.as_slice(),
+            [ClientMessage::Entities(
+                net::entities::EntityRequest::Full { have: Some(1) }
+            )]
+        ));
     }
 }

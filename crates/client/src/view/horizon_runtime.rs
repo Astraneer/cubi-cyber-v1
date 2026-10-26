@@ -36,10 +36,15 @@ struct Context {
 pub(super) struct PreparedHorizon {
     pub owner: horizon::ViewHorizon,
     pub far_plane: f32,
+    near_residents: Vec<PageId>,
     scheduler: Scheduler<horizon::BackgroundTask>,
     contexts: BTreeMap<JobId, Context>,
     pending_task: Option<horizon::BackgroundTask>,
     pending_result: Option<Box<horizon::ProxyBuilt>>,
+    pending_water_result: Option<(
+        crate::far_water_source::Context,
+        Box<crate::far_water_worker::BuiltFarWater>,
+    )>,
     stats: HorizonJobStats,
     #[cfg(not(target_arch = "wasm32"))]
     native: jobs::NativePool<horizon::BackgroundTask, horizon::BackgroundResult>,
@@ -49,6 +54,7 @@ impl PreparedHorizon {
         Ok(Self {
             owner,
             far_plane,
+            near_residents: Vec::with_capacity(512),
             scheduler: Scheduler::new(jobs::Limits {
                 max_jobs: 8,
                 max_bytes: 8 * RETAINED_JOB_BYTES,
@@ -60,6 +66,7 @@ impl PreparedHorizon {
             contexts: BTreeMap::new(),
             pending_task: None,
             pending_result: None,
+            pending_water_result: None,
             stats: HorizonJobStats::default(),
             #[cfg(not(target_arch = "wasm32"))]
             native: horizon::native_pool(1, 4)
@@ -91,6 +98,12 @@ impl PreparedHorizon {
         }
     }
     fn phase(&mut self, tick: Tick, space: u32, camera: [i64; 2]) -> Result<(), String> {
+        if let Some((context, result)) = self.pending_water_result.take()
+            && let Err(result) = self.owner.complete_water(context, result)
+        {
+            self.pending_water_result = Some((context, result));
+            return Ok(());
+        }
         if let Some(result) = self.pending_result.take()
             && let Err(result) = self.owner.complete_proxy(*result)
         {
@@ -119,11 +132,16 @@ impl PreparedHorizon {
             };
             self.enqueue(horizon::BackgroundTask::Proxy(task), tick);
         }
+        if self.pending_task.is_none()
+            && let Some(task) = self.owner.take_water_task()
+        {
+            self.enqueue(task, tick);
+        }
         Ok(())
     }
     fn take(&mut self, tick: Tick) -> Option<Dispatch<horizon::BackgroundTask>> {
         let mut budget = jobs::WorkBudget::unrestricted(jobs::WorkCost {
-            cells: 131072,
+            cells: horizon::MAX_PROXY_WORK_CELLS,
             bytes: 4 * 1024 * 1024,
             ..jobs::WorkCost::ZERO
         });
@@ -157,6 +175,19 @@ impl PreparedHorizon {
             return Ok(());
         }
         let context = self.contexts.remove(&id);
+        if let Finish::Published(result) = &outcome
+            && result.context().is_some_and(|result| {
+                context
+                    .as_ref()
+                    .is_none_or(|captured| captured.source != result)
+            })
+        {
+            if let Some(context) = context {
+                context.source.fail(&mut self.owner);
+            }
+            self.stats.worker_failures += 1;
+            return Ok(());
+        }
         match outcome {
             Finish::Published(horizon::BackgroundResult::Plan(Ok(plan))) => {
                 if self
@@ -195,6 +226,23 @@ impl PreparedHorizon {
                         }
                     }
                 }
+            }
+            Finish::Published(horizon::BackgroundResult::Water {
+                context: water_context,
+                result: Ok(water),
+            }) => {
+                if let Err(water) = self.owner.complete_water(water_context, water) {
+                    if self.pending_water_result.is_some() {
+                        return Err("far-water completion reservation violated".into());
+                    }
+                    self.pending_water_result = Some((water_context, water));
+                }
+            }
+            Finish::Published(horizon::BackgroundResult::Water {
+                context: water_context,
+                result: Err(_),
+            }) => {
+                horizon::TaskContext::Water(water_context).fail(&mut self.owner);
             }
             outcome => {
                 if matches!(outcome, Finish::Failed(_)) {
@@ -257,6 +305,58 @@ impl PreparedHorizon {
 }
 
 impl ClientView {
+    pub fn prepare_far_water(
+        &mut self,
+        limits: crate::far_water_source::Limits,
+    ) -> Result<(), String> {
+        let gpu = self
+            .environment
+            .as_mut()
+            .and_then(|environment| environment.owner.gpu.water_mut())
+            .ok_or("far water requires the shared physical-water loading profile")?;
+        let (objects, quads) = gpu.capacity();
+        if limits
+            .max_pages
+            .checked_mul(3)
+            .is_none_or(|needed| (objects as usize) < needed)
+            || limits
+                .max_total_quads
+                .checked_mul(3)
+                .is_none_or(|needed| (quads as usize) < needed)
+        {
+            return Err("shared near/far water arena cannot retain both fronts and staging".into());
+        }
+        self.horizon
+            .as_mut()
+            .ok_or("horizon must be prepared before far water")?
+            .owner
+            .enable_separate_water(limits)
+            .map_err(|error| error.to_string())
+    }
+    pub fn horizon_water_stats(&self) -> Option<crate::far_water_source::Stats> {
+        self.horizon.as_ref()?.owner.water_stats()
+    }
+    pub fn far_water_guard_ready(&self) -> bool {
+        self.horizon
+            .as_ref()
+            .is_none_or(|horizon| horizon.owner.water_guard_ready())
+    }
+    pub fn horizon_wanted_water(&self) -> impl Iterator<Item = net::water::Request> + '_ {
+        self.horizon
+            .iter()
+            .flat_map(|horizon| horizon.owner.wanted_water())
+    }
+    pub fn ingest_remote_water(
+        &mut self,
+        image: std::sync::Arc<net::water::WaterHalo>,
+    ) -> Result<bool, String> {
+        self.horizon.as_mut().map_or(Ok(false), |horizon| {
+            horizon
+                .owner
+                .admit_water(image)
+                .map_err(|error| error.to_string())
+        })
+    }
     pub fn prepare_horizon(
         &mut self,
         device: &wgpu::Device,
@@ -280,15 +380,66 @@ impl ClientView {
         )
         .map_err(|error| error.to_string())?;
         owner
-            .reserve_near_cutout(u32::from(self.scene.config().horizontal_radius) + 1)
+            .set_near_intent(intended_near_volume(&self.scene.config()))
+            .map_err(|e| e.to_string())?;
+        owner
+            .reserve_near_cutout(u32::from(self.scene.config().horizontal_radius))
             .map_err(|error| error.to_string())?;
         self.pipeline_compilations = self
             .pipeline_compilations
             .saturating_add(u64::from(owner.stats().pipeline_compilations));
-        let far_plane = ((1_u32 << config.horizon_level) * 16) as f32 * 3.;
-        self.horizon = Some(Box::new(PreparedHorizon::new(owner, far_plane.max(2048.))?));
+        let far_plane = if let Some(settings) = &self.requested_settings {
+            let pages = settings.get(ui::settings::Setting::Horizon) as u32;
+            owner
+                .set_selection(
+                    pages,
+                    f64::from(settings.get(ui::settings::Setting::LodError)),
+                )
+                .map_err(|e| e.to_string())?;
+            (pages * 16) as f32
+        } else {
+            ((2_u32 << config.horizon_level) * 16) as f32
+        };
+        self.horizon = Some(Box::new(PreparedHorizon::new(owner, far_plane)?));
         self.invalidate();
         Ok(())
+    }
+    pub fn set_horizon_settings(
+        &mut self,
+        horizon_pages: u32,
+        lod_error_pixels: f64,
+    ) -> Result<bool, String> {
+        let Some(horizon) = &mut self.horizon else {
+            return Ok(false);
+        };
+        let changed = horizon
+            .owner
+            .set_selection(horizon_pages, lod_error_pixels)
+            .map_err(|e| e.to_string())?;
+        if changed {
+            self.invalidate();
+        }
+        Ok(changed)
+    }
+    pub fn horizon_setting_applied(&self, horizon_pages: u32) -> bool {
+        self.horizon
+            .as_ref()
+            .is_some_and(|h| h.owner.horizon_selection_applied(horizon_pages))
+    }
+    pub fn lod_error_setting_applied(&self, lod_error_pixels: f64) -> bool {
+        self.horizon
+            .as_ref()
+            .is_some_and(|h| h.owner.error_selection_applied(lod_error_pixels))
+    }
+    pub fn near_far_join_ready(&self) -> bool {
+        self.horizon
+            .as_ref()
+            .is_none_or(|h| h.owner.near_cover_ready())
+    }
+    pub fn has_committed_far_front(&self) -> bool {
+        self.horizon
+            .as_ref()
+            .is_some_and(|h| h.owner.has_committed_front())
     }
     pub fn horizon_stats(&self) -> Option<horizon::Stats> {
         self.horizon.as_ref().map(|horizon| horizon.owner.stats())
@@ -301,7 +452,8 @@ impl ClientView {
             retained_bytes: horizon.scheduler.retained_bytes(),
             contexts: horizon.contexts.len(),
             capture_pending: horizon.pending_task.is_some(),
-            result_pending: horizon.pending_result.is_some(),
+            result_pending: horizon.pending_result.is_some()
+                || horizon.pending_water_result.is_some(),
             jobs: horizon.scheduler.stats(),
             ..horizon.stats
         })
@@ -392,11 +544,9 @@ impl ClientView {
             outcome: JobOutcome::Failed(jobs::JobFailure::WorkerDisconnected),
         })
     }
-    pub(super) fn pump_horizon(
-        &mut self,
-        queue: &wgpu::Queue,
-        budget: &mut UploadBudget,
-    ) -> Result<(), String> {
+    /// No queue access: worker capture, completion and plan scheduling continue
+    /// while an earlier GPU submission is busy.
+    pub(super) fn advance_horizon_cpu(&mut self) -> Result<(), String> {
         if self.horizon.is_none() {
             return Ok(());
         }
@@ -442,6 +592,13 @@ impl ClientView {
         };
         horizon
             .owner
+            .set_display_space(self.scene.config().center.space.0);
+        horizon
+            .owner
+            .set_near_intent(intended_near_volume(&self.scene.config()))
+            .map_err(|e| e.to_string())?;
+        horizon
+            .owner
             .set_projection(horizon::Projection {
                 eye_min,
                 eye_max,
@@ -456,22 +613,79 @@ impl ClientView {
         horizon.phase(self.tick, self.scene.config().center.space.0, camera_page)?;
         #[cfg(not(target_arch = "wasm32"))]
         horizon.pump_native(self.tick)?;
+        Ok(())
+    }
+    pub(super) fn pump_horizon(
+        &mut self,
+        queue: &wgpu::Queue,
+        budget: &mut UploadBudget,
+    ) -> Result<(), String> {
+        self.advance_horizon_cpu()?;
+        let Some(horizon) = &mut self.horizon else {
+            return Ok(());
+        };
         let before = budget.remaining_bytes;
-        let guarded = horizon
-            .owner
-            .guard_near(
-                queue,
-                self.scene.config().center.space.0,
-                camera_page,
-                budget,
-            )
-            .map_err(|error| error.to_string())?;
-        if guarded.is_some() {
+        horizon.near_residents.clear();
+        horizon.near_residents.extend(
+            self.resident
+                .keys()
+                .copied()
+                .filter(|page| page.space.0 == 0),
+        );
+        let guarded = if horizon.owner.separate_water_enabled() {
+            let water = self
+                .environment
+                .as_mut()
+                .and_then(|e| e.owner.gpu.water_mut())
+                .ok_or("far water GPU was detached")?;
             horizon
                 .owner
-                .pump(queue, budget, 4, 2)
-                .map_err(|error| error.to_string())?;
+                .guard_near_cover(queue, Some(water), &horizon.near_residents, budget)
+        } else {
+            horizon
+                .owner
+                .guard_near_cover(queue, None, &horizon.near_residents, budget)
         }
+        .map_err(|e| e.to_string())?;
+        if guarded.is_some() {
+            let initial = horizon.owner.stats();
+            let (height_uploads, proxy_uploads) =
+                if initial.height_front == 0 && initial.proxy_front == 0 {
+                    (64, 16)
+                } else {
+                    (4, 2)
+                };
+            if horizon.owner.separate_water_enabled() {
+                let water_gpu = self
+                    .environment
+                    .as_mut()
+                    .and_then(|environment| environment.owner.gpu.water_mut())
+                    .ok_or("far water GPU was detached")?;
+                if horizon
+                    .owner
+                    .guard_water_near(queue, water_gpu, budget)
+                    .map_err(|error| error.to_string())?
+                {
+                    horizon
+                        .owner
+                        .pump_with_water(queue, water_gpu, budget, height_uploads, proxy_uploads)
+                        .map_err(|error| error.to_string())?;
+                }
+            } else {
+                horizon
+                    .owner
+                    .pump(queue, budget, height_uploads, proxy_uploads)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        let far_plane_changed = if let Some(pages) = horizon.owner.committed_horizon_pages() {
+            let far_plane = (pages * 16) as f32;
+            let changed = horizon.far_plane != far_plane;
+            horizon.far_plane = far_plane;
+            changed
+        } else {
+            false
+        };
         let bytes = before - budget.remaining_bytes;
         // Count source/header writes through the shared budget once. Only new
         // camera writes remain for the encode phase's upload accounting.
@@ -481,10 +695,28 @@ impl ClientView {
             upload_bytes: bytes,
             ..telemetry::WorkCounts::ZERO
         });
-        if bytes != 0 || guarded.is_none() {
+        if bytes != 0 || guarded.is_none() || far_plane_changed {
             self.renderer.invalidate();
             self.invalidate();
         }
         Ok(())
     }
+}
+
+fn intended_near_volume(config: &crate::SceneConfig) -> [[i32; 3]; 2] {
+    let centre = config.center.page();
+    let horizontal = i32::from(config.horizontal_radius);
+    let vertical = i32::from(config.vertical_radius);
+    [
+        [
+            centre.x - horizontal,
+            centre.y - vertical,
+            centre.z - horizontal,
+        ],
+        [
+            centre.x + horizontal + 1,
+            centre.y + vertical + 1,
+            centre.z + horizontal + 1,
+        ],
+    ]
 }

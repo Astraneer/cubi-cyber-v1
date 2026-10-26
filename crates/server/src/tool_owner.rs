@@ -1,5 +1,8 @@
 //! Owned tool attributes are replaced only with their immutable payload record.
 use super::*;
+#[path = "tool_owner/block.rs"]
+mod block;
+pub(super) use block::BlockTool;
 pub(super) fn inventory_attributes(
     inventory: &rules::survival::Inventory,
     payloads: &rules::item_payload::Ledger,

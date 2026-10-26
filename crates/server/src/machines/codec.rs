@@ -76,6 +76,19 @@ impl Writer {
         self.u64(p.first_due.0);
         self.u64(p.order);
     }
+    fn owner_state(&mut self, state: Option<OwnerState>) {
+        self.u8(u8::from(state.is_some()));
+        if let Some(s) = state {
+            self.u64(s.tick.0);
+            self.u8(s.stage as u8);
+            self.u8(u8::from(s.prepared_after.is_some()));
+            if let Some((due, phase, order)) = s.prepared_after {
+                self.u64(due.0);
+                self.u8(phase);
+                self.u64(order);
+            }
+        }
+    }
     fn reservoir(&mut self, s: Reservoir) {
         self.u8(s.substance);
         self.u64(s.stored);
@@ -219,6 +232,29 @@ impl Reader<'_> {
             first_due: Tick(self.u64()?),
             order: self.u64()?,
         })
+    }
+    fn owner_state(&mut self) -> Result<Option<OwnerState>, MachineError> {
+        if !self.boolean()? {
+            return Ok(None);
+        }
+        let tick = Tick(self.u64()?);
+        let stage = match self.u8()? {
+            0 => OwnerStage::Prepare,
+            1 => OwnerStage::Machines,
+            2 => OwnerStage::Resources,
+            3 => OwnerStage::Transit,
+            _ => return Err(MachineError::Encoding),
+        };
+        let prepared_after = if self.boolean()? {
+            Some((Tick(self.u64()?), self.u8()?, self.u64()?))
+        } else {
+            None
+        };
+        Ok(Some(OwnerState {
+            tick,
+            stage,
+            prepared_after,
+        }))
     }
     fn reservoir(&mut self) -> Result<Reservoir, MachineError> {
         Ok(Reservoir {
@@ -376,6 +412,14 @@ impl RuntimeSnapshot {
             w.count(bytes.len());
             w.raw(&bytes);
         }
+        if self.owner != OwnerSnapshot::default() {
+            w.raw(b"XPH1");
+            w.owner_state(self.owner.state);
+            w.count(self.owner.ready.len());
+            for &p in &self.owner.ready {
+                w.pending(p);
+            }
+        }
         w.finish()
     }
     pub fn decode(bytes: &[u8], config: Config) -> Result<Self, MachineError> {
@@ -448,6 +492,18 @@ impl RuntimeSnapshot {
         } else {
             crate::topology_queue::Snapshot::default()
         };
+        let owner = if r.peek(b"XPH1") {
+            r.raw::<4>()?;
+            let state = r.owner_state()?;
+            let count = r.count(config.events, 33)?;
+            let mut ready = Vec::with_capacity(count);
+            for _ in 0..count {
+                ready.push(r.pending()?);
+            }
+            OwnerSnapshot { state, ready }
+        } else {
+            OwnerSnapshot::default()
+        };
         r.finish()?;
         let snapshot = Self {
             revision,
@@ -460,6 +516,7 @@ impl RuntimeSnapshot {
             configs,
             transport,
             topology_queue,
+            owner,
         };
         MachineRuntime::restore(config, &snapshot)?;
         Ok(snapshot)
@@ -467,7 +524,8 @@ impl RuntimeSnapshot {
 }
 impl RuntimeDelta {
     pub fn is_empty(&self) -> bool {
-        self.machines.is_empty()
+        self.owner.is_empty()
+            && self.machines.is_empty()
             && self.queue.is_empty()
             && self.reservoirs.is_empty()
             && self.topology.is_empty()
@@ -573,6 +631,23 @@ impl RuntimeDelta {
             w.raw(b"XTPQ");
             w.count(bytes.len());
             w.raw(&bytes);
+        }
+        if self.owner.before.is_some() || self.owner.after.is_some() || !self.owner.ready.is_empty()
+        {
+            w.raw(b"XPH1");
+            w.owner_state(self.owner.before);
+            w.owner_state(self.owner.after);
+            w.count(self.owner.ready.len());
+            for p in &self.owner.ready {
+                w.u8(u8::from(p.before.is_some()));
+                if let Some(p) = p.before {
+                    w.pending(p);
+                }
+                w.u8(u8::from(p.after.is_some()));
+                if let Some(p) = p.after {
+                    w.pending(p);
+                }
+            }
         }
         w.finish()
     }
@@ -710,6 +785,36 @@ impl RuntimeDelta {
         } else {
             None
         };
+        let owner = if r.peek(b"XPH1") {
+            r.raw::<4>()?;
+            let before = r.owner_state()?;
+            let after = r.owner_state()?;
+            let count = r.count(config.events, 35)?;
+            let mut ready = Vec::with_capacity(count);
+            for _ in 0..count {
+                let before = if r.boolean()? {
+                    Some(r.pending()?)
+                } else {
+                    None
+                };
+                let after = if r.boolean()? {
+                    Some(r.pending()?)
+                } else {
+                    None
+                };
+                if before.is_none() && after.is_none() {
+                    return Err(MachineError::Encoding);
+                }
+                ready.push(QueuePatch { before, after });
+            }
+            barrier::OwnerDelta {
+                before,
+                after,
+                ready,
+            }
+        } else {
+            barrier::OwnerDelta::default()
+        };
         r.finish()?;
         Ok(Self {
             revision,
@@ -725,6 +830,7 @@ impl RuntimeDelta {
             configs,
             transport,
             topology_queue,
+            owner,
         })
     }
 }

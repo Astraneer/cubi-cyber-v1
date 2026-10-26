@@ -1,6 +1,8 @@
 //! Shared real-session pump. Platform sockets carry bounded binary frames;
 //! authority imports, prediction and visible overlays have one scene owner.
 pub mod diagnostics;
+mod targeting;
+mod water;
 use crate::{
     ClientScene, SceneConfig, SceneError,
     network::{Connection, NetworkConfig, NetworkError},
@@ -20,6 +22,7 @@ pub struct RemoteCounters {
     pub imported_light_pages: u64,
     pub imported_light_samples: u64,
     pub imported_props_frames: u64,
+    pub imported_water_images: u64,
 }
 pub struct RemoteSession {
     connection: Connection,
@@ -30,6 +33,7 @@ pub struct RemoteSession {
     predicted_positions: BTreeSet<BlockPos>,
     mining: Option<(BlockPos, Cell, ActionId)>,
     next_place_ms: u64,
+    next_entity_ms: u64,
     counters: RemoteCounters,
     entity_instances: Vec<rules::entities::mob::Instance>,
     wanted_pages: Vec<core_types::PageId>,
@@ -38,6 +42,7 @@ pub struct RemoteSession {
     height_interest: BTreeSet<net::height::HeightKey>,
     humans: crate::remote_humans::RemoteHumans,
     props_restore_cursor: Option<core_types::PageId>,
+    water_courier: water::Courier,
 }
 impl RemoteSession {
     pub fn new(config: NetworkConfig) -> Result<Self, String> {
@@ -50,6 +55,7 @@ impl RemoteSession {
             predicted_positions: BTreeSet::new(),
             mining: None,
             next_place_ms: 0,
+            next_entity_ms: 0,
             counters: RemoteCounters::default(),
             entity_instances: vec![
                 rules::entities::mob::Instance::default();
@@ -57,9 +63,10 @@ impl RemoteSession {
             ],
             wanted_pages: Vec::with_capacity(config.maximum_pages),
             page_capacity: config.maximum_pages,
-            wanted_heights: Vec::with_capacity(512),
+            wanted_heights: Vec::with_capacity(net::height::MAX_TILES),
             height_interest: BTreeSet::new(),
             props_restore_cursor: None,
+            water_courier: water::Courier::new(),
             humans: crate::remote_humans::RemoteHumans::new(64)
                 .map_err(|e| format!("public human capacity: {e:?}"))?,
         })
@@ -134,6 +141,10 @@ impl RemoteSession {
         }
         let input = view.take_remote_input();
         let changes = self.pump_scene(&mut view.scene, input, now_ms)?;
+        if self.connection.welcome().is_some() {
+            let (tick, sub_tick) = self.connection.visual_clock_sample(now_ms);
+            view.set_public_clock(tick, sub_tick)?;
+        }
         for change in changes {
             for page in change.pages.iter().filter(|page| page.removed) {
                 view.remove_remote_props(page.page)?;
@@ -196,6 +207,12 @@ impl RemoteSession {
         }
         if self.configured && self.connection.player().is_some() {
             self.pump_horizon(view, now_ms)?;
+            self.water_courier.wanted(view.horizon_wanted_water())?;
+            self.counters.imported_water_images +=
+                self.water_courier
+                    .pump(&mut self.connection, now_ms, |image| {
+                        view.ingest_remote_water(image)
+                    })?;
         }
         Ok(())
     }
@@ -246,7 +263,7 @@ impl RemoteSession {
     fn pump_horizon(&mut self, view: &mut ClientView, now_ms: u64) -> Result<(), String> {
         self.wanted_heights.clear();
         for key in view.horizon_wanted_height() {
-            if self.wanted_heights.len() == 512 {
+            if self.wanted_heights.len() == net::height::MAX_TILES {
                 return Err("public horizon request capacity".into());
             }
             self.wanted_heights.push(key);
@@ -572,27 +589,43 @@ impl RemoteSession {
             return Ok(());
         }
         let player = self.connection.player().expect("sampled player");
-        let mut pose = sim::prediction::PredictionState::capture(player)
-            .map_err(str::to_string)?
-            .to_player()
-            .map_err(str::to_string)?;
-        pose.yaw = input.yaw;
-        pose.pitch = input.pitch;
+        if player.health <= 0. {
+            return Ok(());
+        }
+        let eye = player.eye(1.);
+        let look = sim::look_direction(input.yaw, input.pitch);
+        let reach = if player.mode == sim::GameMode::Creative || player.noclip {
+            5.
+        } else {
+            4.5
+        };
         let space = self.connection.welcome().expect("joined").player.space;
+        if let Some(target) = targeting::pick(&self.connection, space, eye, look, 6.) {
+            if self.mining.take().is_some() {
+                self.connection
+                    .aimed_action(Action::StopMining, false, now_ms, input.yaw, input.pitch)
+                    .map_err(error)?;
+            }
+            if now_ms >= self.next_entity_ms && self.connection.pending_actions() < 128 {
+                match self.connection.interact_entity(
+                    target,
+                    !attacking,
+                    now_ms,
+                    input.yaw,
+                    input.pitch,
+                ) {
+                    Ok(_) => self.next_entity_ms = now_ms.saturating_add(200),
+                    Err(NetworkError::Capacity) => {}
+                    Err(e) => return Err(error(e)),
+                }
+            }
+            return Ok(());
+        }
         let query = RemoteQuery {
             connection: &self.connection,
             space,
         };
-        let hit = match sim::raycast(
-            &query,
-            pose.eye(1.0),
-            pose.look(),
-            if pose.mode == sim::GameMode::Creative || pose.noclip {
-                5.0
-            } else {
-                4.5
-            },
-        ) {
+        let hit = match sim::raycast(&query, eye, look, reach) {
             RayResult::Hit(hit) => Some(hit),
             _ => None,
         };
@@ -641,6 +674,44 @@ impl RemoteSession {
             && now_ms >= self.next_place_ms
             && let Some(hit) = hit
         {
+            let tool = self
+                .connection
+                .predicted_inventory()
+                .map(|i| i.hand().item());
+            if matches!(
+                tool,
+                Some(
+                    rules::items::I_CONFIGURATOR
+                        | rules::items::I_UPGRADE_SPEED
+                        | rules::items::I_UPGRADE_ENERGY
+                        | rules::items::I_UPGRADE_GAS
+                )
+            ) && (matches!(
+                rules::blocks::bdef(hit.block.id()).be,
+                Some(rules::blocks::BeKind::Mek(_))
+            ) || matches!(
+                hit.block.id(),
+                rules::ids::BOUNDING
+                    | rules::ids::UNIVERSAL_CABLE
+                    | rules::ids::LOGISTICAL_TRANSPORTER
+                    | rules::ids::MECHANICAL_PIPE
+                    | rules::ids::PRESSURIZED_TUBE
+            )) {
+                self.connection
+                    .use_block_tool(
+                        hit,
+                        if input.place_pressed {
+                            input.place_sneaking
+                        } else {
+                            input.keys & net::InputFrame::SNEAK != 0
+                        },
+                        now_ms,
+                        [input.yaw, input.pitch],
+                    )
+                    .map_err(error)?;
+                self.next_place_ms = now_ms.saturating_add(200);
+                return Ok(());
+            }
             if hit.block.id() == rules::ids::CRAFTING_TABLE
                 || matches!(
                     rules::blocks::bdef(hit.block.id()).be,

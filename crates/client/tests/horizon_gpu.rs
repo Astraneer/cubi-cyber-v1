@@ -1,5 +1,5 @@
 #![cfg(not(target_arch = "wasm32"))]
-pub use client::{height_cache, lodcache};
+pub use client::{far_water_source, far_water_worker, height_cache, height_neighbors, lodcache};
 #[path = "../src/view/horizon.rs"]
 #[allow(dead_code)]
 mod horizon;
@@ -10,6 +10,39 @@ use render::terrain_gpu::{Camera, UploadBudget};
 #[global_allocator]
 static ALLOCATOR: telemetry::CountingAllocator<std::alloc::System> =
     telemetry::CountingAllocator::new(std::alloc::System);
+fn assert_same_image(label: &str, expected: &[u8], actual: &[u8]) {
+    assert_eq!(expected.len(), actual.len());
+    if expected == actual {
+        return;
+    }
+    let mut pixels = 0;
+    let mut maximum = 0;
+    let mut first = None;
+    for (index, (a, b)) in expected
+        .chunks_exact(4)
+        .zip(actual.chunks_exact(4))
+        .enumerate()
+    {
+        if a != b {
+            pixels += 1;
+            first.get_or_insert((index % 96, index / 96, a, b));
+            maximum = maximum.max(a.iter().zip(b).map(|(a, b)| a.abs_diff(*b)).max().unwrap());
+        }
+    }
+    let hash = |bytes: &[u8]| {
+        bytes.iter().fold(0xcbf29ce484222325u64, |h, &v| {
+            (h ^ u64::from(v)).wrapping_mul(0x100000001b3)
+        })
+    };
+    std::fs::create_dir_all(".local/artifacts").unwrap();
+    std::fs::write(format!(".local/artifacts/{label}-expected.rgba"), expected).unwrap();
+    std::fs::write(format!(".local/artifacts/{label}-actual.rgba"), actual).unwrap();
+    panic!(
+        "{label}: exact RGBA mismatch: pixels={pixels}, maxDelta={maximum}, first={first:?}, hashes={:016x}/{:016x}; 96x96 raw RGBA saved in .local/artifacts",
+        hash(expected),
+        hash(actual)
+    );
+}
 fn tile(key: HeightKey, source: u64) -> Box<HeightTile> {
     let mut t = HeightTile {
         key,
@@ -23,6 +56,11 @@ fn tile(key: HeightKey, source: u64) -> Box<HeightTile> {
         replacement: Replacement::None,
     };
     t.known[36] = 1;
+    assert_eq!(
+        seam_error_q1024(&t.heights),
+        0,
+        "flat fixture has no seam displacement"
+    );
     Box::new(t)
 }
 fn page(y: i32) -> PageId {
@@ -304,9 +342,10 @@ fn live_horizon_requires_gpu_manifest_and_preserves_old_cover_and_arch_air() {
             0.1,
             200.,
         );
-        assert_eq!(
-            after,
-            frame_at(&gpu, &mut terrain, &mut horizon, rebased, [8.5, 36.5, 56.])
+        assert_same_image(
+            "horizon-origin-rebase",
+            &after,
+            &frame_at(&gpu, &mut terrain, &mut horizon, rebased, [8.5, 36.5, 56.]),
         );
         horizon
             .rebase(&gpu.queue, [0; 3], &mut UploadBudget::new(1_000_000))
@@ -498,6 +537,7 @@ fn reselected_cached_parent_waits_for_fresh_identical_source_before_gpu_publicat
                 .published
         );
         let fine = frame_at(&gpu, &mut terrain, &mut horizon, camera, eye);
+        let learned = horizon.stats().cached_height_tiles;
         assert!(
             coarse != fine,
             "the old cached parent has a visible material positive control"
@@ -510,12 +550,18 @@ fn reselected_cached_parent_waits_for_fresh_identical_source_before_gpu_publicat
             .execute()
             .unwrap();
         horizon.complete_plan(coarsened).unwrap();
+        assert_eq!(
+            horizon.stats().cached_height_tiles,
+            learned,
+            "coarsening under capacity must not forget learned child certificates"
+        );
         assert_eq!(horizon.stats().pending_height_confirmations, 1);
         let held = horizon
             .pump(&gpu.queue, &mut UploadBudget::new(1_000_000), 64, 16)
             .unwrap();
         assert!(held.held_previous);
-        assert_eq!(held.upload_bytes, 0);
+        assert!(!held.published);
+        assert!(held.height_tiles <= 1, "only the pending parent may stage");
         assert!(
             fine == frame_at(&gpu, &mut terrain, &mut horizon, camera, eye),
             "unconfirmed cached parent changed actual GPU output"
@@ -534,6 +580,49 @@ fn reselected_cached_parent_waits_for_fresh_identical_source_before_gpu_publicat
         assert!(
             fine != frame_at(&gpu, &mut terrain, &mut horizon, camera, eye),
             "fresh confirmation must permit the visible parent publication"
+        );
+        horizon
+            .set_projection(Projection {
+                focal_pixels: 1000.,
+                ..low
+            })
+            .unwrap();
+        let again = horizon
+            .plan_task(0, [0, 0])
+            .unwrap()
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            again.quality.missing_certificates, 0,
+            "cached child metadata should guide the next plan immediately"
+        );
+        horizon.complete_plan(again).unwrap();
+        for x in 1000..1150 {
+            let mut extra = tile(
+                HeightKey {
+                    space: 0,
+                    level: 0,
+                    x,
+                    z: 1000,
+                },
+                1,
+            );
+            extra.error = Some(net::height::HeightErrorBound {
+                max_error_q1024: 0,
+                min_height: 32,
+                max_height: 32,
+            });
+            horizon.ingest_height(extra).unwrap();
+        }
+        let stats = horizon.stats();
+        assert_eq!(
+            stats.cached_height_tiles, 128,
+            "the actual cache bound is enforced by eviction"
+        );
+        assert_eq!(
+            stats.received_desired_heights, stats.desired_height_tiles,
+            "pressure cannot evict the selected public inputs"
         );
     });
 }

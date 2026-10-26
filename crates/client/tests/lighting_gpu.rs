@@ -295,6 +295,31 @@ fn owner_runs_cpu_solver_dirty_uploads_and_shadow_cache_without_geometry_rebuild
         assert_eq!(idle.cpu_cells, 0);
         assert_eq!(idle.upload_bytes, 0);
         assert!(!lighting.needs_work(&world));
+        assert!(lighting.presentation_ready(&world));
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        lighting
+            .encode_lighting(
+                &gpu.queue,
+                &mut encoder,
+                &mut terrain,
+                [8., 0., 8.],
+                [0.4, 0.8, 0.2],
+            )
+            .unwrap();
+        gpu.queue.submit([encoder.finish()]);
+        assert!(lighting.needs_work(&world));
+        assert!(
+            lighting.presentation_ready(&world),
+            "coherent Sun refresh must not revoke source/data readiness"
+        );
+        lighting.invalidate_bounds(render::shadows::WorldBounds {
+            min: [8., 0., 8.],
+            max: [9., 1., 9.],
+        });
+        assert!(
+            !lighting.presentation_ready(&world),
+            "structural invalidation must retain coverage guard"
+        );
         println!(
             "M4 CPU→GPUowner initialCells={cells},uploadedBytes={uploads},removalCells={removal_cells},idleCells=0,idleUploads=0"
         );
@@ -646,6 +671,162 @@ fn scene_source_certificate_gates_zero_snapshot_and_revokes_high_rgb_on_cell_vie
         assert_eq!(revoked.cpu_cells, 0);
         println!(
             "M4 Scene LIGHT defaultzeroUnknown,zeroSnapshotcertifieswithoutWorldTx,RGB[231,17,255]GPUexact,cellView11revokesGPUtoDark"
+        );
+    });
+}
+
+#[test]
+fn cpu_ingest_retires_nonresident_metadata_without_losing_future_volume_snapshot() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut terrain = setup(&gpu);
+        let point = BlockPos {
+            space: SpaceId(0),
+            x: 8,
+            y: 8,
+            z: 8,
+        };
+        let mut scene = client::ClientScene::new(client::SceneConfig {
+            center: point,
+            horizontal_radius: 0,
+            vertical_radius: 0,
+            max_loaded_pages: 27,
+            authoritative_remote: true,
+            ..client::SceneConfig::forest()
+        })
+        .unwrap();
+        let mut config = config().with_authoritative_source();
+        config.max_gpu_pages_per_pump = 1;
+        let mut owner = ClientLighting::prepare_scene(
+            &gpu.device,
+            &gpu.queue,
+            &mut terrain,
+            &mut scene,
+            config,
+            [8.; 3],
+            [0.3, 0.8, 0.2],
+        )
+        .unwrap();
+        scene
+            .import_authoritative_page(
+                &net::PageUpdate::Snapshot(net::PageSnapshot {
+                    page: page(),
+                    version: 1,
+                    source_version: core_types::Version(1),
+                    cells: Box::new([Cell::AIR; 4096]),
+                }),
+                Tick(1),
+            )
+            .unwrap();
+        let mut values = Box::new([0u32; 4096]);
+        let packed = net::light::pack(15, 0, [231, 17, 255]).unwrap();
+        values[usize::from(point.local_index().get())] = packed;
+        scene
+            .import_authoritative_light(
+                &net::light::Update::Snapshot(net::light::Snapshot {
+                    header: net::light::Header {
+                        page: page(),
+                        cell_view: 1,
+                        version: 1,
+                        source: core_types::Version(1),
+                    },
+                    values,
+                }),
+                Tick(1),
+            )
+            .unwrap();
+        let work = owner.ingest_scene_cpu(&mut scene).unwrap();
+        assert_eq!(work.retired_dirty_pages, 27);
+        assert_eq!(work.pending_gpu_pages, 0);
+        assert_eq!(work.upload_bytes, 0);
+        assert_eq!(work.sample_reads, 0);
+        let handle = terrain
+            .upload_page(
+                &gpu.queue,
+                None,
+                1,
+                translation([0.; 3]),
+                &PageMesh::default(),
+                &mut UploadBudget::new(100000),
+            )
+            .unwrap();
+        owner
+            .register_page(
+                page(),
+                handle,
+                WorldBounds {
+                    min: [0.; 3],
+                    max: [16.; 3],
+                },
+            )
+            .unwrap();
+        let work = owner
+            .pump_scene(
+                &gpu.queue,
+                &mut scene,
+                Tick(1),
+                &mut UploadBudget::new(LIGHT_PAGE_BYTES),
+            )
+            .unwrap();
+        assert_eq!(work.gpu_pages, 1);
+        let index = light_index([8, 8, 8]).unwrap() as usize;
+        assert_eq!(
+            read_word(
+                &gpu,
+                &owner,
+                handle.slot as usize * render::light_volume::LIGHT_PAGE_WORDS + 1 + index
+            ),
+            packed
+        );
+        let next = net::light::pack(14, 0, [17, 231, 255]).unwrap();
+        scene
+            .import_authoritative_light(
+                &net::light::Update::Delta(net::light::Delta {
+                    header: net::light::Header {
+                        page: page(),
+                        cell_view: 1,
+                        version: 2,
+                        source: core_types::Version(2),
+                    },
+                    base: 1,
+                    changes: vec![(point.local_index().get(), next)],
+                }),
+                Tick(2),
+            )
+            .unwrap();
+        let cpu = owner.ingest_scene_cpu(&mut scene).unwrap();
+        assert_eq!(
+            cpu.retired_dirty_pages, 0,
+            "resident volume cannot be retired"
+        );
+        assert_eq!(cpu.pending_gpu_pages, 1);
+        assert_eq!(cpu.upload_bytes, 0);
+        assert_eq!(cpu.sample_reads, 0);
+        assert_eq!(
+            read_word(
+                &gpu,
+                &owner,
+                handle.slot as usize * render::light_volume::LIGHT_PAGE_WORDS + 1 + index
+            ),
+            packed,
+            "CPU-only phase cannot change GPU data"
+        );
+        let upload = owner
+            .pump_scene(&gpu.queue, &mut scene, Tick(2), &mut UploadBudget::new(4))
+            .unwrap();
+        assert_eq!(upload.upload_bytes, 4);
+        assert_eq!(
+            read_word(
+                &gpu,
+                &owner,
+                handle.slot as usize * render::light_volume::LIGHT_PAGE_WORDS + 1 + index
+            ),
+            next
+        );
+        println!(
+            "M4 CPU_nonresident27retired/0samples/0GPU; laterregistrationfullSnapshot23332B HDR_exact; residentdirtyKEPT then4Bdelta/sourceguardsRetained"
         );
     });
 }

@@ -45,8 +45,10 @@ pub enum Setting {
     UiScale,
     Hints,
     Animations,
+    ViewTime,
 }
-pub const COUNT: usize = 29;
+pub const COUNT: usize = 30;
+const LEGACY_COUNT: usize = 29;
 #[derive(Clone, Copy)]
 pub enum Domain {
     Range { step: i32, min: i32, max: i32 },
@@ -119,10 +121,10 @@ pub const SCHEMA: [Definition; COUNT] = [
     choice!(
         LodError,
         Graphics,
-        "Ошибка дали, пиксели",
+        "Цель ошибки дали, пиксели",
         &[1, 2, 4, 8, 16, 32],
-        4,
-        2
+        32,
+        4
     ),
     choice!(Msaa, Graphics, "Сглаживание MSAA", &[1, 4], 4, 4),
     choice!(Shadows, Graphics, "Тени", &[0, 1], 1, 1),
@@ -131,7 +133,7 @@ pub const SCHEMA: [Definition; COUNT] = [
         Graphics,
         "Размер карты теней",
         &[512, 1024, 2048, 4096],
-        4096,
+        2048,
         4096
     ),
     choice!(Cascades, Graphics, "Каскады теней", &[1, 2, 3], 3, 3),
@@ -180,6 +182,14 @@ pub const SCHEMA: [Definition; COUNT] = [
     ),
     choice!(Hints, Interface, "Подсказки", &[0, 1], 1, 1),
     choice!(Animations, Interface, "Анимации интерфейса", &[0, 1], 1, 1),
+    choice!(
+        ViewTime,
+        Graphics,
+        "Время вида, только у вас",
+        &[0, 1, 2, 3, 4],
+        0,
+        0
+    ),
 ];
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -249,10 +259,11 @@ impl Settings {
         bytes
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
-        if bytes.len() != 7 + COUNT * 4
-            || &bytes[..4] != b"CUI1"
-            || u16::from_le_bytes([bytes[5], bytes[6]]) as usize != COUNT
-        {
+        if bytes.len() < 7 || &bytes[..4] != b"CUI1" {
+            return Err("unsupported settings format");
+        }
+        let stored = u16::from_le_bytes([bytes[5], bytes[6]]) as usize;
+        if ![LEGACY_COUNT, COUNT].contains(&stored) || bytes.len() != 7 + stored * 4 {
             return Err("unsupported settings format");
         }
         let preset = match bytes[4] {
@@ -262,13 +273,22 @@ impl Settings {
             _ => return Err("invalid preset"),
         };
         let mut value = Self::default();
-        for (i, definition) in SCHEMA.iter().enumerate() {
+        for (i, definition) in SCHEMA.iter().enumerate().take(stored) {
             let start = 7 + i * 4;
             let n = i32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
             if !definition.domain.accepts(n) {
                 return Err("invalid stored setting");
             }
             value.values[i] = n;
+        }
+        if stored == LEGACY_COUNT
+            && preset == Preset::Default
+            && value.get(Setting::ShadowResolution) == 4096
+        {
+            value.values[Setting::ShadowResolution as usize] = 2048;
+        }
+        if preset == Preset::Default && value.get(Setting::LodError) == 4 {
+            value.values[Setting::LodError as usize] = 32;
         }
         value.preset = preset;
         Ok(value)

@@ -1,6 +1,8 @@
 //! Loading-prepared public horizon. Exact source/view manifests become ready only
 //! after immutable proxy jobs complete AND their payloads reside on GPU.
 use crate::{
+    far_water_source::{self, FarWaterSource},
+    far_water_worker::{self, BuiltFarWater, FarWaterTask},
     height_cache::{self, HeightCache},
     lodcache::{BuiltProxy, LodBuildTask, LodCacheError},
 };
@@ -19,9 +21,12 @@ use std::{
     sync::Arc,
 };
 pub const MAX_PLAN_PAIRS: u64 = 4_000_000;
+/// Worker classification, face and AO lookup upper bound for a Cutout page.
+/// This is scheduling credit, distinct from measured mesh work.
+pub const MAX_PROXY_WORK_CELLS: u64 = 524_288;
 #[path = "horizon_selection.rs"]
 mod selection;
-pub use selection::{Certificate, Projection, SelectionQuality};
+pub use selection::{Certificate, Projection, SelectionQuality, seam_error_q1024};
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub max_tiles: usize,
@@ -31,17 +36,21 @@ pub struct Config {
     pub horizon_level: u8,
     pub screen_error_pixels: f64,
     pub hysteresis_pixels: f64,
+    /// Exact intended draw volume in page coordinates, max exclusive. The CPU
+    /// sampling halo is deliberately excluded from this replacement volume.
+    pub near_volume: Option<[[i32; 3]; 2]>,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
-            max_tiles: 512,
-            max_sources: 2048,
+            max_tiles: net::height::MAX_TILES,
+            max_sources: net::height::MAX_SOURCES,
             max_proxy_pages: 512,
             atlas_layers: 186,
             horizon_level: 9,
             screen_error_pixels: 32.,
             hysteresis_pixels: 8.,
+            near_volume: None,
         }
     }
 }
@@ -55,6 +64,7 @@ pub enum Error {
     Cache(height_cache::Error),
     Lod(LodCacheError),
     Proxy(ProxyError),
+    Water(far_water_source::Error),
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -75,6 +85,11 @@ impl From<LodCacheError> for Error {
 impl From<ProxyError> for Error {
     fn from(e: ProxyError) -> Self {
         Self::Proxy(e)
+    }
+}
+impl From<far_water_source::Error> for Error {
+    fn from(error: far_water_source::Error) -> Self {
+        Self::Water(error)
     }
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -159,6 +174,58 @@ pub struct Planned {
     pub quality: SelectionQuality,
     pub exact_leaves: Vec<HeightKey>,
 }
+/// A bounded, GPU-free snapshot for worker planning and capacity measurements.
+/// Larger diagnostic capacities do not change the live transport or GPU limits.
+pub struct PublicSelection {
+    pub config: Config,
+    pub space: u32,
+    pub camera: [i64; 2],
+    pub near_radius: u32,
+    pub projection: Projection,
+    pub certificates: Vec<Certificate>,
+    pub previous: Vec<HeightTileKey>,
+    pub refine: Vec<HeightKey>,
+}
+impl PublicSelection {
+    pub fn execute(self) -> Result<Planned, Error> {
+        if !(16..=4096).contains(&self.config.max_tiles)
+            || self.config.max_sources < self.config.max_tiles
+            || self.config.max_sources > 16_384
+            || self.config.horizon_level > 10
+            || !valid_near_volume(self.config.near_volume)
+            || self.near_radius > 128
+            || self.certificates.len() > self.config.max_sources
+            || self.previous.len() > self.config.max_tiles
+            || self.refine.len() > self.config.max_tiles
+            || self.camera.iter().any(|&coordinate| {
+                coordinate < i64::from(i32::MIN) / 16 || coordinate > i64::from(i32::MAX) / 16
+            })
+        {
+            return Err(Error::InvalidConfig);
+        }
+        self.projection.validate()?;
+        for certificate in &self.certificates {
+            certificate.key.validate().map_err(|_| Error::InvalidWire)?;
+            certificate
+                .bound
+                .validate()
+                .map_err(|_| Error::InvalidWire)?;
+        }
+        PlanTask {
+            id: 1,
+            generation: 0,
+            config: self.config,
+            space: self.space,
+            camera: self.camera,
+            refine: self.refine,
+            near_radius: i64::from(self.near_radius),
+            projection: Some(self.projection),
+            certificates: self.certificates,
+            previous: self.previous,
+        }
+        .execute()
+    }
+}
 impl PlanTask {
     pub fn execute(self) -> Result<Planned, Error> {
         if let Some(projection) = self.projection {
@@ -175,18 +242,27 @@ impl PlanTask {
             base_nodes: u64::from(plan.visited_nodes),
             ..PlanWork::default()
         };
-        let near = [
-            (self.camera[0] - self.near_radius) * 16,
-            (self.camera[1] - self.near_radius) * 16,
-            (self.camera[0] + self.near_radius + 1) * 16,
-            (self.camera[1] + self.near_radius + 1) * 16,
-        ];
+        let near = if let Some([min, max]) = self.config.near_volume {
+            [
+                i64::from(min[0]) * 16,
+                i64::from(min[2]) * 16,
+                i64::from(max[0]) * 16,
+                i64::from(max[2]) * 16,
+            ]
+        } else {
+            [
+                (self.camera[0] - self.near_radius) * 16,
+                (self.camera[1] - self.near_radius) * 16,
+                (self.camera[0] + self.near_radius + 1) * 16,
+                (self.camera[1] + self.near_radius + 1) * 16,
+            ]
+        };
         loop {
             let mut split = None;
             let mut remove = None;
             for (i, tile) in plan.tiles.iter().enumerate() {
                 let b = tile.key.bounds().ok_or(Error::Plan)?;
-                if contains(near, b) {
+                if self.config.near_volume.is_none() && contains(near, b) {
                     remove = Some(i);
                     break;
                 }
@@ -293,6 +369,7 @@ pub struct ProxyTask {
     pub revision: u64,
     atlas_layers: u32,
     input: Arc<net::PublicGeometry>,
+    separate_water: bool,
 }
 pub struct ProxyBuilt {
     pub stamp: GeometryStamp,
@@ -318,7 +395,7 @@ impl ProxyTask {
                 },
             })
             .collect::<Vec<_>>();
-        let source = crate::lodcache::decode_geometry(
+        let mut source = crate::lodcache::decode_geometry(
             &crate::lodcache::GeometryInput {
                 page: self.input.page,
                 source: self.input.source_version,
@@ -332,6 +409,25 @@ impl ProxyTask {
             self.atlas_layers,
         )
         .map_err(|_| ProxyError::InvalidMaterial)?;
+        if self.separate_water {
+            // Physical water is separately certified and staged for EVERY
+            // exact-column page before this opaque proxy may be enabled.
+            for y in 0..16 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        if matches!(
+                            source.get([x, y, z]),
+                            render::lod::PublicVoxel::Solid {
+                                kind: render::lod::SurfaceKind::Water,
+                                ..
+                            }
+                        ) {
+                            source.set([x, y, z], render::lod::PublicVoxel::Air);
+                        }
+                    }
+                }
+            }
+        }
         let task = LodBuildTask::from_public_snapshot(
             lod_key(self.stamp.page),
             self.revision,
@@ -354,6 +450,9 @@ pub struct ViewHorizon {
     next_proxy_revision: u64,
     wire: BTreeMap<HeightKey, Arc<net::height::HeightTile>>,
     certificates: BTreeMap<HeightKey, Certificate>,
+    height_touched: BTreeMap<HeightKey, u64>,
+    required_height_metadata: BTreeSet<HeightKey>,
+    height_cache_clock: u64,
     geometry: BTreeMap<PageId, GeometryMeta>,
     wanted: BTreeMap<PageId, GeometryStamp>,
     front: BTreeMap<PageId, Resident>,
@@ -364,16 +463,27 @@ pub struct ViewHorizon {
     keys: Vec<PageId>,
     models: Vec<(ProxyHandle, [[f32; 4]; 4])>,
     origin: [i64; 3],
+    water: Option<Box<FarWaterSource>>,
+    wanted_water: Vec<(GeometryStamp, u64)>,
     plan_id: u64,
     accepted_plan_id: u64,
     plan_generation: u64,
     last_request: Option<(u32, [i64; 2], u64)>,
     projection: Option<Projection>,
     quality: SelectionQuality,
+    requested_selection: (u32, f64),
+    candidate_selection: Option<(u32, f64)>,
+    committed_selection: Option<(u32, f64)>,
+    committed_quality: SelectionQuality,
     fresh_heights: BTreeSet<HeightKey>,
     exact_leaves: BTreeSet<HeightKey>,
     near_radius: Option<i64>,
     near_bounds: Option<(u32, [i64; 4])>,
+    committed_near_volume: Option<[[i32; 3]; 2]>,
+    display_space: u32,
+    near_extra: Vec<PageId>,
+    near_pending_extra: Vec<PageId>,
+    near_points: Vec<[i32; 3]>,
     guard_ready: bool,
     dirty: bool,
     enabled: bool,
@@ -398,12 +508,13 @@ impl ViewHorizon {
         atmosphere: Option<&render::atmosphere::AtmosphereGpu>,
     ) -> Result<Self, Error> {
         if config.max_tiles == 0
-            || config.max_tiles > 512
+            || config.max_tiles > net::height::MAX_TILES
             || config.max_sources < config.max_tiles
-            || config.max_sources > 4096
+            || config.max_sources > net::height::MAX_SOURCES
             || config.max_proxy_pages == 0
             || config.max_proxy_pages > 512
             || config.horizon_level > 10
+            || !valid_near_volume(config.near_volume)
             || !config.screen_error_pixels.is_finite()
             || config.screen_error_pixels <= 0.
             || !config.hysteresis_pixels.is_finite()
@@ -460,6 +571,9 @@ impl ViewHorizon {
             next_proxy_revision: 1,
             wire: BTreeMap::new(),
             certificates: BTreeMap::new(),
+            height_touched: BTreeMap::new(),
+            required_height_metadata: BTreeSet::new(),
+            height_cache_clock: 0,
             geometry: BTreeMap::new(),
             wanted: BTreeMap::new(),
             front: BTreeMap::new(),
@@ -470,16 +584,27 @@ impl ViewHorizon {
             keys: Vec::with_capacity(config.max_proxy_pages * 2),
             models: Vec::with_capacity(config.max_proxy_pages * 2),
             origin: [0; 3],
+            water: None,
+            wanted_water: Vec::with_capacity(config.max_proxy_pages),
             plan_id: 0,
             accepted_plan_id: 0,
             plan_generation: 0,
             last_request: None,
             projection: None,
             quality: SelectionQuality::default(),
+            requested_selection: (2_u32 << config.horizon_level, config.screen_error_pixels),
+            candidate_selection: None,
+            committed_selection: None,
+            committed_quality: SelectionQuality::default(),
             fresh_heights: BTreeSet::new(),
             exact_leaves: BTreeSet::new(),
             near_radius: None,
             near_bounds: None,
+            committed_near_volume: None,
+            display_space: 0,
+            near_extra: Vec::with_capacity(512),
+            near_pending_extra: Vec::with_capacity(512),
+            near_points: Vec::with_capacity(512),
             guard_ready: false,
             dirty: false,
             enabled: false,
@@ -507,6 +632,110 @@ impl ViewHorizon {
     /// Call before EVERY camera-page transition can draw. Budget refusal makes
     /// draw() return zero until the full guard batch succeeds. Old distant cover
     /// remains allocated; newly near tiles/proxies are conservatively suppressed.
+    pub fn set_display_space(&mut self, space: u32) {
+        self.display_space = space;
+    }
+    pub fn near_cover_ready(&self) -> bool {
+        self.display_space != 0
+            || (self.guard_ready
+                && self.config.near_volume == self.committed_near_volume
+                && self.water_guard_ready())
+    }
+    pub fn set_near_intent(&mut self, volume: [[i32; 3]; 2]) -> Result<bool, Error> {
+        if !valid_near_volume(Some(volume)) {
+            return Err(Error::InvalidConfig);
+        }
+        if self.config.near_volume == Some(volume) {
+            return Ok(false);
+        }
+        self.plan_generation = self.plan_generation.checked_add(1).ok_or(Error::Capacity)?;
+        self.config.near_volume = Some(volume);
+        self.guard_ready = false;
+        self.dirty = true;
+        Ok(true)
+    }
+    /// Publish one joined near mask. Exact proxies/water remain present for Y
+    /// pages outside the intended raw volume, even at the same X/Z column.
+    pub fn guard_near_cover(
+        &mut self,
+        queue: &wgpu::Queue,
+        water_gpu: Option<&mut render::water_gpu::WaterGpu>,
+        extras: &[PageId],
+        budget: &mut UploadBudget,
+    ) -> Result<Option<u64>, Error> {
+        let volume = self.config.near_volume.ok_or(Error::InvalidConfig)?;
+        if extras.len() > 512
+            || extras.iter().any(|p| p.space.0 != 0)
+            || (self.water.is_some() && water_gpu.is_none())
+        {
+            return Err(Error::InvalidConfig);
+        }
+        self.near_pending_extra.clear();
+        self.near_pending_extra.extend_from_slice(extras);
+        self.near_pending_extra.sort_unstable();
+        self.near_pending_extra.dedup();
+        if self.guard_ready
+            && self.committed_near_volume == Some(volume)
+            && self.near_extra == self.near_pending_extra
+        {
+            return Ok(Some(0));
+        }
+        // Complete conservative credit covers every flag, plus the fixed mask.
+        let worst = render::near_cover::UPLOAD_BYTES
+            + self.front.len() as u64 * 4
+            + if self.water.is_some() {
+                self.config.max_proxy_pages as u64 * 4
+            } else {
+                0
+            };
+        if budget.remaining_bytes < worst {
+            self.guard_ready = false;
+            return Ok(None);
+        }
+        self.near_points.clear();
+        self.near_points
+            .extend(self.near_pending_extra.iter().map(|p| [p.x, p.y, p.z]));
+        let before = budget.remaining_bytes;
+        match self.height.update_near_cover(
+            queue,
+            Some(volume),
+            &self.near_points,
+            self.origin,
+            budget,
+        ) {
+            Ok(_) => {}
+            Err(render::near_cover::Error::Extent | render::near_cover::Error::UploadBudget) => {
+                self.guard_ready = false;
+                return Ok(None);
+            }
+            Err(render::near_cover::Error::Bounds) => return Err(Error::InvalidConfig),
+        }
+        self.changes.clear();
+        for (&page, r) in &self.front {
+            self.changes.push((
+                r.handle,
+                !page_covered(page, None, Some(volume), &self.near_pending_extra)
+                    && !self.removed.contains(&page),
+            ));
+        }
+        self.changes.sort_unstable_by_key(|c| c.0.slot);
+        self.proxies
+            .set_enabled_batch(queue, &self.changes, budget)?;
+        if let Some(source) = &mut self.water {
+            source.guard_near(
+                queue,
+                water_gpu.expect("validated water GPU"),
+                budget,
+                |p| !page_covered(p, None, Some(volume), &self.near_pending_extra),
+            )?;
+        }
+        core::mem::swap(&mut self.near_extra, &mut self.near_pending_extra);
+        self.committed_near_volume = Some(volume);
+        self.near_bounds = None;
+        self.guard_ready = true;
+        self.dirty = true;
+        Ok(Some(before - budget.remaining_bytes))
+    }
     pub fn guard_near(
         &mut self,
         queue: &wgpu::Queue,
@@ -579,7 +808,7 @@ impl ViewHorizon {
             .filter(|t| matches!(t.replacement, Replacement::Refine))
             .map(|t| t.key)
             .collect::<Vec<_>>();
-        if refine.len() > 512 {
+        if refine.len() > self.config.max_tiles {
             self.last_request = None;
             return Err(Error::Capacity);
         }
@@ -613,6 +842,7 @@ impl ViewHorizon {
                     .any(|tile| wire_key(tile.key) == *key)
         });
         self.quality = result.quality;
+        self.candidate_selection = Some(self.requested_selection);
         self.exact_leaves = result.exact_leaves.into_iter().collect();
         let keys = self.cache.wanted().map(wire_key).collect::<Vec<_>>();
         for key in keys {
@@ -621,8 +851,9 @@ impl ViewHorizon {
             }
         }
         self.rebuild_wanted()?;
-        // Keep only current leaves and ancestors useful for future coarsening.
-        // A long route cannot fill the fixed cache with obsolete fine tiles.
+        // Protect the current tree, but keep other learned certificates until
+        // actual pressure. Eagerly pruning children during a capacity-driven
+        // plan change can otherwise cause re-fetch/refinement oscillation.
         let mut keep = BTreeSet::new();
         for tile in &result.plan.tiles {
             let mut key = wire_key(tile.key);
@@ -639,8 +870,13 @@ impl ViewHorizon {
                 };
             }
         }
-        self.wire.retain(|key, _| keep.contains(key));
-        self.certificates.retain(|key, _| keep.contains(key));
+        self.required_height_metadata = keep;
+        self.height_cache_clock = self.height_cache_clock.saturating_add(1);
+        for key in self.cache.wanted().map(wire_key) {
+            if self.wire.contains_key(&key) {
+                self.height_touched.insert(key, self.height_cache_clock);
+            }
+        }
         self.accepted_plan_id = result.id;
         self.dirty = true;
         Ok(true)
@@ -651,6 +887,66 @@ impl ViewHorizon {
     pub fn wanted_exact_height(&self) -> impl Iterator<Item = HeightKey> + '_ {
         self.exact_leaves.iter().copied()
     }
+    pub fn enable_separate_water(&mut self, limits: far_water_source::Limits) -> Result<(), Error> {
+        if self.water.is_some()
+            || !self.front.is_empty()
+            || !self.staged.is_empty()
+            || !self.proxy_running.is_empty()
+            || limits.max_pages < self.config.max_proxy_pages
+        {
+            return Err(Error::InvalidConfig);
+        }
+        self.water = Some(Box::new(FarWaterSource::new(limits)?));
+        self.rebuild_wanted()?;
+        self.dirty = true;
+        Ok(())
+    }
+    pub fn water_stats(&self) -> Option<far_water_source::Stats> {
+        self.water.as_ref().map(|water| water.stats())
+    }
+    pub fn separate_water_enabled(&self) -> bool {
+        self.water.is_some()
+    }
+    pub fn water_guard_ready(&self) -> bool {
+        self.water
+            .as_ref()
+            .is_none_or(|water| self.guard_ready && water.guard_ready())
+    }
+    pub fn wanted_water(&self) -> impl Iterator<Item = net::water::Request> + '_ {
+        self.wanted_water
+            .iter()
+            .map(|&(stamp, column_source)| net::water::Request {
+                page: stamp.page,
+                geometry_source: stamp.source,
+                geometry_view: stamp.view,
+                column_source,
+                acknowledged: None,
+            })
+    }
+    pub fn admit_water(&mut self, image: Arc<net::water::WaterHalo>) -> Result<bool, Error> {
+        let Some(water) = &mut self.water else {
+            return Ok(false);
+        };
+        let changed = water.admit(image)?;
+        self.dirty |= changed;
+        Ok(changed)
+    }
+    pub fn take_water_task(&mut self) -> Option<BackgroundTask> {
+        let (context, task) = self.water.as_mut()?.take_task()?;
+        Some(BackgroundTask::Water { context, task })
+    }
+    pub fn complete_water(
+        &mut self,
+        context: far_water_source::Context,
+        result: Box<BuiltFarWater>,
+    ) -> Result<bool, Box<BuiltFarWater>> {
+        let Some(water) = &mut self.water else {
+            return Ok(false);
+        };
+        let current = water.complete(context, result)?;
+        self.dirty |= current;
+        Ok(current)
+    }
     pub fn ingest_height(&mut self, tile: Box<net::height::HeightTile>) -> Result<bool, Error> {
         tile.validate().map_err(|_| Error::InvalidWire)?;
         let selected = self.cache.wanted().any(|key| wire_key(key) == tile.key);
@@ -660,6 +956,9 @@ impl ViewHorizon {
                 return Ok(false);
             }
             if tile.source == old.source && **old == *tile {
+                self.height_cache_clock = self.height_cache_clock.saturating_add(1);
+                self.height_touched
+                    .insert(tile.key, self.height_cache_clock);
                 if selected && self.fresh_heights.insert(tile.key) {
                     self.dirty = true;
                 }
@@ -683,7 +982,16 @@ impl ViewHorizon {
                 }
             }
         } else if self.wire.len() >= self.config.max_sources {
-            return Err(Error::Capacity);
+            let victim = self
+                .wire
+                .keys()
+                .filter(|key| !self.required_height_metadata.contains(key))
+                .min_by_key(|key| (self.height_touched.get(key).copied().unwrap_or(0), **key))
+                .copied()
+                .ok_or(Error::Capacity)?;
+            self.wire.remove(&victim);
+            self.certificates.remove(&victim);
+            self.height_touched.remove(&victim);
         }
         let refine = matches!(tile.replacement, Replacement::Refine);
         let certified = tile.error.is_some();
@@ -704,13 +1012,65 @@ impl ViewHorizon {
         } else {
             self.certificates.remove(&tile.key);
         }
-        self.wire.insert(tile.key, tile);
+        let key = tile.key;
+        self.wire.insert(key, tile);
+        self.height_cache_clock = self.height_cache_clock.saturating_add(1);
+        self.height_touched.insert(key, self.height_cache_clock);
         if refine || certified {
             self.plan_generation = self.plan_generation.checked_add(1).ok_or(Error::Capacity)?;
         }
         self.rebuild_wanted()?;
         self.dirty = true;
         Ok(true)
+    }
+    /// Runtime selection changes reuse the prepared GPU capacities. The next
+    /// immutable plan must complete and atomically commit before its receipt.
+    pub fn set_selection(
+        &mut self,
+        horizon_pages: u32,
+        maximum_error_pixels: f64,
+    ) -> Result<bool, Error> {
+        if !(2..=2048).contains(&horizon_pages)
+            || !maximum_error_pixels.is_finite()
+            || maximum_error_pixels <= 0.
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let requested = (horizon_pages, maximum_error_pixels);
+        if self.requested_selection == requested {
+            return Ok(false);
+        }
+        let generation = self.plan_generation.checked_add(1).ok_or(Error::Capacity)?;
+        // A dyadic ring conservatively covers intermediate choices such as384;
+        // the View's committed far clip applies the exact requested distance.
+        self.config.horizon_level = (horizon_pages.next_power_of_two().ilog2() - 1) as u8;
+        self.config.screen_error_pixels = maximum_error_pixels;
+        self.config.hysteresis_pixels = maximum_error_pixels * 0.25;
+        if let Some(projection) = &mut self.projection {
+            projection.target_pixels = maximum_error_pixels;
+            projection.hysteresis_pixels = self.config.hysteresis_pixels;
+        }
+        self.requested_selection = requested;
+        self.plan_generation = generation;
+        Ok(true)
+    }
+    pub fn committed_horizon_pages(&self) -> Option<u32> {
+        self.has_committed_front()
+            .then_some(self.committed_selection?.0)
+    }
+    pub fn horizon_selection_applied(&self, horizon_pages: u32) -> bool {
+        self.committed_horizon_pages() == Some(horizon_pages)
+    }
+    pub fn error_selection_applied(&self, maximum_error_pixels: f64) -> bool {
+        self.has_committed_front()
+            && self.projection.is_some()
+            && self
+                .committed_selection
+                .is_some_and(|(_, error)| error == maximum_error_pixels)
+            && self.committed_quality.missing_certificates == 0
+            && !self.committed_quality.capacity_limited
+            && self.committed_quality.leaf_limited == 0
+            && self.committed_quality.maximum_error_pixels <= maximum_error_pixels
     }
     /// The eye box is quantized by the View, so head bob and camera interpolation
     /// never replan at display frequency. Resizing or FOV changes do replan.
@@ -726,6 +1086,7 @@ impl ViewHorizon {
     }
     fn rebuild_wanted(&mut self) -> Result<(), Error> {
         self.wanted.clear();
+        self.wanted_water.clear();
         for key in self.cache.wanted() {
             if let Some(tile) = self.wire.get(&wire_key(key))
                 && let Replacement::Column { geometry, .. } = &tile.replacement
@@ -741,8 +1102,14 @@ impl ViewHorizon {
                     {
                         return Err(Error::InvalidWire);
                     }
+                    if self.water.is_some() {
+                        self.wanted_water.push((stamp, tile.source));
+                    }
                 }
             }
+        }
+        if let Some(water) = &mut self.water {
+            water.set_wanted(&self.wanted_water)?;
         }
         Ok(())
     }
@@ -812,6 +1179,7 @@ impl ViewHorizon {
             revision: meta.revision,
             atlas_layers: self.config.atlas_layers,
             input,
+            separate_water: self.water.is_some(),
         })
     }
     pub fn complete_proxy(&mut self, result: ProxyBuilt) -> Result<bool, Box<ProxyBuilt>> {
@@ -877,8 +1245,52 @@ impl ViewHorizon {
         max_height: usize,
         max_proxy: usize,
     ) -> Result<Work, Error> {
+        self.pump_inner(queue, None, budget, max_height, max_proxy, true)
+    }
+    pub fn pump_with_water(
+        &mut self,
+        queue: &wgpu::Queue,
+        water_gpu: &mut render::water_gpu::WaterGpu,
+        budget: &mut UploadBudget,
+        max_height: usize,
+        max_proxy: usize,
+    ) -> Result<Work, Error> {
+        self.pump_inner(queue, Some(water_gpu), budget, max_height, max_proxy, true)
+    }
+    /// Load a complete candidate without enabling any new Height/proxy/water
+    /// object. Publication still requires the normal combined preflight.
+    pub fn stage_with_water(
+        &mut self,
+        queue: &wgpu::Queue,
+        water_gpu: &mut render::water_gpu::WaterGpu,
+        budget: &mut UploadBudget,
+        max_height: usize,
+        max_proxy: usize,
+    ) -> Result<Work, Error> {
+        self.pump_inner(queue, Some(water_gpu), budget, max_height, max_proxy, false)
+    }
+    fn pump_inner(
+        &mut self,
+        queue: &wgpu::Queue,
+        mut water_gpu: Option<&mut render::water_gpu::WaterGpu>,
+        budget: &mut UploadBudget,
+        max_height: usize,
+        max_proxy: usize,
+        allow_publish: bool,
+    ) -> Result<Work, Error> {
+        if self.water.is_some() && water_gpu.is_none() {
+            return Err(Error::InvalidConfig);
+        }
         if !self.dirty && self.retired.is_empty() && self.cache.pending_retirements() == 0 {
-            return Ok(Work::default());
+            if self
+                .water
+                .as_ref()
+                .is_some_and(|water| water.stats().retiring != 0)
+            {
+                self.dirty = true;
+            } else {
+                return Ok(Work::default());
+            }
         }
         let before = budget.remaining_bytes;
         if !self.removed.is_empty() {
@@ -909,6 +1321,16 @@ impl ViewHorizon {
             self.removed.clear();
         }
         let mut work = Work::default();
+        if let Some(water) = &mut self.water {
+            let origin = self.origin;
+            water.flush_staging(
+                queue,
+                water_gpu.as_deref_mut().expect("validated water GPU"),
+                budget,
+                max_proxy,
+                |page| Some(page_model(page, origin)),
+            )?;
+        }
         while work.retired < max_proxy
             && let Some(&handle) = self.retired.last()
         {
@@ -919,17 +1341,12 @@ impl ViewHorizon {
             self.retired.pop();
             work.retired += 1;
         }
-        if self
+        let inputs_fresh = !(self
             .cache
             .wanted()
             .any(|key| !self.fresh_heights.contains(&wire_key(key)))
             || self.exact_leaves.iter().any(|key|self.wire.get(key).is_none_or(|tile|
-                !matches!(&tile.replacement,Replacement::Column{geometry,..}if !geometry.is_empty())))
-        {
-            work.held_previous = true;
-            work.upload_bytes = before - budget.remaining_bytes;
-            return Ok(work);
-        }
+                !matches!(&tile.replacement,Replacement::Column{geometry,..}if !geometry.is_empty()))));
         self.keys.clear();
         for (&page, resident) in &self.staged {
             if self.wanted.get(&page) != Some(&resident.stamp) {
@@ -972,6 +1389,19 @@ impl ViewHorizon {
             self.staged.insert(page, Resident { stamp, handle });
             work.proxy_pages += 1;
         }
+        if !inputs_fresh || !allow_publish {
+            // Inactive uploads overlap authority metadata/worker arrivals.
+            // The explicit staging API cannot enable Height or publish a
+            // partial cover, even when every currently cached source exists.
+            let staged = self
+                .cache
+                .pump_staging(&mut self.height, queue, budget, max_height)?;
+            work.height_tiles = staged.staged;
+            work.retired += staged.released;
+            work.held_previous = true;
+            work.upload_bytes = before - budget.remaining_bytes;
+            return Ok(work);
+        }
         let all_proxy_ready = self.wanted.iter().all(|(page, stamp)| {
             self.staged
                 .get(page)
@@ -979,8 +1409,9 @@ impl ViewHorizon {
                 .or_else(|| self.front.get(page).filter(|r| r.stamp == *stamp))
                 .is_some()
         });
+        let all_water_ready = self.water.as_ref().is_none_or(|water| water.all_ready());
         self.changes.clear();
-        if all_proxy_ready {
+        if all_proxy_ready && all_water_ready {
             for (&page, resident) in &self.front {
                 if self.wanted.get(&page) != Some(&resident.stamp) {
                     self.changes.push((resident.handle, false));
@@ -988,13 +1419,35 @@ impl ViewHorizon {
             }
             for (&page, resident) in &self.staged {
                 if self.wanted.get(&page) == Some(&resident.stamp) {
-                    self.changes
-                        .push((resident.handle, !page_near(page, self.near_bounds)));
+                    self.changes.push((
+                        resident.handle,
+                        !page_covered(
+                            page,
+                            self.near_bounds,
+                            self.committed_near_volume,
+                            &self.near_extra,
+                        ),
+                    ));
                 }
             }
         }
         self.changes.sort_unstable_by_key(|c| c.0.slot);
-        let reserve = self.changes.len() as u64 * 4;
+        let near = self.near_bounds;
+        let near_volume = self.committed_near_volume;
+        let near_extra = &self.near_extra;
+        let water_reserve = if all_water_ready {
+            if let Some(water) = &mut self.water {
+                water.publication_bytes(
+                    water_gpu.as_deref_mut().expect("validated water GPU"),
+                    |page| !page_covered(page, near, near_volume, near_extra),
+                )?
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let reserve = self.changes.len() as u64 * 4 + water_reserve;
         if budget.remaining_bytes < reserve {
             work.held_previous = true;
             work.upload_bytes = before - budget.remaining_bytes;
@@ -1028,6 +1481,10 @@ impl ViewHorizon {
                                         self.front.get(&stamp.page).filter(|r| r.stamp == *stamp)
                                     })
                                     .is_some()
+                                    && self
+                                        .water
+                                        .as_ref()
+                                        .is_none_or(|water| water.ready(*stamp, wire.source))
                             })
                     }
                 }
@@ -1037,10 +1494,21 @@ impl ViewHorizon {
         let h = h?;
         work.height_tiles = h.staged;
         work.retired += h.released;
-        work.held_previous = h.held_previous || !all_proxy_ready;
-        if !h.held_previous && all_proxy_ready {
+        work.held_previous = h.held_previous || !all_proxy_ready || !all_water_ready;
+        if !h.held_previous && all_proxy_ready && all_water_ready {
             self.proxies
                 .set_enabled_batch(queue, &self.changes, budget)?;
+            let water_published = if let Some(water) = &mut self.water {
+                let w = water.publish(
+                    queue,
+                    water_gpu.expect("validated water GPU"),
+                    budget,
+                    |page| !page_covered(page, near, near_volume, near_extra),
+                )?;
+                w.published != 0 || w.gpu_upload_bytes != 0
+            } else {
+                false
+            };
             self.keys.clear();
             for (&page, resident) in &self.front {
                 if self.wanted.get(&page) != Some(&resident.stamp) {
@@ -1061,12 +1529,36 @@ impl ViewHorizon {
                 self.front
                     .insert(*page, self.staged.remove(page).expect("current staging"));
             }
-            work.published = h.published || !self.changes.is_empty();
+            work.published = h.published || !self.changes.is_empty() || water_published;
             self.dirty = false;
+            self.committed_selection = self.candidate_selection;
+            self.committed_quality = self.quality;
             self.enabled = self.near_radius.is_some() && self.guard_ready;
         }
         work.upload_bytes = before - budget.remaining_bytes;
         Ok(work)
+    }
+    pub fn guard_water_near(
+        &mut self,
+        queue: &wgpu::Queue,
+        water_gpu: &mut render::water_gpu::WaterGpu,
+        budget: &mut UploadBudget,
+    ) -> Result<bool, Error> {
+        let Some(water) = &mut self.water else {
+            return Ok(true);
+        };
+        let near = self.near_bounds;
+        let near_volume = self.committed_near_volume;
+        let near_extra = &self.near_extra;
+        match water.guard_near(queue, water_gpu, budget, |page| {
+            !page_covered(page, near, near_volume, near_extra)
+        }) {
+            Ok(_) => Ok(self.guard_ready && water.guard_ready()),
+            Err(far_water_source::Error::Gpu(render::water_gpu::WaterError::UploadBudget)) => {
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
     pub fn rebase(
         &mut self,
@@ -1074,11 +1566,47 @@ impl ViewHorizon {
         origin: [i64; 3],
         budget: &mut UploadBudget,
     ) -> Result<Option<u64>, Error> {
+        self.rebase_inner(queue, None, origin, budget)
+    }
+    pub fn rebase_with_water(
+        &mut self,
+        queue: &wgpu::Queue,
+        water: &mut render::water_gpu::WaterGpu,
+        origin: [i64; 3],
+        budget: &mut UploadBudget,
+    ) -> Result<Option<u64>, Error> {
+        self.rebase_inner(queue, Some(water), origin, budget)
+    }
+    fn rebase_inner(
+        &mut self,
+        queue: &wgpu::Queue,
+        mut water_gpu: Option<&mut render::water_gpu::WaterGpu>,
+        origin: [i64; 3],
+        budget: &mut UploadBudget,
+    ) -> Result<Option<u64>, Error> {
+        if self.water.is_some() && water_gpu.is_none() {
+            return Err(Error::InvalidConfig);
+        }
         if origin == self.origin {
             return Ok(Some(0));
         }
+        let water_bytes = if let Some(source) = &mut self.water {
+            source.rebase_bytes(
+                water_gpu.as_deref_mut().expect("water GPU validated"),
+                |page| Some(page_model(page, origin)),
+            )?
+        } else {
+            0
+        };
+        let near_bytes = if self.committed_near_volume.is_some() {
+            render::near_cover::UPLOAD_BYTES
+        } else {
+            0
+        };
         let worst = self.config.max_tiles as u64 * 2 * 64
-            + (self.front.len() + self.staged.len()) as u64 * 256;
+            + (self.front.len() + self.staged.len()) as u64 * 256
+            + water_bytes
+            + near_bytes;
         if budget.remaining_bytes < worst {
             return Ok(None);
         }
@@ -1089,7 +1617,23 @@ impl ViewHorizon {
         self.models.sort_unstable_by_key(|c| c.0.slot);
         let before = budget.remaining_bytes;
         self.cache.rebase(&mut self.height, queue, origin, budget)?;
+        if let Some(volume) = self.committed_near_volume {
+            self.near_points.clear();
+            self.near_points
+                .extend(self.near_extra.iter().map(|p| [p.x, p.y, p.z]));
+            self.height
+                .update_near_cover(queue, Some(volume), &self.near_points, origin, budget)
+                .map_err(|_| Error::InvalidConfig)?;
+        }
         self.proxies.set_models_batch(queue, &self.models, budget)?;
+        if let Some(source) = &mut self.water {
+            source.rebase(
+                queue,
+                water_gpu.expect("water GPU validated"),
+                budget,
+                |page| Some(page_model(page, origin)),
+            )?;
+        }
         self.origin = origin;
         Ok(Some(before - budget.remaining_bytes))
     }
@@ -1101,30 +1645,83 @@ impl ViewHorizon {
         eye: [f32; 3],
         viewport_height: u32,
     ) -> Result<(), Error> {
-        if !self.enabled || !self.guard_ready {
+        // Compatibility for standard symmetric perspective/orthographic
+        // projections. Runtime shells use the explicit attachment extent.
+        let viewport_width = (viewport_height as f64
+            * libm::sqrt(
+                (0..3)
+                    .map(|i| f64::from(camera.view_projection[i][1]).powi(2))
+                    .sum::<f64>(),
+            )
+            / libm::sqrt(
+                (0..3)
+                    .map(|i| f64::from(camera.view_projection[i][0]).powi(2))
+                    .sum::<f64>(),
+            ))
+        .round()
+        .max(1.) as u32;
+        self.prepare_camera_extent(
+            queue,
+            encoder,
+            camera,
+            eye,
+            [viewport_width, viewport_height],
+        )
+    }
+    pub fn prepare_camera_extent(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: Camera,
+        eye: [f32; 3],
+        viewport: [u32; 2],
+    ) -> Result<(), Error> {
+        if self.display_space != 0
+            || !self.enabled
+            || !self.guard_ready
+            || !self.water_guard_ready()
+        {
             return Ok(());
         }
         self.height
             .prepare_frame(queue, encoder, camera)
             .map_err(height_cache::Error::Gpu)?;
-        self.proxies.prepare_frame(
+        self.proxies.prepare_frame_extent(
             queue,
             encoder,
             ProxyCamera {
                 camera,
                 eye,
-                viewport_height,
+                viewport_height: viewport[1],
                 orthographic_direction: None,
             },
+            viewport[0],
         )?;
         Ok(())
     }
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> u32 {
-        if self.enabled && self.guard_ready {
+        if self.display_space == 0 && self.enabled && self.guard_ready && self.water_guard_ready() {
             self.height.draw(pass) + self.proxies.draw(pass)
         } else {
             0
         }
+    }
+    /// Draw only the committed Height front, for independently supplied exact proxies.
+    pub fn draw_heights(&self, pass: &mut wgpu::RenderPass<'_>) -> u32 {
+        if self.display_space == 0 && self.enabled && self.guard_ready && self.water_guard_ready() {
+            self.height.draw(pass)
+        } else {
+            0
+        }
+    }
+    /// A real committed cover exists; incoming inactive replacements do not
+    /// revoke it. Initial loading and failed near guards are ineligible.
+    pub fn has_committed_front(&self) -> bool {
+        self.display_space == 0
+            && self.enabled
+            && self.guard_ready
+            && self.water_guard_ready()
+            && self.cache.front_len() > 0
     }
     pub fn front_source(&self, key: HeightKey) -> Option<u64> {
         self.cache.front_source(render_key(key))
@@ -1229,6 +1826,28 @@ fn adjacent(a: HeightTileKey, b: HeightTileKey) -> bool {
         || ((a[3] == b[1] || a[1] == b[3]) && a[0] < b[2] && b[0] < a[2])
 }
 
+fn valid_near_volume(volume: Option<[[i32; 3]; 2]>) -> bool {
+    volume.is_none_or(|[min, max]| {
+        (0..3).all(|a| min[a] < max[a] && i64::from(max[a]) - i64::from(min[a]) <= 32)
+    })
+}
+fn page_covered(
+    page: PageId,
+    legacy: Option<(u32, [i64; 4])>,
+    volume: Option<[[i32; 3]; 2]>,
+    extras: &[PageId],
+) -> bool {
+    if let Some([min, max]) = volume {
+        page.space.0 == 0
+            && (([page.x, page.y, page.z]
+                .into_iter()
+                .enumerate()
+                .all(|(a, v)| v >= min[a] && v < max[a]))
+                || extras.binary_search(&page).is_ok())
+    } else {
+        page_near(page, legacy)
+    }
+}
 fn page_near(page: PageId, near: Option<(u32, [i64; 4])>) -> bool {
     near.is_some_and(|(space, bounds)| {
         page.space.0 == space
@@ -1247,18 +1866,25 @@ fn page_near(page: PageId, near: Option<(u32, [i64; 4])>) -> bool {
 #[path = "horizon_wire.rs"]
 mod wire;
 pub use wire::{
-    WireError, decode_background_result, encode_background_task, execute_background_request,
+    MAX_BACKGROUND_BYTES, WireError, decode_background_result, encode_background_task,
+    execute_background_request,
 };
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskContext {
     Plan { id: u64 },
     Proxy { key: LodKey, revision: u64 },
+    Water(far_water_source::Context),
 }
 impl TaskContext {
     pub fn fail(self, owner: &mut ViewHorizon) {
         match self {
             Self::Plan { id } => owner.fail_plan(id),
             Self::Proxy { key, revision } => owner.fail_proxy(key, revision),
+            Self::Water(context) => {
+                if let Some(water) = &mut owner.water {
+                    water.fail(context);
+                }
+            }
         }
     }
 }
@@ -1267,6 +1893,10 @@ impl TaskContext {
 pub enum BackgroundTask {
     Plan(Box<PlanTask>),
     Proxy(ProxyTask),
+    Water {
+        context: far_water_source::Context,
+        task: FarWaterTask,
+    },
 }
 impl BackgroundTask {
     pub fn context(&self) -> TaskContext {
@@ -1276,6 +1906,7 @@ impl BackgroundTask {
                 key: lod_key(task.stamp.page),
                 revision: task.revision,
             },
+            Self::Water { context, .. } => TaskContext::Water(*context),
         }
     }
     pub fn job_key(&self) -> jobs::JobKey {
@@ -1293,6 +1924,10 @@ impl BackgroundTask {
                 page: task.stamp.page,
                 kind: 0x4850,
             },
+            Self::Water { context, .. } => jobs::JobKey {
+                page: context.stamp.page,
+                kind: 0x4857,
+            },
         }
     }
     pub fn retained_bytes(&self) -> usize {
@@ -1307,17 +1942,25 @@ impl BackgroundTask {
                 std::mem::size_of::<net::PublicGeometry>()
                     + task.input.palette.capacity() * std::mem::size_of::<net::PublicSurface>()
                     + task.input.indices.capacity()
+                    + render::lod_gpu::MAX_RETAINED_BYTES
+            }
+            Self::Water { .. } => {
+                far_water_worker::MAX_RETAINED_RESULT_BYTES + net::water::MAX_BYTES
             }
         }
     }
     pub fn cost(&self) -> jobs::WorkCost {
         jobs::WorkCost {
-            cells: if matches!(self, Self::Proxy(_)) {
-                65536
-            } else {
-                0
+            cells: match self {
+                Self::Plan(_) => 0,
+                Self::Proxy(_) => MAX_PROXY_WORK_CELLS,
+                Self::Water { .. } => 131072,
             },
-            bytes: (self.retained_bytes() + 262144) as u64,
+            bytes: if matches!(self, Self::Proxy(_)) {
+                2 * 1024 * 1024
+            } else {
+                (self.retained_bytes() + 262144) as u64
+            },
             ..jobs::WorkCost::ZERO
         }
     }
@@ -1333,6 +1976,12 @@ impl ViewHorizon {
             BackgroundResult::Proxy(Ok(proxy)) => {
                 self.complete_proxy(proxy).map_err(|_| Error::Capacity)
             }
+            BackgroundResult::Water {
+                context,
+                result: Ok(water),
+            } => self
+                .complete_water(context, water)
+                .map_err(|_| Error::Capacity),
             _ => {
                 context.fail(self);
                 Ok(false)
@@ -1343,6 +1992,23 @@ impl ViewHorizon {
 pub enum BackgroundResult {
     Plan(Result<Planned, Error>),
     Proxy(Result<ProxyBuilt, ProxyError>),
+    Water {
+        context: far_water_source::Context,
+        result: Result<Box<BuiltFarWater>, far_water_worker::Error>,
+    },
+}
+impl BackgroundResult {
+    pub fn context(&self) -> Option<TaskContext> {
+        match self {
+            Self::Plan(Ok(plan)) => Some(TaskContext::Plan { id: plan.id }),
+            Self::Proxy(Ok(proxy)) => Some(TaskContext::Proxy {
+                key: lod_key(proxy.stamp.page),
+                revision: proxy.built.revision,
+            }),
+            Self::Water { context, .. } => Some(TaskContext::Water(*context)),
+            _ => None,
+        }
+    }
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub fn native_pool(
@@ -1359,6 +2025,10 @@ pub fn native_pool(
             let result = match task {
                 BackgroundTask::Plan(task) => BackgroundResult::Plan(task.execute()),
                 BackgroundTask::Proxy(task) => BackgroundResult::Proxy(task.execute()),
+                BackgroundTask::Water { context, task } => BackgroundResult::Water {
+                    context,
+                    result: task.execute(|| cancel.is_cancelled()),
+                },
             };
             if cancel.is_cancelled() {
                 return Err("cancelled horizon job".into());
@@ -1371,6 +2041,70 @@ pub fn native_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn public_lava_stays_opaque_when_physical_water_is_separated() {
+        use core_types::{Cell, Version};
+        let lava = rules::block(rules::ids::LAVA).unwrap();
+        assert_eq!(lava.render, rules::blocks::Render::Cube);
+        let mut cells = [Cell::AIR; 4096];
+        cells[0] = Cell::from_parts(rules::ids::LAVA, 0);
+        cells[1] = Cell::from_parts(rules::ids::WATER, 0);
+        let public = server::lod::geometry_from_cells(&cells, None);
+        let page = PageId {
+            space: SpaceId(0),
+            x: 0,
+            y: 0,
+            z: 0,
+        };
+        let input = Arc::new(net::PublicGeometry {
+            page,
+            source_version: Version(1),
+            view_version: 1,
+            known: public.known,
+            occupied: public.occupied,
+            palette: public
+                .palette
+                .into_iter()
+                .map(|surface| net::PublicSurface {
+                    atlas_layer: surface.atlas_layer,
+                    tint: surface.tint,
+                    kind: match surface.kind {
+                        server::lod::PublicSurfaceKind::Opaque => net::PublicSurfaceKind::Opaque,
+                        server::lod::PublicSurfaceKind::Cutout => net::PublicSurfaceKind::Cutout,
+                        server::lod::PublicSurfaceKind::Water => net::PublicSurfaceKind::Water,
+                    },
+                })
+                .collect(),
+            index_bits: public.index_bits,
+            indices: public.indices,
+        });
+        assert!(input.palette.iter().any(|surface| {
+            surface.kind == net::PublicSurfaceKind::Opaque
+                && u32::from(surface.atlas_layer)
+                    == rules::blocks::layer_cell(rules::ids::LAVA, 0, rules::blocks::mesh_face(1)).0
+        }));
+        let built = ProxyTask {
+            stamp: GeometryStamp {
+                page,
+                source: Version(1),
+                view: 1,
+            },
+            revision: 1,
+            atlas_layers: 186,
+            input,
+            separate_water: true,
+        }
+        .execute()
+        .unwrap();
+        let payload = &built.built.payload;
+        assert_eq!(
+            payload.occupied_cells(),
+            1,
+            "only physical water leaves the opaque proxy"
+        );
+        assert_eq!(payload.palette_len(), 1);
+    }
     #[test]
     fn adaptive_1024_plan_refines_known_protected_hints_and_balances_unknown_near_cutout() {
         let camera = [0, 0];

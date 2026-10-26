@@ -38,14 +38,16 @@ struct ConnectOptions {
     name: String,
 }
 struct RemoteNative {
-    session: client::remote::RemoteSession,
-    socket: remote_transport::Socket,
+    session: remote_transport::SharedSession,
+    socket: remote_transport::SharedSocket,
     identity: std::path::PathBuf,
     name: String,
     persisted: bool,
+    diagnostics: bool,
+    last_light_bindings: u64,
 }
 impl RemoteNative {
-    fn new(options: ConnectOptions) -> Result<Self, String> {
+    fn new(options: ConnectOptions, clock_origin: Instant) -> Result<Self, String> {
         let mut session = client::remote::RemoteSession::new(client::network::NetworkConfig {
             input_lead_ticks: 2,
             ..client::network::NetworkConfig::remote_scene()
@@ -59,34 +61,89 @@ impl RemoteNative {
             .connection_mut()
             .hello(hello.name.clone(), hello.identity, hello.credential)
             .map_err(|e| format!("identity handshake: {e:?}"))?;
+        let session = Arc::new(std::sync::Mutex::new(session));
         Ok(Self {
-            socket: remote_transport::Socket::connect(options.url)?,
+            socket: remote_transport::SharedSocket::connect(
+                options.url,
+                session.clone(),
+                clock_origin,
+            )?,
             session,
             identity: options.identity,
             name: hello.name,
             persisted: hello.credential.is_some(),
+            diagnostics: std::env::var_os("CUBI_UI_DIAGNOSTICS").is_some(),
+            last_light_bindings: 0,
         })
     }
-    fn pump_socket(&mut self, now: u64) -> Result<(), String> {
-        self.socket.pump(&mut self.session, now)?;
-        if !self.persisted
-            && let Some(welcome) = self.session.connection().welcome()
-            && let Some(credential) = self.session.connection().credential()
-        {
-            remote_transport::save_identity(
-                &self.identity,
-                &net::Hello {
-                    identity: welcome.identity,
-                    name: self.name.clone(),
-                    credential: Some(credential),
-                },
-            )?;
-            self.persisted = true;
-            println!(
-                "NATIVE_AUTHORITY_CONNECTED tick={} role={:?}",
-                welcome.tick.0, welcome.role
-            );
+    fn session(&self) -> Result<std::sync::MutexGuard<'_, client::remote::RemoteSession>, String> {
+        self.session
+            .lock()
+            .map_err(|_| "shared session poisoned".into())
+    }
+    fn pump_socket(&mut self) -> Result<(), String> {
+        self.socket.pump()?;
+        if !self.persisted {
+            let identity = {
+                let session = self.session()?;
+                session
+                    .connection()
+                    .welcome()
+                    .zip(session.connection().credential())
+                    .map(|(welcome, credential)| {
+                        (
+                            net::Hello {
+                                identity: welcome.identity,
+                                name: self.name.clone(),
+                                credential: Some(credential),
+                            },
+                            welcome.tick,
+                            welcome.role,
+                        )
+                    })
+            };
+            if let Some((identity, tick, role)) = identity {
+                remote_transport::save_identity(&self.identity, &identity)?;
+                self.persisted = true;
+                println!("NATIVE_AUTHORITY_CONNECTED tick={} role={role:?}", tick.0);
+            }
         }
+        Ok(())
+    }
+    fn report_light_bindings(&mut self, view: &ClientView) -> Result<(), String> {
+        if !self.diagnostics {
+            return Ok(());
+        }
+        let session = self.session()?;
+        let mut hash = 0xcbf29ce484222325u64;
+        let mut count = 0;
+        for binding in session.pending_light_bindings(&view.scene).take(8) {
+            count += 1;
+            let header = binding.network_light;
+            let retained = binding.retained_scene_light;
+            for word in [
+                u64::from(binding.page.space.0),
+                binding.page.x as u64,
+                binding.page.y as u64,
+                binding.page.z as u64,
+                binding.scene_cells.unwrap_or(0),
+                binding.network_cells.unwrap_or(0),
+                header.map_or(0, |h| h.cell_view),
+                header.map_or(0, |h| h.version),
+                retained.map_or(0, |h| h.cell_view),
+                retained.map_or(0, |h| h.view),
+            ] {
+                hash = (hash ^ word).wrapping_mul(0x100000001b3);
+            }
+        }
+        if hash != self.last_light_bindings {
+            println!("NATIVE_LIGHT_BINDINGS count={count}");
+            for binding in session.pending_light_bindings(&view.scene).take(8) {
+                println!("NATIVE_LIGHT_BINDING {binding:?}");
+            }
+        }
+        drop(session);
+        self.last_light_bindings = hash;
         Ok(())
     }
 }
@@ -100,12 +157,14 @@ struct NativeState {
     view: Option<Box<ClientView>>,
     loading: Option<mpsc::Receiver<Result<Box<ClientView>, String>>>,
     loading_thread: Option<std::thread::JoinHandle<()>>,
+    loading_cancel: Option<Arc<AtomicU32>>,
     workers: Option<jobs::NativePool<client::SceneTask, client::SceneOutput>>,
     // The history is 43 KiB. Keeping it inline duplicates that storage across
     // async return slots and window-event state moves on the 1 MiB Windows stack.
     recorder: Box<telemetry::FrameRecorder<600>>,
     frames: u64,
     last_frame: Instant,
+    cpu_continuations: u64,
     captured: bool,
     reported_ready: bool,
     modifiers: [bool; 4],
@@ -141,7 +200,7 @@ impl NativeState {
             product.connecting();
         }
         if let Some(view) = self.view.as_deref_mut() {
-            let applied = view.apply_settings(&product.layer.app.settings);
+            let applied = view.apply_settings(product.settings_target());
             product
                 .layer
                 .app
@@ -162,9 +221,14 @@ impl NativeState {
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
         if let Some(product) = &mut self.product {
+            let mut session = self
+                .remote
+                .as_ref()
+                .map(RemoteNative::session)
+                .transpose()?;
             product.drain(
                 self.view.as_deref_mut(),
-                self.remote.as_mut().map(|r| r.session.connection_mut()),
+                session.as_mut().map(|session| session.connection_mut()),
                 now,
             );
         }
@@ -172,11 +236,13 @@ impl NativeState {
             match command {
                 product_ui::Command::Capture(capture) => self.capture(capture),
                 product_ui::Command::Disconnect => {
+                    if let Some(cancel) = &self.loading_cancel {
+                        cancel.store(1, Ordering::Release);
+                    }
                     self.remote = None;
                     self.capture(false);
-                    if let Some(view) = self.view.as_deref_mut() {
-                        view.clear_keys();
-                    }
+                    self.view = None;
+                    self.workers = None;
                     if let Some(product) = &mut self.product {
                         product.disconnected("");
                     }
@@ -224,11 +290,14 @@ impl NativeState {
         for byte in address.bytes() {
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
         }
-        let remote = RemoteNative::new(ConnectOptions {
-            url: address,
-            identity: product_ui::data_path(&format!("identity-{hash:016x}.cubi")),
-            name,
-        })?;
+        let remote = RemoteNative::new(
+            ConnectOptions {
+                url: address,
+                identity: product_ui::data_path(&format!("identity-{hash:016x}.cubi")),
+                name,
+            },
+            self.network_started,
+        )?;
         if let Some(product) = &mut self.product {
             product.layer.app.name = remote.name.clone();
             product.save_preferences();
@@ -245,22 +314,33 @@ impl NativeState {
             materials: true,
             environment: true,
             horizon: true,
+            settings: self
+                .product
+                .as_ref()
+                .map(|product| product.settings_target().clone()),
         };
         let device = self.gpu.device.clone();
         let queue = self.gpu.queue.clone();
+        let (retired_sender, retired_receiver) = mpsc::sync_channel(1);
+        self.gpu.queue.on_submitted_work_done(move || {
+            let _ = retired_sender.try_send(());
+        });
         let (sender, receiver) = mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicU32::new(0));
+        let worker_cancel = cancel.clone();
         let thread = std::thread::Builder::new()
             .name("cubi-remote-loading".into())
             .spawn(move || {
-                let result = loading::prepare(&device, &queue, preparation);
+                let result = loading::wait_retirement(&retired_receiver, &worker_cancel)
+                    .and_then(|()| loading::prepare(&device, &queue, preparation));
                 let _ = sender.send(result);
             })
             .map_err(|e| e.to_string())?;
         self.loading = Some(receiver);
         self.loading_thread = Some(thread);
+        self.loading_cancel = Some(cancel);
         self.workers = Some(client::native_pool(2, 16).map_err(|e| format!("{e:?}"))?);
         self.remote = Some(remote);
-        self.flight.begin_scene()?;
         self.reported_ready = false;
         Ok(())
     }
@@ -380,6 +460,7 @@ impl NativeState {
                     materials: mode == SceneMode::Product,
                     environment: mode == SceneMode::Product,
                     horizon: mode == SceneMode::Product,
+                    settings: None,
                 };
                 // Actual separate loading thread: async fn alone would still block frames.
                 let thread = std::thread::Builder::new()
@@ -411,6 +492,7 @@ impl NativeState {
         } else {
             (None, None)
         };
+        let network_started = Instant::now();
         Ok(Self {
             window,
             surface,
@@ -421,16 +503,20 @@ impl NativeState {
             view: None,
             loading,
             loading_thread,
+            loading_cancel: None,
             workers,
             recorder: Box::new(telemetry::FrameRecorder::new()),
             frames: 0,
             last_frame: Instant::now(),
+            cpu_continuations: 0,
             captured: false,
             reported_ready: false,
             modifiers: [false; 4],
             demo_mesh_delay_ticks: 0,
-            remote: connection.map(RemoteNative::new).transpose()?,
-            network_started: Instant::now(),
+            remote: connection
+                .map(|options| RemoteNative::new(options, network_started))
+                .transpose()?,
+            network_started,
             flight,
             in_flight: Arc::new(AtomicU32::new(0)),
             drawable: size.width != 0 && size.height != 0,
@@ -465,19 +551,33 @@ impl NativeState {
         };
         match receiver.try_recv() {
             Ok(result) => {
+                if self.mode == SceneMode::Product && self.remote.is_none() {
+                    self.loading = None;
+                    self.loading_cancel = None;
+                    if let Some(thread) = self.loading_thread.take() {
+                        thread
+                            .join()
+                            .map_err(|_| "cancelled pipeline worker panicked")?;
+                    }
+                    return Ok(());
+                }
                 let mut view = result?;
                 view.resize(&self.gpu.device, self.config.width, self.config.height)?;
                 view.set_demo_mesh_delay_ticks(self.demo_mesh_delay_ticks);
                 if let Some(product) = &mut self.product {
-                    let applied = view.apply_settings(&product.layer.app.settings);
+                    let applied = view.apply_settings(product.settings_target());
                     product
                         .layer
                         .app
                         .set_pending_settings(applied.pending_render);
                     product.apply_local(&self.gpu.device, &self.gpu.queue, &mut view)?;
                 }
+                if self.mode == SceneMode::Product {
+                    self.flight.begin_scene()?;
+                }
                 self.view = Some(view);
                 self.loading = None;
+                self.loading_cancel = None;
                 if let Some(thread) = self.loading_thread.take() {
                     thread.join().map_err(|_| "pipeline worker panicked")?;
                 }
@@ -489,12 +589,99 @@ impl NativeState {
         }
         Ok(())
     }
+    /// Progress authority and bounded CPU jobs even if window redraw delivery
+    /// waits for the previous GPU presentation. No queue writes or surface work.
+    fn continue_cpu(&mut self) -> Result<(), String> {
+        if self.flight.route_active()
+            || self.remote.is_none()
+            || self.view.is_none()
+            || self.last_frame.elapsed() < Duration::from_millis(8)
+        {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let scope = telemetry::AllocationScope::begin()
+            .map_err(|error| format!("CPU continuation allocator: {error:?}"))?;
+        let elapsed = self.last_frame.elapsed().as_secs_f64();
+        self.last_frame = Instant::now();
+        let now = self
+            .network_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        self.gpu
+            .device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| error.to_string())?;
+        self.collect_quality();
+        let mut stages = [None; telemetry::flight::CPU_STAGES.len()];
+        if let Some(remote) = &mut self.remote
+            && let Err(error) = remote.pump_socket()
+        {
+            self.remote = None;
+            if let Some(product) = &mut self.product {
+                product.disconnected(&error);
+            }
+        }
+        if let Some(view) = self.view.as_deref_mut() {
+            if let Some(remote) = &mut self.remote {
+                {
+                    let mut session = remote.session()?;
+                    session.pump(view, now)?;
+                    if let Some(product) = &mut self.product {
+                        product.sync(session.connection(), view)?;
+                        product.sync_quality(view, now, self.flight.benchmark_configured());
+                    }
+                }
+                remote.pump_socket()?;
+                remote.report_light_bindings(view)?;
+            }
+            view.set_movement_replay_time(
+                self.network_started
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64,
+            )?;
+            view.advance_input(elapsed)?;
+            stages[1] = Some(flight::nanos(started.elapsed()));
+            let jobs = Instant::now();
+            let mut budget = client::ClientScene::default_budget();
+            view.scene
+                .pump_native(
+                    self.workers.as_ref().ok_or("missing scene worker")?,
+                    view.tick(),
+                    &mut budget,
+                    8,
+                )
+                .map_err(|error| error.to_string())?;
+            stages[2] = Some(flight::nanos(jobs.elapsed()));
+            if let Some(error) = view.scene.error() {
+                return Err(error.to_string());
+            }
+        }
+        self.cpu_continuations = self.cpu_continuations.saturating_add(1);
+        if let Some(product) = &self.product {
+            product.report_cpu_continuation(self.cpu_continuations);
+        }
+        let work = self
+            .view
+            .as_deref_mut()
+            .map_or(telemetry::WorkCounts::ZERO, ClientView::take_frame_work);
+        self.record_flight(
+            started,
+            stages,
+            work,
+            scope.finish(),
+            false,
+            self.in_flight.load(Ordering::Acquire) > 0,
+        )
+    }
     fn draw(&mut self, force_present: bool) -> Result<Option<bool>, String> {
         self.gpu
             .device
             .poll(wgpu::PollType::Poll)
             .map_err(|error| error.to_string())?;
-        self.flight.collect();
+        self.collect_quality();
         self.poll_product_loading()?;
         self.poll_loading()?;
         if let Some(product) = &mut self.product {
@@ -534,7 +721,7 @@ impl NativeState {
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
         if let Some(remote) = self.remote.as_mut()
-            && let Err(error) = remote.pump_socket(now)
+            && let Err(error) = remote.pump_socket()
         {
             if self.product.is_none() {
                 return Err(error);
@@ -554,11 +741,16 @@ impl NativeState {
                 stages[0] = Some(flight::nanos(input_started.elapsed()));
             }
             if let Some(remote) = self.remote.as_mut() {
-                remote.session.pump(view, now)?;
-                remote.pump_socket(now)?;
-            }
-            if let (Some(product), Some(remote)) = (&mut self.product, &self.remote) {
-                product.sync(remote.session.connection(), view)?;
+                {
+                    let mut session = remote.session()?;
+                    session.pump(view, now)?;
+                    if let Some(product) = &mut self.product {
+                        product.sync(session.connection(), view)?;
+                        product.sync_quality(view, now, self.flight.benchmark_configured());
+                    }
+                }
+                remote.pump_socket()?;
+                remote.report_light_bindings(view)?;
             }
             let simulation_started = Instant::now();
             view.set_movement_replay_time(
@@ -596,7 +788,17 @@ impl NativeState {
                 }
             {
                 let upload_started = Instant::now();
-                view.upload_ready(&self.gpu.queue, &mut UploadBudget::new(2 * 1024 * 1024))?;
+                let mut upload = UploadBudget::new(2 * 1024 * 1024);
+                if self
+                    .product
+                    .as_ref()
+                    .is_some_and(|product| product.layer.app.uses_cached_background())
+                    && view.has_cached_present()
+                {
+                    view.upload_cached_settings(&self.gpu.queue, &mut upload)?;
+                } else {
+                    view.upload_ready(&self.gpu.queue, &mut upload)?;
+                }
                 stages[4] = Some(flight::nanos(upload_started.elapsed()));
             }
         }
@@ -628,13 +830,22 @@ impl NativeState {
                 product.painted();
             }
         }
-        let clean = !self.ui_pending
-            && !force_present
-            && !self.flight.route_active()
+        let cached_background = self
+            .product
+            .as_ref()
+            .is_some_and(|product| product.layer.app.uses_cached_background())
             && self
                 .view
                 .as_deref()
-                .is_none_or(|view| !view.needs_redraw(self.config.width, self.config.height));
+                .is_some_and(ClientView::has_cached_present);
+        let clean = !self.ui_pending
+            && !force_present
+            && !self.flight.route_active()
+            && (cached_background
+                || self
+                    .view
+                    .as_deref()
+                    .is_none_or(|view| !view.needs_redraw(self.config.width, self.config.height)));
         if clean || busy {
             let work = self
                 .view
@@ -667,13 +878,23 @@ impl NativeState {
                     });
             self.flight
                 .begin_gpu_frame(&mut encoder, self.gpu.queue.get_timestamp_period());
-            view.encode(
-                &self.gpu.queue,
-                &mut encoder,
-                &output,
-                self.config.width,
-                self.config.height,
-            )?;
+            let initial_loading = self
+                .product
+                .as_ref()
+                .is_some_and(|product| product.layer.app.screen == ui::app::Screen::Loading)
+                && !view.has_cached_present()
+                && !view.initial_scene_inputs_ready();
+            if initial_loading {
+                view.encode_loading_clear(&mut encoder, &output);
+            } else if !(cached_background && view.encode_cached_present(&mut encoder, &output)?) {
+                view.encode(
+                    &self.gpu.queue,
+                    &mut encoder,
+                    &output,
+                    self.config.width,
+                    self.config.height,
+                )?;
+            }
             if let Some(product) = &mut self.product {
                 product.layer.encode(&mut encoder, &output);
             }
@@ -741,6 +962,15 @@ impl NativeState {
         }
         Ok(Some(ready))
     }
+    fn collect_quality(&mut self) {
+        if let Some(product) = &mut self.product {
+            self.flight.collect_with(|frame, ns, complete| {
+                product.quality.runtime.complete_gpu(frame, ns, complete)
+            });
+        } else {
+            self.flight.collect();
+        }
+    }
     fn record_flight(
         &mut self,
         started: Instant,
@@ -750,42 +980,52 @@ impl NativeState {
         presented: bool,
         waiting: bool,
     ) -> Result<(), String> {
-        self.flight.record(
-            telemetry::flight::Sample {
-                cpu_ns: Some(flight::nanos(started.elapsed())),
-                cpu_stages_ns: stages,
-                work,
-                allocations: Some(allocations),
-                observations: if waiting {
-                    flight::waiting()
-                } else {
-                    Default::default()
-                },
-                in_flight: self
-                    .in_flight
-                    .load(Ordering::Acquire)
-                    .min(u32::from(u8::MAX)) as u8,
-                ..Default::default()
+        let sample = telemetry::flight::Sample {
+            cpu_ns: Some(flight::nanos(started.elapsed())),
+            cpu_stages_ns: stages,
+            work,
+            allocations: Some(allocations),
+            observations: if waiting {
+                flight::waiting()
+            } else {
+                Default::default()
             },
-            self.view.as_deref(),
-            presented,
-        )
+            in_flight: self
+                .in_flight
+                .load(Ordering::Acquire)
+                .min(u32::from(u8::MAX)) as u8,
+            ..Default::default()
+        };
+        if let Some(product) = &mut self.product {
+            self.flight
+                .record_with(sample, self.view.as_deref(), presented, |sample| {
+                    product.quality.runtime.record_present(sample)
+                })
+        } else {
+            self.flight.record(sample, self.view.as_deref(), presented)
+        }
     }
+
     fn export_flight(&mut self) -> Result<(), String> {
-        self.flight.collect();
+        self.collect_quality();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|error| error.to_string())?
             .as_millis();
+        let session = self
+            .remote
+            .as_ref()
+            .map(RemoteNative::session)
+            .transpose()?;
         self.flight.export_with_movement(
             &std::path::PathBuf::from(format!(".local/artifacts/flight/native-{stamp}.json")),
             &self.gpu.adapter.get_info(),
             self.view.as_deref(),
             self.config.width,
             self.config.height,
-            self.remote
+            session
                 .as_ref()
-                .map(|remote| remote.session.connection().movement_replay()),
+                .map(|session| session.connection().movement_replay()),
         )
     }
     fn print_stats(&self, label: &str) {
@@ -875,13 +1115,21 @@ impl NativeState {
         if self.flight.benchmark_configured() {
             return;
         }
+        let shift = self.ui_modifiers().shift;
         if let Some(view) = self.view.as_deref_mut() {
-            view.set_key(key, pressed);
+            if key == InputKey::Place {
+                view.set_place_key(pressed, shift);
+            } else {
+                view.set_key(key, pressed);
+            }
         }
     }
 }
 impl Drop for NativeState {
     fn drop(&mut self) {
+        if let Some(cancel) = &self.loading_cancel {
+            cancel.store(1, Ordering::Release);
+        }
         if let Some(thread) = self.loading_thread.take() {
             let _ = thread.join();
         }
@@ -1058,7 +1306,9 @@ impl ApplicationHandler for App {
                             position.y as f32 / 40.0
                         }
                     };
-                    product.layer.app.wheel(y.signum() as i32);
+                    // Winit reports upward scrolling as positive; the shared
+                    // UI uses a positive step for the next row/page.
+                    product.layer.app.wheel((-y).signum() as i32);
                 }
             }
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
@@ -1162,7 +1412,12 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         if now >= self.next_redraw {
-            if let Some(state) = &self.state {
+            if let Some(state) = &mut self.state {
+                if let Err(error) = state.continue_cpu() {
+                    eprintln!("CPU authority continuation failed: {error}");
+                    event_loop.exit();
+                    return;
+                }
                 state.window.request_redraw();
             }
             self.next_redraw = now + Duration::from_millis(16);

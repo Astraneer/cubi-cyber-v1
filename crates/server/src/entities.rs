@@ -1,6 +1,7 @@
 //! Single-owner mob phase with actual snapshot path workers and detached durable
 //! ledger updates. The caller commits world edits/drops/player hits with the same
 //! WAL batch, acknowledges this delta, then sends public poses.
+pub mod interaction_batch;
 pub mod interactions;
 pub mod items;
 pub mod owner;
@@ -107,6 +108,7 @@ pub struct Work {
     pub push_buckets: u64,
     pub push_pairs: u64,
     pub push_deferred: u64,
+    pub audio_cues_clipped: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MobAttack {
@@ -278,6 +280,7 @@ impl MobRuntime {
         let mut patches = Vec::with_capacity(count);
         let mut attacks = Vec::new();
         let mut drops = Vec::new();
+        let mut audio_events = Vec::new();
         let mut edits = BTreeMap::<BlockPos, Cell>::new();
         let mut work = Work {
             deferred_actors: self.store.active_len().saturating_sub(count) as u64,
@@ -321,6 +324,18 @@ impl MobRuntime {
                     }
                     work.actors += 1;
                     if control.lay_egg {
+                        if audio_events.len() < crate::audio_cue::MAX_EVENTS
+                            && let Ok(event) = crate::audio_cue::egg_event(
+                                id.0,
+                                now,
+                                after.space,
+                                after.body.position,
+                            )
+                        {
+                            audio_events.push(event);
+                        } else {
+                            work.audio_cues_clipped += 1;
+                        }
                         drops.push(DeathDrops {
                             actor: id,
                             space: after.space,
@@ -429,6 +444,13 @@ impl MobRuntime {
         };
         let mut inputs = inputs.into_inner();
         let mut transactions = BTreeMap::<SpaceId, Transaction>::new();
+        for event in audio_events {
+            let space = event.position.as_ref().expect("causal egg position").space;
+            transactions
+                .entry(space)
+                .or_insert_with(|| Transaction::new(now, space))
+                .event(event);
+        }
         for (position, value) in edits {
             transactions
                 .entry(position.space)

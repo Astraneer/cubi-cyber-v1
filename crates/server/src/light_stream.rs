@@ -2,6 +2,7 @@
 //! initial and missing-history snapshots alone read all4096 light samples.
 use super::*;
 use net::light::{Header, Request, Update};
+mod projected;
 const JOURNAL_ENTRIES: usize = 262_144;
 const JOURNAL_BATCHES: usize = 4096;
 const HISTORY: usize = 4;
@@ -14,6 +15,10 @@ struct ChangeBatch {
 struct PageHistory {
     headers: VecDeque<Header>,
     confirmed: Option<u64>,
+    public_values: Option<projected::Values>,
+    public_source: u64,
+    private_source: Option<Version>,
+    public_cell_view: Option<u64>,
 }
 #[derive(Default)]
 struct PeerHistory {
@@ -66,8 +71,33 @@ impl LightStream {
             return;
         }
         let page = peer.pages.entry(request.page).or_default();
+        if page
+            .headers
+            .back()
+            .is_some_and(|h| h.cell_view > request.cell_view)
+            || peer
+                .requests
+                .iter()
+                .any(|old| old.page == request.page && old.cell_view > request.cell_view)
+        {
+            return;
+        }
+        // A queued full repair survives late ACKs of the same binding. Reliable
+        // datagrams can finish out of order; an old ACK cannot restore a base
+        // that the client explicitly dropped after sending it. The credit is
+        // consumed only when publication pops this request.
+        if peer.requests.iter().any(|old| {
+            old.page == request.page
+                && old.cell_view == request.cell_view
+                && old.acknowledged.is_none()
+        }) {
+            request.acknowledged = None;
+        }
         if let Some(ack) = request.acknowledged {
-            if page.headers.iter().any(|h| h.version == ack)
+            if page
+                .headers
+                .iter()
+                .any(|h| h.version == ack && h.cell_view <= request.cell_view)
                 && page.confirmed.is_none_or(|old| ack >= old)
             {
                 page.confirmed = Some(ack);
@@ -200,82 +230,23 @@ impl LightStream {
         }
         (cursor == source).then(|| changes.into_iter().collect())
     }
+    #[cfg(test)]
     fn build(
         &mut self,
         connection: u64,
         request: Request,
         page: &world::Page,
     ) -> Result<Option<Update>, ServerError> {
-        let source = page.channel_version(core_types::ChannelMask::LIGHTING);
-        let peer = self
-            .peers
-            .get(&connection)
-            .ok_or(ServerError::Invalid("light peer history"))?;
-        let history = peer
-            .pages
-            .get(&request.page)
-            .ok_or(ServerError::Invalid("light page history"))?;
-        if request.acknowledged.is_some()
-            && history.headers.back().is_some_and(|h| {
-                h.cell_view == request.cell_view && history.confirmed.is_none_or(|v| v < h.version)
-            })
-        {
-            return Ok(None);
-        }
-        let base = history
-            .confirmed
-            .and_then(|v| history.headers.iter().find(|h| h.version == v))
-            .copied();
-        let latest = history
-            .headers
-            .back()
-            .copied()
-            .filter(|h| h.cell_view == request.cell_view && h.source == source);
-        if base.is_some() && base == latest {
-            return Ok(None);
-        }
-        let changes = base.and_then(|h| {
-            self.delta(request.page, h.source, source)
-                .map(|c| (h.version, c))
-        });
-        let peer = self.peers.get_mut(&connection).expect("known peer");
-        let header = if let Some(h) = latest {
-            h
-        } else {
-            peer.next = peer
-                .next
-                .checked_add(1)
-                .ok_or(ServerError::Invalid("light view revision exhausted"))?;
-            let h = Header {
-                page: request.page,
-                cell_view: request.cell_view,
-                version: peer.next,
-                source,
-            };
-            let page = peer.pages.get_mut(&request.page).expect("known page");
-            page.headers.push_back(h);
-            while page.headers.len() > HISTORY {
-                page.headers.pop_front();
-            }
-            h
-        };
-        if let Some((base, changes)) = changes {
-            return Ok(Some(Update::Delta(net::light::Delta {
-                header,
-                base,
-                changes,
-            })));
-        }
-        let mut values = vec![0; core_types::PAGE_VOLUME].into_boxed_slice();
-        for (index, value) in values.iter_mut().enumerate() {
-            let sample = page.light(core_types::LocalIdx::new(index as u16).expect("page index"));
-            *value = net::light::pack(sample.sky, sample.block, sample.rgb)
-                .ok_or(ServerError::Invalid("light snapshot sample"))?;
-        }
-        Ok(Some(Update::Snapshot(net::light::Snapshot {
-            header,
-            values: values.try_into().expect("page volume"),
-        })))
+        self.build_admitted(connection, request, page, &page.cells())
+    }
+    fn build_admitted(
+        &mut self,
+        connection: u64,
+        request: Request,
+        page: &world::Page,
+        admitted: &[Cell; core_types::PAGE_VOLUME],
+    ) -> Result<Option<Update>, ServerError> {
+        self.build_projected(connection, request, page, admitted)
     }
 }
 impl Server {
@@ -327,6 +298,23 @@ impl Server {
                     continue;
                 };
                 request.cell_view = cell_view;
+                let Some(admitted) = self
+                    .peers
+                    .get(&connection)
+                    .and_then(|peer| peer.history.confirmed_page(request.page))
+                else {
+                    continue;
+                };
+                if !self.peers[&connection].raw_view.validates(
+                    request.page,
+                    admitted.version,
+                    self.raw_sources.source(request.page),
+                ) {
+                    // New cell truth has not been admitted yet. Preserve the
+                    // request and old LIGHT; never bind new samples to old cells.
+                    self.light_stream.request(connection, request);
+                    continue;
+                }
                 let Some(page) = self.world.page(request.page) else {
                     output.push(Outgoing::reliable(
                         connection,
@@ -334,7 +322,10 @@ impl Server {
                     ));
                     continue;
                 };
-                match self.light_stream.build(connection, request, page) {
+                match self
+                    .light_stream
+                    .build_admitted(connection, request, page, &admitted.cells)
+                {
                     Ok(Some(update)) => {
                         match &update {
                             Update::Snapshot(_) => {
@@ -353,7 +344,7 @@ impl Server {
                     }
                     Ok(None) => {}
                     Err(_) => {
-                        self.failed = true;
+                        self.fail("publish_lights");
                         break;
                     }
                 }
@@ -387,6 +378,57 @@ mod tests {
             cell_view: view,
             acknowledged,
         }
+    }
+    #[test]
+    fn same_binding_late_ack_cannot_retire_a_queued_missing_base_repair() {
+        let world = fixture();
+        let mut stream = LightStream::new(&world);
+        stream.request(1, request(8, None));
+        let initial = stream
+            .build(1, request(8, None), world.page(position().page()).unwrap())
+            .unwrap()
+            .unwrap();
+        stream.peers.get_mut(&1).unwrap().requests.clear();
+        let ack = request(8, Some(initial.header().version));
+        stream.request(1, ack);
+        stream.peers.get_mut(&1).unwrap().requests.clear();
+
+        // Reliable UDP messages can finish out of order. An older ACK of the
+        // same binding does not prove the client's lost base has been restored.
+        stream.request(1, request(8, None));
+        stream.request(1, ack);
+        stream.queue_auto(1, position().page(), 8);
+        let pending = stream
+            .peers
+            .get_mut(&1)
+            .unwrap()
+            .requests
+            .pop_front()
+            .unwrap();
+        assert_eq!(pending, request(8, None));
+        assert_eq!(stream.peers[&1].pages[&position().page()].confirmed, None);
+        let repair = stream
+            .build(1, pending, world.page(position().page()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(repair, Update::Snapshot(_)));
+        assert_eq!(repair.header(), initial.header());
+        // After that credit is serviced, a fresh ACK resumes delta/no-op use.
+        stream.request(1, ack);
+        let next = stream
+            .peers
+            .get_mut(&1)
+            .unwrap()
+            .requests
+            .pop_front()
+            .unwrap();
+        assert_eq!(next.acknowledged, ack.acknowledged);
+        assert!(
+            stream
+                .build(1, next, world.page(position().page()).unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
     #[test]
     fn light_binding_rebase_and_sparse_delta_are_independent_of_cell_versions() {
@@ -438,12 +480,128 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        let Update::Delta(rebound) = rebound else {
-            panic!("binding-only change")
+        let Update::Snapshot(rebound) = rebound else {
+            panic!("new raw binding requires a complete admitted image")
         };
-        assert!(rebound.changes.is_empty());
+        assert_eq!(
+            rebound.values[usize::from(position().local_index().get())],
+            net::light::pack(4, 7, [255, 17, 240]).unwrap()
+        );
         assert_eq!(rebound.header.source, delta.header.source);
         assert_eq!(rebound.header.cell_view, 9);
+    }
+    #[test]
+    fn admitted_cells_mask_hidden_glow_and_visibility_rebase_uses_a_full_image() {
+        let mut world = fixture();
+        let page_id = position().page();
+        let index = usize::from(position().local_index().get());
+        let lava = Cell::from_parts(rules::ids::LAVA, 0);
+        let mut transaction = Transaction::new(Tick(2), SpaceId(0));
+        transaction.set_cell(position(), lava);
+        transaction.set_light(
+            position(),
+            world::LightSample {
+                sky: 0,
+                block: 15,
+                rgb: [255, 13, 0],
+            },
+        );
+        world.commit(transaction).unwrap();
+        let mut admitted = world.page(page_id).unwrap().cells();
+        admitted[index] = Cell::from_parts(rules::ids::STONE, 0);
+        let mut stream = LightStream::new(&world);
+        stream.request(1, request(1, None));
+        let image = stream
+            .build_admitted(1, request(1, None), world.page(page_id).unwrap(), &admitted)
+            .unwrap()
+            .unwrap();
+        let first = image.header();
+        let Update::Snapshot(image) = image else {
+            panic!("initial snapshot")
+        };
+        assert_eq!(
+            image.values[index], 0,
+            "closed lava sample must not cross the raw mask"
+        );
+        assert_ne!(
+            world
+                .page(page_id)
+                .unwrap()
+                .light(position().local_index())
+                .rgb,
+            [0; 3]
+        );
+        stream.request(1, request(1, Some(first.version)));
+        let mut transaction = Transaction::new(Tick(3), SpaceId(0));
+        transaction.set_light(
+            position(),
+            world::LightSample {
+                sky: 0,
+                block: 14,
+                rgb: [251, 34, 50],
+            },
+        );
+        let change = world.commit(transaction).unwrap();
+        stream.observe(&[change]).unwrap();
+        let hidden = stream
+            .build_admitted(
+                1,
+                request(1, Some(first.version)),
+                world.page(page_id).unwrap(),
+                &admitted,
+            )
+            .unwrap();
+        assert!(
+            hidden.is_none(),
+            "hidden-only updates cannot change packets or public sources"
+        );
+        let hidden_header = first;
+        admitted[index] = lava;
+        stream.request(1, request(2, Some(hidden_header.version)));
+        let revealed = stream
+            .build_admitted(
+                1,
+                request(2, Some(hidden_header.version)),
+                world.page(page_id).unwrap(),
+                &admitted,
+            )
+            .unwrap()
+            .unwrap();
+        let revealed_header = revealed.header();
+        let Update::Snapshot(revealed) = revealed else {
+            panic!("new raw mask requires a full LIGHT image")
+        };
+        assert_eq!(
+            revealed.values[index],
+            net::light::pack(0, 14, [251, 34, 50]).unwrap()
+        );
+        assert!(
+            revealed_header.source > hidden_header.source,
+            "public values changed after real visibility"
+        );
+        assert_eq!(
+            world
+                .page(page_id)
+                .unwrap()
+                .channel_version(core_types::ChannelMask::LIGHTING),
+            Version(3),
+            "visibility alone cannot change canonical light"
+        );
+        admitted[index] = Cell::from_parts(rules::ids::STONE, 0);
+        stream.request(1, request(3, Some(revealed_header.version)));
+        let sealed = stream
+            .build_admitted(
+                1,
+                request(3, Some(revealed_header.version)),
+                world.page(page_id).unwrap(),
+                &admitted,
+            )
+            .unwrap()
+            .unwrap();
+        let Update::Snapshot(sealed) = sealed else {
+            panic!("mask removal requires snapshot")
+        };
+        assert_eq!(sealed.values[index], 0);
     }
     #[test]
     fn new_cell_binding_bypasses_an_old_unacknowledgeable_light_credit() {
@@ -614,5 +772,74 @@ mod binding_fallback_contract {
         replica.apply(a, Some(1)).unwrap();
         replica.apply(repair, Some(2)).unwrap();
         assert_eq!(replica.page(page).unwrap().header.cell_view, 2);
+    }
+}
+
+#[cfg(test)]
+mod stale_binding_request_contract {
+    use super::*;
+    #[test]
+    fn delayed_old_binding_ack_cannot_change_or_delta_encode_a_queued_full_repair() {
+        let page = PageId {
+            space: SpaceId(0),
+            x: 0,
+            y: 0,
+            z: 0,
+        };
+        let mut world = World::new(rules::properties, 64);
+        let mut tx = Transaction::new(Tick(1), SpaceId(0));
+        tx.create_page(page, vec![Cell::AIR; 4096]);
+        world.commit(tx).unwrap();
+        let mut stream = LightStream::new(&world);
+        let old = Request {
+            page,
+            cell_view: 1,
+            acknowledged: None,
+        };
+        stream.request(1, old);
+        let first = stream
+            .build(1, old, world.page(page).unwrap())
+            .unwrap()
+            .unwrap();
+        stream.peers.get_mut(&1).unwrap().requests.clear();
+        let repair = Request {
+            page,
+            cell_view: 2,
+            acknowledged: None,
+        };
+        stream.request(1, repair);
+        stream.request(
+            1,
+            Request {
+                acknowledged: Some(first.header().version),
+                ..old
+            },
+        );
+        let pending = stream
+            .peers
+            .get_mut(&1)
+            .unwrap()
+            .requests
+            .pop_front()
+            .unwrap();
+        assert_eq!(pending, repair);
+        assert_eq!(stream.peers[&1].pages[&page].confirmed, None);
+        // Even a retained known base cannot turn an explicit full request into a
+        // delta after another response has updated internal confirmation metadata.
+        stream
+            .peers
+            .get_mut(&1)
+            .unwrap()
+            .pages
+            .get_mut(&page)
+            .unwrap()
+            .confirmed = Some(first.header().version);
+        let image = stream
+            .build(1, pending, world.page(page).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(image, Update::Snapshot(_)));
+        let mut replica = net::light::Replica::new(1).unwrap();
+        replica.apply(image, Some(2)).unwrap();
     }
 }

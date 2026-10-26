@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -81,6 +81,11 @@ pub struct TransportCounters {
     pub peak_udp_queue_packets: usize,
     pub peak_ws_staged_bytes: usize,
     pub ingress_backpressure: u64,
+    /// Aggregate counts for ActionIds 1, 2 and 3; duplicates included. No
+    /// identity, command text, inventory or credential content is retained.
+    pub received_actions_123: [u64; 3],
+    pub staged_accepted_actions_123: [u64; 3],
+    pub staged_rejected_actions_123: [u64; 3],
 }
 
 enum SocketEvent {
@@ -121,6 +126,7 @@ pub struct Runtime {
     next_connection: u64,
     counters: TransportCounters,
     send_cursor: u64,
+    diagnostic_lines: Arc<AtomicUsize>,
 }
 
 impl Runtime {
@@ -151,6 +157,7 @@ impl Runtime {
             next_connection: 1,
             counters: TransportCounters::default(),
             send_cursor: 0,
+            diagnostic_lines: Arc::new(AtomicUsize::new(128)),
         })
     }
 
@@ -206,7 +213,9 @@ impl Runtime {
                         self.receive_frame(connection, &bytes, now_ms);
                     }
                 }
-                Ok(SocketEvent::Closed(connection)) => self.disconnect(connection),
+                Ok(SocketEvent::Closed(connection)) => {
+                    self.disconnect_reason(connection, "ws_worker_closed")
+                }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
@@ -216,7 +225,7 @@ impl Runtime {
         let mut expired = Vec::new();
         for (&connection, peer) in &mut self.udp {
             if now_ms.saturating_sub(peer.last_seen) > IDLE_TIMEOUT_MS {
-                expired.push(connection);
+                expired.push((connection, "udp_idle_timeout"));
                 continue;
             }
             if let Some(channel) = &mut peer.channel
@@ -225,25 +234,46 @@ impl Runtime {
                 match channel.tick(now_ms) {
                     Ok(packets) => {
                         if !queue_packets(peer, packets, &mut self.counters) {
-                            expired.push(connection);
+                            expired.push((connection, "udp_packet_queue_limit"));
                         }
                     }
-                    Err(_) => expired.push(connection),
+                    Err(error) => {
+                        diagnostic(
+                            &self.diagnostic_lines,
+                            format_args!(
+                                "udp_reliable_failure connection={connection} error={error:?} expired={:?} pending_messages={} counters={:?}",
+                                channel.last_expired(),
+                                channel.pending_messages(),
+                                channel.counters()
+                            ),
+                        );
+                        expired.push((connection, "udp_channel_error"));
+                    }
                 }
             }
             if !pump_udp_frames(peer, now_ms, &mut self.counters) {
-                expired.push(connection);
+                expired.push((connection, "udp_frame_error"));
             }
         }
         expired.extend(self.ws.iter().filter_map(|(&connection, peer)| {
-            (now_ms.saturating_sub(peer.last_seen) > IDLE_TIMEOUT_MS).then_some(connection)
+            (now_ms.saturating_sub(peer.last_seen) > IDLE_TIMEOUT_MS)
+                .then_some((connection, "ws_idle_timeout"))
         }));
-        for connection in expired {
-            self.disconnect(connection);
+        for (connection, cause) in expired {
+            self.disconnect_reason(connection, cause);
         }
         self.flush_ws();
         self.flush_udp()?;
         self.update_connection_counters();
+        if self.server.is_failed() {
+            eprintln!(
+                "authority_owner_failed reason={:?}",
+                self.server.failure_reason()
+            );
+            return Err(TransportError::Server(ServerError::Invalid(
+                "authority entered failed state",
+            )));
+        }
         Ok(())
     }
 
@@ -269,10 +299,13 @@ impl Runtime {
             let control_socket = socket.try_clone()?;
             let incoming = self.incoming_tx.clone();
             let stop = Arc::clone(&self.stop);
+            let diagnostic_lines = Arc::clone(&self.diagnostic_lines);
             let (outgoing, rx) = mpsc::sync_channel(WS_OUTGOING_CAPACITY);
             let worker = thread::Builder::new()
                 .name(format!("cubi-ws-{connection}"))
-                .spawn(move || websocket_worker(connection, socket, incoming, rx, stop))?;
+                .spawn(move || {
+                    websocket_worker(connection, socket, incoming, rx, stop, diagnostic_lines)
+                })?;
             self.ws.insert(
                 connection,
                 WsPeer {
@@ -293,6 +326,12 @@ impl Runtime {
         self.counters.received_frames += 1;
         match net::decode_client(bytes) {
             Ok(message) => {
+                if let ClientMessage::Action { id, .. } | ClientMessage::AimedAction { id, .. } =
+                    &message
+                    && let Some(index) = first_action_index(id.0)
+                {
+                    self.counters.received_actions_123[index] += 1;
+                }
                 let outgoing = self.server.handle(connection, message, now_ms);
                 self.dispatch(outgoing, now_ms);
             }
@@ -395,6 +434,19 @@ impl Runtime {
 
     fn dispatch(&mut self, outgoing: Vec<Outgoing>, now_ms: u64) {
         for outgoing in outgoing {
+            if let ServerMessage::Action(reply) = &outgoing.message
+                && let Some(index) = first_action_index(reply.id.0)
+            {
+                match reply.status {
+                    net::ActionStatus::Accepted => {
+                        self.counters.staged_accepted_actions_123[index] += 1
+                    }
+                    net::ActionStatus::Rejected(_) => {
+                        self.counters.staged_rejected_actions_123[index] += 1
+                    }
+                    net::ActionStatus::Pending => {}
+                }
+            }
             let connection = outgoing.connection;
             let Ok(bytes) = net::encode_server(&outgoing.message) else {
                 self.counters.rejected_packets += 1;
@@ -523,7 +575,17 @@ impl Runtime {
         }
     }
 
+    #[track_caller]
     fn disconnect(&mut self, connection: u64) {
+        self.disconnect_reason(connection, "owner_retired");
+    }
+    #[track_caller]
+    fn disconnect_reason(&mut self, connection: u64, cause: &'static str) {
+        let transport = if self.ws.contains_key(&connection) {
+            "ws"
+        } else {
+            "udp"
+        };
         let mut removed = false;
         if let Some(peer) = self.ws.remove(&connection) {
             let _ = peer.socket.shutdown(Shutdown::Both);
@@ -537,6 +599,16 @@ impl Runtime {
         if removed {
             self.server.disconnect(connection);
             self.counters.disconnected += 1;
+            let at = std::panic::Location::caller();
+            diagnostic(
+                &self.diagnostic_lines,
+                format_args!(
+                    "transport_close connection={connection} transport={transport} cause={cause} source={}:{} owner_failure={:?}",
+                    at.file(),
+                    at.line(),
+                    self.server.failure_reason()
+                ),
+            );
         }
     }
 
@@ -547,7 +619,7 @@ impl Runtime {
             .filter_map(|(&connection, peer)| peer.worker.is_finished().then_some(connection))
             .collect();
         for connection in completed {
-            self.disconnect(connection);
+            self.disconnect_reason(connection, "ws_worker_finished");
         }
         let mut index = 0;
         while index < self.retired_workers.len() {
@@ -561,12 +633,18 @@ impl Runtime {
     }
 }
 
+fn first_action_index(id: u64) -> Option<usize> {
+    (1..=3)
+        .contains(&id)
+        .then_some(id.saturating_sub(1) as usize)
+}
+
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         let connections: Vec<_> = self.ws.keys().chain(self.udp.keys()).copied().collect();
         for connection in connections {
-            self.disconnect(connection);
+            self.disconnect_reason(connection, "runtime_stopped");
         }
         for worker in self.retired_workers.drain(..) {
             let _ = worker.join();
@@ -653,13 +731,26 @@ fn check_origin(request: &Request, response: Response) -> Result<Response, Error
     }
 }
 
+fn diagnostic(budget: &AtomicUsize, message: fmt::Arguments<'_>) {
+    if budget
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok()
+    {
+        eprintln!("{message}");
+    }
+}
+
 fn websocket_worker(
     connection: u64,
     socket: TcpStream,
     incoming: SyncSender<SocketEvent>,
     outgoing: Receiver<Vec<u8>>,
     stop: Arc<AtomicBool>,
+    diagnostic_lines: Arc<AtomicUsize>,
 ) {
+    let mut close_cause = "handshake_rejected_or_error";
     let config = WebSocketConfig::default()
         .read_buffer_size(4096)
         .write_buffer_size(0)
@@ -670,8 +761,14 @@ fn websocket_worker(
         tungstenite::accept_hdr_with_config(socket, check_origin, Some(config))
     {
         if websocket.get_mut().set_nonblocking(true).is_err() {
+            diagnostic(
+                &diagnostic_lines,
+                format_args!("ws_worker_close connection={connection} cause=socket_mode"),
+            );
+            let _ = incoming.try_send(SocketEvent::Closed(connection));
             return;
         }
+        close_cause = "stopped";
         let mut pending_ingress = None;
         let mut pending_outgoing = None;
         'connection: while !stop.load(Ordering::Acquire) {
@@ -681,7 +778,10 @@ fn websocket_worker(
                 Err(WebSocketError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
                     false
                 }
-                Err(_) => break,
+                Err(_) => {
+                    close_cause = "flush_error";
+                    break;
+                }
             };
             if writable {
                 for _ in 0..WS_OUTGOING_CAPACITY {
@@ -691,7 +791,10 @@ fn websocket_worker(
                         match outgoing.try_recv() {
                             Ok(bytes) => Message::Binary(bytes.into()),
                             Err(TryRecvError::Empty) => break,
-                            Err(TryRecvError::Disconnected) => break 'connection,
+                            Err(TryRecvError::Disconnected) => {
+                                close_cause = "egress_closed";
+                                break 'connection;
+                            }
                         }
                     };
                     match websocket.write(message) {
@@ -707,8 +810,8 @@ fn websocket_worker(
                             pending_outgoing = Some(*message);
                             break;
                         }
-                        Err(error) => {
-                            eprintln!("authority websocket write failure: {error}");
+                        Err(_) => {
+                            close_cause = "write_error";
                             break 'connection;
                         }
                     }
@@ -717,7 +820,10 @@ fn websocket_worker(
                     Ok(()) => {}
                     Err(WebSocketError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        close_cause = "flush_error";
+                        break;
+                    }
                 }
             }
             let mut can_read = true;
@@ -728,7 +834,10 @@ fn websocket_worker(
                         pending_ingress = Some(event);
                         can_read = false;
                     }
-                    Err(TrySendError::Disconnected(_)) => break,
+                    Err(TrySendError::Disconnected(_)) => {
+                        close_cause = "ingress_closed";
+                        break;
+                    }
                 }
             }
             if can_read {
@@ -743,23 +852,48 @@ fn websocket_worker(
                                     pending_ingress = Some(event);
                                     break;
                                 }
-                                Err(TrySendError::Disconnected(_)) => break 'connection,
+                                Err(TrySendError::Disconnected(_)) => {
+                                    close_cause = "ingress_closed";
+                                    break 'connection;
+                                }
                             }
                         }
                         Ok(Message::Ping(_) | Message::Pong(_)) => progress = true,
-                        Ok(_) => break 'connection,
+                        Ok(Message::Close(_)) => {
+                            close_cause = "peer_close";
+                            break 'connection;
+                        }
+                        Ok(_) => {
+                            close_cause = "unsupported_message";
+                            break 'connection;
+                        }
                         Err(WebSocketError::Io(error))
                             if error.kind() == io::ErrorKind::WouldBlock =>
                         {
                             break;
                         }
-                        Err(_) => break 'connection,
+                        Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => {
+                            close_cause = "peer_close";
+                            break 'connection;
+                        }
+                        Err(WebSocketError::Io(_)) => {
+                            close_cause = "read_io_error";
+                            break 'connection;
+                        }
+                        Err(_) => {
+                            close_cause = "read_protocol_or_capacity";
+                            break 'connection;
+                        }
                     }
                 }
             }
             thread::sleep(Duration::from_millis(if progress { 1 } else { 4 }));
         }
     }
+    diagnostic(
+        &diagnostic_lines,
+        format_args!("ws_worker_close connection={connection} cause={close_cause}"),
+    );
     let _ = incoming.try_send(SocketEvent::Closed(connection));
 }
 
@@ -797,7 +931,19 @@ impl RunningServer {
                 let start = Instant::now();
                 while !worker_stop.load(Ordering::Acquire) {
                     let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    runtime.poll(now_ms)?;
+                    if let Err(error) = runtime.poll(now_ms) {
+                        let cause = match &error {
+                            TransportError::Io(_) => "io",
+                            TransportError::Server(_) => "authority",
+                            TransportError::NonLoopback => "configuration",
+                            TransportError::WorkerPanic => "worker_panic",
+                        };
+                        eprintln!(
+                            "transport_owner_exit cause={cause} owner_failure={:?}",
+                            runtime.server.failure_reason()
+                        );
+                        return Err(error);
+                    }
                     if let Ok(mut counters) = worker_counters.lock() {
                         *counters = runtime.counters();
                     }
@@ -818,6 +964,9 @@ impl RunningServer {
     }
     pub fn udp_address(&self) -> SocketAddr {
         self.udp_address
+    }
+    pub fn is_finished(&self) -> bool {
+        self.worker.as_ref().is_some_and(JoinHandle::is_finished)
     }
     pub fn counters(&self) -> TransportCounters {
         self.counters

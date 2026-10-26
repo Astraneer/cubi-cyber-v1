@@ -631,6 +631,7 @@ fn environment_graph_sample_mode(sample_count: u32) {
         underwater: false,
     };
     let config = EnvironmentConfig {
+        contact_ao: None,
         atmosphere: AtmosphereConfig {
             transmittance_size: [16, 8],
             sky_size: [16, 8],
@@ -756,6 +757,7 @@ fn environment_graph_sample_mode(sample_count: u32) {
     let output = output(&gpu);
     let view = output.create_view(&Default::default());
     let fresh_budget = || EnvironmentBudget {
+        contact_depth_reads: 0,
         aerial_steps: 1_000_000,
         aerial_samples: 1_000_000,
         upload_bytes: 1_000_000,
@@ -1075,6 +1077,7 @@ fn exposure_only_environment_frames_reuse_hdr_without_geometry_or_histogram_work
     let output = output(&gpu);
     let view = output.create_view(&Default::default());
     let mut budget = EnvironmentBudget {
+        contact_depth_reads: 0,
         aerial_steps: 1_000_000,
         aerial_samples: 1_000_000,
         upload_bytes: 10000,
@@ -1104,6 +1107,7 @@ fn exposure_only_environment_frames_reuse_hdr_without_geometry_or_histogram_work
     assert!(environment.needs_redraw(&terrain, &camera, CullingMode::FrustumAndHiZ, state));
     terrain.take_work();
     let mut budget = EnvironmentBudget {
+        contact_depth_reads: 0,
         aerial_steps: 1_000_000,
         aerial_samples: 1_000_000,
         upload_bytes: 0,
@@ -1298,6 +1302,7 @@ fn physical_atmosphere_shares_surface_energy_and_removes_white_skylight_at_night
     let output = output(&gpu);
     let view = output.create_view(&Default::default());
     let budget = || EnvironmentBudget {
+        contact_depth_reads: 0,
         aerial_steps: 1_000_000,
         aerial_samples: 1_000_000,
         upload_bytes: 100000,

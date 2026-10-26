@@ -1,5 +1,8 @@
 //! Prepared M10 frame graph. Each consumer writes a separate HDR target.
 //! World sampling and authoritative fluid/lighting updates belong to the client.
+use crate::contact_ao::{
+    ContactAoConfig, ContactAoError, ContactAoGpu, ContactAoInputs, ContactAoWork,
+};
 use crate::{
     OutputTransfer,
     aerial_gpu::{
@@ -24,6 +27,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EnvironmentConfig {
     pub atmosphere: AtmosphereConfig,
+    pub contact_ao: Option<ContactAoConfig>,
     pub clouds: Option<CloudConfig>,
     pub water: Option<WaterConfig>,
     pub gi: Option<GiConfig>,
@@ -71,6 +75,7 @@ impl EnvironmentState {
 #[derive(Clone, Copy, Debug)]
 pub struct EnvironmentBudget {
     pub upload_bytes: u64,
+    pub contact_depth_reads: u64,
     pub aerial_steps: u64,
     pub aerial_samples: u64,
     pub atmosphere_steps: u64,
@@ -81,6 +86,7 @@ pub struct EnvironmentBudget {
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EnvironmentWork {
+    pub contact_ao: ContactAoWork,
     pub aerial: AerialWork,
     pub celestial: CelestialWork,
     pub atmosphere: AtmosphereWork,
@@ -107,6 +113,7 @@ pub enum EnvironmentError {
     Post(PostError),
     Celestial(CelestialError),
     Aerial(AerialError),
+    ContactAo(ContactAoError),
 }
 impl std::fmt::Display for EnvironmentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -131,6 +138,7 @@ error_from!(GiError, Gi);
 error_from!(PostError, Post);
 error_from!(CelestialError, Celestial);
 error_from!(AerialError, Aerial);
+error_from!(ContactAoError, ContactAo);
 
 struct AerialShadowOwner {
     parameters: wgpu::Buffer,
@@ -150,6 +158,7 @@ pub struct EnvironmentGpu {
     sample_count: u32,
     config: EnvironmentConfig,
     atmosphere: AtmosphereGpu,
+    contact_ao: Option<ContactAoGpu>,
     atmosphere_state: AtmosphereState,
     solar_scale: f32,
     water: Option<WaterGpu>,
@@ -198,6 +207,12 @@ impl EnvironmentGpu {
         if config.gi.is_some() && lighting.is_none() {
             return Err(EnvironmentError::MissingLighting);
         }
+        let reflection_setup_bytes =
+            u64::from(config.water.is_some_and(|water| water.reflection_steps > 0)) * 16;
+        if budget.remaining_bytes < reflection_setup_bytes {
+            return Err(EnvironmentError::UploadBudget);
+        }
+        budget.remaining_bytes -= reflection_setup_bytes;
         let mut atmosphere =
             AtmosphereGpu::new(device, queue, config.atmosphere, state.atmosphere(), budget)?;
         atmosphere.set_state_and_solar(queue, state.atmosphere(), state.sun_intensity, budget)?;
@@ -207,7 +222,31 @@ impl EnvironmentGpu {
             None
         };
         terrain.prepare_scene_sampling(device)?;
+        if config.contact_ao.is_some_and(|config| config.quality > 0) {
+            terrain.prepare_ambient_mrt(device)?;
+        }
         terrain.attach_environment_lighting(device, &atmosphere, lighting, gi.as_ref())?;
+        let contact_ao = if let Some(config) = config.contact_ao {
+            ContactAoGpu::new(
+                device,
+                queue,
+                width,
+                height,
+                sample_count,
+                config,
+                ContactAoInputs {
+                    hdr: terrain.scene_color_msaa_view().expect("prepared sampling"),
+                    ambient: terrain.ambient_msaa_view().unwrap_or_else(|| {
+                        terrain.scene_color_msaa_view().expect("prepared sampling")
+                    }),
+                    depth: terrain.scene_depth_msaa_view(),
+                    statistics: None,
+                },
+                budget,
+            )?
+        } else {
+            None
+        };
         let mut water = if let Some(config) = config.water {
             Some(WaterGpu::new_with_samples(
                 device,
@@ -216,7 +255,10 @@ impl EnvironmentGpu {
                 width,
                 height,
                 WaterInputs {
-                    color_msaa: terrain.scene_color_msaa_view().expect("prepared sampling"),
+                    color_msaa: contact_ao.as_ref().map_or_else(
+                        || terrain.scene_color_msaa_view().expect("prepared sampling"),
+                        ContactAoGpu::color_msaa,
+                    ),
                     depth_msaa: terrain.scene_depth_msaa_view(),
                     sky: atmosphere.sky_view(),
                     transmittance: atmosphere.transmittance_view(),
@@ -238,7 +280,12 @@ impl EnvironmentGpu {
                     transmittance: atmosphere.transmittance_view(),
                     sky: atmosphere.sky_view(),
                     scene_color_msaa: water.as_ref().map_or_else(
-                        || terrain.scene_color_msaa_view().expect("prepared sampling"),
+                        || {
+                            contact_ao.as_ref().map_or_else(
+                                || terrain.scene_color_msaa_view().expect("prepared sampling"),
+                                ContactAoGpu::color_msaa,
+                            )
+                        },
                         WaterGpu::color_msaa,
                     ),
                     scene_depth_msaa: water
@@ -254,6 +301,7 @@ impl EnvironmentGpu {
             .as_ref()
             .map(CloudGpu::resolved_view)
             .or_else(|| water.as_ref().map(WaterGpu::resolved_view))
+            .or_else(|| contact_ao.as_ref().map(ContactAoGpu::resolved_view))
             .unwrap_or_else(|| terrain.resolved_hdr_view());
         let post = PostGpu::new(
             device,
@@ -267,6 +315,7 @@ impl EnvironmentGpu {
             budget,
         )?;
         let startup_pipeline_compilations = 2
+            + u32::from(contact_ao.is_some())
             + post.pipeline_count()
             + water
                 .as_mut()
@@ -282,6 +331,7 @@ impl EnvironmentGpu {
             sample_count,
             config,
             atmosphere,
+            contact_ao,
             atmosphere_state: state.atmosphere(),
             solar_scale: state.sun_intensity,
             water,
@@ -334,17 +384,38 @@ impl EnvironmentGpu {
         {
             return Err(EnvironmentError::Aerial(AerialError::InvalidConfig));
         }
-        if budget.remaining_bytes < self.post.resize_upload_bytes(width, height) {
+        if budget.remaining_bytes
+            < self.post.resize_upload_bytes(width, height)
+                + u64::from(self.contact_ao.is_some()) * 16
+        {
             return Err(EnvironmentError::UploadBudget);
         }
         terrain.resize(device, width, height)?;
+        if let Some(ao) = &mut self.contact_ao {
+            ao.resize_inputs(
+                device,
+                queue,
+                width,
+                height,
+                ContactAoInputs {
+                    hdr: terrain.scene_color_msaa_view().expect("prepared sampling"),
+                    ambient: terrain.ambient_msaa_view().expect("prepared ambient"),
+                    depth: terrain.scene_depth_msaa_view(),
+                    statistics: None,
+                },
+                budget,
+            )?;
+        }
         if let Some(water) = &mut self.water {
             water.resize_inputs(
                 device,
                 width,
                 height,
                 WaterInputs {
-                    color_msaa: terrain.scene_color_msaa_view().expect("prepared sampling"),
+                    color_msaa: self.contact_ao.as_ref().map_or_else(
+                        || terrain.scene_color_msaa_view().expect("prepared sampling"),
+                        ContactAoGpu::color_msaa,
+                    ),
                     depth_msaa: terrain.scene_depth_msaa_view(),
                     sky: self.atmosphere.sky_view(),
                     transmittance: self.atmosphere.transmittance_view(),
@@ -358,7 +429,12 @@ impl EnvironmentGpu {
                 height,
                 AerialInputs {
                     color_msaa: self.water.as_ref().map_or_else(
-                        || terrain.scene_color_msaa_view().expect("prepared sampling"),
+                        || {
+                            self.contact_ao.as_ref().map_or_else(
+                                || terrain.scene_color_msaa_view().expect("prepared sampling"),
+                                ContactAoGpu::color_msaa,
+                            )
+                        },
                         WaterGpu::color_msaa,
                     ),
                     depth_msaa: self
@@ -386,7 +462,16 @@ impl EnvironmentGpu {
                         .map(AerialGpu::color_msaa)
                         .unwrap_or_else(|| {
                             self.water.as_ref().map_or_else(
-                                || terrain.scene_color_msaa_view().expect("prepared sampling"),
+                                || {
+                                    self.contact_ao.as_ref().map_or_else(
+                                        || {
+                                            terrain
+                                                .scene_color_msaa_view()
+                                                .expect("prepared sampling")
+                                        },
+                                        ContactAoGpu::color_msaa,
+                                    )
+                                },
                                 WaterGpu::color_msaa,
                             )
                         }),
@@ -403,6 +488,7 @@ impl EnvironmentGpu {
             .map(CloudGpu::resolved_view)
             .or_else(|| self.aerial.as_ref().map(AerialGpu::resolved_view))
             .or_else(|| self.water.as_ref().map(WaterGpu::resolved_view))
+            .or_else(|| self.contact_ao.as_ref().map(ContactAoGpu::resolved_view))
             .unwrap_or_else(|| terrain.resolved_hdr_view());
         self.post
             .resize_input(device, queue, source, width, height, budget)?;
@@ -411,6 +497,9 @@ impl EnvironmentGpu {
     }
     /// Auxiliary node pipelines only. Terrain's final variants and sky draw
     /// are already counted by TerrainGpu::take_work and must not be added twice.
+    pub fn contact_ao(&self) -> Option<&ContactAoGpu> {
+        self.contact_ao.as_ref()
+    }
     pub fn startup_pipeline_compilations(&self) -> u32 {
         self.startup_pipeline_compilations
     }
@@ -428,13 +517,14 @@ impl EnvironmentGpu {
         if self.encoded || self.celestial.is_some() {
             return Err(EnvironmentError::Terrain(TerrainError::LatePreparation));
         }
-        let mut celestial = CelestialGpu::new_with_samples(
+        let mut celestial = CelestialGpu::new_with_samples_and_ambient(
             device,
             queue,
             &self.atmosphere,
             config,
             budget,
             self.sample_count,
+            self.contact_ao.is_some(),
         )?;
         self.startup_pipeline_compilations += celestial.take_work().pipeline_compilations;
         self.celestial = Some(celestial);
@@ -486,7 +576,12 @@ impl EnvironmentGpu {
             height,
             AerialInputs {
                 color_msaa: self.water.as_ref().map_or_else(
-                    || terrain.scene_color_msaa_view().expect("prepared sampling"),
+                    || {
+                        self.contact_ao.as_ref().map_or_else(
+                            || terrain.scene_color_msaa_view().expect("prepared sampling"),
+                            ContactAoGpu::color_msaa,
+                        )
+                    },
                     WaterGpu::color_msaa,
                 ),
                 depth_msaa: self
@@ -781,6 +876,31 @@ impl EnvironmentGpu {
             })
             || self.post.needs_redraw(self.output_revision)
     }
+    /// Present a previously completed HDR while atomic near/far admission is
+    /// pending. No camera, atmosphere, GI, water or scene commands are encoded.
+    /// None means no valid retained HDR exists (also after a resource resize).
+    pub fn encode_cached_present(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        output: &wgpu::TextureView,
+        remaining_pixels: &mut u64,
+    ) -> Result<Option<EnvironmentWork>, EnvironmentError> {
+        self.last_work = EnvironmentWork::default();
+        if !self.encoded || !self.post.has_cached_source() {
+            return Ok(None);
+        }
+        let post = self
+            .post
+            .present_cached(encoder, output, remaining_pixels)?;
+        let work = EnvironmentWork {
+            passes: post.passes,
+            draws: post.draws,
+            post,
+            ..EnvironmentWork::default()
+        };
+        self.last_work = work;
+        Ok(Some(work))
+    }
     /// Complete preflight precedes queue writes. Shadow/light updates and CPU
     /// source publications must precede this call; prepared extras draw in HDR.
     #[allow(clippy::too_many_arguments)]
@@ -836,6 +956,15 @@ impl EnvironmentGpu {
                 .min(budget.gi_rays / (config.rays_per_probe + 6))
             });
         let scene_needed = self.scene_needed_with_gi(terrain, camera, mode, state, gi_plan > 0);
+        let ao_plan = self
+            .contact_ao
+            .as_ref()
+            .map_or(Ok(ContactAoWork::default()), |ao| {
+                ao.pending_work(
+                    *camera,
+                    terrain.hdr_revision().wrapping_add(u64::from(scene_needed)),
+                )
+            })?;
         let water_state = self.water_state(
             *camera,
             state,
@@ -878,7 +1007,8 @@ impl EnvironmentGpu {
             .output_revision
             .wrapping_add(u64::from(precloud_changed || cloud_plan.passes > 0));
         let post_plan = self.post.pending_work(next_output);
-        if atmosphere_work.integration_steps > budget.atmosphere_steps
+        if ao_plan.max_depth_reads > budget.contact_depth_reads
+            || atmosphere_work.integration_steps > budget.atmosphere_steps
             || water_plan.max_reflection_steps > budget.water_reflection_steps
             || cloud_plan.max_density_samples > budget.cloud_density_samples
             || aerial_plan.integration_steps > budget.aerial_steps
@@ -903,7 +1033,8 @@ impl EnvironmentGpu {
             + u64::from(gi_plan) * 16
             + relight_bytes
             + celestial_upload
-            + aerial_plan.upload_bytes;
+            + aerial_plan.upload_bytes
+            + ao_plan.upload_bytes;
         if parameter_bytes > budget.upload_bytes {
             return Err(EnvironmentError::UploadBudget);
         }
@@ -970,6 +1101,19 @@ impl EnvironmentGpu {
                 .map_or(0, CelestialGpu::vertex_count);
             upload.remaining_bytes -= work.terrain.camera_upload_bytes;
         }
+        if let Some(ao) = &mut self.contact_ao
+            && ao_plan.passes > 0
+        {
+            work.contact_ao = ao.encode(
+                queue,
+                encoder,
+                *camera,
+                terrain.hdr_revision(),
+                &mut upload,
+                budget.contact_depth_reads,
+            )?;
+            budget.contact_depth_reads -= work.contact_ao.max_depth_reads;
+        }
         if let Some(water) = &mut self.water
             && water_plan.passes > 0
         {
@@ -1024,12 +1168,14 @@ impl EnvironmentGpu {
             + work.clouds.passes
             + work.gi.passes
             + work.post.passes
-            + work.aerial.passes;
+            + work.aerial.passes
+            + work.contact_ao.passes;
         work.draws = work.terrain.draw_calls
             + work.water.draws
             + work.clouds.draws
             + work.post.draws
-            + work.aerial.draws;
+            + work.aerial.draws
+            + work.contact_ao.draws;
         self.last_work = work;
         self.encoded = true;
         Ok(work)
@@ -1038,6 +1184,9 @@ impl EnvironmentGpu {
     pub fn invalidate(&mut self, terrain: &mut TerrainGpu, tick: u64) {
         terrain.invalidate();
         self.atmosphere.invalidate();
+        if let Some(ao) = &mut self.contact_ao {
+            ao.invalidate();
+        }
         if let Some(water) = &mut self.water {
             water.invalidate();
         }
@@ -1053,8 +1202,12 @@ impl EnvironmentGpu {
         self.last_gi_attempt = None;
         self.post.invalidate();
     }
-    pub fn extra_timing_sources(&self) -> [Option<TimingSource<'_>>; 7] {
+    pub fn extra_timing_sources(&self) -> [Option<TimingSource<'_>>; 8] {
         [
+            self.contact_ao
+                .as_ref()
+                .filter(|_| self.last_work.contact_ao.passes > 0)
+                .and_then(|ao| timing(ao.timestamp_buffer(), ao.graph(), |_| 6)),
             (self.last_work.atmosphere.passes > 0)
                 .then(|| {
                     self.atmosphere.multiple_scattering_timing().and_then(
@@ -1103,7 +1256,7 @@ impl EnvironmentGpu {
                 .flatten(),
         ]
     }
-    pub fn timing_sources<'a>(&'a self, terrain: &'a TerrainGpu) -> [Option<TimingSource<'a>>; 8] {
+    pub fn timing_sources<'a>(&'a self, terrain: &'a TerrainGpu) -> [Option<TimingSource<'a>>; 9] {
         let scene = if self.last_work.terrain.passes > 0 {
             terrain.timestamp_buffer().map(|(buffer, period)| {
                 let graph = terrain.frame_graph();
@@ -1129,8 +1282,11 @@ impl EnvironmentGpu {
         } else {
             None
         };
-        let [multiple, aerial, water, clouds, post, gi, atmosphere] = self.extra_timing_sources();
-        [scene, water, aerial, multiple, clouds, post, gi, atmosphere]
+        let [ao, multiple, aerial, water, clouds, post, gi, atmosphere] =
+            self.extra_timing_sources();
+        [
+            scene, ao, water, aerial, multiple, clouds, post, gi, atmosphere,
+        ]
     }
 }
 fn timing<const N: usize>(

@@ -1,6 +1,9 @@
 //! Public height samples and explicit replacement evidence. No cells or seed.
 use core_types::{PageId, SpaceId, Version};
 pub const MAX_LEVEL: u8 = 10;
+/// Measured strict32px horizon profile; source metadata includes ancestors/LRU.
+pub const MAX_TILES: usize = 4096;
+pub const MAX_SOURCES: usize = 8192;
 pub const MAX_VERTICAL_PAGES: usize = 32;
 pub const MAX_HEIGHT_BYTES: usize = 4096;
 pub const ATLAS_LAYERS: u16 = 186;

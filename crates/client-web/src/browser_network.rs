@@ -2,22 +2,23 @@
 //! protocol frames reach the socket; local resource bytes have no route here.
 use client::{network::NetworkConfig, remote::RemoteSession, view::ClientView};
 use net::{PlayerId, SecretToken};
-use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+use std::{
+    cell::{Ref, RefCell, RefMut},
+    rc::Rc,
+};
 use wasm_bindgen::{JsCast, prelude::*};
 use web_sys::{BinaryType, Event, MessageEvent, WebSocket};
-const INBOX_FRAMES: usize = 64;
-const INBOX_BYTES: usize = 8 * 1024 * 1024;
 const SOCKET_BACKLOG: u32 = 2 * 1024 * 1024;
 struct Inbox {
-    frames: VecDeque<Vec<u8>>,
-    bytes: usize,
-    fault: Option<&'static str>,
+    fault: Option<String>,
+    admitted_frames: u64,
+    rejected_frames: u64,
     open: bool,
     closed: bool,
 }
 pub struct BrowserSocket {
     socket: WebSocket,
-    session: RemoteSession,
+    session: Rc<RefCell<RemoteSession>>,
     inbox: Rc<RefCell<Inbox>>,
     pending: Option<Vec<u8>>,
     identity: PlayerId,
@@ -108,36 +109,47 @@ impl BrowserSocket {
             .connection_mut()
             .hello(name.to_owned(), identity, credential)
             .map_err(|_| error("Имя или данные входа отклонены"))?;
+        let session = Rc::new(RefCell::new(session));
         let socket = WebSocket::new(&url)?;
         socket.set_binary_type(BinaryType::Arraybuffer);
         let inbox = Rc::new(RefCell::new(Inbox {
-            frames: VecDeque::with_capacity(INBOX_FRAMES),
-            bytes: 0,
             fault: None,
+            admitted_frames: 0,
+            rejected_frames: 0,
             open: false,
             closed: false,
         }));
         let messages = inbox.clone();
+        let receiving = session.clone();
         let message = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
             let Some(event) = event.dyn_ref::<MessageEvent>() else {
                 return;
             };
             let Ok(buffer) = event.data().dyn_into::<js_sys::ArrayBuffer>() else {
-                messages.borrow_mut().fault = Some("Мир прислал неподдерживаемый кадр");
+                messages.borrow_mut().fault = Some("Мир прислал неподдерживаемый кадр".into());
                 return;
             };
             let length = buffer.byte_length() as usize;
-            let mut inbox = messages.borrow_mut();
-            if length > net::MAX_FRAME_BYTES
-                || inbox.frames.len() >= INBOX_FRAMES
-                || length > INBOX_BYTES.saturating_sub(inbox.bytes)
-            {
-                inbox.fault = Some("Очередь мира переполнена");
+            if length > net::MAX_FRAME_BYTES {
+                messages.borrow_mut().fault = Some("Кадр мира превышает допустимый размер".into());
                 return;
             }
             let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
-            inbox.bytes += bytes.len();
-            inbox.frames.push_back(bytes);
+            // Browser WebSocket has no TCP pause API. Admit each bounded frame
+            // directly into the shared Rust caches, which coalesce RAW/LIGHT
+            // versions by page. Scene imports, prediction and GPU work remain
+            // in the bounded owner pump; no arbitrary raw event backlog grows.
+            let received = receiving
+                .borrow_mut()
+                .receive_frame(&bytes, super::clock_ms().max(0.) as u64);
+            if let Err(error) = received {
+                let mut inbox = messages.borrow_mut();
+                inbox.rejected_frames = inbox.rejected_frames.saturating_add(1);
+                inbox.fault = Some(error);
+            } else {
+                let mut inbox = messages.borrow_mut();
+                inbox.admitted_frames = inbox.admitted_frames.saturating_add(1);
+            }
         });
         socket.set_onmessage(Some(message.as_ref().unchecked_ref()));
         let opened = inbox.clone();
@@ -152,7 +164,7 @@ impl BrowserSocket {
         socket.set_onclose(Some(close.as_ref().unchecked_ref()));
         let failed = inbox.clone();
         let failure = Closure::<dyn FnMut(Event)>::new(move |_| {
-            failed.borrow_mut().fault = Some("Не удалось подключиться к миру")
+            failed.borrow_mut().fault = Some("Не удалось подключиться к миру".into())
         });
         socket.set_onerror(Some(failure.as_ref().unchecked_ref()));
         Ok(Self {
@@ -167,40 +179,34 @@ impl BrowserSocket {
             _listeners: [message, open, close, failure],
         })
     }
-    pub fn session(&self) -> &RemoteSession {
-        &self.session
+    pub fn session(&self) -> Ref<'_, RemoteSession> {
+        self.session.borrow()
     }
-    pub fn session_mut(&mut self) -> &mut RemoteSession {
-        &mut self.session
+    pub fn receive_counts(&self) -> [u64; 2] {
+        let inbox = self.inbox.borrow();
+        [inbox.admitted_frames, inbox.rejected_frames]
+    }
+    pub fn session_mut(&mut self) -> RefMut<'_, RemoteSession> {
+        self.session.borrow_mut()
     }
     pub fn pump(&mut self, view: &mut ClientView, now_ms: u64) -> Result<(), String> {
         if let Some(fault) = self.inbox.borrow_mut().fault.take() {
-            return Err(fault.to_owned());
+            return Err(fault);
         }
         if self.inbox.borrow().closed {
             return Err("Соединение с миром закрыто".into());
         }
-        if self.session.connection().welcome().is_none()
+        let mut session = self.session.borrow_mut();
+        if session.connection().welcome().is_none()
             && now_ms.saturating_sub(self.started_ms) > 15_000
         {
             return Err("Мир не ответил вовремя".into());
         }
-        for _ in 0..32 {
-            let bytes = {
-                let mut inbox = self.inbox.borrow_mut();
-                let Some(bytes) = inbox.frames.pop_front() else {
-                    break;
-                };
-                inbox.bytes -= bytes.len();
-                bytes
-            };
-            self.session.receive_frame(&bytes, now_ms)?;
-        }
-        self.session.pump(view, now_ms)?;
-        if let Some(welcome) = self.session.connection().welcome() {
+        session.pump(view, now_ms)?;
+        if let Some(welcome) = session.connection().welcome() {
             self.identity = welcome.identity;
         }
-        if let Some(credential) = self.session.connection().credential() {
+        if let Some(credential) = session.connection().credential() {
             let bytes = *credential.as_bytes();
             if self.saved_credential != Some(bytes) {
                 if let Some(storage) = storage() {
@@ -220,7 +226,7 @@ impl BrowserSocket {
                 break;
             }
             if self.pending.is_none() {
-                self.pending = self.session.take_outgoing();
+                self.pending = session.take_outgoing();
             }
             let Some(bytes) = self.pending.as_ref() else {
                 break;

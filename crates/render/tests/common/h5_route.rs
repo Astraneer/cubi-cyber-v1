@@ -1,5 +1,6 @@
 //! Default-profile shadow route through a voxel forest. Full redraw is the
 //! independent publication control; receiver images remain in world space.
+use super::signals;
 use super::*;
 use render::{
     entity_gpu::{EntityConfig, EntityGpu, EntityInstance, PRIMARY_HIDDEN},
@@ -8,8 +9,6 @@ use render::{
     terrain_gpu::{Camera, CullingMode},
     terrain_mesh::MeshClass,
 };
-#[path = "h5_probe.rs"]
-mod signals;
 use signals::{LayerProbe, expected, footprint_edge, signal_error, temporal_residual};
 fn rgba8(signal: &[[f32; 4]]) -> Vec<u8> {
     signal

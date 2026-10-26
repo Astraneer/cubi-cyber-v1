@@ -1,5 +1,7 @@
 //! Shared UI/input/audio adapter. Shells transport physical events and execute
 //! returned local intents; this module never grants inventory or permissions.
+pub mod quality;
+pub mod sender;
 use crate::{
     network::{Connection, NetworkError},
     view::{ClientView, InputKey},
@@ -264,6 +266,7 @@ pub fn dispatch(
 ) -> Result<Dispatch, NetworkError> {
     let action = match intent {
         Intent::SelectSlot(slot) => Action::SelectSlot(slot),
+        Intent::Respawn => Action::Respawn,
         Intent::Chat(ref text) if text.starts_with('/') => Action::Command(text.clone()),
         Intent::CreativeGive { item, count } => Action::Command(format!("/give {item} {count}")),
         Intent::Chat(text) => Action::Chat(text),

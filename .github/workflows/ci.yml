@@ -100,6 +100,11 @@ jobs:
         run: |
           source tools/env.sh
           bash tools/check_one.sh 'Windows WARP authoritative light' cargo test --locked -p client --test lighting_gpu -- --test-threads=1 --nocapture
+      - name: Validate sparse shadow preservation with D3D12 WARP
+        run: |
+          source tools/env.sh
+          bash tools/check_one.sh 'Windows WARP shadow footprints' cargo test --locked -p render --test shadow_footprint -- --nocapture
+          bash tools/check_one.sh 'Windows WARP sparse shadow depth' cargo test --locked -p render --test shadows shadow_sparse::gpu_projected_old_new_clear_matches_full_depth_for_sun_models_and_removal -- --exact --nocapture
       - name: Present three native Windows frames
         run: bash tools/windows_native_smoke.sh
       - name: Build portable Windows bundle

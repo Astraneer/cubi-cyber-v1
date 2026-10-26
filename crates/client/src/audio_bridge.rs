@@ -1,5 +1,6 @@
 //! Read-only fixed-tick audio inputs. Queries never generate/load world cells.
 mod actions;
+mod cues;
 mod entities;
 mod machines;
 pub use actions::{BlockCue, ConfirmedBlockSounds};
@@ -9,6 +10,7 @@ use audio::{
     events::{StepBody, Surface},
 };
 use core_types::Cell;
+pub use cues::CausalSounds;
 pub use entities::EntitySounds;
 pub use machines::{MachineCommand, MachineSoundWork, MachineSounds};
 use rules::blocks::Snd;

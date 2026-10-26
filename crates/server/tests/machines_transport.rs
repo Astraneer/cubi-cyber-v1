@@ -610,10 +610,18 @@ fn exhausted_route_budget_never_extracts_source_and_retries_keep_original_age() 
     let pending = runtime.snapshot().transport.pulls[0];
     assert_eq!(pending.due, Tick(1));
     assert_eq!(pending.first_due, Tick(1));
+    assert!(runtime.owner_pending());
+    assert!(matches!(
+        runtime.plan_tick_with_payloads(&world, &ledger, Tick(2), Budget::default()),
+        Err(MachineError::Stale)
+    ));
+    // A budget retry continues the held logical tick; it cannot make the
+    // world's clock run ahead of its unfinished transport phase.
     let plan = runtime
-        .plan_tick_with_payloads(&world, &ledger, Tick(2), Budget::default())
+        .plan_tick_with_payloads(&world, &ledger, Tick(1), Budget::default())
         .unwrap();
-    assert!(plan.work.oldest_age >= 1);
+    assert_eq!(plan.work.oldest_age, 0);
+    assert!(plan.owner_complete());
     commit(&mut world, &mut runtime, &mut ledger, &mut items, plan);
     assert_eq!(count(&world, 1), 2);
     assert_eq!(runtime.packet(1).unwrap().progress, 5);
@@ -940,7 +948,8 @@ fn zero_work_registration_and_exhausted_spawn_budget_keep_packet_without_freezin
         )
         .unwrap();
     assert_eq!(plan.work, Work::default());
-    assert!(plan.delta.is_empty());
+    assert!(!plan.delta.is_empty());
+    assert!(!plan.owner_complete());
     assert_eq!(runtime.snapshot(), before);
     let mut machine = Machine::new(MekKind::Smelter);
     machine.energy = 10_000;

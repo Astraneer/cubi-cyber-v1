@@ -1,7 +1,7 @@
 //! Canonical Server/WAL integration, using trusted world fixtures rather than
 //! client-supplied inventory or a detached phase demonstration.
 use core_types::{BlockPos, Cell, ChannelMask, ComponentId, PageId, SpaceId, Tick};
-use net::{ClientMessage, Hello, ServerMessage};
+use net::{Action, ActionId, ActionStatus, ClientMessage, Hello, ServerMessage};
 use rules::{
     blocks::MekKind,
     ids::*,
@@ -43,7 +43,10 @@ impl Directory {
     fn config(&self) -> ServerConfig {
         let mut c = ServerConfig::new(&self.0);
         c.generation_enabled = false;
-        c.spawn_override = Some([2.5, 1., 8.5]);
+        // Observe the pipes from their open side. The former eye atx2.5 was
+        // behind the opaque Smelter and correctly loses its raw certificate
+        // under the shared underground visibility policy.
+        c.spawn_override = Some([10.5, 1., 8.5]);
         c
     }
     fn owner(&self) -> Hello {
@@ -79,7 +82,7 @@ fn fixture() -> World {
         cells,
     );
     let mut machine = Machine::new(MekKind::Smelter);
-    machine.eject = true;
+    machine.eject = false;
     machine.sides = [SideMode::Output; 6];
     machine.slots[1] = Slot {
         stack: ItemStack::new(I_ENERGY_TABLET, 1).unwrap(),
@@ -158,7 +161,14 @@ impl H {
         });
     }
     fn packet(&mut self) -> net::machine_packets::Frame {
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
+            assert!(
+                Instant::now() < deadline,
+                "packet data progress deadline, counters={:?} load={:?}",
+                self.server.packet_stream_counters(),
+                self.server.load_metrics()
+            );
             let out = self.until(|o| {
                 matches!(
                     o.message,
@@ -187,6 +197,18 @@ impl H {
                 _ => unreachable!(),
             }
         }
+    }
+    fn start_ejection(&mut self) {
+        let mut machine =
+            server::machines::read_machine(self.server.world(), ComponentId(1)).unwrap();
+        machine.eject = true;
+        let mut tx = Transaction::new(Tick(self.server.current_tick().0 + 1), SpaceId(0));
+        tx.set_component(
+            ComponentId(1),
+            server::machines::machine_component(p(9), &machine),
+            ChannelMask::CONTENTS,
+        );
+        assert!(self.server.queue_transaction(tx).is_ok());
     }
     fn advance(&mut self, tick: u64) {
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -222,11 +244,16 @@ fn canonical_pipe_packets_wait_for_raw_ack_and_credit_then_remove_against_confir
     });
     let view = h.raw_page();
     assert!(
+        matches!(h.raw.read(p(10)),net::ReplicaRead::Known(cell) if cell.id()==LOGISTICAL_TRANSPORTER),
+        "fixture pipe must actually be visible from the authoritative eye"
+    );
+    assert!(
         !h.out
             .iter()
             .any(|o| matches!(o.message, ServerMessage::MachinePackets(_)))
     );
     h.ack_page(view);
+    h.start_ejection();
     let full = h.packet();
     assert!(full.base.is_none());
     assert_eq!(
@@ -290,6 +317,7 @@ fn packet_recovery_full_and_forged_view_requests_do_not_advance_confirmed_source
     });
     let view = h.raw_page();
     h.ack_page(view);
+    h.start_ejection();
     let full = h.packet();
     let before = h.server.packet_stream_counters().frames;
     h.send(ClientMessage::MachinePackets(
@@ -370,6 +398,21 @@ fn newly_created_pipe_location_is_withheld_until_exact_current_raw_cells_are_con
             .iter()
             .any(|o| matches!(o.message, ServerMessage::MachinePackets(_))),
         "unconfirmed model location must not leak via item pose"
+    );
+    // Privacy work may take longer than this short pipe's 40 active travel
+    // ticks. Freeze the real page clock through an authorized spectator action
+    // while its new conduit image is still deliberately unconfirmed.
+    h.send(ClientMessage::Action {
+        id: ActionId(1),
+        action: Action::Command("/gamemode spectator".into()),
+    });
+    h.until(|o|matches!(&o.message,ServerMessage::Action(reply) if reply.id==ActionId(1)&&reply.status==ActionStatus::Accepted));
+    assert!(
+        !h.server
+            .machine_runtime()
+            .packet_epoch(1, h.server.current_tick())
+            .unwrap()
+            .1
     );
     // Consume and ACK the newest real raw updates. The packet source compares each
     // current conduit cell, including final arms, to that exact confirmed image.

@@ -26,6 +26,10 @@ run_check 'Web Worker SAB/transfer' node crates/jobs/tests/browser_smoke.mjs
 run_check 'WebGPU sky pixels' node tools/web_smoke.mjs
 run_check 'WebGPU GI, water and worker bounds' node tools/m10_graphics_smoke.mjs
 run_check 'WebGPU cloud optics and sample preservation' node tools/cloud_gpu_smoke.mjs
+run_check 'WebGPU sparse shadow footprint and depth preservation' node tools/shadow_footprint_smoke.mjs
+run_check 'WebGPU model GI and absent-probe behavior' node tools/model_gi_gpu_smoke.mjs
+run_check 'WebGPU water reflections and fallback' node tools/water_reflection_gpu_smoke.mjs
+run_check 'WebGPU contact occlusion and direct-light preservation' node tools/contact_ao_gpu_smoke.mjs
 run_check 'WebGPU forest and movement' node tools/terrain_smoke.mjs
 run_check 'Player edits, completed frames and image equality' node tools/player_smoke.mjs
 run_check 'Authority binary for product scenario' cargo build --locked -p server

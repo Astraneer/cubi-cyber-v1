@@ -59,9 +59,7 @@ impl MachineRuntime {
             })
             .collect();
         for key in retired {
-            if let Some(index) = self.keys.remove(&Event::Network(key)) {
-                self.events.remove(&index);
-            }
+            self.remove_pending_indexed(Event::Network(key));
             self.network_orders.remove(&key);
             self.producers.remove(&key);
         }
@@ -72,10 +70,7 @@ impl MachineRuntime {
             first_due: first,
             order: self.network_orders[&key],
         };
-        if let Some(old) = self.keys.insert(event.event, queue_key(event)) {
-            self.events.remove(&old);
-        }
-        self.events.insert(queue_key(event), event);
+        self.insert_pending_indexed(event);
         Ok(())
     }
     fn refresh_endpoints_fixture(

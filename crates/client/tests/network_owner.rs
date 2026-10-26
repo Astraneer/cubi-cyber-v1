@@ -557,6 +557,38 @@ fn public_light_crosses_actual_lossy_udp_and_repairs_its_own_base_without_cell_c
         }
         thread::sleep(Duration::from_micros(300));
     }
+    if !complete || !base_lost {
+        let counters = runtime.server().counters();
+        eprintln!(
+            "UDP_LIGHT_PROGRESS complete={complete} injected={injected} base_lost={base_lost} stable_at={stable_at:?} tick={} server_failed={} pages={} view_cells={} view_rays={} view_copy_bytes={} snapshots={} snapshot_cells={} deltas={} delta_cells={} geometry_published={} height_published={}",
+            runtime.server().current_tick().0,
+            runtime.server().is_failed(),
+            counters.page_images,
+            counters.view_cells,
+            counters.visibility_rays,
+            counters.view_copy_bytes,
+            counters.light_snapshots,
+            counters.light_snapshot_cells,
+            counters.light_deltas,
+            counters.light_delta_cells,
+            counters.geometry_published,
+            counters.height_published,
+        );
+        for (index, bot) in bots.iter().enumerate() {
+            eprintln!(
+                "UDP_LIGHT_CLIENT index={index} raw_view={:?} light_view={:?} client_sample={:?} scene_sample={:?} queues={:?}",
+                bot.client.replica().page(page).map(|p| p.version),
+                bot.client.light_replica().page(page).map(|p| (
+                    p.header.cell_view,
+                    p.header.version,
+                    net::light::unpack(p.values[usize::from(sample.local_index().get())])
+                )),
+                bot.client.replica().read(sample),
+                scenes[index].read_authoritative_light(sample),
+                bot.client.queue_depths(),
+            );
+        }
+    }
     assert!(complete && base_lost);
     assert!(runtime.server().counters().light_deltas > 0);
     assert!(runtime.server().counters().light_delta_cells >= 2);

@@ -82,6 +82,38 @@ impl LightDirtyTracker {
     pub fn first_page(&self) -> Option<PageId> {
         self.ordered.first().map(|(_, page)| *page)
     }
+    /// Metadata only: skipped resident entries do not block later nonresidents.
+    /// The cursor bounds each call and keeps progress across repeated GPU waits.
+    fn retire_nonresident(
+        &mut self,
+        cursor: &mut Option<(u64, PageId)>,
+        limit: usize,
+        mut resident: impl FnMut(PageId) -> bool,
+    ) -> usize {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut retired = 0;
+        for _ in 0..limit.min(self.pages.len()) {
+            let next = cursor
+                .and_then(|at| {
+                    self.ordered
+                        .range((Excluded(at), Unbounded))
+                        .next()
+                        .copied()
+                })
+                .or_else(|| self.ordered.first().copied());
+            let Some((order, page)) = next else {
+                *cursor = None;
+                break;
+            };
+            *cursor = Some((order, page));
+            if !resident(page) {
+                let version = self.pages[&page].version;
+                self.acknowledge(page, version);
+                retired += 1;
+            }
+        }
+        retired
+    }
     /// New/reused resident slots always need a full snapshot, even at version 0.
     pub fn mark_full(&mut self, page: PageId, version: Version) -> Result<(), LightBackpressure> {
         self.preflight(&[page])?;
@@ -557,6 +589,7 @@ pub struct ClientLightingWork {
     pub unknown_source_pages: usize,
     pub provenance_page_reads: u64,
     pub coalesced_light_changes: u64,
+    pub retired_dirty_pages: usize,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LightingReadyDiagnostics {
@@ -589,6 +622,7 @@ pub struct ClientLighting {
     bootstrap: VecDeque<(PageId, usize)>,
     bootstrap_sky_complete: bool,
     dirty: LightDirtyTracker,
+    dirty_retire_cursor: Option<(u64, PageId)>,
     scratch: LightUploadScratch,
     residents: BTreeMap<PageId, ResidentLight>,
     gpu_capacity: usize,
@@ -666,6 +700,7 @@ impl ClientLighting {
             bootstrap,
             bootstrap_sky_complete: !derived,
             dirty: LightDirtyTracker::new(config.max_pending_light_pages),
+            dirty_retire_cursor: None,
             scratch: LightUploadScratch::default(),
             residents: BTreeMap::new(),
             gpu_capacity: max_pages as usize,
@@ -873,6 +908,15 @@ impl ClientLighting {
         self.shadows.invalidate_bounds(bounds);
     }
     pub fn needs_work(&self, world: &World) -> bool {
+        self.pending_light_work(world) || self.shadows.needs_work()
+    }
+    /// Source certificates remain the Scene caller's separate guard. This
+    /// permits only coherent Sun-only refresh, preserving every data/journal
+    /// condition and initial/recenter/structural shadow coverage requirement.
+    pub fn presentation_ready(&self, world: &World) -> bool {
+        !self.pending_light_work(world) && self.shadows.presentation_ready()
+    }
+    fn pending_light_work(&self, world: &World) -> bool {
         !self.bootstrap.is_empty()
             || self.engine.as_ref().is_some_and(|engine| !engine.is_idle())
             || self.next_sequence != world.journal_next()
@@ -884,7 +928,6 @@ impl ClientLighting {
                 .any(|overlay| overlay.bound_source.is_none())
             || self.instances.values().any(|instance| instance.dirty)
             || !self.sky_dirty.is_empty()
-            || self.shadows.cache().pending() != 0
     }
     /// Bounded CPU journal work can run while an older GPU frame is in flight.
     /// No queue, GPU resource, uniform update or solver is reachable here.
@@ -897,6 +940,12 @@ impl ClientLighting {
         }
         let mut work = ClientLightingWork::default();
         self.ingest(scene.derived_world_mut(), &mut work)?;
+        let residents = &self.residents;
+        work.retired_dirty_pages = self.dirty.retire_nonresident(
+            &mut self.dirty_retire_cursor,
+            self.config.max_gpu_pages_per_pump.saturating_mul(27),
+            |page| residents.contains_key(&page),
+        );
         work.pending_gpu_pages = self.dirty.pending_pages();
         Ok(work)
     }
@@ -958,6 +1007,13 @@ impl ClientLighting {
     }
     pub fn light_volumes(&self) -> &LightVolumeGpu {
         &self.lights
+    }
+    pub fn set_shadow_visibility(
+        &mut self,
+        enabled: bool,
+        cascades: u32,
+    ) -> Result<bool, ClientLightingError> {
+        Ok(self.shadows.set_visibility(enabled, cascades)?)
     }
     pub fn shadows(&self) -> &ShadowGpu {
         &self.shadows
@@ -1143,6 +1199,8 @@ impl ClientLighting {
         if work.cascade_updates > 0
             || work.dynamic_copy_bytes > 0
             || work.dynamic_restore_pixels > 0
+            || work.gpu_restore_mask != 0
+            || work.uniform_upload_bytes != 0
         {
             terrain.invalidate();
         }
@@ -1161,6 +1219,8 @@ impl ClientLighting {
         if work.cascade_updates > 0
             || work.dynamic_copy_bytes > 0
             || work.dynamic_restore_pixels > 0
+            || work.gpu_restore_mask != 0
+            || work.uniform_upload_bytes != 0
         {
             terrain.invalidate();
         }

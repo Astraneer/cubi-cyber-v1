@@ -588,6 +588,10 @@ fn scaled_hdr_bilinear_matches_independent_f64_and_charges_the_native_output() {
     .unwrap();
     assert_eq!(post.pipeline_count(), 1);
     assert_eq!(post.set_output_extent(0, 44), Err(PostError::InvalidConfig));
+    assert_eq!(
+        post.set_output_extent(u32::MAX, 44),
+        Err(PostError::InvalidConfig)
+    );
     assert_eq!(post.output_extent(), [width, height]);
     post.set_output_extent(64, 44).unwrap();
     assert_eq!(post.pending_work(1).tone_pixels, 64 * 44);

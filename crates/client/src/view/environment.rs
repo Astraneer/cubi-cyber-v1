@@ -20,6 +20,8 @@ use render::{
 };
 use std::sync::Arc;
 use world::{CellRead, CursorError, CursorId, WorldChange};
+mod source_jobs;
+pub use source_jobs::SourceJobStats;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EnvironmentProfile {
@@ -33,10 +35,12 @@ pub struct EnvironmentProfile {
     pub source_reads_per_pump: u64,
     pub gi_rays_per_tick: u32,
     pub atmosphere_steps: u64,
+    pub contact_depth_reads: u64,
     pub aerial_steps: u64,
     pub aerial_samples: u64,
     pub cloud_density_samples: u64,
     pub water_reflection_steps: u64,
+    pub reflection_budget_follows_extent: bool,
     pub post_pixels: u64,
 }
 impl Default for EnvironmentProfile {
@@ -52,11 +56,105 @@ impl Default for EnvironmentProfile {
             source_reads_per_pump: 131072,
             gi_rays_per_tick: 152,
             atmosphere_steps: 4_000_000,
+            contact_depth_reads: 800_000_000,
             aerial_steps: 1_000_000,
             aerial_samples: 64_000_000,
             cloud_density_samples: 64_000_000,
             water_reflection_steps: 0,
+            reflection_budget_follows_extent: false,
             post_pixels: 16_000_000,
+        }
+    }
+}
+impl EnvironmentProfile {
+    /// Prepare a bounded contact-visibility graph during loading. Mode zero
+    /// keeps the original scene layout, targets and fragment entry points.
+    pub fn with_contact_ao(mut self, mode: u8) -> Result<Self, ViewEnvironmentError> {
+        self.graphics.contact_ao = match mode {
+            0 => None,
+            1 | 2 => Some(render::contact_ao::ContactAoConfig {
+                quality: mode,
+                ..Default::default()
+            }),
+            _ => return Err(ViewEnvironmentError::InvalidConfig),
+        };
+        // 3840×2160×4×37 = 1,227,571,200 depth reads in quality2.
+        // The selected high preset must not permanently reject every 4K frame.
+        if mode == 2 {
+            self.contact_depth_reads = self.contact_depth_reads.max(1_300_000_000);
+        }
+        Ok(self)
+    }
+    /// Loading-only selection. Its exact viewport/sample ray allowance follows
+    /// explicit resize; the surface count never multiplies this bound.
+    pub fn with_reflections(mut self, mode: u8) -> Result<Self, ViewEnvironmentError> {
+        if mode > 2 {
+            return Err(ViewEnvironmentError::InvalidConfig);
+        }
+        if let Some(water) = &mut self.graphics.water {
+            water.reflection_steps = match mode {
+                0 => 0,
+                1 => 32,
+                _ => 64,
+            };
+            water.reflection_distance = if mode == 1 { 16. } else { 32. };
+            water.reflection_tolerance = if mode == 1 { 0.75 } else { 1.2 };
+        } else if mode != 0 {
+            return Err(ViewEnvironmentError::InvalidConfig);
+        }
+        self.reflection_budget_follows_extent = true;
+        Ok(self)
+    }
+    /// Select resources only during asynchronous loading/repreparation.
+    /// 0 disables, 1 is the default bounded mode, 2 increases physical quality.
+    pub fn with_quality(mut self, clouds: u8, gi: u8) -> Result<Self, ViewEnvironmentError> {
+        if clouds > 2 || gi > 2 {
+            return Err(ViewEnvironmentError::InvalidConfig);
+        }
+        self.graphics.clouds = match clouds {
+            0 => None,
+            1 => Some(render::cloud_gpu::CloudConfig::default()),
+            _ => Some(render::cloud_gpu::CloudConfig {
+                quality: render::cloud_gpu::CloudQuality::VolumeB,
+                // 3440×1440: ceil(w/4)*ceil(h/4)*32*5 = 49,536,000
+                // density samples, within the explicit 64M allowance.
+                downsample: 4,
+                ..Default::default()
+            }),
+        };
+        // VolumeB at 4K: 960×540×32×5 = 82,944,000 density samples.
+        if clouds == 2 {
+            self.cloud_density_samples = self.cloud_density_samples.max(96_000_000);
+        }
+        self.graphics.gi = match gi {
+            0 => None,
+            1 => Some(GiConfig::default()),
+            _ => Some(GiConfig {
+                rays_per_probe: 64,
+                max_steps: 128,
+                ..Default::default()
+            }),
+        };
+        self.gi_rays_per_tick = if gi == 2 { 280 } else { 152 };
+        Ok(self)
+    }
+    /// Verified normal-product resources. Full GI bakes use the attached worker
+    /// owner; SSR remains off under the explicit zero reflection-ray allowance.
+    pub fn product() -> Self {
+        Self {
+            graphics: EnvironmentConfig {
+                water: Some(render::water_gpu::WaterConfig {
+                    max_objects: 2048,
+                    max_quads: 262144,
+                    reflection_steps: 0,
+                    ..Default::default()
+                }),
+                clouds: Some(render::cloud_gpu::CloudConfig::default()),
+                gi: Some(GiConfig::default()),
+                ..Default::default()
+            },
+            post_pixels: 64_000_000,
+            ..Self::default()
         }
     }
 }
@@ -66,11 +164,15 @@ pub struct EnvironmentStats {
     pub journal_lag: u64,
     pub source_pages: u32,
     pub source_reads: u64,
+    pub source_worker_reads: u64,
+    pub source_jobs: SourceJobStats,
     pub source_upload_bytes: u64,
     pub probe_visibility_samples: u32,
     pub pending_source_pages: usize,
     pub pending_probes: u32,
     pub source_ready: bool,
+    pub known_source_pages: u32,
+    pub gi_started: bool,
     pub recovered_cursor: bool,
     pub backpressure: bool,
     pub gpu: EnvironmentWork,
@@ -82,6 +184,7 @@ pub enum ViewEnvironmentError {
     Source(GiSourceError),
     Gi(GiError),
     Cursor(CursorError),
+    Worker(String),
 }
 impl std::fmt::Display for ViewEnvironmentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -117,6 +220,7 @@ pub struct ViewEnvironment {
     source: Option<SourceOwner>,
     gi_tick: Option<u64>,
     gi_rays_left: u32,
+    gi_started: bool,
 }
 impl ViewEnvironment {
     /// Call from the existing native loading worker or browser loading task.
@@ -147,6 +251,10 @@ impl ViewEnvironment {
             let (origin, probe) = desired_grid(eye, *config)?;
             config.world_origin_page = origin;
             config.probe_origin = probe;
+        }
+        if profile.reflection_budget_follows_extent {
+            profile.water_reflection_steps =
+                reflection_budget(profile, width, height, terrain.sample_count())?;
         }
         let initial = Self::state(eye, 0., 1. / 60., scene.world().tick(), sun, false);
         let mut budget = UploadBudget::new(16 * 1024 * 1024);
@@ -200,6 +308,7 @@ impl ViewEnvironment {
             source,
             gi_tick: None,
             gi_rays_left: profile.gi_rays_per_tick,
+            gi_started: false,
         })
     }
     pub fn state(
@@ -251,14 +360,96 @@ impl ViewEnvironment {
                 &mut self.stats,
             )?;
         }
+        if self.stats.known_source_pages == 0 {
+            self.gi_started = false;
+        }
+        self.stats.gi_started = self.gi_started;
+        Ok(self.stats)
+    }
+    /// CPU-only progress while presentation slots are occupied. Full bakes run
+    /// in workers; this phase never uploads a buffer or executes a GPU pass.
+    pub fn phase(
+        &mut self,
+        scene: &mut ClientScene,
+        eye: [f32; 3],
+        camera: &Camera,
+        tick: Tick,
+    ) -> Result<EnvironmentStats, ViewEnvironmentError> {
+        self.stats = EnvironmentStats {
+            source_ready: self.source.is_none(),
+            ..Default::default()
+        };
+        if let (Some(source), Some(gi)) = (&mut self.source, self.gpu.gi_mut()) {
+            source.phase(
+                scene,
+                gi,
+                eye,
+                camera,
+                tick.max(scene.world().tick()),
+                self.profile,
+                &mut self.stats,
+            )?;
+        }
+        if self.stats.known_source_pages == 0 {
+            self.gi_started = false;
+        }
+        self.stats.gi_started = self.gi_started;
         Ok(self.stats)
     }
     pub fn needs_cpu_work(&self, scene: &ClientScene) -> bool {
         self.source.as_ref().is_some_and(|owner| {
             owner.pending.is_some()
+                || owner.jobs.pending()
                 || owner.sequence != scene.world().journal_next()
                 || owner.slots.iter().any(|slot| slot.dirty)
         })
+    }
+    pub fn take_source_task(
+        &mut self,
+        tick: Tick,
+    ) -> Result<Option<jobs::Dispatch<crate::gi_source::GiBakeTask>>, ViewEnvironmentError> {
+        match &mut self.source {
+            Some(source) => source.jobs.take_task(tick),
+            None => Ok(None),
+        }
+    }
+    pub fn encode_source_task(
+        &mut self,
+        dispatch: &jobs::Dispatch<crate::gi_source::GiBakeTask>,
+    ) -> Result<Vec<u8>, ViewEnvironmentError> {
+        self.source
+            .as_mut()
+            .ok_or(ViewEnvironmentError::InvalidConfig)?
+            .jobs
+            .encode(dispatch)
+    }
+    pub fn requeue_source_task(
+        &mut self,
+        dispatch: jobs::Dispatch<crate::gi_source::GiBakeTask>,
+    ) -> Result<(), ViewEnvironmentError> {
+        self.source
+            .as_mut()
+            .ok_or(ViewEnvironmentError::InvalidConfig)?
+            .jobs
+            .requeue(dispatch)
+    }
+    pub fn complete_source_bytes(
+        &mut self,
+        id: jobs::JobId,
+        bytes: &[u8],
+    ) -> Result<(), ViewEnvironmentError> {
+        self.source
+            .as_mut()
+            .ok_or(ViewEnvironmentError::InvalidConfig)?
+            .jobs
+            .complete_bytes(id, bytes)
+    }
+    pub fn fail_source_task(&mut self, id: jobs::JobId) -> Result<(), ViewEnvironmentError> {
+        self.source
+            .as_mut()
+            .ok_or(ViewEnvironmentError::InvalidConfig)?
+            .jobs
+            .fail(id)
     }
     pub fn needs_redraw(
         &self,
@@ -297,6 +488,20 @@ impl ViewEnvironment {
             self.available_gi_rays(state.tick),
         )
     }
+    /// Preserve the last complete scene during a pending atomic coverage join.
+    pub fn encode_cached_present(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        output: &wgpu::TextureView,
+    ) -> Result<Option<EnvironmentWork>, ViewEnvironmentError> {
+        self.stats.gpu = EnvironmentWork::default();
+        let mut pixels = self.profile.post_pixels;
+        let work = self
+            .gpu
+            .encode_cached_present(encoder, output, &mut pixels)?;
+        self.stats.gpu = work.unwrap_or_default();
+        Ok(work)
+    }
     /// Use the remaining shared frame upload budget; this does not create a
     /// second independent 2-MiB allowance after terrain/source uploads.
     #[allow(clippy::too_many_arguments)]
@@ -313,6 +518,7 @@ impl ViewEnvironment {
         extra: impl FnOnce(&mut wgpu::RenderPass<'_>) -> u32,
     ) -> Result<EnvironmentWork, ViewEnvironmentError> {
         let mut budget = EnvironmentBudget {
+            contact_depth_reads: self.profile.contact_depth_reads,
             aerial_steps: self.profile.aerial_steps,
             aerial_samples: self.profile.aerial_samples,
             upload_bytes: upload.remaining_bytes,
@@ -337,19 +543,26 @@ impl ViewEnvironment {
         self.gi_rays_left = budget.gi_rays;
         upload.remaining_bytes = budget.upload_bytes;
         self.stats.gpu = work;
+        if work.gi.updated_probes > 0 && self.stats.known_source_pages > 0 {
+            self.gi_started = true;
+        }
+        self.stats.gi_started = self.gi_started;
         self.stats.pending_probes = self.gpu.gi().map_or(0, GiGpu::pending);
         Ok(work)
     }
     pub fn replace_albedo(&mut self, atlas: &AtlasImage) -> Result<(), ViewEnvironmentError> {
         if let Some(source) = &mut self.source {
-            source
-                .builder
-                .invalidate_materials(GiAlbedo::from_atlas(atlas)?);
-            source.epoch = source
+            let albedo = GiAlbedo::from_atlas(atlas)?;
+            let epoch = source
                 .epoch
                 .checked_add(1)
                 .ok_or(ViewEnvironmentError::InvalidConfig)?;
+            source.builder.invalidate_materials(albedo);
+            source.epoch = epoch;
             source.mark_all();
+            self.gi_started = false;
+            self.stats.gi_started = false;
+            self.stats.known_source_pages = 0;
         }
         Ok(())
     }
@@ -364,6 +577,10 @@ impl ViewEnvironment {
     ) -> Result<(), ViewEnvironmentError> {
         self.gpu
             .resize(device, queue, terrain, width, height, budget)?;
+        if self.profile.reflection_budget_follows_extent {
+            self.profile.water_reflection_steps =
+                reflection_budget(self.profile, width, height, terrain.sample_count())?;
+        }
         Ok(())
     }
     /// Needed when a profile is disabled while retaining the same World.
@@ -373,12 +590,33 @@ impl ViewEnvironment {
         }
     }
 }
+fn reflection_budget(
+    profile: EnvironmentProfile,
+    width: u32,
+    height: u32,
+    samples: u32,
+) -> Result<u64, ViewEnvironmentError> {
+    u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|n| n.checked_mul(u64::from(samples)))
+        .and_then(|n| {
+            n.checked_mul(u64::from(
+                profile
+                    .graphics
+                    .water
+                    .map_or(0, |water| water.reflection_steps),
+            ))
+        })
+        .ok_or(ViewEnvironmentError::InvalidConfig)
+}
 
 struct SourceSlot {
     page: PageId,
     dirty: bool,
     edited: bool,
     since: u64,
+    waiting_tints: bool,
+    published_known: bool,
 }
 struct PendingRecord {
     change: Arc<WorldChange>,
@@ -395,6 +633,8 @@ struct SourceOwner {
     pending: Option<PendingRecord>,
     last_visibility: Option<(Camera, u32)>,
     epoch: u64,
+    jobs: source_jobs::SourceJobs,
+    worker_reported: u64,
 }
 impl SourceOwner {
     fn new(
@@ -427,6 +667,8 @@ impl SourceOwner {
                         dirty: true,
                         edited: false,
                         since: scene.world().tick().0,
+                        waiting_tints: false,
+                        published_known: false,
                     });
                 }
             }
@@ -442,12 +684,15 @@ impl SourceOwner {
             pending: None,
             last_visibility: None,
             epoch: 0,
+            jobs: source_jobs::SourceJobs::new()?,
+            worker_reported: 0,
         })
     }
     fn mark_all(&mut self) {
         for slot in &mut self.slots {
             slot.dirty = true;
             slot.edited = false;
+            slot.published_known = false;
         }
         self.last_visibility = None;
     }
@@ -716,55 +961,82 @@ impl SourceOwner {
                             dirty: true,
                             edited: false,
                             since: tick.0,
+                            waiting_tints: false,
+                            published_known: false,
                         };
                     }
                     self.last_visibility = None;
                 }
                 Err(GiError::UploadBudget) => {
+                    self.update_stats(scene, gi, stats);
+                    stats.source_ready = false;
                     stats.backpressure = true;
                     return Ok(());
                 }
                 Err(error) => return Err(error.into()),
             }
         }
-        // A partial journal record must not certify an incomplete owner union.
-        if self.ingest(scene, gi, tick, profile.journal_rows_per_pump, stats)? {
-            let mut reads = SourceBudget {
-                remaining_world_reads: profile.source_reads_per_pump,
-            };
+        self.phase(scene, gi, eye, camera, tick, profile, stats)?;
+        if self.pending.is_none() && self.sequence == scene.world().journal_next() {
             for _ in 0..profile.source_pages_per_pump {
-                let selected = self
-                    .slots
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, slot)| slot.dirty)
-                    .max_by_key(|(_, slot)| {
-                        let visible = page_visible(slot.page, camera);
-                        let age = tick.0.saturating_sub(slot.since);
-                        (age >= 12, visible && slot.edited, visible, slot.edited, age)
-                    })
-                    .map(|(index, _)| index);
-                let Some(index) = selected else {
+                let Some(ready) = self.jobs.pop_ready() else {
                     break;
                 };
-                let page = self.slots[index].page;
-                if scene.world().page(page).is_none()
-                    && gi.source_page_version([page.x, page.y, page.z])?.is_none()
-                {
-                    self.slots[index].dirty = false;
-                    self.builder.forget(page);
+                let page = ready.stamp.page;
+                let Some(index) = self.slots.iter().position(|slot| slot.page == page) else {
                     continue;
-                }
-                match self.builder.update_scene_page(
-                    scene, page, self.epoch, queue, gi, tick.0, &mut reads, budget,
+                };
+                match self.builder.publish_full(
+                    scene.world(),
+                    &ready.stamp,
+                    &ready.built,
+                    self.epoch,
+                    queue,
+                    gi,
+                    tick.0,
+                    budget,
                 ) {
                     Ok(work) => {
                         self.slots[index].dirty = false;
                         self.slots[index].edited = false;
+                        self.slots[index].waiting_tints = false;
+                        self.slots[index].published_known = scene.world().page(page).is_some();
                         stats.source_pages += 1;
-                        stats.source_reads += work.world_reads;
                         stats.source_upload_bytes += work.upload_bytes;
                     }
+                    Err(GiSourceError::StaleInput | GiSourceError::Cancelled) => {}
+                    Err(GiSourceError::MissingTint) => {
+                        self.slots[index].waiting_tints = true;
+                    }
+                    Err(GiSourceError::Gi(GiError::UploadBudget)) => {
+                        self.jobs.push_ready(ready);
+                        stats.backpressure = true;
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let mut reads = SourceBudget {
+                remaining_world_reads: profile.source_reads_per_pump,
+            };
+            for _ in 0..profile.source_pages_per_pump {
+                let Some(index) = self.select(scene, gi, camera, tick, true)? else {
+                    break;
+                };
+                let page = self.slots[index].page;
+                let result = self.builder.update_scene_page(
+                    scene, page, self.epoch, queue, gi, tick.0, &mut reads, budget,
+                );
+                stats.source_reads += self.builder.take_attempt_work().world_reads;
+                match result {
+                    Ok(work) => {
+                        self.slots[index].dirty = false;
+                        self.slots[index].edited = false;
+                        self.slots[index].published_known = scene.world().page(page).is_some();
+                        stats.source_pages += 1;
+                        stats.source_upload_bytes += work.upload_bytes;
+                    }
+                    Err(GiSourceError::MissingTint) => self.slots[index].waiting_tints = true,
                     Err(GiSourceError::ReadBudget | GiSourceError::Gi(GiError::UploadBudget)) => {
                         stats.backpressure = true;
                         break;
@@ -788,11 +1060,130 @@ impl SourceOwner {
             }
             self.last_visibility = Some((*camera, gi.source_revision()));
         }
+        self.update_stats(scene, gi, stats);
+        Ok(())
+    }
+    fn update_stats(&self, scene: &ClientScene, gi: &GiGpu, stats: &mut EnvironmentStats) {
+        stats.source_jobs = self.jobs.stats;
+        stats.known_source_pages = self
+            .slots
+            .iter()
+            .filter(|slot| slot.published_known)
+            .count() as u32;
         stats.pending_source_pages = self.slots.iter().filter(|slot| slot.dirty).count();
         stats.pending_probes = gi.pending();
         stats.source_ready = stats.pending_source_pages == 0
+            && !self.jobs.pending()
             && self.pending.is_none()
             && self.sequence == scene.world().journal_next();
+    }
+    fn select(
+        &self,
+        scene: &ClientScene,
+        gi: &GiGpu,
+        camera: &Camera,
+        tick: Tick,
+        small: bool,
+    ) -> Result<Option<usize>, ViewEnvironmentError> {
+        let mut best = None;
+        for (index, slot) in self.slots.iter().enumerate() {
+            if !slot.dirty
+                || self.jobs.busy(slot.page)
+                || (slot.waiting_tints && scene.cached_biome_tints(slot.page).is_none())
+            {
+                continue;
+            }
+            if self
+                .builder
+                .can_update_small(scene.world(), slot.page, self.epoch, gi, 64)?
+                != small
+            {
+                continue;
+            }
+            let visible = page_visible(slot.page, camera);
+            let age = tick.0.saturating_sub(slot.since);
+            let score = (
+                age >= 12,
+                visible && slot.edited,
+                visible,
+                slot.edited,
+                age,
+                index,
+            );
+            if best.is_none_or(|(_, key)| score > key) {
+                best = Some((index, score));
+            }
+        }
+        Ok(best.map(|(index, _)| index))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn phase(
+        &mut self,
+        scene: &mut ClientScene,
+        gi: &mut GiGpu,
+        eye: [f32; 3],
+        camera: &Camera,
+        tick: Tick,
+        profile: EnvironmentProfile,
+        stats: &mut EnvironmentStats,
+    ) -> Result<(), ViewEnvironmentError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.jobs.poll_native()?;
+        let config = self.config;
+        self.jobs
+            .cancel_stale(&self.builder, scene.world(), self.epoch, tick, |page| {
+                page.space == SpaceId(0)
+                    && [page.x, page.y, page.z]
+                        .into_iter()
+                        .enumerate()
+                        .all(|(axis, v)| {
+                            (0..i64::from(config.world_pages[axis])).contains(
+                                &(i64::from(v) - i64::from(config.world_origin_page[axis])),
+                            )
+                        })
+            });
+        let caught_up = self.ingest(scene, gi, tick, profile.journal_rows_per_pump, stats)?;
+        // Recenter is a GPU publication; do not prepare obsolete new work while it is pending.
+        let (origin, _) = desired_grid(eye, self.config)?;
+        if caught_up && origin == self.config.world_origin_page {
+            for slot in &mut self.slots {
+                if slot.dirty
+                    && scene.world().page(slot.page).is_none()
+                    && gi
+                        .source_page_version([slot.page.x, slot.page.y, slot.page.z])?
+                        .is_none()
+                {
+                    slot.dirty = false;
+                    slot.published_known = false;
+                    self.builder.forget(slot.page);
+                }
+            }
+            for _ in 0..profile.source_pages_per_pump {
+                let Some(index) = self.select(scene, gi, camera, tick, false)? else {
+                    break;
+                };
+                let slot = &self.slots[index];
+                if !self.jobs.enqueue(
+                    &self.builder,
+                    scene,
+                    slot.page,
+                    self.epoch,
+                    slot.edited,
+                    tick,
+                )? {
+                    stats.backpressure = true;
+                    break;
+                }
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.jobs.dispatch_native(tick)?;
+        stats.source_worker_reads = self.jobs.stats.worker_reads - self.worker_reported;
+        self.worker_reported = self.jobs.stats.worker_reads;
+        self.update_stats(scene, gi, stats);
+        if origin != self.config.world_origin_page {
+            stats.source_ready = false;
+        }
         Ok(())
     }
 }
@@ -870,11 +1261,13 @@ mod tests {
     #[test]
     fn live_owner_bounds_journal_rows_publishes_complete_delta_and_never_generates_unknown() {
         for directional in [false, true] {
-            live_owner_mode(directional);
+            for external in [false, true] {
+                live_owner_mode(directional, external);
+            }
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
-    fn live_owner_mode(directional: bool) {
+    fn live_owner_mode(directional: bool, external: bool) {
         use crate::{SceneConfig, lighting::ClientLightingConfig};
         use core_types::Cell;
         use render::{
@@ -1010,18 +1403,75 @@ mod tests {
             sun,
         )
         .unwrap();
+        if external {
+            view.source.as_mut().unwrap().jobs.native.take();
+        }
         let camera = Camera::perspective(eye, [24.5, 8.5, 12.5], [0., 1., 0.], 1., 1.5, 0.1, 200.);
         let mut budget = UploadBudget::new(2 * 1024 * 1024);
-        let bootstrap = view
+        let mut bootstrap = view
             .pump(&gpu.queue, &mut scene, eye, &camera, Tick(1), &mut budget)
             .unwrap();
-        assert!(bootstrap.source_ready);
-        assert_eq!(bootstrap.source_pages, 2);
-        assert_eq!(bootstrap.source_reads, 8198);
+        assert!(!bootstrap.source_ready);
         assert_eq!(
-            bootstrap.source_upload_bytes,
-            2 * if directional { 213088 } else { 16480 }
+            bootstrap.source_reads, 0,
+            "full GI source classification must not run on the owner"
         );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut pages = bootstrap.source_pages;
+        let mut bytes = bootstrap.source_upload_bytes;
+        let mut worker_reads = bootstrap.source_worker_reads;
+        budget.remaining_bytes = 0;
+        let mut retry_proven = false;
+        let mut cpu_phase_completed = false;
+        while !bootstrap.source_ready {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bounded GI workers did not settle"
+            );
+            std::thread::yield_now();
+            if external {
+                while let Some(dispatch) = view.take_source_task(Tick(1)).unwrap() {
+                    let request = view.encode_source_task(&dispatch).unwrap();
+                    let response =
+                        crate::gi_source::execute_gi_request(&request, || false).unwrap();
+                    view.complete_source_bytes(dispatch.id, &response).unwrap();
+                }
+            }
+            let phase = view.phase(&mut scene, eye, &camera, Tick(1)).unwrap();
+            assert_eq!((phase.source_reads, phase.source_upload_bytes), (0, 0));
+            worker_reads += phase.source_worker_reads;
+            cpu_phase_completed |= phase.source_jobs.ready > 0;
+            bootstrap = view
+                .pump(&gpu.queue, &mut scene, eye, &camera, Tick(1), &mut budget)
+                .unwrap();
+            assert_eq!(bootstrap.source_reads, 0);
+            pages += bootstrap.source_pages;
+            bytes += bootstrap.source_upload_bytes;
+            worker_reads += bootstrap.source_worker_reads;
+            if !retry_proven && bootstrap.source_jobs.ready > 0 {
+                assert!(bootstrap.backpressure);
+                assert_eq!(
+                    bytes, 0,
+                    "a refused full source upload must publish nothing"
+                );
+                budget.remaining_bytes = 2 * 1024 * 1024;
+                retry_proven = true;
+            }
+        }
+        assert_eq!(pages, 2);
+        assert_eq!(bootstrap.known_source_pages, 2);
+        assert!(!bootstrap.gi_started);
+        assert!(retry_proven);
+        assert!(
+            cpu_phase_completed,
+            "full source completion must progress without GPU publication"
+        );
+        assert_eq!(worker_reads, 8198);
+        assert_eq!(
+            view.source.as_ref().unwrap().jobs.stats.wire_reads,
+            if external { 32768 } else { 0 }
+        );
+        assert_eq!(bytes, 2 * if directional { 213088 } else { 16480 });
         let page = stone.page();
         let initial = view
             .gpu
@@ -1058,6 +1508,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first.gi.updated_probes, 2);
+        assert!(view.stats.gi_started);
         let reflected = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("live World directional/RGB source proof"),
             size: 256,
@@ -1084,6 +1535,23 @@ mod tests {
         drop(bytes);
         reflected.unmap();
         assert_eq!(view.gpu.gi().unwrap().pending(), 0);
+        let scope = telemetry::AllocationScope::begin().unwrap();
+        for _ in 0..1000 {
+            let idle = view
+                .pump(&gpu.queue, &mut scene, eye, &camera, Tick(1), &mut budget)
+                .unwrap();
+            assert!(idle.source_ready);
+            assert_eq!(
+                (
+                    idle.source_reads,
+                    idle.source_worker_reads,
+                    idle.source_upload_bytes
+                ),
+                (0, 0, 0)
+            );
+        }
+        let allocations = scope.finish();
+        assert_eq!(allocations, telemetry::AllocationCounts::default());
         let mut night = ViewEnvironment::state(eye, 0., 1. / 60., Tick(2), sun, false);
         night.sun_intensity = 0.;
         for shadow_revision in [0, 1] {
@@ -1147,6 +1615,10 @@ mod tests {
             assert_eq!(deferred.gi.rays, 0);
             assert_eq!(deferred.terrain.passes, 0);
             assert_eq!(view.gpu.gi().unwrap().pending(), 2);
+            assert!(
+                view.stats.gi_started,
+                "freshness backlog must not erase a working selected backend"
+            );
             gpu.queue.submit([encoder.finish()]);
             assert!(!view.needs_redraw(&terrain, &camera, CullingMode::FrustumAndHiZ, night));
             let mut encoder = gpu.device.create_command_encoder(&Default::default());
@@ -1246,6 +1718,11 @@ mod tests {
             .pump(&gpu.queue, &mut scene, moved, &camera, Tick(3), &mut budget)
             .unwrap();
         assert!(moved.source_ready);
+        assert_eq!(moved.known_source_pages, 0);
+        assert!(
+            !moved.gi_started,
+            "complete Unknown AOI clears first-use proof"
+        );
         assert_eq!(
             scene.world().loaded_pages(),
             known_pages,

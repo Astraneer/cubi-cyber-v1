@@ -167,8 +167,9 @@ impl LayerProbe {
         }
     }
     pub(super) fn capture(&self, gpu: &render::Gpu, mode: u32) -> Vec<[f32; 4]> {
-        gpu.queue
-            .write_buffer(&self.mode, 0, bytemuck::bytes_of(&[mode, 0, 0, 0]));
+        let mut mode_bytes = [0u8; 16];
+        mode_bytes[..4].copy_from_slice(&mode.to_le_bytes());
+        gpu.queue.write_buffer(&self.mode, 0, &mode_bytes);
         let view = self.texture.create_view(&Default::default());
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         {
@@ -296,19 +297,17 @@ pub(super) fn expected(sampling: &render::shadows::ShadowSampling, base: &[[f32;
                 if layer == 2 || edge <= 0.60 {
                     return f64::from(layers[layer]);
                 }
-                // Every farther layer actually sampled by this blend must also
-                // lie inside its own production footprint; the per-layer raw
-                // metric therefore covers all rendered layer contributions.
-                assert!(footprint_edge(sampling, layer + 1, i) < 0.96);
-                assert!(
-                    committed_valid(sampling, layer + 1, i),
-                    "positive farther blend escaped committed guard layer{} pixel{i}",
-                    layer + 1
-                );
+                // Inactive/invalid layers cannot contribute. With fewer active
+                // cascades the last valid layer keeps its own visibility.
+                let Some(farther) = (layer + 1..3).find(|next| committed_valid(sampling, *next, i))
+                else {
+                    return f64::from(layers[layer]);
+                };
+                assert!(footprint_edge(sampling, farther, i) < 0.96);
                 let t = ((edge - 0.60) / (0.96 - 0.60)).clamp(0., 1.);
                 let weight = t * t * (3. - 2. * t);
                 return f64::from(layers[layer])
-                    + f64::from(layers[layer + 1] - layers[layer]) * weight;
+                    + f64::from(layers[farther] - layers[layer]) * weight;
             }
             1.
         })

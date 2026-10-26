@@ -43,6 +43,165 @@ fn trace(gpu: &render::Gpu, gi: &mut GiGpu, tick: u64) -> ProbeSample {
     gpu.queue.submit([encoder.finish()]);
     bytemuck::pod_read_unaligned(&read(gpu, gi.probe_buffer())[..128])
 }
+#[test]
+fn all_six_first_hit_faces_match_independent_ray_box_sh_after_portable_dda_normal_selection() {
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let terrain = TerrainGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        32,
+        32,
+        OutputTransfer::Attachment,
+        GpuConfig {
+            max_pages: 1,
+            max_quads: 16,
+            occlusion: false,
+        },
+        &AtlasImage::donor().unwrap(),
+    )
+    .unwrap();
+    let shadows = ShadowGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        terrain.geometry(),
+        ShadowConfig {
+            resolution: 32,
+            ..Default::default()
+        },
+        [8.5; 3],
+        [0., 1., 0.],
+    )
+    .unwrap();
+    let mut budget = UploadBudget::new(2 * 1024 * 1024);
+    let atmosphere = AtmosphereGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        AtmosphereConfig {
+            transmittance_size: [16, 8],
+            sky_size: [16, 8],
+            transmittance_steps: 8,
+            sky_steps: 8,
+        },
+        AtmosphereState {
+            sun_direction: [0., 1., 0.],
+            altitude_km: 0.,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    let mut gi = GiGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        GiConfig {
+            world_origin_page: [0; 3],
+            world_pages: [1; 3],
+            probe_origin: [8.5; 3],
+            probe_counts: [1; 3],
+            rays_per_probe: 64,
+            max_jobs: 1,
+            max_steps: 64,
+            max_distance: 16.,
+            ..Default::default()
+        },
+        &mut budget,
+    )
+    .unwrap();
+    gi.prepare_directional(&gpu.device, &atmosphere, &shadows)
+        .unwrap();
+    let colors = [
+        [15, 0, 0],
+        [0, 15, 0],
+        [0, 0, 15],
+        [15, 15, 0],
+        [15, 0, 15],
+        [0, 15, 15],
+    ];
+    let mut face_source = GiSurface::EMPTY;
+    for (face, rgb) in colors.into_iter().enumerate() {
+        face_source = face_source.with_face(face as u8, [1.; 3], 0, rgb).unwrap();
+    }
+    let mut voxels = Box::new([GiVoxel::EMPTY; 4096]);
+    let mut surfaces = Box::new([GiSurface::EMPTY; 4096]);
+    for y in 7..=9 {
+        for z in 7..=9 {
+            for x in 7..=9 {
+                if [x, y, z] == [8; 3] {
+                    continue;
+                }
+                let index = x + 16 * (z + 16 * y);
+                voxels[index] = GiVoxel::opaque_reflected([0.; 3]).unwrap();
+                surfaces[index] = face_source;
+            }
+        }
+    }
+    gi.upload_page_directional(&gpu.queue, [0; 3], 1, &voxels, &surfaces, 0, &mut budget)
+        .unwrap();
+    let actual = trace(&gpu, &mut gi, 1);
+    let mut expected = [[0f64; 4]; 3];
+    let mut wrong_face = [[0f64; 4]; 3];
+    let mut hits = [0u32; 6];
+    // Independent intersection with the six planes of an axis-aligned box.
+    for ray in RAYS {
+        let d = ray.map(f64::from);
+        let mut axis = 0;
+        for candidate in 1..3 {
+            if 0.5 / d[candidate].abs() < 0.5 / d[axis].abs() {
+                axis = candidate;
+            }
+        }
+        let face = match (axis, d[axis] > 0.) {
+            (0, true) => 4,
+            (0, false) => 5,
+            (1, true) => 0,
+            (1, false) => 1,
+            (2, true) => 2,
+            _ => 3,
+        };
+        hits[face] += 1;
+        let basis = [
+            0.2820947918,
+            0.4886025119 * d[1],
+            0.4886025119 * d[2],
+            0.4886025119 * d[0],
+        ];
+        for channel in 0..3 {
+            for (coefficient, value) in basis.into_iter().enumerate() {
+                let convolution = if coefficient == 0 {
+                    std::f64::consts::PI
+                } else {
+                    2. * std::f64::consts::PI / 3.
+                };
+                let weight = value * convolution * 4. * std::f64::consts::PI / 64.;
+                expected[channel][coefficient] += f64::from(colors[face][channel]) / 15. * weight;
+                wrong_face[channel][coefficient] +=
+                    f64::from(colors[(face + 1) % 6][channel]) / 15. * weight;
+            }
+        }
+    }
+    let coefficients = [actual.sh_r, actual.sh_g, actual.sh_b];
+    let mut error = 0f64;
+    let mut negative = 0f64;
+    for channel in 0..3 {
+        for coefficient in 0..4 {
+            error = error.max(
+                (f64::from(coefficients[channel][coefficient]) - expected[channel][coefficient])
+                    .abs(),
+            );
+            negative = negative
+                .max((wrong_face[channel][coefficient] - expected[channel][coefficient]).abs());
+        }
+    }
+    assert!(hits.iter().all(|&count| count > 0));
+    assert!(error < 0.00002, "six-face f64 SH error {error}");
+    assert!(
+        negative > 0.1,
+        "fixture must detect a wrong normal/face permutation"
+    );
+    eprintln!(
+        "GI_DDA_SIX_FACE_GPU_OK ray_counts={hits:?} max_f64_SH_error={error} wrong_face_negative={negative}"
+    );
+}
 // Independent flat finite-plane intersections and f64 SH projection. No DDA.
 fn expected(source: [f64; 3]) -> [[f64; 4]; 3] {
     let mut result = [[0.; 4]; 3];

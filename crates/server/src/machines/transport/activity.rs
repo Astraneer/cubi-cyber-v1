@@ -384,6 +384,65 @@ impl TransportOwner {
         }
         Ok(out)
     }
+    /// Check the detached post-transit queues without cloning or walking cold
+    /// packets. At most the changed rows plus one unchanged due row are read.
+    pub(in crate::machines) fn has_due_projected(
+        &self,
+        overlay: &Overlay,
+        now: Tick,
+    ) -> Result<bool, MachineError> {
+        let due = |position: BlockPos, tick: Tick| -> Result<bool, MachineError> {
+            let clock = overlay
+                .clocks
+                .get(&position.page())
+                .map(|p| p.after)
+                .unwrap_or_else(|| self.clocks.get(&position.page()).copied())
+                .ok_or(MachineError::Encoding)?;
+            Ok(clock.active && tick <= clock.local_now(now)?)
+        };
+        let limit = overlay
+            .packets
+            .len()
+            .saturating_add(overlay.pulls.len())
+            .saturating_add(1);
+        for event in self.agenda(overlay, now, limit)?.into_values() {
+            match event {
+                TransitEvent::Packet(id) => {
+                    if let Some(p) = overlay
+                        .packets
+                        .get(&id)
+                        .map(|p| p.after.as_ref())
+                        .unwrap_or_else(|| self.packets.get(&id))
+                        && due(p.at().ok_or(MachineError::Encoding)?, p.due)?
+                    {
+                        return Ok(true);
+                    }
+                }
+                TransitEvent::Pull(position) => {
+                    if let Some(p) = overlay
+                        .pulls
+                        .get(&position)
+                        .map(|p| p.after)
+                        .unwrap_or_else(|| self.pulls.get(&position).copied())
+                        && due(position, p.due)?
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        for p in overlay.packets.values().filter_map(|p| p.after.as_ref()) {
+            if due(p.at().ok_or(MachineError::Encoding)?, p.due)? {
+                return Ok(true);
+            }
+        }
+        for p in overlay.pulls.values().filter_map(|p| p.after) {
+            if due(p.position, p.due)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 impl crate::machines::view::Stage<'_> {
     pub(super) fn page_active(&mut self, page: PageId) -> Result<bool, MachineError> {

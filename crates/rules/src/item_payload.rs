@@ -427,7 +427,7 @@ pub use encoded::Encoded;
 mod machine_slot;
 #[path = "item_payload/view.rs"]
 mod view;
-pub use view::{Resolver, View};
+pub use view::{Capacity, Resolver, View};
 #[path = "item_payload/configurator.rs"]
 mod configurator;
 pub use configurator::{ConfiguratorMode, cycle_configurator, resolve_configurator};

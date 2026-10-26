@@ -104,6 +104,16 @@ fn wal_header(base: u64, snapshot_digest: [u8; 32]) -> Vec<u8> {
 }
 
 impl Store {
+    /// Current durable WAL size. Foreground owners use SaveWorker's atomic
+    /// published copy; filesystem metadata is queried only on the writer.
+    pub fn wal_bytes(&self) -> Result<u64, SaveError> {
+        Ok(self
+            .wal
+            .as_ref()
+            .ok_or(SaveError::Poisoned)?
+            .metadata()?
+            .len())
+    }
     pub fn open(directory: impl AsRef<Path>) -> Result<(Self, Recovery), SaveError> {
         let directory = directory.as_ref().to_path_buf();
         std::fs::create_dir_all(&directory)?;

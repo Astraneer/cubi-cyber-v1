@@ -150,7 +150,7 @@ impl EntityGpu {
         config: EntityConfig,
         shadows: Option<&ShadowGpu>,
     ) -> Result<Self, EntityError> {
-        Self::build(device, queue, geometry, config, shadows, None, None)
+        Self::build(device, queue, geometry, config, shadows, None, None, None)
     }
     /// Prepare an independent nonblock item texture array once during loading.
     pub fn new_with_items(
@@ -161,7 +161,16 @@ impl EntityGpu {
         shadows: Option<&ShadowGpu>,
         items: &crate::terrain_gpu::AtlasImage,
     ) -> Result<Self, EntityError> {
-        Self::build(device, queue, geometry, config, shadows, Some(items), None)
+        Self::build(
+            device,
+            queue,
+            geometry,
+            config,
+            shadows,
+            Some(items),
+            None,
+            None,
+        )
     }
     /// Optional shared atmosphere prepared during loading, including item sprites.
     pub fn new_with_environment(
@@ -181,6 +190,31 @@ impl EntityGpu {
             shadows,
             items,
             Some(atmosphere),
+            None,
+        )
+    }
+    /// Prepare optional reflected lighting together with the shared physical
+    /// atmosphere. The disabled variant preserves the existing shader exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_lighting(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        geometry: TerrainGeometry<'_>,
+        config: EntityConfig,
+        shadows: Option<&ShadowGpu>,
+        items: Option<&crate::terrain_gpu::AtlasImage>,
+        atmosphere: &crate::atmosphere::AtmosphereGpu,
+        gi: Option<&crate::gi::GiGpu>,
+    ) -> Result<Self, EntityError> {
+        Self::build(
+            device,
+            queue,
+            geometry,
+            config,
+            shadows,
+            items,
+            Some(atmosphere),
+            gi,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -192,9 +226,11 @@ impl EntityGpu {
         shadows: Option<&ShadowGpu>,
         items: Option<&crate::terrain_gpu::AtlasImage>,
         atmosphere: Option<&crate::atmosphere::AtmosphereGpu>,
+        gi: Option<&crate::gi::GiGpu>,
     ) -> Result<Self, EntityError> {
         let sample_count = geometry.sample_count;
         if config.max_entities == 0
+            || (gi.is_some() && atmosphere.is_none())
             || config.atlas_layers == 0
             || u64::from(config.max_entities) * 64
                 > u64::from(device.limits().max_storage_buffer_binding_size)
@@ -399,9 +435,18 @@ impl EntityGpu {
         if atmosphere.is_some() {
             entries.push(buffer_layout(20, f, false, true));
         }
+        if gi.is_some() {
+            crate::gi_model::layout(&mut entries);
+        }
         let render_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("instanced entity catalog layout"),
             entries: &entries,
+        });
+        let dummy_footprint = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("inactive color cull footprint binding"),
+            size: 256,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
         });
         let cull_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("entity independent GPU cull"),
@@ -411,6 +456,7 @@ impl EntityGpu {
                 buffer_layout(2, c, false, false),
                 buffer_layout(3, c, false, false),
                 buffer_layout(4, c, false, true),
+                buffer_layout(5, c, false, false),
             ],
         });
         let mut entries = vec![
@@ -453,6 +499,9 @@ impl EntityGpu {
         if let Some(atmosphere) = atmosphere {
             entries.push(buffer_binding(20, atmosphere.lighting_buffer()));
         }
+        if let Some(gi) = gi {
+            crate::gi_model::bindings(&mut entries, gi);
+        }
         let render_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("entity atlas lights and instance tables"),
             layout: &render_layout,
@@ -467,19 +516,15 @@ impl EntityGpu {
                 buffer_binding(2, &visible),
                 buffer_binding(3, &indirect),
                 buffer_binding(4, &ranges),
+                buffer_binding(5, &dummy_footprint),
             ],
         });
-        let source = crate::atmosphere::surface_shader(
-            include_str!("entity.wgsl"),
+        let source = shader_source_with_ambient(
             shadows.is_some(),
             atmosphere.is_some(),
-            true,
-            if shadows.is_some() {
-                "return light.rgb+vec3(light.a*(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.0)));"
-            } else {
-                "return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.));"
-            },
-        );
+            gi.is_some(),
+            geometry.ambient_mrt,
+        )?;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("GPU model pose and texture shading"),
             source: wgpu::ShaderSource::Wgsl(source.clone().into()),
@@ -536,6 +581,7 @@ impl EntityGpu {
                 shader_location: 8,
             },
         ];
+        let color_targets = crate::ambient_mrt::targets(None, geometry.ambient_mrt);
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("GPU animated entity HDR MSAA4"),
             layout: Some(&layout),
@@ -569,18 +615,22 @@ impl EntityGpu {
                 module: &shader,
                 entry_point: Some("fragment"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &color_targets,
             }),
             multiview: None,
             cache: None,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("GPU entity frustum model buckets"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("entity_cull.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}\n{}",
+                    crate::shadows::footprint::COMMON,
+                    crate::shadows::footprint::MODEL,
+                    include_str!("entity_cull.wgsl")
+                )
+                .into(),
+            ),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("entity cull pipeline"),
@@ -682,6 +732,12 @@ impl EntityGpu {
                         buffer_binding(2, &visible),
                         buffer_binding(3, &indirect),
                         buffer_binding(4, &ranges),
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: shadows
+                                .and_then(|s| s.footprint_binding(i))
+                                .unwrap_or_else(|| dummy_footprint.as_entire_binding()),
+                        },
                     ],
                 })
             });
@@ -1076,7 +1132,39 @@ impl DynamicShadowCaster for EntityGpu {
         ShadowPrepareWork {
             dispatches: 2,
             upload_bytes: 192,
+            bounds_complete: false,
         }
+    }
+    fn prepare_shadow_sparse(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        cascade: usize,
+        camera: Camera,
+        resolution: u32,
+    ) -> ShadowPrepareWork {
+        let mut work = self.prepare_shadow_region(
+            queue,
+            encoder,
+            cascade,
+            camera,
+            ShadowRect::full(resolution),
+            resolution,
+        );
+        if work.dispatches != 0 {
+            let shadow = self
+                .shadow
+                .as_ref()
+                .expect("prepared model shadow resources");
+            queue.write_buffer(
+                &shadow.cull_cameras[cascade],
+                80,
+                bytemuck::bytes_of(&[resolution, 1u32, 0, 0]),
+            );
+            work.upload_bytes += 16;
+        }
+        work.bounds_complete = true;
+        work
     }
     fn draw_shadow(&self, pass: &mut wgpu::RenderPass<'_>, cascade: usize) -> u32 {
         if self.count == 0 {
@@ -1137,4 +1225,43 @@ fn buffer_binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'
         binding,
         resource: buffer.as_entire_binding(),
     }
+}
+
+/// Loading/tooling source generated by the exact constructor path.
+pub fn shader_source(shadows: bool, atmosphere: bool, gi: bool) -> Result<String, EntityError> {
+    if gi && !atmosphere {
+        return Err(EntityError::InvalidConfig);
+    }
+    let source = crate::atmosphere::surface_shader(
+        include_str!("entity.wgsl"),
+        shadows,
+        atmosphere,
+        true,
+        if shadows {
+            "return light.rgb+vec3(light.a*(0.15+0.85*cascade_shadow(world,normal)*max(dot(normal,normalize(shadow_sampling.sun.xyz)),0.0)));"
+        } else {
+            "return vec3(0.65+0.35*max(dot(normal,normalize(vec3(0.35,0.8,0.2))),0.));"
+        },
+    );
+    let source = if gi {
+        crate::gi_model::shader(source)
+    } else {
+        source
+    };
+    Ok(source)
+}
+
+/// Exact optional MRT constructor source for independent backend oracles.
+pub fn shader_source_with_ambient(
+    shadows: bool,
+    atmosphere: bool,
+    gi: bool,
+    ambient: bool,
+) -> Result<String, EntityError> {
+    let source = shader_source(shadows, atmosphere, gi)?;
+    Ok(if ambient {
+        crate::ambient_mrt::entity(&source, shadows, atmosphere, gi)
+    } else {
+        source
+    })
 }

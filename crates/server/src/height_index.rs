@@ -455,6 +455,57 @@ impl HeightEditIndex {
         }
         Ok(out)
     }
+    /// Exact cold-source capture: half-open16x16 body and selected canonical
+    /// profile pages only. Resident/out-of-profile rows need no baseline copy.
+    pub fn capture_body_pages(
+        &self,
+        key: TileKey,
+        pages: u8,
+        max_cells: usize,
+    ) -> Result<TileEdits, IndexError> {
+        if key.level != 0 {
+            return Err(IndexError::InvalidTile);
+        }
+        let source = self.source(key)?;
+        let bounds = key.bounds().ok_or(IndexError::InvalidTile)?;
+        let mut out = TileEdits {
+            key,
+            source,
+            columns: Vec::new(),
+            visited_columns: 0,
+            visited_cells: 0,
+        };
+        if pages == 0 {
+            return Ok(out);
+        }
+        let first = morton(bounds[0] as i32, bounds[1] as i32);
+        let last = first | 255;
+        for (_, column) in self.columns.range((key.space, first)..=(key.space, last)) {
+            out.visited_columns += 1;
+            let mut cells = Vec::new();
+            for page in 0..8 {
+                if pages & (1 << page) == 0 {
+                    continue;
+                }
+                for (&y, &(cell, source_tx)) in column.cells.range(page * 16..page * 16 + 16) {
+                    if out.visited_cells >= max_cells {
+                        return Err(IndexError::Capacity);
+                    }
+                    out.visited_cells += 1;
+                    cells.push(IndexedCell { y, cell, source_tx });
+                }
+            }
+            if !cells.is_empty() {
+                out.columns.push(EditedColumn {
+                    space: key.space,
+                    x: column.x,
+                    z: column.z,
+                    cells,
+                });
+            }
+        }
+        Ok(out)
+    }
     /// Snapshot serialization belongs to a checkpoint worker. WAL records use the
     /// bounded delta codec below; serializing the whole index per edit is forbidden.
     pub fn encode_snapshot(&self) -> Result<Vec<u8>, IndexError> {

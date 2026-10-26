@@ -101,6 +101,7 @@ pub struct PostGpu {
     config: PostConfig,
     parameters: Parameters,
     output_extent: [u32; 2],
+    max_output_dimension: u32,
     uniform: wgpu::Buffer,
     state: wgpu::Buffer,
     auto: Option<AutoExposure>,
@@ -561,6 +562,7 @@ impl PostGpu {
             config,
             parameters,
             output_extent: [width, height],
+            max_output_dimension: device.limits().max_texture_dimension_2d,
             uniform,
             state,
             auto,
@@ -720,7 +722,11 @@ impl PostGpu {
     /// The final surface can retain native resolution while HDR inputs shrink.
     /// This changes only accounting/presentation dirtiness, never GPU resources.
     pub fn set_output_extent(&mut self, width: u32, height: u32) -> Result<(), PostError> {
-        if width == 0 || height == 0 {
+        if width == 0
+            || height == 0
+            || width > self.max_output_dimension
+            || height > self.max_output_dimension
+        {
             return Err(PostError::InvalidConfig);
         }
         if self.output_extent != [width, height] {

@@ -160,11 +160,13 @@ fn perlin(noise: &v4::noise::Noise, x: I, z: I, work: &mut u64) -> I {
     let cx = (x.lo * 0.5 + x.hi * 0.5).clamp(x.lo, x.hi);
     let cz = (z.lo * 0.5 + z.hi * 0.5).clamp(z.lo, z.hi);
     let center = noise.perlin(cx, cz);
-    // Gradients have components <=1. Fade'<=1.875, corner dot differences<=4:
-    // |dP/dx|,|dP/dz| <=0.7*(1+4*1.875)=5.95. Eight is a conservative bound.
+    // Gradients have components<=1. For two horizontal corners, the x terms
+    // contribute <=(1-x)+x=1 and the common z terms<=2, hence dot difference<=3.
+    // Fade'<=1.875, so each axis derivative<=0.7*(1+3*1.875)=4.6375.
+    //4.638 rounds that UP; the separate endpoint guard covers scalar roundoff.
     // The f32 quintic/lerps use local fractions in[0,1], not world coordinates;
     // 1e-4 covers their rounding plus the center evaluation's rounding.
-    let radius = 8.
+    let radius = 4.638
         * (f64::from((cx - x.lo).max(x.hi - cx)) + f64::from((cz - z.lo).max(z.hi - cz)))
         + 0.0001;
     let global = I::outward(
@@ -292,6 +294,12 @@ fn terrace(value: I, step: I, sharp: f32) -> I {
     // |G'|<=1.5/a and |dT/ds|<=1+K*(1+1.5/a), K=max|v/s|.
     let a = f64::from(sharp);
     let k = f64::from(value.lo.abs().max(value.hi.abs())) / f64::from(step.lo);
+    // The fractional-subtraction bound below assumes every relevant integer
+    // floor is exactly representable. Terrain stays far inside this range;
+    // retain the generic enclosure for a broader caller instead of assuming it.
+    if !k.is_finite() || k >= 2f64.powi(24) {
+        return generic;
+    }
     let derivative = 1. + k * (1. + 1.5 / a);
     let midpoint = ((step.lo + step.hi) * 0.5).clamp(step.lo, step.hi);
     let radius =

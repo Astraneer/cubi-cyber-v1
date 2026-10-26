@@ -65,6 +65,9 @@ impl MachineRuntime {
         context: PhaseContext<'_>,
         topology: &[BlockPos],
     ) -> Result<PhasePlan, MachineError> {
+        if self.owner_tick().is_some_and(|tick| tick != now) {
+            return Err(MachineError::Stale);
+        }
         let topology_queue = self.topology_registration(topology, now)?;
         let new_dirty = self.new_dirty_networks(topology);
         let initial =
@@ -89,21 +92,7 @@ impl MachineRuntime {
                 )
             })
             .collect();
-        let mut agenda: BTreeMap<(u8, u64), Pending> = self
-            .events
-            .range(..=(now, u8::MAX, u64::MAX))
-            .filter(|(_, p)| !queue.contains_key(&p.event))
-            .take(budget.events)
-            .map(|(_, p)| ((phase(p.event), p.order), *p))
-            .collect();
-        for event in queue
-            .values()
-            .filter_map(|p| *p)
-            .filter(|p| p.due <= now)
-            .take(budget.events)
-        {
-            agenda.insert((phase(event.event), event.order), event);
-        }
+        let mut cohort = self.owner.project();
         let mut work = Work::default();
         let mut overlay = Overlay {
             clocks: self.transport.activity_patches(context.activity, now)?,
@@ -114,8 +103,14 @@ impl MachineRuntime {
         } else {
             !self.transport.agenda(&overlay, now, 1)?.is_empty()
         };
-        if agenda.is_empty()
+        let due = self
+            .events
+            .range(..=(now, u8::MAX, u64::MAX))
+            .any(|(_, p)| !queue.contains_key(&p.event))
+            || queue.values().filter_map(|p| *p).any(|p| p.due <= now);
+        if !due
             && !transit_due
+            && !self.owner_pending()
             && overlay.clocks.is_empty()
             && topology_queue.is_none()
             && initial.machines.is_empty()
@@ -131,23 +126,60 @@ impl MachineRuntime {
                 work,
             });
         }
-        let machine_limit = if transit_due {
-            budget.events.saturating_mul(3) / 4
-        } else {
-            budget.events
-        };
-        let machine_budget = if transit_due {
-            Budget {
-                events: machine_limit,
-                reads: budget.reads.saturating_mul(3) / 4,
-                bytes: budget.bytes.saturating_mul(3) / 4,
-                endpoints: budget.endpoints.saturating_mul(3) / 4,
-                route_nodes: budget.route_nodes.saturating_mul(3) / 4,
-                item_spawns: budget.item_spawns,
+        if cohort.state.is_none() && (due || transit_due) {
+            cohort.state = Some(OwnerState {
+                tick: now,
+                stage: OwnerStage::Prepare,
+                prepared_after: None,
+            });
+        }
+        // Activity changes join the same detached cohort. They are admitted
+        // before the finite due-index capture, never by a dense idle scan.
+        for (&event, &after) in &queue {
+            if let Some(before) = self.pending(event) {
+                cohort.remove(before);
             }
-        } else {
-            budget
-        };
+            if let Some(p) = after
+                && p.due <= now
+                && cohort.state.is_some()
+            {
+                cohort.put(p);
+            }
+        }
+        if let Some(state) = cohort.state
+            && state.stage == OwnerStage::Prepare
+            && budget.events > 0
+        {
+            let lower = state
+                .prepared_after
+                .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+            let mut source = self
+                .events
+                .range((lower, std::ops::Bound::Included((now, u8::MAX, u64::MAX))));
+            let mut cursor = state.prepared_after;
+            for (&key, &p) in source.by_ref().take(budget.events) {
+                work.prepared += 1;
+                cursor = Some(key);
+                let effective = queue.get(&p.event).copied().unwrap_or(Some(p));
+                if let Some(p) = effective.filter(|p| p.due <= now) {
+                    cohort.put(p);
+                }
+            }
+            cohort.state = Some(if source.next().is_none() {
+                OwnerState {
+                    stage: OwnerStage::Machines,
+                    prepared_after: None,
+                    ..state
+                }
+            } else {
+                OwnerState {
+                    prepared_after: cursor,
+                    ..state
+                }
+            });
+        }
+        let machine_limit = budget.events;
+        let machine_budget = budget;
         let owner = ReadOwner {
             dirty_networks: &self.dirty_networks,
             new_dirty: &new_dirty,
@@ -165,11 +197,32 @@ impl MachineRuntime {
         let mut metadata = activity_meta.clone();
         let mut retired = Vec::new();
         let mut processed = BTreeSet::new();
-        while let Some(((current_phase, current_order), event)) = agenda.pop_first() {
+        loop {
+            let Some(state) = cohort.state else {
+                break;
+            };
+            let current_phase = match state.stage {
+                OwnerStage::Prepare | OwnerStage::Transit => break,
+                OwnerStage::Machines => 0,
+                OwnerStage::Resources => 1,
+            };
+            let Some(event) = cohort.next(current_phase) else {
+                cohort.state = Some(OwnerState {
+                    stage: if current_phase == 0 {
+                        OwnerStage::Resources
+                    } else {
+                        OwnerStage::Transit
+                    },
+                    ..state
+                });
+                continue;
+            };
+            let current_order = event.order;
             if work.events >= machine_limit as u64 {
-                work.deferred += 1 + agenda.len() as u64;
+                work.deferred += 1;
                 break;
             }
+            cohort.remove(event);
             work.events += 1;
             work.oldest_age = work.oldest_age.max(now.0.saturating_sub(event.first_due.0));
             queue.insert(event.event, None);
@@ -190,7 +243,7 @@ impl MachineRuntime {
                     schedule(
                         self,
                         &mut queue,
-                        &mut agenda,
+                        &mut cohort,
                         &processed,
                         Pending {
                             due: Tick(now.0.saturating_add(1)),
@@ -218,7 +271,7 @@ impl MachineRuntime {
                 schedule(
                     self,
                     &mut queue,
-                    &mut agenda,
+                    &mut cohort,
                     &processed,
                     Pending {
                         due: Tick(now.0.saturating_add(1)),
@@ -350,7 +403,7 @@ impl MachineRuntime {
                         schedule(
                             self,
                             &mut queue,
-                            &mut agenda,
+                            &mut cohort,
                             &processed,
                             Pending {
                                 due: Tick(now.0.saturating_add(1)),
@@ -366,12 +419,13 @@ impl MachineRuntime {
                         schedule(
                             self,
                             &mut queue,
-                            &mut agenda,
+                            &mut cohort,
                             &processed,
                             event,
                             now,
                             current_phase,
                         )?;
+                        cohort.put(event);
                         break;
                     }
                     _ => return Err(error),
@@ -392,7 +446,7 @@ impl MachineRuntime {
                     schedule(
                         self,
                         &mut queue,
-                        &mut agenda,
+                        &mut cohort,
                         &processed,
                         Pending {
                             event: Event::Machine(meta.id),
@@ -427,7 +481,7 @@ impl MachineRuntime {
                 schedule(
                     self,
                     &mut queue,
-                    &mut agenda,
+                    &mut cohort,
                     &processed,
                     Pending {
                         event: Event::Machine(id),
@@ -449,7 +503,7 @@ impl MachineRuntime {
                 schedule(
                     self,
                     &mut queue,
-                    &mut agenda,
+                    &mut cohort,
                     &processed,
                     Pending {
                         event: Event::Network(key),
@@ -462,15 +516,18 @@ impl MachineRuntime {
                 )?;
             }
         }
-        let transport_wakes =
-            transport::advance(owner, world, &mut overlay, &mut work, budget, now)?;
+        let transport_wakes = if cohort.state.is_some_and(|s| s.stage == OwnerStage::Transit) {
+            transport::advance(owner, world, &mut overlay, &mut work, budget, now)?
+        } else {
+            BTreeSet::new()
+        };
         for id in transport_wakes {
             if let Some(meta) = owner.machine_meta(id).filter(|_| owner.machine_active(id)) {
                 let due = Tick(now.0.saturating_add(1));
                 schedule(
                     self,
                     &mut queue,
-                    &mut agenda,
+                    &mut cohort,
                     &processed,
                     Pending {
                         event: Event::Machine(id),
@@ -482,6 +539,11 @@ impl MachineRuntime {
                     3,
                 )?;
             }
+        }
+        if cohort.state.is_some_and(|s| s.stage == OwnerStage::Transit)
+            && !self.transport.has_due_projected(&overlay, now)?
+        {
+            cohort.state = None;
         }
         let transport_delta = self.transport.projected_delta(&overlay)?;
         let mut transactions = BTreeMap::<SpaceId, Transaction>::new();
@@ -597,6 +659,7 @@ impl MachineRuntime {
             .map(|(page, version)| jobs::InputVersion { page, version })
             .collect();
         let mut delta = self.delta(machines, queue, reservoirs, self.next_order)?;
+        delta.owner = cohort.delta();
         delta.topology_queue = topology_queue;
         if !transport_delta.is_empty() {
             delta.transport = Some(transport_delta);
@@ -617,7 +680,7 @@ impl MachineRuntime {
 fn schedule(
     runtime: &MachineRuntime,
     queue: &mut BTreeMap<Event, Option<Pending>>,
-    agenda: &mut BTreeMap<(u8, u64), Pending>,
+    cohort: &mut barrier::Cohort<'_>,
     processed: &BTreeSet<Event>,
     mut next: Pending,
     now: Tick,
@@ -633,7 +696,7 @@ fn schedule(
     }
     queue.insert(next.event, Some(next));
     if next.due <= now && phase(next.event) >= current_phase && !processed.contains(&next.event) {
-        agenda.insert((phase(next.event), next.order), next);
+        cohort.put(next);
     }
     if queue.len() > runtime.config.events {
         return Err(MachineError::Bounds);
