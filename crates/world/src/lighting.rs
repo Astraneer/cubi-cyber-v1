@@ -714,6 +714,7 @@ impl LightingEngine {
                 block: *rgb.iter().max().expect("RGB"),
                 rgb,
             };
+            let mut intrinsic = next;
             let mut neighbors = [entry.position; 6];
             let mut neighbor_count = 0;
             for direction in 0..6 {
@@ -742,14 +743,35 @@ impl LightingEngine {
                         && let Some(incoming) = sky.incoming_from_unknown_above(entry.position)
                     {
                         let incoming = incoming.min(15);
-                        next.sky = next.sky.max(if incoming == 15 && opacity == 0 {
+                        let boundary = if incoming == 15 && opacity == 0 {
                             15
                         } else {
                             incoming.saturating_sub(attenuation)
-                        });
+                        };
+                        next.sky = next.sky.max(boundary);
+                        intrinsic.sky = boundary;
                     }
                 }
             }
+            // Withdraw stale transport support in one step. Re-addition from
+            // retained genuine sources uses the ordinary neighbor frontier.
+            // Otherwise cycles of old light count down one level at a time,
+            // and direct skylight columns can take thousands of owner phases.
+            let withdrawn = next.sky < current.sky
+                || next.block < current.block
+                || (0..3).any(|channel| next.rgb[channel] < current.rgb[channel]);
+            if next.sky < current.sky {
+                next.sky = intrinsic.sky;
+            }
+            if next.block < current.block {
+                next.block = intrinsic.block;
+            }
+            for channel in 0..3 {
+                if next.rgb[channel] < current.rgb[channel] {
+                    next.rgb[channel] = intrinsic.rgb[channel];
+                }
+            }
+            next.block = next.block.max(*next.rgb.iter().max().expect("RGB"));
             if next != current {
                 if work.light_updates >= budget.max_updates {
                     break;
@@ -757,7 +779,7 @@ impl LightingEngine {
                 if !self.can_add_positions(
                     &neighbors[..neighbor_count],
                     entry.priority,
-                    Some(index),
+                    if withdrawn { None } else { Some(index) },
                 ) {
                     backpressure = true;
                     work.frontier_deferrals += 1;
@@ -772,6 +794,17 @@ impl LightingEngine {
                 for position in neighbors[..neighbor_count].iter().copied() {
                     self.frontier.insert(
                         position,
+                        entry.priority,
+                        entry.queued_at,
+                        Some(&mut undo),
+                    );
+                }
+                if withdrawn {
+                    // A genuine incoming source may remain unchanged, so its
+                    // neighbor notifications alone cannot guarantee re-addition.
+                    // Retain this explicit recheck after withdrawing support.
+                    self.frontier.insert(
+                        entry.position,
                         entry.priority,
                         entry.queued_at,
                         Some(&mut undo),

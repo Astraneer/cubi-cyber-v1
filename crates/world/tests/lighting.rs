@@ -651,6 +651,21 @@ fn bounded_seed_admission_drains_a_large_daylight_removal_without_growing_the_fr
 }
 
 #[test]
+fn increased_attenuation_readds_unchanged_neighbor_light_after_withdrawal() {
+    let mut world = world(&[page(0, 0, 0)]);
+    let mut engine = LightingEngine::attach(&mut world, limits()).unwrap();
+    set(&mut world, &[(pos(8, 6, 7), 2)]);
+    settle(&mut world, &mut engine, &|_| None);
+    set(&mut world, &[(pos(4, 3, 1), 4)]);
+    settle(&mut world, &mut engine, &|_| None);
+    assert_eq!(stored(&world, pos(4, 3, 1)).block, 1);
+    assert_reference(&world, &|_| None);
+    set(&mut world, &[(pos(8, 6, 7), 0)]);
+    settle(&mut world, &mut engine, &|_| None);
+    assert_reference(&world, &|_| None);
+}
+
+#[test]
 fn near_edits_have_reserved_slots_and_small_work_budgets_are_resumable() {
     let mut world = world(&[page(0, 0, 0)]);
     let policy = LightingLimits {
