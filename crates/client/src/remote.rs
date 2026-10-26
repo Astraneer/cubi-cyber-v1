@@ -32,6 +32,9 @@ pub struct RemoteSession {
     lead: u64,
     predicted_positions: BTreeSet<BlockPos>,
     mining: Option<(BlockPos, Cell, ActionId)>,
+    food_use: Option<(usize, u16, u16)>,
+    food_rejected: bool,
+    pending_bucket: Option<(Action, [f32; 2])>,
     next_place_ms: u64,
     next_entity_ms: u64,
     counters: RemoteCounters,
@@ -54,6 +57,9 @@ impl RemoteSession {
             lead: config.input_lead_ticks,
             predicted_positions: BTreeSet::new(),
             mining: None,
+            food_use: None,
+            food_rejected: false,
+            pending_bucket: None,
             next_place_ms: 0,
             next_entity_ms: 0,
             counters: RemoteCounters::default(),
@@ -573,6 +579,15 @@ impl RemoteSession {
         Ok(changes)
     }
     fn interactions(&mut self, input: RemoteInput, now_ms: u64) -> Result<(), String> {
+        if !input.placing {
+            self.food_rejected = false;
+        }
+        if self.food_use.is_some() && !self.connection.using_food() {
+            self.food_use = None;
+            // A rejected inventory guard must not be retried on every input
+            // pump while the same physical press is still held.
+            self.food_rejected = input.placing;
+        }
         if self
             .mining
             .is_some_and(|(_, _, id)| !self.connection.action_pending(id))
@@ -580,6 +595,53 @@ impl RemoteSession {
             self.mining = None;
         }
         let attacking = input.keys & net::InputFrame::ATTACK != 0;
+        let food = self
+            .connection
+            .predicted_inventory()
+            .filter(|i| {
+                input.placing
+                    && !self.food_rejected
+                    && (!attacking || self.food_use.is_some())
+                    && rules::items::food_nutrition(i.hand().item()).is_some()
+                    && self.connection.player().is_some_and(|p| {
+                        p.health > 0.
+                            && (p.health < 20.
+                                || self.food_use.is_some_and(|(slot, item, count)| {
+                                    slot == i.selected()
+                                        && item == i.hand().item()
+                                        && i.hand().count() >= count
+                                }))
+                    })
+            })
+            .map(|i| (i.selected(), i.hand().item(), i.hand().count()));
+        let same_food = self
+            .food_use
+            .zip(food)
+            .is_some_and(|(a, b)| (a.0, a.1) == (b.0, b.1));
+        if self.food_use.is_some() && !same_food {
+            match self.connection.use_food(false, now_ms) {
+                Ok(_) => self.food_use = None,
+                Err(NetworkError::Capacity) => return Ok(()),
+                Err(e) => return Err(error(e)),
+            }
+        }
+        if let Some((action, aim)) = self.pending_bucket.as_ref() {
+            match self
+                .connection
+                .aimed_action(action.clone(), false, now_ms, aim[0], aim[1])
+            {
+                Ok(_) => {
+                    self.pending_bucket = None;
+                    self.next_place_ms = now_ms.saturating_add(200);
+                }
+                Err(NetworkError::Capacity) => return Ok(()),
+                Err(e) => return Err(error(e)),
+            }
+        }
+        if same_food {
+            self.food_use = food;
+            return Ok(());
+        }
         if !attacking && !input.placing && !input.place_pressed {
             if self.mining.take().is_some() {
                 self.connection
@@ -625,7 +687,16 @@ impl RemoteSession {
             connection: &self.connection,
             space,
         };
-        let hit = match sim::raycast(&query, eye, look, reach) {
+        let empty_bucket = self
+            .connection
+            .predicted_inventory()
+            .is_some_and(|i| i.hand().item() == rules::items::I_BUCKET);
+        let ray = if empty_bucket && !attacking {
+            sim::raycast_fluid_sources(&query, eye, look, reach)
+        } else {
+            sim::raycast(&query, eye, look, reach)
+        };
+        let hit = match ray {
             RayResult::Hit(hit) => Some(hit),
             _ => None,
         };
@@ -747,6 +818,51 @@ impl RemoteSession {
                 return Ok(());
             };
             let hand = inventory.hand();
+            if let rules::items::ItemKind::Bucket { fluid } = rules::items::idef(hand.item()).kind {
+                let target = if fluid == 0 {
+                    hit.cell
+                } else {
+                    let direction = rules::cell::DIRS[hit.face as usize];
+                    std::array::from_fn(|i| hit.cell[i] + direction[i])
+                };
+                let position = BlockPos {
+                    space,
+                    x: target[0],
+                    y: target[1],
+                    z: target[2],
+                };
+                if let ReplicaRead::Known(expected) = self.connection.read(position) {
+                    let action = Action::UseBucket {
+                        position,
+                        expected,
+                        inventory: net::InventoryGuard {
+                            revision: inventory.revision(),
+                            selected: inventory.selected() as u8,
+                            item: hand.item(),
+                            count: hand.count(),
+                            damage: hand.damage(),
+                            payload: hand.payload().map_or(0, |p| p.0),
+                        },
+                    };
+                    match self.connection.aimed_action(
+                        action.clone(),
+                        false,
+                        now_ms,
+                        input.yaw,
+                        input.pitch,
+                    ) {
+                        Ok(_) => self.next_place_ms = now_ms.saturating_add(200),
+                        Err(NetworkError::Capacity) => {
+                            self.pending_bucket = Some((action, [input.yaw, input.pitch]))
+                        }
+                        Err(e) => return Err(error(e)),
+                    }
+                }
+                return Ok(());
+            }
+            if food.is_some() {
+                return self.start_food_use(food, now_ms);
+            }
             let rules::items::ItemKind::Block(block) = rules::items::idef(hand.item()).kind else {
                 return Ok(());
             };
@@ -776,6 +892,21 @@ impl RemoteSession {
                     .map_err(error)?;
                 self.next_place_ms = now_ms.saturating_add(200);
             }
+        }
+        if food.is_some() && self.food_use.is_none() {
+            self.start_food_use(food, now_ms)?;
+        }
+        Ok(())
+    }
+    fn start_food_use(
+        &mut self,
+        food: Option<(usize, u16, u16)>,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        match self.connection.use_food(true, now_ms) {
+            Ok(_) => self.food_use = food,
+            Err(NetworkError::Capacity) => {}
+            Err(e) => return Err(error(e)),
         }
         Ok(())
     }

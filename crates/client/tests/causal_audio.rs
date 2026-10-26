@@ -127,3 +127,88 @@ fn durable_causal_wire_reaches_real_egg_pcm_once_without_item_inference_or_idle_
     assert_eq!(sounds.visit(&resumed, [0.; 3], |_| {}), 1);
     assert_eq!(sounds.emitted, 2);
 }
+
+#[test]
+fn owned_cue_kinds_cross_the_actual_wire_and_select_decoded_pcm_exactly_once() {
+    let mut network = connection(3);
+    let mut sounds = CausalSounds::default();
+    let prepared = audio::scene::PreparedSounds::prepare(None, None).unwrap();
+    let (mut mixer, events) = prepared.into_parts();
+    for (ordinal, (kind, expected)) in [
+        (Kind::ChestOpen, "chest.open"),
+        (Kind::ChestClose, "chest.close"),
+        (Kind::ItemPickup, "item.pickup"),
+        (Kind::AttackWeak, "player.attack_weak"),
+        (Kind::AttackStrong, "player.attack_strong"),
+        (Kind::AttackCrit, "player.attack_crit"),
+        (Kind::AttackKnockback, "player.attack_knockback"),
+        (Kind::BucketFill, "bucket.fill"),
+        (Kind::BucketEmpty, "bucket.empty"),
+        (Kind::Eat, "player.eat"),
+        (Kind::EatDone, "player.eat_done"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let cue = Cue {
+            kind,
+            actor: 7,
+            sequence: if kind == Kind::ItemPickup {
+                102
+            } else {
+                ordinal as u64 + 1
+            },
+            tick: Tick(102),
+            space: SpaceId(0),
+            position: [1., 0., 0.],
+        };
+        let message = ServerMessage::AudioCue(cue);
+        for _ in 0..2 {
+            network
+                .receive(
+                    net::decode_server(&net::encode_server(&message).unwrap()).unwrap(),
+                    5100,
+                )
+                .unwrap();
+        }
+        let mut voice = None;
+        assert_eq!(
+            sounds.visit(&network, [0.; 3], |cue| {
+                assert_eq!(cue.event, expected);
+                voice = Some(
+                    mixer
+                        .play(
+                            events
+                                .request(cue.event, cue.emitter, Some(cue.position), cue.seed)
+                                .unwrap(),
+                        )
+                        .unwrap(),
+                );
+            }),
+            1
+        );
+        let mut pcm = [0.; 2048];
+        let mut audible = false;
+        for _ in 0..8 {
+            mixer.mix_stereo(&mut pcm);
+            audible |= pcm.iter().any(|sample| sample.abs() > 1e-6);
+        }
+        assert!(audible, "{expected} must select actual decoded PCM");
+        mixer.stop(voice.unwrap());
+        assert_eq!(
+            sounds.visit(&network, [0.; 3], |_| panic!("duplicate {expected}")),
+            0
+        );
+    }
+    assert_eq!(network.audio_cues().counts().duplicate, 11);
+    let scope = telemetry::AllocationScope::begin().unwrap();
+    for _ in 0..10000 {
+        assert_eq!(
+            sounds.visit(&network, [0.; 3], |_| panic!("replayed cue")),
+            0
+        );
+    }
+    let counts = scope.finish();
+    assert_eq!(counts.allocating_calls(), 0);
+    assert_eq!(counts.dealloc_calls, 0);
+}

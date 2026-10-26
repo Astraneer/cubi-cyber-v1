@@ -172,6 +172,7 @@ pub struct Connection {
     replica: Replica,
     overlay: PredictionOverlay,
     player: Option<Player>,
+    using_food: Option<ActionId>,
     movement_replay: Box<sim::replay::Recorder>,
     replay_time_ns: u64,
     input_history: InputHistory,
@@ -236,6 +237,7 @@ impl Connection {
             replica: Replica::new(config.maximum_pages),
             overlay: PredictionOverlay::new(MAX_ACTIONS),
             player: None,
+            using_food: None,
             movement_replay: Box::new(
                 sim::replay::Recorder::new(sim::replay::DEFAULT_STEPS)
                     .map_err(NetworkError::Simulation)?,
@@ -1066,6 +1068,12 @@ impl Connection {
                     ActionStatus::Rejected(_) => {
                         if self.actions.remove(&reply.id).is_some() {
                             self.counters.rejected_actions += 1;
+                            // Only this still-pending start owns the local
+                            // slowdown. Old or duplicate replies cannot cancel
+                            // a newer start (or an already accepted one).
+                            if self.using_food == Some(reply.id) {
+                                self.using_food = None;
+                            }
                         }
                         self.world_changed = true;
                     }
@@ -1567,7 +1575,7 @@ impl Connection {
                 player,
                 &query,
                 key_state(frame.map_or(0, |f| f.keys)),
-                false,
+                self.using_food.is_some(),
             );
             if outcome.waiting_for_world {
                 self.counters.unknown_steps += 1;
@@ -1695,6 +1703,49 @@ impl Connection {
                     damage: held.damage(),
                     payload: held.payload().map_or(0, |id| id.0),
                 },
+            },
+            false,
+            now_ms,
+            aim[0],
+            aim[1],
+        )
+    }
+    fn held_inventory_guard(&self) -> Result<net::InventoryGuard, NetworkError> {
+        let inventory = self
+            .predicted_inventory()
+            .ok_or(NetworkError::NotConnected)?;
+        let held = inventory.hand();
+        Ok(net::InventoryGuard {
+            revision: inventory.revision(),
+            selected: inventory.selected() as u8,
+            item: held.item(),
+            count: held.count(),
+            damage: held.damage(),
+            payload: held.payload().map_or(0, |p| p.0),
+        })
+    }
+    pub fn use_food(&mut self, held: bool, now_ms: u64) -> Result<ActionId, NetworkError> {
+        let inventory = self.held_inventory_guard()?;
+        let id = self.action(Action::UseFood { held, inventory }, false, now_ms)?;
+        self.using_food = held.then_some(id);
+        Ok(id)
+    }
+    pub(crate) fn using_food(&self) -> bool {
+        self.using_food.is_some()
+    }
+    pub fn use_bucket(
+        &mut self,
+        position: BlockPos,
+        expected: Cell,
+        now_ms: u64,
+        aim: [f32; 2],
+    ) -> Result<ActionId, NetworkError> {
+        let inventory = self.held_inventory_guard()?;
+        self.aimed_action(
+            Action::UseBucket {
+                position,
+                expected,
+                inventory,
             },
             false,
             now_ms,

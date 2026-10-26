@@ -162,6 +162,9 @@ impl ViewLighting {
     pub fn is_ready(&self, scene: &ClientScene) -> bool {
         self.source_pending_pages(scene) == 0 && self.owner.presentation_ready(scene.world())
     }
+    pub fn inputs_ready(&self, scene: &ClientScene) -> bool {
+        self.source_pending_pages(scene) == 0 && self.owner.inputs_ready(scene.world())
+    }
     fn source_pending_pages(&self, scene: &ClientScene) -> usize {
         if self.stats.authoritative_source {
             // Visible pages form the configured box. Its one-page expansion is

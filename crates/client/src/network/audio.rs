@@ -28,6 +28,16 @@ impl Connection {
                 | net::Action::PlaceOwned { position, cell, .. } => {
                     (*position, *cell, crate::audio_bridge::BlockSound::Place)
                 }
+                net::Action::UseBucket {
+                    position,
+                    expected,
+                    inventory,
+                } if inventory.item != rules::items::I_BUCKET
+                    && expected.id() != rules::ids::AIR
+                    && rules::survival::fluid::fluid(*expected).is_none() =>
+                {
+                    (*position, *expected, crate::audio_bridge::BlockSound::Break)
+                }
                 _ => return None,
             };
             (Some(position.space) == space).then_some(PendingBlockSound {

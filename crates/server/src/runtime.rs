@@ -578,6 +578,24 @@ impl Server {
             };
             self.record_tick_actor(saved, batch);
         }
+        for pickup in plan.pickups {
+            let identity = identities[&pickup.player];
+            self.commit_owned_audio(
+                batch,
+                identity,
+                net::audio_cue::Cue {
+                    kind: net::audio_cue::Kind::ItemPickup,
+                    actor: pickup.item.0,
+                    sequence: self.tick.0,
+                    tick: self.tick,
+                    space: self
+                        .tick_actor_ref(identity)
+                        .ok_or(ServerError::Invalid("item pickup sound actor"))?
+                        .space,
+                    position: pickup.position,
+                },
+            );
+        }
         self.counters.item_steps += plan.work.entities;
         self.counters.item_pickups += plan.work.picked_items;
         let record = RuntimeRecord {

@@ -26,6 +26,7 @@ pub mod lod;
 mod machine_owner;
 pub mod public_projection;
 pub use load_metrics::{LoadMetrics, QueueLoad};
+mod consumable_owner;
 pub mod machines;
 mod migration_owner;
 mod mob_action_owner;
@@ -283,6 +284,7 @@ struct Peer {
     actions: BTreeMap<ActionId, (Action, Option<[f32; 2]>)>,
     next_action_to_start: u64,
     mining: Option<MiningAction>,
+    use_item: consumable_owner::UseState,
     interaction: InteractionController,
     place_ready_at: Tick,
     break_ready_at: Tick,
@@ -969,9 +971,10 @@ impl Server {
                     peer.player.yaw = frame.yaw.rem_euclid(360.0);
                     peer.player.pitch = frame.pitch;
                 }
-                let outcome = peer.player.tick(
+                let outcome = peer.player.tick_using(
                     &WorldQuery::new(&self.world, peer.space),
                     keys(frame.map_or(0, |f| f.keys)),
+                    peer.use_item.slowing(),
                 );
                 if !outcome.waiting_for_world {
                     peer.last_keys = frame.map_or(0, |f| f.keys);
@@ -1037,6 +1040,10 @@ impl Server {
                     );
                 }
                 self.advance_mining(connection, &mut peer, &mut batch, &mut deferred);
+                if self.advance_use_item(&mut peer, &mut batch).is_err() {
+                    self.fail("tick_use_item");
+                    return output;
+                }
                 if self.maintain_window(&mut peer, &mut batch).is_err() {
                     self.fail("tick");
                     return output;
@@ -1452,6 +1459,12 @@ impl Server {
             }
             ClientMessage::Action { id, action } => {
                 let state = self.dedup.entry(peer.identity).or_default();
+                if id.0 > state.contiguous
+                    && id.0 <= state.contiguous.saturating_add(256)
+                    && matches!(&action, Action::UseFood { held: false, .. })
+                {
+                    peer.use_item.observe_release(id);
+                }
                 if let Some(reply) = state.replies.iter().find(|r| r.id == id) {
                     if let Some(line) = self.runtimes.chat.get(peer.identity, id) {
                         out.push(Outgoing::reliable(
@@ -1936,6 +1949,7 @@ impl Server {
                 actions: BTreeMap::new(),
                 next_action_to_start: welcome.next_action.0,
                 mining: None,
+                use_item: consumable_owner::UseState::default(),
                 interaction: InteractionController::default(),
                 place_ready_at,
                 break_ready_at,
@@ -2013,7 +2027,11 @@ impl Server {
         if !peer.health.alive()
             && !matches!(
                 &action,
-                Action::Respawn | Action::Chat(_) | Action::Command(_) | Action::StopMining
+                Action::Respawn
+                    | Action::Chat(_)
+                    | Action::Command(_)
+                    | Action::StopMining
+                    | Action::UseFood { held: false, .. }
             )
         {
             self.terminal(
@@ -2042,6 +2060,35 @@ impl Server {
                 connection,
                 peer.identity,
                 reply(id, status, None, self.world.version(), None, None),
+                batch,
+                out,
+            );
+            return;
+        }
+        if peer.use_item.slowing()
+            && matches!(
+                &action,
+                Action::Mine { .. }
+                    | Action::Place { .. }
+                    | Action::PlaceOwned { .. }
+                    | Action::AttackEntity { .. }
+                    | Action::UseEntity { .. }
+                    | Action::UseBucket { .. }
+                    | Action::UseBlockTool { .. }
+                    | Action::Window(_)
+            )
+        {
+            self.terminal(
+                connection,
+                peer.identity,
+                reply(
+                    id,
+                    ActionStatus::Rejected(RejectReason::RateLimited),
+                    None,
+                    self.world.version(),
+                    None,
+                    None,
+                ),
                 batch,
                 out,
             );
@@ -2084,6 +2131,27 @@ impl Server {
         let mut cell = None;
         match action {
             Action::SelectSlot(_) | Action::PlaceOwned { .. } => unreachable!("handled above"),
+            Action::UseFood { held, inventory } => {
+                if let Err(reason) = self.use_food(peer, id, held, inventory) {
+                    status = ActionStatus::Rejected(reason);
+                }
+            }
+            Action::UseBucket {
+                position: target,
+                expected,
+                inventory,
+            } => {
+                position = Some(target);
+                match self.use_bucket(peer, id, target, expected, inventory, batch) {
+                    Ok(tx) => {
+                        transaction = Some(tx);
+                        if let CellRead::Known(actual) = self.world.read(target) {
+                            cell = Some(actual);
+                        }
+                    }
+                    Err(reason) => status = ActionStatus::Rejected(reason),
+                }
+            }
             Action::CycleToolMode { back, inventory } => {
                 if let Err(reason) = self.cycle_tool_mode(peer, back, inventory, batch) {
                     status = ActionStatus::Rejected(reason);

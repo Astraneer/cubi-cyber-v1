@@ -2553,6 +2553,10 @@ impl ClientView {
         self.near_far_join_ready()
             && self.near_meshes_ready()
             && self.scene.is_ready()
+            && self
+                .lighting
+                .as_ref()
+                .is_none_or(|lighting| lighting.inputs_ready(&self.scene))
             && self.props.as_ref().is_none_or(|props| props.stats.ready)
     }
     /// A real cheap Loading frame, with no scene/content/timestamp publication.

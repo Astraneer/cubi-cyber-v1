@@ -113,6 +113,17 @@ pub struct Stats {
     pub near_guard_ready: bool,
     pub plan_id: u64,
     pub accepted_plan_id: u64,
+    /// Accepted candidate versus the plan whose quality is actually committed.
+    pub candidate_plan_id: u64,
+    pub committed_plan_id: u64,
+    /// Current projection presence is an explicit error-receipt predicate.
+    pub projection_present: bool,
+    pub requested_error_pixels: f64,
+    pub committed_requested_error_pixels: Option<f64>,
+    pub committed_missing_error_certificates: u64,
+    pub committed_selection_capacity_limited: bool,
+    pub committed_selection_leaf_limited: u64,
+    pub committed_maximum_error_pixels: f64,
     pub plan_generation: u64,
     pub missing_error_certificates: u64,
     pub selection_capacity_limited: bool,
@@ -467,6 +478,7 @@ pub struct ViewHorizon {
     wanted_water: Vec<(GeometryStamp, u64)>,
     plan_id: u64,
     accepted_plan_id: u64,
+    committed_plan_id: u64,
     plan_generation: u64,
     last_request: Option<(u32, [i64; 2], u64)>,
     projection: Option<Projection>,
@@ -588,6 +600,7 @@ impl ViewHorizon {
             wanted_water: Vec::with_capacity(config.max_proxy_pages),
             plan_id: 0,
             accepted_plan_id: 0,
+            committed_plan_id: 0,
             plan_generation: 0,
             last_request: None,
             projection: None,
@@ -1533,6 +1546,7 @@ impl ViewHorizon {
             self.dirty = false;
             self.committed_selection = self.candidate_selection;
             self.committed_quality = self.quality;
+            self.committed_plan_id = self.accepted_plan_id;
             self.enabled = self.near_radius.is_some() && self.guard_ready;
         }
         work.upload_bytes = before - budget.remaining_bytes;
@@ -1756,6 +1770,15 @@ impl ViewHorizon {
             near_guard_ready:self.guard_ready,
             plan_id:self.plan_id,
             accepted_plan_id:self.accepted_plan_id,
+            candidate_plan_id:self.accepted_plan_id,
+            committed_plan_id:self.committed_plan_id,
+            projection_present:self.projection.is_some(),
+            requested_error_pixels:self.requested_selection.1,
+            committed_requested_error_pixels:self.committed_selection.map(|(_,error)|error),
+            committed_missing_error_certificates:self.committed_quality.missing_certificates,
+            committed_selection_capacity_limited:self.committed_quality.capacity_limited,
+            committed_selection_leaf_limited:self.committed_quality.leaf_limited,
+            committed_maximum_error_pixels:self.committed_quality.maximum_error_pixels,
             plan_generation:self.plan_generation,
             missing_error_certificates:self.quality.missing_certificates,
             selection_capacity_limited:self.quality.capacity_limited,

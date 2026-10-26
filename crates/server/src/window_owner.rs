@@ -2,6 +2,11 @@
 //! frozen behind the WAL boundary, then mirrored only to that owner.
 use super::*;
 use net::window::{WindowGuard, WindowIntent};
+fn chest(bound: &windows::BoundWindow) -> Option<BlockPos> {
+    (!bound.state.closed() && matches!(bound.state.kind(), ui::WindowKind::Chest(_)))
+        .then(|| bound.binding.map(|b| b.anchor))
+        .flatten()
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Stamp {
     guard: WindowGuard,
@@ -138,6 +143,8 @@ impl Server {
         plan.validate(&self.world, &peer.window, &peer.inventory)
             .map_err(reason)?;
         let after = plan.window_after().clone();
+        let before_chest = chest(&peer.window);
+        let after_chest = chest(&after);
         let inventory = *plan.inventory_after();
         let drops = plan.drops().to_vec();
         let payload_record = self.plan_payloads(batch, plan.take_payloads())?;
@@ -174,6 +181,28 @@ impl Server {
         peer.window = after;
         peer.inventory = inventory;
         peer.window_sent = None;
+        if before_chest != after_chest {
+            for (kind, position) in [
+                (net::audio_cue::Kind::ChestClose, before_chest),
+                (net::audio_cue::Kind::ChestOpen, after_chest),
+            ] {
+                if let Some(position) = position {
+                    self.commit_owned_audio(
+                        batch,
+                        peer.identity,
+                        net::audio_cue::Cue {
+                            kind,
+                            actor: runtime::player_entity(peer.identity).0,
+                            sequence: id.0,
+                            tick: self.tick,
+                            space: position.space,
+                            position: [position.x, position.y, position.z]
+                                .map(|v| f64::from(v) + 0.5),
+                        },
+                    );
+                }
+            }
+        }
         Ok(())
     }
     pub(super) fn maintain_window(

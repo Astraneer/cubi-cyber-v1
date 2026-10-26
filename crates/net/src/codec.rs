@@ -446,6 +446,21 @@ pub fn encode_client(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
                     out.u64(inventory.payload);
                 }
                 Action::Respawn => out.byte(20),
+                Action::UseFood { held, inventory } => {
+                    out.byte(22);
+                    out.bool(*held);
+                    write_inventory_guard(&mut out, *inventory)?;
+                }
+                Action::UseBucket {
+                    position,
+                    expected,
+                    inventory,
+                } => {
+                    out.byte(23);
+                    out.position(*position);
+                    out.u32(expected.raw());
+                    write_inventory_guard(&mut out, *inventory)?;
+                }
                 Action::UseBlockTool {
                     position,
                     expected,
@@ -755,6 +770,15 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
                     }
                 }
                 20 => Action::Respawn,
+                22 => Action::UseFood {
+                    held: input.bool()?,
+                    inventory: read_inventory_guard(&mut input)?,
+                },
+                23 => Action::UseBucket {
+                    position: input.position()?,
+                    expected: Cell::from_raw(input.u32()?),
+                    inventory: read_inventory_guard(&mut input)?,
+                },
                 21 => {
                     let position = input.position()?;
                     let expected = Cell::from_raw(input.u32()?);
@@ -1543,4 +1567,31 @@ fn read_blob<'a>(input: &mut Reader<'a>, maximum: usize) -> Result<&'a [u8], Cod
         return Err(CodecError::InvalidBounds);
     }
     input.take(len)
+}
+
+fn write_inventory_guard(out: &mut Writer, inventory: InventoryGuard) -> Result<(), CodecError> {
+    if inventory.selected >= 9 || (inventory.payload != 0 && inventory.count != 1) {
+        return Err(CodecError::InvalidBounds);
+    }
+    out.u64(inventory.revision);
+    out.byte(inventory.selected);
+    out.u16(inventory.item);
+    out.u16(inventory.count);
+    out.u16(inventory.damage);
+    out.u64(inventory.payload);
+    Ok(())
+}
+fn read_inventory_guard(input: &mut Reader<'_>) -> Result<InventoryGuard, CodecError> {
+    let inventory = InventoryGuard {
+        revision: input.u64()?,
+        selected: input.byte()?,
+        item: input.u16()?,
+        count: input.u16()?,
+        damage: input.u16()?,
+        payload: input.u64()?,
+    };
+    if inventory.selected >= 9 || (inventory.payload != 0 && inventory.count != 1) {
+        return Err(CodecError::InvalidBounds);
+    }
+    Ok(inventory)
 }

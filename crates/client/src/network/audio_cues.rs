@@ -24,9 +24,9 @@ pub struct AudioCues {
     head: usize,
     len: usize,
     revision: u64,
-    sequence: u64,
-    actors: [u64; CAPACITY],
-    actors_len: usize,
+    tick: u64,
+    keys: [Option<(net::audio_cue::Kind, u64, u64)>; CAPACITY],
+    keys_len: usize,
     counts: Counts,
 }
 impl Default for AudioCues {
@@ -36,9 +36,9 @@ impl Default for AudioCues {
             head: 0,
             len: 0,
             revision: 0,
-            sequence: 0,
-            actors: [0; CAPACITY],
-            actors_len: 0,
+            tick: 0,
+            keys: [None; CAPACITY],
+            keys_len: 0,
             counts: Counts::default(),
         }
     }
@@ -46,16 +46,17 @@ impl Default for AudioCues {
 impl AudioCues {
     pub fn push(&mut self, cue: Cue) -> Result<bool, Error> {
         cue.validate().map_err(|_| Error::Invalid)?;
-        if cue.sequence < self.sequence {
+        if cue.tick.0 < self.tick {
             self.counts.stale = self.counts.stale.saturating_add(1);
             return Ok(false);
         }
-        if cue.sequence == self.sequence {
-            if self.actors[..self.actors_len].contains(&cue.actor) {
+        let key = Some((cue.kind, cue.actor, cue.sequence));
+        if cue.tick.0 == self.tick {
+            if self.keys[..self.keys_len].contains(&key) {
                 self.counts.duplicate = self.counts.duplicate.saturating_add(1);
                 return Ok(false);
             }
-            if self.actors_len == CAPACITY {
+            if self.keys_len == CAPACITY {
                 self.counts.overflow = self.counts.overflow.saturating_add(1);
                 return Ok(false);
             }
@@ -64,12 +65,12 @@ impl AudioCues {
             .revision
             .checked_add(1)
             .ok_or(Error::RevisionOverflow)?;
-        if cue.sequence > self.sequence {
-            self.sequence = cue.sequence;
-            self.actors_len = 0;
+        if cue.tick.0 > self.tick {
+            self.tick = cue.tick.0;
+            self.keys_len = 0;
         }
-        self.actors[self.actors_len] = cue.actor;
-        self.actors_len += 1;
+        self.keys[self.keys_len] = key;
+        self.keys_len += 1;
         if self.len == CAPACITY {
             self.head = (self.head + 1) % CAPACITY;
             self.len -= 1;
@@ -133,5 +134,53 @@ mod tests {
         let revision = cache.revision();
         assert_eq!(cache.push(Cue { actor: 0, ..first }), Err(Error::Invalid));
         assert_eq!(cache.revision(), revision);
+    }
+    #[test]
+    fn same_actor_actions_and_kinds_are_independent_but_late_ticks_never_replay() {
+        use net::audio_cue::Kind;
+        let mut cache = AudioCues::default();
+        let open = Cue {
+            kind: Kind::ChestOpen,
+            sequence: 900,
+            ..cue(1, 10)
+        };
+        let close = Cue {
+            kind: Kind::ChestClose,
+            ..open
+        };
+        assert!(cache.push(open).unwrap());
+        assert!(cache.push(close).unwrap());
+        assert!(
+            cache
+                .push(Cue {
+                    sequence: 901,
+                    ..open
+                })
+                .unwrap()
+        );
+        assert!(!cache.push(open).unwrap());
+        // An action counter is not the server clock. A smaller next sequence
+        // must not suppress a newer durable tick or an unrelated item pickup.
+        assert!(
+            cache
+                .push(Cue {
+                    sequence: 1,
+                    tick: Tick(11),
+                    ..open
+                })
+                .unwrap()
+        );
+        assert!(cache.push(cue(1, 11)).unwrap());
+        assert!(
+            !cache
+                .push(Cue {
+                    sequence: 999,
+                    ..close
+                })
+                .unwrap()
+        );
+        assert_eq!(cache.after(0).count(), 5);
+        assert_eq!(cache.counts().duplicate, 1);
+        assert_eq!(cache.counts().stale, 1);
     }
 }

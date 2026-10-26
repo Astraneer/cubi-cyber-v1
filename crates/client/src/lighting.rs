@@ -919,6 +919,11 @@ impl ClientLighting {
     pub fn presentation_ready(&self, world: &World) -> bool {
         !self.pending_light_work(world) && self.shadows.presentation_ready()
     }
+    /// CPU and uploaded lighting inputs needed before the first scene. Shadow
+    /// maps are built by that scene and deliberately do not participate here.
+    pub fn inputs_ready(&self, world: &World) -> bool {
+        !self.pending_light_work(world)
+    }
     fn pending_light_work(&self, world: &World) -> bool {
         !self.bootstrap.is_empty()
             || self.engine.as_ref().is_some_and(|engine| !engine.is_idle())

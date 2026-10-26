@@ -180,9 +180,23 @@ impl Server {
             Self::replace_runtime(batch, record);
         }
         self.mob_owner.note_birth(target);
+        if let Some(strike) = plan.strike {
+            self.commit_owned_audio(
+                batch,
+                peer.identity,
+                net::audio_cue::Cue {
+                    kind: audio_cue::attack_kind(strike),
+                    actor: actor.id.0,
+                    sequence: request.id.0,
+                    tick: self.tick,
+                    space: peer.space,
+                    position: actor.position,
+                },
+            );
+        }
         Ok(())
     }
-    fn prepare_owned_item_rows(
+    pub(super) fn prepare_owned_item_rows(
         &self,
         batch: &Batch,
         rows: &[rules::entities::item::ItemEntity],
@@ -210,7 +224,7 @@ impl Server {
             payload: delta.encode().map_err(reason)?,
         }))
     }
-    fn replace_runtime(batch: &mut Batch, record: save::RuntimeRecord) {
+    pub(super) fn replace_runtime(batch: &mut Batch, record: save::RuntimeRecord) {
         if let Some(old) = batch.runtimes.iter_mut().find(|r| r.kind == record.kind) {
             *old = record;
         } else {
@@ -310,6 +324,20 @@ impl Server {
         peer.player.swing_hand();
         if let Some(record) = item_record {
             Self::replace_runtime(batch, record);
+        }
+        if plan.hit.is_some() {
+            self.commit_owned_audio(
+                batch,
+                peer.identity,
+                net::audio_cue::Cue {
+                    kind: audio_cue::attack_kind(plan.strike),
+                    actor: actor.id.0,
+                    sequence: request.id.0,
+                    tick: self.tick,
+                    space: peer.space,
+                    position: actor.position,
+                },
+            );
         }
         Ok(())
     }

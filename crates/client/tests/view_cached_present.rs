@@ -198,6 +198,42 @@ fn cached_tone_preserves_physical_pixels_camera_world_and_edit_stamps() {
             .unwrap();
     }
     let pool = native_pool(2, 8).unwrap();
+    // Geometry and all27 authoritative LIGHT bindings can be ready while a
+    // required resident18³ GPU volume still exceeds this partial allowance.
+    // That state must keep the cheap Loading frame rather than start HDR.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while view.stats().resident_pages == 0 {
+        assert!(Instant::now() < deadline, "partial geometry preparation");
+        view.scene
+            .pump_native(&pool, Tick(2), &mut ClientScene::default_budget(), 8)
+            .unwrap();
+        view.advance_input(0.).unwrap();
+        view.upload_ready(&gpu.queue, &mut UploadBudget::new(8192))
+            .unwrap();
+        std::thread::yield_now();
+    }
+    assert!(view.scene.is_ready());
+    let light = view.lighting_stats().unwrap();
+    assert_eq!(light.pending_source_pages, 0);
+    assert!(
+        light.pending_pages > 0,
+        "resident lighting must still need GPU upload"
+    );
+    assert!(!view.initial_scene_inputs_ready());
+    let hdr_before = view.renderer_mut().hdr_revision();
+    for _ in 0..3 {
+        view.upload_ready(&gpu.queue, &mut UploadBudget::new(0))
+            .unwrap();
+        assert!(!view.initial_scene_inputs_ready());
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        view.encode_loading_clear(&mut encoder, &output);
+        gpu.queue.submit([encoder.finish()]);
+        gpu.device.poll(wgpu::PollType::Wait).unwrap();
+        assert_eq!(view.renderer_mut().hdr_revision(), hdr_before);
+        assert_eq!(view.stats().terrain_frames, 0);
+        assert!(!view.has_cached_present());
+        assert!(!view.is_ready());
+    }
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut first_scene = false;
     while !view.is_ready() {
@@ -220,6 +256,10 @@ fn cached_tone_preserves_physical_pixels_camera_world_and_edit_stamps() {
                     "CPU inputs do not replace actual shadow/content presentation"
                 );
                 assert!(!view.has_cached_present());
+                assert!(
+                    view.lighting_stats().unwrap().pending_shadow_cascades > 0,
+                    "first shadow maps must remain outside the lighting-input gate"
+                );
                 first_scene = true;
             }
             view.encode(&gpu.queue, &mut encoder, &output, 64, 64)

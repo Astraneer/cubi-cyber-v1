@@ -75,13 +75,26 @@ impl CausalSounds {
             }
             let event = match cue.kind {
                 net::audio_cue::Kind::ChickenEgg => "entity.chicken.egg",
+                net::audio_cue::Kind::ChestOpen => "chest.open",
+                net::audio_cue::Kind::ChestClose => "chest.close",
+                net::audio_cue::Kind::ItemPickup => "item.pickup",
+                net::audio_cue::Kind::AttackWeak => "player.attack_weak",
+                net::audio_cue::Kind::AttackStrong => "player.attack_strong",
+                net::audio_cue::Kind::AttackCrit => "player.attack_crit",
+                net::audio_cue::Kind::AttackKnockback => "player.attack_knockback",
+                net::audio_cue::Kind::BucketFill => "bucket.fill",
+                net::audio_cue::Kind::BucketEmpty => "bucket.empty",
+                net::audio_cue::Kind::Eat => "player.eat",
+                net::audio_cue::Kind::EatDone => "player.eat_done",
             };
             emit(BlockCue {
                 event,
                 gain: 1.,
                 position: cue.position,
-                emitter: audio::EmitterId(cue.actor ^ 0x4547_4700_0000_0000),
-                seed: cue.sequence ^ cue.actor,
+                emitter: audio::EmitterId(
+                    cue.actor ^ 0x4547_4700_0000_0000 ^ ((cue.kind as u64) << 48),
+                ),
+                seed: cue.sequence ^ cue.actor ^ (cue.kind as u64),
             });
             self.emitted = self.emitted.saturating_add(1);
             played += 1;

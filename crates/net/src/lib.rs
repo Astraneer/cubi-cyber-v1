@@ -179,6 +179,17 @@ pub enum Action {
         inventory: InventoryGuard,
     },
     Respawn,
+    /// Reliable press/release. Only the server's canonical ticks advance the
+    /// 32-tick food duration; clients never request an amount of healing.
+    UseFood {
+        held: bool,
+        inventory: InventoryGuard,
+    },
+    UseBucket {
+        position: BlockPos,
+        expected: Cell,
+        inventory: InventoryGuard,
+    },
     UseBlockTool {
         position: BlockPos,
         expected: Cell,

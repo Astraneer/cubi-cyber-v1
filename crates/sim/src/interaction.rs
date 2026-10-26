@@ -143,6 +143,25 @@ pub fn raycast(
     direction: [f64; 3],
     reach: f64,
 ) -> RayResult {
+    raycast_kind(world, eye, direction, reach, false)
+}
+/// Empty buckets select source fluid cubes while retaining the same bounded
+/// DDA, block outlines and fail-closed Unknown/occlusion behavior.
+pub fn raycast_fluid_sources(
+    world: &impl QueryWorld,
+    eye: [f64; 3],
+    direction: [f64; 3],
+    reach: f64,
+) -> RayResult {
+    raycast_kind(world, eye, direction, reach, true)
+}
+fn raycast_kind(
+    world: &impl QueryWorld,
+    eye: [f64; 3],
+    direction: [f64; 3],
+    reach: f64,
+    fluid_sources: bool,
+) -> RayResult {
     if !eye
         .iter()
         .chain(direction.iter())
@@ -165,7 +184,25 @@ pub fn raycast(
         };
         let offset = position.map(f64::from);
         let mut best = None;
-        for shape in rules::blocks::outline_of(cell.raw()) {
+        let source = fluid_sources
+            .then(|| rules::survival::fluid::fluid(cell))
+            .flatten()
+            .filter(|f| f.source);
+        let mut source_box = [Aabb {
+            lo: [0.; 3],
+            hi: [1., 8. / 9., 1.],
+        }];
+        let outline = if let Some(source) = source {
+            let above = [position[0], position[1] + 1, position[2]];
+            if matches!(world.cell(above), CellRead::Known(c) if rules::survival::fluid::fluid(c).is_some_and(|f| f.liquid == source.liquid))
+            {
+                source_box[0].hi[1] = 1.;
+            }
+            &source_box[..]
+        } else {
+            rules::blocks::outline_of(cell.raw())
+        };
+        for shape in outline {
             if let Some((t, face)) = segment_box(eye, end, shape.moved(offset))
                 && best.is_none_or(|(old, _)| t < old)
             {

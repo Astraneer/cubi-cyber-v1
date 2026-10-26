@@ -12,6 +12,8 @@ pub struct InteractionBatch {
     pub delta: MobDelta,
     pub drops: Vec<DeathDrops>,
     pub inputs: Vec<jobs::InputVersion>,
+    /// A sound is warranted only when authoritative damage actually applied.
+    pub strike: Option<rules::entities::combat::Strike>,
 }
 impl MobRuntime {
     /// Pending changes come from earlier accepted actions in the same bounded
@@ -54,7 +56,7 @@ impl MobRuntime {
             exhausted: &exhausted,
             inputs: &inputs,
         };
-        let (actor, after, drops) = if use_entity {
+        let (actor, after, drops, strike) = if use_entity {
             reachable(before.bbox(), request.context.eye, |a, b| {
                 movement::line_of_sight(&query, a, b)
             })?;
@@ -80,6 +82,7 @@ impl MobRuntime {
                     action: request.action,
                     stacks: [shear.wool, ItemStack::EMPTY, ItemStack::EMPTY],
                 }],
+                None,
             )
         } else {
             let hit = MobAttackPlan::prepare(&request.actor, &before, request.context, |a, b| {
@@ -104,7 +107,7 @@ impl MobRuntime {
             } else {
                 Vec::new()
             };
-            (hit.attacker, after, drops)
+            (hit.attacker, after, drops, hit.hit.map(|_| hit.strike))
         };
         if exhausted.get() {
             return Err(EntityError::Capacity);
@@ -136,6 +139,7 @@ impl MobRuntime {
             actor,
             delta,
             drops,
+            strike,
             inputs: inputs
                 .into_inner()
                 .into_iter()

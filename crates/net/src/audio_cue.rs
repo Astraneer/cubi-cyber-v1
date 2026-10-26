@@ -1,9 +1,20 @@
-//! Fixed public causal audio event. No item state, RNG, or private actor fields.
+//! Fixed causal audio event. No item state, RNG, or private actor fields.
 use core_types::{SpaceId, Tick};
 pub const BYTES: usize = 64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     ChickenEgg,
+    ChestOpen,
+    ChestClose,
+    ItemPickup,
+    AttackWeak,
+    AttackStrong,
+    AttackCrit,
+    AttackKnockback,
+    BucketFill,
+    BucketEmpty,
+    Eat,
+    EatDone,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cue {
@@ -22,7 +33,8 @@ impl Cue {
     pub fn validate(self) -> Result<(), Error> {
         if self.actor == 0
             || self.sequence == 0
-            || self.sequence != self.tick.0
+            || (matches!(self.kind, Kind::ChickenEgg | Kind::ItemPickup)
+                && self.sequence != self.tick.0)
             || self
                 .position
                 .iter()
@@ -38,6 +50,17 @@ impl Cue {
         bytes[..4].copy_from_slice(b"ACU1");
         bytes[4] = match self.kind {
             Kind::ChickenEgg => 0,
+            Kind::ChestOpen => 1,
+            Kind::ChestClose => 2,
+            Kind::ItemPickup => 3,
+            Kind::AttackWeak => 4,
+            Kind::AttackStrong => 5,
+            Kind::AttackCrit => 6,
+            Kind::AttackKnockback => 7,
+            Kind::BucketFill => 8,
+            Kind::BucketEmpty => 9,
+            Kind::Eat => 10,
+            Kind::EatDone => 11,
         };
         bytes[8..16].copy_from_slice(&self.actor.to_le_bytes());
         bytes[16..24].copy_from_slice(&self.sequence.to_le_bytes());
@@ -58,6 +81,17 @@ impl Cue {
         }
         let kind = match bytes[4] {
             0 => Kind::ChickenEgg,
+            1 => Kind::ChestOpen,
+            2 => Kind::ChestClose,
+            3 => Kind::ItemPickup,
+            4 => Kind::AttackWeak,
+            5 => Kind::AttackStrong,
+            6 => Kind::AttackCrit,
+            7 => Kind::AttackKnockback,
+            8 => Kind::BucketFill,
+            9 => Kind::BucketEmpty,
+            10 => Kind::Eat,
+            11 => Kind::EatDone,
             _ => return Err(Error::Invalid),
         };
         let actor = u64::from_le_bytes(bytes[8..16].try_into().map_err(|_| Error::Invalid)?);

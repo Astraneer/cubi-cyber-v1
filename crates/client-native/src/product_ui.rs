@@ -59,6 +59,7 @@ pub struct ProductUi {
     last_diagnostic: Option<DiagnosticStamp>,
     last_aim: Option<(Option<[i32; 3]>, u16)>,
     last_world_diagnostic: Option<(usize, usize, bool, Option<u8>)>,
+    last_horizon_diagnostic: Option<HorizonReceiptStamp>,
     last_light_diagnostic: Option<(bool, usize, usize, u32, u64)>,
     last_time_diagnostic: Option<(i32, bool, u32, i32)>,
     last_render_diagnostic: Option<(u32, [u32; 2], bool)>,
@@ -83,6 +84,19 @@ type DiagnosticStamp = (
     bool,
     Option<ui::app::ItemFact>,
 );
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HorizonReceiptStamp {
+    front: bool,
+    candidate: u64,
+    committed: u64,
+    projection: bool,
+    requested_error_bits: u64,
+    committed_error_bits: Option<u64>,
+    missing: u64,
+    capacity: bool,
+    leaf: u64,
+    maximum_error_bits: u64,
+}
 pub fn data_path(name: &str) -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .or_else(|| std::env::var_os("LOCALAPPDATA"))
@@ -138,6 +152,7 @@ impl ProductUi {
             last_diagnostic: None,
             last_aim: None,
             last_world_diagnostic: None,
+            last_horizon_diagnostic: None,
             last_light_diagnostic: None,
             last_time_diagnostic: None,
             last_render_diagnostic: None,
@@ -379,6 +394,7 @@ impl ProductUi {
         self.intent_sender.clear();
         self.intent_waiting = false;
         self.last_near_diagnostic = None;
+        self.last_horizon_diagnostic = None;
         self.ready_world = false;
         self.layer.app.set_status("Ожидание ответа мира…");
         self.layer.app.open(Screen::Loading);
@@ -586,9 +602,10 @@ impl ProductUi {
                 y: position[1].floor() as i32 + 2,
                 z: position[2].floor() as i32,
             });
+            let horizon = view.horizon_stats();
             let stamp = (
                 network.light_replica().len(),
-                view.horizon_stats().map_or(0, |s| s.height_front),
+                horizon.map_or(0, |s| s.height_front),
                 view.environment_stats().is_some(),
                 light.map(|s| s.sky),
             );
@@ -603,6 +620,38 @@ impl ProductUi {
                     stamp.3
                 );
                 self.last_world_diagnostic = Some(stamp);
+            }
+            if let Some(horizon) = horizon {
+                let stamp = HorizonReceiptStamp {
+                    front: view.has_committed_far_front(),
+                    candidate: horizon.candidate_plan_id,
+                    committed: horizon.committed_plan_id,
+                    projection: horizon.projection_present,
+                    requested_error_bits: horizon.requested_error_pixels.to_bits(),
+                    committed_error_bits: horizon
+                        .committed_requested_error_pixels
+                        .map(f64::to_bits),
+                    missing: horizon.committed_missing_error_certificates,
+                    capacity: horizon.committed_selection_capacity_limited,
+                    leaf: horizon.committed_selection_leaf_limited,
+                    maximum_error_bits: horizon.committed_maximum_error_pixels.to_bits(),
+                };
+                if self.last_horizon_diagnostic != Some(stamp) {
+                    println!(
+                        "NATIVE_UI_HORIZON_RECEIPT front={} candidate_plan={} committed_plan={} projection={} requested_error_px={} committed_error_px={:?} committed_missing={} committed_capacity={} committed_leaf={} committed_max_px={}",
+                        stamp.front,
+                        stamp.candidate,
+                        stamp.committed,
+                        stamp.projection,
+                        horizon.requested_error_pixels,
+                        horizon.committed_requested_error_pixels,
+                        stamp.missing,
+                        stamp.capacity,
+                        stamp.leaf,
+                        horizon.committed_maximum_error_pixels,
+                    );
+                    self.last_horizon_diagnostic = Some(stamp);
+                }
             }
             let aim = (stats.target_position, stats.target_cell);
             if self.last_aim != Some(aim) {
