@@ -18,7 +18,7 @@ pub const MAX_SNAPSHOT_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_WAL_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_IDENTITIES: usize = 10_000;
 pub const MAX_RECENT_ACTIONS: usize = 256;
-pub const MAX_RUNTIME_RECORDS: usize = 7;
+pub const MAX_RUNTIME_RECORDS: usize = 8;
 pub const MAX_RUNTIME_BYTES: usize = 8 * 1024 * 1024;
 pub const RUNTIME_SURVIVAL: u16 = 1;
 pub const RUNTIME_MOBS: u16 = 2;
@@ -27,6 +27,7 @@ pub const RUNTIME_MACHINES: u16 = 4;
 pub const RUNTIME_HEIGHT: u16 = 5;
 pub const RUNTIME_CHAT: u16 = 6;
 pub const RUNTIME_PAYLOADS: u16 = 7;
+pub const RUNTIME_LIGHT: u16 = 8;
 /// Snapshot payloads are complete owner state; WAL payloads are detached deltas.
 /// Save validates envelope bounds/kinds; each owner validates its private schema.
 #[derive(Clone, Debug, PartialEq, Eq)]

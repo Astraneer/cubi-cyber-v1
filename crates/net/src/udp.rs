@@ -224,6 +224,20 @@ impl Channel {
         Ok(packets)
     }
     pub fn receive(&mut self, packet: &[u8], now_ms: u64) -> Result<Receive, UdpError> {
+        self.receive_inner(packet, now_ms, true)
+    }
+    /// Service authenticated transport ACKs and already-delivered duplicates
+    /// while the owner cannot retain a new application frame. New data remains
+    /// unacknowledged and is retried under the existing channel limits.
+    pub fn receive_control(&mut self, packet: &[u8], now_ms: u64) -> Result<Receive, UdpError> {
+        self.receive_inner(packet, now_ms, false)
+    }
+    fn receive_inner(
+        &mut self,
+        packet: &[u8],
+        now_ms: u64,
+        admit: bool,
+    ) -> Result<Receive, UdpError> {
         self.counters.received_bytes += packet.len() as u64;
         if packet.len() < HEADER + TAG || packet.len() > MAX_DATAGRAM || &packet[..4] != b"CUDP" {
             return Err(UdpError::Invalid);
@@ -283,6 +297,9 @@ impl Channel {
                 frames: Vec::new(),
                 replies,
             });
+        }
+        if !admit {
+            return Err(UdpError::Capacity);
         }
         self.expire_assemblies(now_ms);
         if !self.assembling.contains_key(&id) {

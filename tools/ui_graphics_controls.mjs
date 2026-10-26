@@ -3,15 +3,27 @@ import assert from 'node:assert/strict';
 import {writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {pngPixels,root,pause} from './browser.mjs';
+export async function horizonProfile({evaluate,painted,click,ui}) {
+  await click(295,292);
+  for(let step=0;step<16&&(await ui()).requestedHorizon<1024;step++) {
+    await painted();const box=await evaluate("window.__CUBI.product_ui_widget('Setting(Horizon)')");assert(box);
+    await click(box[0]+box[2]/2,box[1]+box[3]/2);
+  }
+  assert.equal((await ui()).requestedHorizon,1024);
+  assert.equal((await ui()).requestedNear,32);
+  await painted();const back=await evaluate("window.__CUBI.product_ui_widget('Back')");assert(back);
+  await click(back[0]+back[2]/2,back[1]+back[3]/2);
+  return {actualWelcomeButtons:true,horizon:1024,near:32,lodError:32,otherDefaultChoicesRetained:true};
+}
 export async function componentProfile({call,evaluate,painted,click,ui}) {
   await click(295,292);
-  const choices={requestedHorizon:16,requestedSsao:0,requestedReflections:0,requestedClouds:0,requestedGi:0};
+  const choices={requestedHorizon:16,requestedSsao:0,requestedReflections:0,requestedClouds:0,requestedGi:0,requestedHold60:0};
   for(let step=0;step<16&&(await ui()).requestedHorizon>16;step++){
     await painted();const box=await evaluate("window.__CUBI.product_ui_widget('Setting(Horizon)')");assert(box);
     await click(box[0]+box[2]/2,box[1]+box[3]/2,'right');
   }
   assert.equal((await ui()).requestedHorizon,16);
-  for(const [name,field] of [['Ssao','requestedSsao'],['Reflections','requestedReflections'],['Clouds','requestedClouds'],['Gi','requestedGi']]) {
+  for(const [name,field] of [['Ssao','requestedSsao'],['Reflections','requestedReflections'],['Clouds','requestedClouds'],['Gi','requestedGi'],['Hold60','requestedHold60']]) {
     let found=false;
     for(let attempt=0;attempt<32;attempt++) {
       await painted();
@@ -32,11 +44,11 @@ export async function componentProfile({call,evaluate,painted,click,ui}) {
   return {actualWelcomeButtons:true,saved:choices};
 }
 export async function graphicsControls({call,evaluate,waitFor,waitUi,painted,key,click,status,ui,requireFar=true}) {
-  async function widget(name,scroll=false) {
+  async function widget(name,scroll=false,button='left') {
     for(let attempt=0;attempt<32;attempt++) {
       await painted();
       const box=await evaluate(`window.__CUBI.product_ui_widget(${JSON.stringify(name)})`);
-      if(box&&(!scroll||(box[1]+box[3]/2>110&&box[1]+box[3]/2<355))) { await click(box[0]+box[2]/2,box[1]+box[3]/2); return; }
+      if(box&&(!scroll||(box[1]+box[3]/2>110&&box[1]+box[3]/2<355))) { await click(box[0]+box[2]/2,box[1]+box[3]/2,button); return; }
       if(!scroll){await pause(100);continue;}
       await call('Input.dispatchMouseEvent',{type:'mouseWheel',x:400,y:220,deltaX:0,deltaY:80});
     }
@@ -84,16 +96,24 @@ export async function graphicsControls({call,evaluate,waitFor,waitUi,painted,key
   const exposurePixels=compare(baseExposure,exposed);assert(exposurePixels.changed>500,'actual tone compensation did not change pixels');
   assert.equal(exposure.framePipelineCompilations,0);
   await menu('Settings');await widget('Setting(Msaa)',true);
-  await waitUi(s=>s.screen==='Game'&&s.requestedSamples===1,120000);
+  await waitUi(s=>s.screen==='Game'&&s.requestedSamples===1&&s.smaaPrepared===1&&s.smaaReservedBytes>0,120000);
   const selected=await waitFor('window.__M2Stats()',s=>s.sampleCount===1&&s.connected&&s.lightReady&&(!requireFar||s.horizonHeightFront>0),120000);
   await world('msaa-one');
   const same=await evaluate(`Object.keys(localStorage).filter(key=>key.startsWith('cubi.identity.')).map(key=>localStorage.getItem(key).split(':')[0]).join(',')===${JSON.stringify(identity)}`);
   assert(same,'graphics reprepare replaced authority identity');
   assert.equal((await ui()).settingsReloadRequired,0);
   assert.equal(selected.framePipelineCompilations,0);
+  assert.equal((await ui()).effectiveNearBlocks,32);
+  await menu('Settings');await widget('Setting(Near)');
+  await waitUi(s=>s.requestedNear===48&&s.effectiveNearBlocks===32&&s.nearUnsupported===1);
+  assert.equal((await status()).connected,true,'unsupported Near48 dropped active session');
+  assert.equal((await ui()).screen,'Settings(Graphics)');
+  await widget('Setting(Near)',false,'right');
+  await waitUi(s=>s.requestedNear===32&&s.effectiveNearBlocks===32&&s.nearUnsupported===0);
+  await widget('Back');await key('Escape','Escape');
   await menu('Crossroads');await widget('ServerTime');
   await waitUi(s=>s.viewTimeChoice===0);await widget('Back');await key('Escape','Escape');
-  const result={scope:'graphics controls',fullProfileAccepted:false,farHeightTiles:selected.horizonHeightFront,personalTime:{actualButtons:true,dayTime:6000,nightTime:18000,publicEpochPreserved:true,...solarPixels},exposure:{before:before.exposureGain,after:exposure.exposureGain,...exposurePixels},msaa:{before:initial.sampleCount,after:selected.sampleCount,asynchronousLoading:true,sameIdentity:true,noFramePipelineCompilation:true}};
+  const result={scope:'graphics controls',fullProfileAccepted:false,farHeightTiles:selected.horizonHeightFront,effectiveNearBlocks:32,unsupportedNear48Retains32:true,personalTime:{actualButtons:true,dayTime:6000,nightTime:18000,publicEpochPreserved:true,...solarPixels},exposure:{before:before.exposureGain,after:exposure.exposureGain,...exposurePixels},msaa:{before:initial.sampleCount,after:selected.sampleCount,smaaPrepared:true,smaaReservedBytes:(await ui()).smaaReservedBytes,asynchronousLoading:true,sameIdentity:true,noFramePipelineCompilation:true}};
   await writeFile(join(root,'.local/artifacts/product-graphics-controls.json'),JSON.stringify(result,null,2)+'\n');
   return result;
 }

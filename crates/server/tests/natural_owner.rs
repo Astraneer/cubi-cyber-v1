@@ -61,6 +61,19 @@ fn fixture() -> World {
     world.commit(tx).unwrap();
     world
 }
+// Private finite-cohort progress may wrap the unchanged natural/mob codec.
+fn body(record: &save::RuntimeRecord) -> &[u8] {
+    let bytes = &record.payload;
+    if !bytes.starts_with(b"MOP1") {
+        return bytes;
+    }
+    assert!(bytes.len() >= 20 && bytes.len() <= save::MAX_RUNTIME_BYTES);
+    let remaining = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    let length = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+    assert!(remaining <= 5000);
+    assert_eq!(length.checked_add(20), Some(bytes.len()));
+    &bytes[20..]
+}
 #[test]
 fn natural_herd_birth_and_population_flag_reopen_together_without_repeat() {
     let directory = Directory(
@@ -123,8 +136,8 @@ fn natural_herd_birth_and_population_flag_reopen_together_without_repeat() {
         .iter()
         .find(|r| r.kind == save::RUNTIME_MOBS)
         .unwrap();
-    let length = u32::from_le_bytes(record.payload[4..8].try_into().unwrap()) as usize;
-    let mut wal_state = State::decode(&record.payload[12 + length..]).unwrap();
+    let length = u32::from_le_bytes(body(record)[4..8].try_into().unwrap()) as usize;
+    let mut wal_state = State::decode(&body(record)[12 + length..]).unwrap();
     let mut atomic_birth_records = 0;
     for (_, batch) in &recovery.batches {
         for record in batch
@@ -132,9 +145,9 @@ fn natural_herd_birth_and_population_flag_reopen_together_without_repeat() {
             .iter()
             .filter(|r| r.kind == save::RUNTIME_MOBS)
         {
-            if record.payload.starts_with(b"MND1") {
-                let mobs = u32::from_le_bytes(record.payload[4..8].try_into().unwrap()) as usize;
-                let metadata = &record.payload[12 + mobs..];
+            if body(record).starts_with(b"MND1") {
+                let mobs = u32::from_le_bytes(body(record)[4..8].try_into().unwrap()) as usize;
+                let metadata = &body(record)[12 + mobs..];
                 assert!(mobs > 0, "a nonempty herd must carry its entity delta");
                 wal_state
                     .apply(server::natural::Delta::decode(metadata).unwrap())
@@ -151,10 +164,8 @@ fn natural_herd_birth_and_population_flag_reopen_together_without_repeat() {
     assert_eq!(server.current_tick(), durable_tick);
     assert_eq!(server.mob_entities().rows(), rows);
     assert!(server.request_checkpoint());
-    while server.awaiting_durability() {
-        server.tick(now);
-        thread::sleep(Duration::from_micros(300));
-    }
+    // Closing the real writer drains this checkpoint. Calling tick after its
+    // ACK would also admit a legitimate next simulation tick on a fresh owner.
     drop(server);
     let (store, recovery) = save::Store::open(&directory.0).unwrap();
     let snapshot = recovery.snapshot.unwrap();
@@ -164,9 +175,9 @@ fn natural_herd_birth_and_population_flag_reopen_together_without_repeat() {
         .iter()
         .find(|r| r.kind == save::RUNTIME_MOBS)
         .unwrap();
-    assert_eq!(&record.payload[..4], b"MNS1");
-    let mob_length = u32::from_le_bytes(record.payload[4..8].try_into().unwrap()) as usize;
-    let state = State::decode(&record.payload[12 + mob_length..]).unwrap();
+    assert_eq!(&body(record)[..4], b"MNS1");
+    let mob_length = u32::from_le_bytes(body(record)[4..8].try_into().unwrap()) as usize;
+    let state = State::decode(&body(record)[12 + mob_length..]).unwrap();
     assert_eq!(state.len(), 1);
     assert!(state.populated(Column {
         space: SpaceId(0),
@@ -198,10 +209,6 @@ fn natural_herd_birth_and_population_flag_reopen_together_without_repeat() {
         thread::sleep(Duration::from_micros(300));
     }
     assert!(reopened.request_checkpoint());
-    while reopened.awaiting_durability() {
-        reopened.tick(now);
-        thread::sleep(Duration::from_micros(300));
-    }
     drop(reopened);
     let (_store, recovery) = save::Store::open(&directory.0).unwrap();
     let snapshot = recovery.snapshot.unwrap();
@@ -210,6 +217,9 @@ fn natural_herd_birth_and_population_flag_reopen_together_without_repeat() {
         .iter()
         .find(|r| r.kind == save::RUNTIME_MOBS)
         .unwrap();
-    let length = u32::from_le_bytes(record.payload[4..8].try_into().unwrap()) as usize;
-    assert_eq!(&record.payload[12 + length..], encoded);
+    let length = u32::from_le_bytes(body(record)[4..8].try_into().unwrap()) as usize;
+    assert!(
+        body(record)[12 + length..] == encoded,
+        "exact natural metadata survives reopening"
+    );
 }

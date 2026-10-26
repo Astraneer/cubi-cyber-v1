@@ -60,7 +60,9 @@ pub struct ProductUi {
     last_world_diagnostic: Option<(usize, usize, bool, Option<u8>)>,
     last_light_diagnostic: Option<(bool, usize, usize, u32, u64)>,
     last_time_diagnostic: Option<(i32, bool, u32, i32)>,
-    last_render_diagnostic: Option<(u32, [u32; 2])>,
+    last_render_diagnostic: Option<(u32, [u32; 2], bool)>,
+    last_near_diagnostic: Option<(i32, u16, bool)>,
+    last_visual_diagnostic: Option<(Option<bool>, Option<[u32; 3]>)>,
     last_props_diagnostic: Option<(bool, usize, usize, usize, bool)>,
     last_quality_diagnostic: Option<(u64, u64, u64, u64)>,
     last_settings_diagnostic: Option<[u32; 3]>,
@@ -137,6 +139,8 @@ impl ProductUi {
             last_light_diagnostic: None,
             last_time_diagnostic: None,
             last_render_diagnostic: None,
+            last_near_diagnostic: None,
+            last_visual_diagnostic: None,
             last_props_diagnostic: None,
             last_quality_diagnostic: None,
             last_settings_diagnostic: None,
@@ -249,6 +253,8 @@ impl ProductUi {
                                 | Setting::Reflections
                                 | Setting::Ssao
                                 | Setting::Horizon
+                                | Setting::ExposureMode
+                                | Setting::SkyStyle
                         )
                 )
             }) {
@@ -258,12 +264,13 @@ impl ProductUi {
                 );
             }
             println!(
-                "NATIVE_UI_SAVED_EFFECTS clouds={} gi={} reflections={} ssao={} horizon={}",
+                "NATIVE_UI_SAVED_EFFECTS clouds={} gi={} reflections={} ssao={} horizon={} hold60={}",
                 self.layer.app.settings.get(Setting::Clouds),
                 self.layer.app.settings.get(Setting::Gi),
                 self.layer.app.settings.get(Setting::Reflections),
                 self.layer.app.settings.get(Setting::Ssao),
-                self.layer.app.settings.get(Setting::Horizon)
+                self.layer.app.settings.get(Setting::Horizon),
+                self.layer.app.settings.get(Setting::Hold60)
             );
             println!(
                 "NATIVE_UI_PAINTED screen={:?} window={:016x} tab={} debug={} focus={:?} revision={} window_revision={}",
@@ -359,6 +366,7 @@ impl ProductUi {
     pub fn connecting(&mut self) {
         self.intent_sender.clear();
         self.intent_waiting = false;
+        self.last_near_diagnostic = None;
         self.ready_world = false;
         self.layer.app.set_status("Ожидание ответа мира…");
         self.layer.app.open(Screen::Loading);
@@ -399,7 +407,9 @@ impl ProductUi {
             .quality
             .advance(&self.layer.app, view, now_ms, benchmark)
         {
-            if view.settings_application().reload_required != 0 {
+            if view.settings_application().reload_required != 0
+                && view.near_settings_error().is_none()
+            {
                 self.command(Command::Connect {
                     address: self.layer.app.address.clone(),
                     name: self.layer.app.name.clone(),
@@ -455,11 +465,39 @@ impl ProductUi {
                 );
                 self.last_settings_diagnostic = Some(settings_stamp);
             }
-            let render = (view.render_scale(), view.render_extent());
+            let visual = (view.exposure_automatic(), view.celestial_styles());
+            let near = (
+                self.layer.app.settings.get(ui::settings::Setting::Near),
+                view.effective_near_blocks(),
+                view.near_settings_error().is_some(),
+            );
+            if self.last_near_diagnostic != Some(near) {
+                println!(
+                    "NATIVE_UI_NEAR requested={} effective={} unsupported={}",
+                    near.0, near.1, near.2
+                );
+                self.last_near_diagnostic = Some(near);
+            }
+            if self.last_visual_diagnostic != Some(visual) {
+                println!(
+                    "NATIVE_UI_VISUAL automatic={:?} styles={:?}",
+                    visual.0, visual.1
+                );
+                self.last_visual_diagnostic = Some(visual);
+            }
+            let render = (
+                view.render_scale(),
+                view.render_extent(),
+                view.smaa_prepared(),
+            );
             if self.last_render_diagnostic != Some(render) {
                 println!(
-                    "NATIVE_UI_RENDER scale={} width={} height={}",
-                    render.0, render.1[0], render.1[1]
+                    "NATIVE_UI_RENDER scale={} width={} height={} smaa={} smaa_bytes={}",
+                    render.0,
+                    render.1[0],
+                    render.1[1],
+                    render.2,
+                    view.smaa_reserved_bytes()
                 );
                 self.last_render_diagnostic = Some(render);
             }
@@ -728,13 +766,24 @@ impl ProductUi {
                     self.apply_sound();
                     self.save_preferences();
                     if let Some(view) = view.as_deref_mut() {
+                        let previous_near_error = view.near_settings_error();
                         let applied = view.apply_settings(self.quality.target());
                         self.layer.app.set_pending_settings(
                             applied.pending_render & !(1 << ui::settings::Setting::Hold60 as u32),
                         );
                         self.layer.app.set_reload_settings(applied.reload_required);
                         view.invalidate();
-                        if applied.reload_required != 0 && self.layer.app.snapshot.connected {
+                        if let Some(error) = view.near_settings_error() {
+                            self.layer.app.set_status(error.message());
+                        } else if previous_near_error
+                            .is_some_and(|error| self.layer.app.status() == error.message())
+                        {
+                            self.layer.app.set_status("");
+                        }
+                        if applied.reload_required != 0
+                            && view.near_settings_error().is_none()
+                            && self.layer.app.snapshot.connected
+                        {
                             self.command(Command::Connect {
                                 address: self.layer.app.address.clone(),
                                 name: self.layer.app.name.clone(),

@@ -21,6 +21,75 @@ fn camera(path: &Path, name: &str, camera: Camera, eye: [f32; 3], direction: Opt
 }
 fn payload(path: &Path, name: &str, samples: impl Fn([u8; 3]) -> PublicVoxel) {
     let page = PublicPage::from_exposed(samples);
+    // Independent unit-face reference. This never calls the greedy mesher or
+    // reads ProxyPayload words; actual cube sides matter for cutout MSAA depth.
+    let faces = [
+        [[0, 0, 0], [1, 0, 0], [0, 0, 1], [1, 0, 1]],
+        [[0, 1, 1], [1, 1, 1], [0, 1, 0], [1, 1, 0]],
+        [[1, 0, 0], [0, 0, 0], [1, 1, 0], [0, 1, 0]],
+        [[0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]],
+        [[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1]],
+        [[1, 0, 1], [1, 0, 0], [1, 1, 1], [1, 1, 0]],
+    ];
+    let offsets = [
+        [0, -1, 0],
+        [0, 1, 0],
+        [0, 0, -1],
+        [0, 0, 1],
+        [-1, 0, 0],
+        [1, 0, 0],
+    ];
+    let mut reference = Vec::<u32>::new();
+    for kind in [SurfaceKind::Opaque, SurfaceKind::Cutout] {
+        for y in 0..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let PublicVoxel::Solid {
+                        material,
+                        kind: actual,
+                        ..
+                    } = page.get([x, y, z])
+                    else {
+                        continue;
+                    };
+                    if actual != kind {
+                        continue;
+                    }
+                    for (face, corners) in faces.iter().enumerate() {
+                        let p = [
+                            x as i32 + offsets[face][0],
+                            y as i32 + offsets[face][1],
+                            z as i32 + offsets[face][2],
+                        ];
+                        if p.iter().all(|v| (0..16).contains(v))
+                            && matches!(
+                                page.get(p.map(|v| v as u8)),
+                                PublicVoxel::Solid {
+                                    kind: SurfaceKind::Opaque,
+                                    ..
+                                }
+                            )
+                        {
+                            continue;
+                        }
+                        for index in [0, 1, 2, 2, 1, 3] {
+                            reference.extend([
+                                f32::from(x + corners[index][0]).to_bits(),
+                                f32::from(y + corners[index][1]).to_bits(),
+                                f32::from(z + corners[index][2]).to_bits(),
+                                u32::from(material),
+                            ]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fs::write(
+        path.join(name.replace(".pxp", ".reference")),
+        bytemuck::cast_slice(&reference),
+    )
+    .unwrap();
     let mask = render::lod::coarsen_page(&page, 4, true).protection;
     let source = MaskedRayProxy::from_public_page(&page, mask);
     let payload = ProxyPayload::from_public(&source, 186).unwrap();
@@ -40,6 +109,15 @@ fn main() {
                 "proxy.wgsl"
             }),
             render::lod_gpu::shader_source(false, false, ambient, true),
+        )
+        .unwrap();
+        fs::write(
+            path.join(if ambient {
+                "cutout-mrt.wgsl"
+            } else {
+                "cutout.wgsl"
+            }),
+            render::lod_gpu::cutout_shader_source(false, false, ambient),
         )
         .unwrap();
     }

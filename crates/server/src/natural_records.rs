@@ -101,3 +101,106 @@ pub(super) fn decode_delta(
         Some(natural::Delta::decode(state).map_err(|_| "natural delta codec")?),
     ))
 }
+
+/// Actual finite owner-cohort progress, including visited Unknown actors. A
+/// continuation must not infer this count from successful body timestamps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Progress {
+    pub tick: core_types::Tick,
+    pub remaining: usize,
+}
+pub(super) fn with_progress(
+    inner: Vec<u8>,
+    progress: Option<Progress>,
+) -> Result<Vec<u8>, &'static str> {
+    let Some(progress) = progress else {
+        return Ok(inner);
+    };
+    if progress.remaining > MAX_MOBS || inner.len() > save::MAX_RUNTIME_BYTES - 20 {
+        return Err("mob owner progress capacity");
+    }
+    let mut bytes = Vec::with_capacity(20 + inner.len());
+    bytes.extend_from_slice(b"MOP1");
+    bytes.extend_from_slice(&progress.tick.0.to_le_bytes());
+    bytes.extend_from_slice(&(progress.remaining as u32).to_le_bytes());
+    bytes.extend_from_slice(&(inner.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&inner);
+    Ok(bytes)
+}
+pub(super) fn progress(bytes: &[u8]) -> Result<(&[u8], Option<Progress>), &'static str> {
+    if !bytes.starts_with(b"MOP1") {
+        return Ok((bytes, None));
+    }
+    if bytes.len() < 20 || bytes.len() > save::MAX_RUNTIME_BYTES {
+        return Err("mob owner progress header");
+    }
+    let remaining = u32::from_le_bytes(bytes[12..16].try_into().expect("fixed remaining")) as usize;
+    let len = u32::from_le_bytes(bytes[16..20].try_into().expect("fixed length")) as usize;
+    if remaining > MAX_MOBS
+        || 20usize.checked_add(len) != Some(bytes.len())
+        || bytes[20..].starts_with(b"MOP1")
+    {
+        return Err("mob owner progress bounds");
+    }
+    Ok((
+        &bytes[20..],
+        Some(Progress {
+            tick: core_types::Tick(u64::from_le_bytes(
+                bytes[4..12].try_into().expect("fixed tick"),
+            )),
+            remaining,
+        }),
+    ))
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    #[test]
+    fn progress_preserves_legacy_inner_and_supports_unknown_only_portions() {
+        let legacy = b"MOD1fixture".to_vec();
+        assert_eq!(with_progress(legacy.clone(), None).unwrap(), legacy);
+        assert_eq!(progress(&legacy).unwrap(), (legacy.as_slice(), None));
+        for inner in [legacy, Vec::new()] {
+            let value = Progress {
+                tick: core_types::Tick(u64::MAX),
+                remaining: 5000,
+            };
+            let bytes = with_progress(inner.clone(), Some(value)).unwrap();
+            assert_eq!(progress(&bytes).unwrap(), (inner.as_slice(), Some(value)));
+            assert_eq!(bytes.len(), 20 + inner.len());
+        }
+    }
+    #[test]
+    fn progress_rejects_corruption_trailing_bytes_nested_envelopes_and_quota() {
+        let value = Progress {
+            tick: core_types::Tick(7),
+            remaining: 1,
+        };
+        let bytes = with_progress(b"MOD1".to_vec(), Some(value)).unwrap();
+        for end in 4..bytes.len() {
+            assert!(progress(&bytes[..end]).is_err());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(progress(&trailing).is_err());
+        let mut count = bytes.clone();
+        count[12..16].copy_from_slice(&5001u32.to_le_bytes());
+        assert!(progress(&count).is_err());
+        let mut length = bytes.clone();
+        length[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(progress(&length).is_err());
+        assert!(progress(&with_progress(bytes, Some(value)).unwrap()).is_err());
+        assert!(
+            with_progress(
+                Vec::new(),
+                Some(Progress {
+                    remaining: 5001,
+                    ..value
+                })
+            )
+            .is_err()
+        );
+        assert!(with_progress(vec![0; save::MAX_RUNTIME_BYTES - 19], Some(value)).is_err());
+    }
+}

@@ -5,7 +5,7 @@ import {spawn,spawnSync} from 'node:child_process';
 import {mkdir,mkdtemp,readFile,writeFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {withBrowser,pngPixels,pause,root} from './browser.mjs';
-import {componentProfile,graphicsControls} from './ui_graphics_controls.mjs';
+import {componentProfile,graphicsControls,horizonProfile} from './ui_graphics_controls.mjs';
 await mkdir(join(root,'.local/tmp'),{recursive:true});
 const folder=await mkdtemp(join(root,'.local/tmp/product-authority-'));
 const ready=join(folder,'ready'),pack=join(folder,'private.zip'),minecraft=join(folder,'minecraft/.minecraft'),downloads=join(folder,'downloads');
@@ -43,6 +43,10 @@ try{
     if(process.env.CUBI_UI_LOW_EFFECTS==='1'){
       assert(componentOnly,'manual low effects is only valid for explicit UI-component scope');
       componentSettings=await componentProfile({call,evaluate,painted,click,ui});
+    }
+    if(process.env.CUBI_UI_HORIZON_1024==='1') {
+      assert(!componentSettings,'manual1024 route retains default effects');
+      await horizonProfile({evaluate,painted,click,ui});
     }
     await click(350,200);for(let i=0;i<30;i++)await key('Backspace','Backspace');await type(address);
     let socketFrames=0;const unsubscribe=onEvent('Network.webSocketFrameSent',()=>socketFrames++);await call('Network.enable');

@@ -1,6 +1,9 @@
 //! Histogram exposure, cached bloom pyramid and final HDR transfer for M10.
 use crate::{OutputTransfer, terrain_gpu::UploadBudget};
 use bytemuck::{Pod, Zeroable};
+mod timer;
+use crate::smaa::{SmaaConfig, SmaaGpu};
+use timer::PostTimer;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Exposure {
@@ -23,12 +26,14 @@ pub struct BloomConfig {
 #[derive(Clone, Copy, Debug)]
 pub struct PostConfig {
     pub exposure: Exposure,
+    pub smaa: Option<SmaaConfig>,
     pub bloom: Option<BloomConfig>,
     pub histogram_stride: u32,
 }
 impl Default for PostConfig {
     fn default() -> Self {
         Self {
+            smaa: None,
             exposure: Exposure::Automatic {
                 key: 0.18,
                 min_ev: -8.0,
@@ -63,12 +68,14 @@ pub struct PostWork {
     pub histogram_samples: u64,
     pub bloom_texels: u64,
     pub tone_pixels: u64,
+    pub aa_pixels: u64,
+    pub aa_search_reads_bound: u64,
     pub passes: u32,
     pub draws: u32,
 }
 impl PostWork {
     pub fn pixels(self) -> u64 {
-        self.histogram_samples + self.bloom_texels + self.tone_pixels
+        self.histogram_samples + self.bloom_texels + self.tone_pixels + self.aa_pixels
     }
 }
 #[repr(C)]
@@ -111,10 +118,11 @@ pub struct PostGpu {
     tone_layout: wgpu::BindGroupLayout,
     tone_bind: wgpu::BindGroup,
     tone: wgpu::RenderPipeline,
+    smaa: Option<Box<SmaaGpu>>,
     last_source: Option<u64>,
     output_requested: bool,
     adaptation_remaining: f32,
-    timer: crate::gpu_time::GpuPassTimer<12>,
+    timer: PostTimer,
 }
 
 fn buffer_entry(binding: u32, uniform: bool, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -353,9 +361,27 @@ impl PostGpu {
             + config
                 .bloom
                 .map_or(0, |bloom| u64::from(levels(width, height, bloom)) * 16);
-        if budget.remaining_bytes < upload {
+        let aa_upload = config
+            .smaa
+            .map_or(0, |_| u64::from(crate::smaa::AREA_ENTRIES) * 8 + 16);
+        if budget.remaining_bytes < upload + aa_upload {
             return Err(PostError::UploadBudget);
         }
+        let smaa = config
+            .smaa
+            .map(|config| {
+                SmaaGpu::new(
+                    device, queue, width, height, format, transfer, config, budget,
+                )
+                .map(Box::new)
+                .map_err(|_| PostError::InvalidConfig)
+            })
+            .transpose()?;
+        let tone_format = if smaa.is_some() {
+            wgpu::TextureFormat::Rgba16Float
+        } else {
+            format
+        };
         let mut adaptation = match config.exposure {
             Exposure::Automatic {
                 brighten_seconds,
@@ -517,7 +543,7 @@ impl PostGpu {
                     "color+=sample_bloom(input.uv)*params.bloom.z;",
                 );
         }
-        if transfer == OutputTransfer::ShaderSrgb {
+        if transfer == OutputTransfer::ShaderSrgb && smaa.is_none() {
             source = source.replace(
                 "return vec4(mapped,1.0);",
                 "return vec4(linear_to_srgb(mapped),1.0);",
@@ -549,7 +575,7 @@ impl PostGpu {
                 entry_point: Some("fragment"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format,
+                    format: tone_format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -572,10 +598,11 @@ impl PostGpu {
             tone_layout,
             tone_bind,
             tone,
+            smaa,
             last_source: None,
             output_requested: false,
             adaptation_remaining: 0.0,
-            timer: crate::gpu_time::GpuPassTimer::new(device, queue, "HDR post pass timings"),
+            timer: PostTimer::new(device, queue, config.smaa.is_some()),
         })
     }
 
@@ -598,6 +625,9 @@ impl PostGpu {
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&self.parameters));
         budget.remaining_bytes -= 64;
         Ok(64)
+    }
+    pub fn automatic(&self) -> bool {
+        self.auto.is_some()
     }
     /// Display compensation leaves the measured luminance and adaptation state
     /// intact. A cached scene needs only a new tone pass after this64B update.
@@ -637,7 +667,7 @@ impl PostGpu {
     pub fn invalidate(&mut self) {
         self.last_source = None;
     }
-    pub fn frame_graph(&self) -> crate::gpu_time::PassGraph<12> {
+    pub fn frame_graph(&self) -> crate::gpu_time::PassGraph<16> {
         self.timer.graph()
     }
     pub fn timestamp_buffer(&self) -> Option<(&wgpu::Buffer, f32)> {
@@ -655,7 +685,9 @@ impl PostGpu {
         &self.state
     }
     pub fn pipeline_count(&self) -> u32 {
-        1 + if self.auto.is_some() { 3 } else { 0 } + u32::from(self.bloom.is_some())
+        1 + if self.auto.is_some() { 3 } else { 0 }
+            + u32::from(self.bloom.is_some())
+            + if self.smaa.is_some() { 3 } else { 0 }
     }
     pub(crate) fn resize_upload_bytes(&self, width: u32, height: u32) -> u64 {
         64 + self
@@ -685,6 +717,10 @@ impl PostGpu {
         let upload = self.resize_upload_bytes(width, height);
         if budget.remaining_bytes < upload {
             return Err(PostError::UploadBudget);
+        }
+        if let Some(smaa) = &mut self.smaa {
+            smaa.resize(device, width, height)
+                .map_err(|_| PostError::InvalidConfig)?;
         }
         self.bloom = self
             .config
@@ -729,11 +765,41 @@ impl PostGpu {
         {
             return Err(PostError::InvalidConfig);
         }
+        if self
+            .smaa
+            .as_ref()
+            .is_some_and(|smaa| smaa.extent() != [width, height])
+        {
+            return Err(PostError::InvalidConfig);
+        }
         if self.output_extent != [width, height] {
             self.output_extent = [width, height];
             self.output_requested = true;
         }
         Ok(())
+    }
+    /// Explicit physical-surface resize; reuses all SMAA pipelines and its LUT.
+    pub fn set_output_extent_with_device(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> Result<(), PostError> {
+        if width == 0
+            || height == 0
+            || width > self.max_output_dimension
+            || height > self.max_output_dimension
+        {
+            return Err(PostError::InvalidConfig);
+        }
+        if let Some(smaa) = &mut self.smaa {
+            smaa.resize(device, width, height)
+                .map_err(|_| PostError::InvalidConfig)?;
+        }
+        self.set_output_extent(width, height)
+    }
+    pub fn smaa(&self) -> Option<&SmaaGpu> {
+        self.smaa.as_deref()
     }
     pub fn output_extent(&self) -> [u32; 2] {
         self.output_extent
@@ -758,11 +824,19 @@ impl PostGpu {
             0
         };
         let adapting = automatic && (changed || self.adaptation_remaining > 0.0);
+        let aa = self
+            .smaa
+            .as_ref()
+            .map(|smaa| smaa.pending_work())
+            .unwrap_or_default();
         PostWork {
             histogram_samples: histogram,
+            aa_pixels: aa.pixels,
+            aa_search_reads_bound: aa.search_reads_bound,
             bloom_texels: bloom,
             tone_pixels: u64::from(self.output_extent[0]) * u64::from(self.output_extent[1]),
             passes: 1
+                + aa.passes
                 + if histogram > 0 { 2 } else { 0 }
                 + u32::from(adapting)
                 + if changed {
@@ -770,7 +844,7 @@ impl PostGpu {
                 } else {
                     0
                 },
-            draws: 1,
+            draws: 1 + aa.draws,
         }
     }
     pub fn has_cached_source(&self) -> bool {
@@ -787,7 +861,13 @@ impl PostGpu {
         if !self.has_cached_source() {
             return Err(PostError::InvalidConfig);
         }
-        let pixels = u64::from(self.output_extent[0]) * u64::from(self.output_extent[1]);
+        let tone_pixels = u64::from(self.output_extent[0]) * u64::from(self.output_extent[1]);
+        let aa = self
+            .smaa
+            .as_ref()
+            .map(|smaa| smaa.pending_work())
+            .unwrap_or_default();
+        let pixels = tone_pixels + aa.pixels;
         if pixels > *remaining_pixels {
             return Err(PostError::WorkBudget);
         }
@@ -797,9 +877,11 @@ impl PostGpu {
         self.output_requested = false;
         *remaining_pixels -= pixels;
         Ok(PostWork {
-            tone_pixels: pixels,
-            passes: 1,
-            draws: 1,
+            tone_pixels,
+            aa_pixels: aa.pixels,
+            aa_search_reads_bound: aa.search_reads_bound,
+            passes: 1 + aa.passes,
+            draws: 1 + aa.draws,
             ..PostWork::default()
         })
     }
@@ -808,7 +890,7 @@ impl PostGpu {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("HDR exposure bloom tone output"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: output,
+                    view: self.smaa.as_ref().map_or(output, |smaa| smaa.input_view()),
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -823,6 +905,9 @@ impl PostGpu {
             pass.set_pipeline(&self.tone);
             pass.set_bind_group(0, &self.tone_bind, &[]);
             pass.draw(0..3, 0..1);
+        }
+        if let Some(smaa) = &self.smaa {
+            smaa.encode(encoder, output, self.timer.smaa());
         }
     }
     pub fn encode(

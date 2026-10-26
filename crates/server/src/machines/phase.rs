@@ -68,6 +68,9 @@ impl MachineRuntime {
         if self.owner_tick().is_some_and(|tick| tick != now) {
             return Err(MachineError::Stale);
         }
+        if self.owner_pending() && (!context.activity.is_empty() || !topology.is_empty()) {
+            return Err(MachineError::Stale);
+        }
         let topology_queue = self.topology_registration(topology, now)?;
         let new_dirty = self.new_dirty_networks(topology);
         let initial =
@@ -180,10 +183,21 @@ impl MachineRuntime {
         }
         let machine_limit = budget.events;
         let machine_budget = budget;
+        let frozen = self
+            .owner
+            .active_pages
+            .as_deref()
+            .filter(|_| self.owner.context_tick == Some(now));
+        let frozen_active =
+            |p: BlockPos| frozen.is_some_and(|pages| pages.binary_search(&p.page()).is_ok());
         let owner = ReadOwner {
             dirty_networks: &self.dirty_networks,
             new_dirty: &new_dirty,
-            active: context.active,
+            active: if frozen.is_some() {
+                Some(&frozen_active)
+            } else {
+                context.active
+            },
             now,
             packet_limit: self.config.packets,
             transport: &self.transport,

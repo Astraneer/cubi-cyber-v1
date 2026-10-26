@@ -21,7 +21,7 @@ use world::CellRead;
 const MAX_INPUTS: usize = 256;
 const MAX_ACTIONS: usize = 128;
 const MAX_OUTBOX: usize = 256;
-const MAX_PAGE_UPDATES: usize = 128;
+const MAX_PAGE_UPDATES_PER_DRAIN: usize = 128;
 const MAX_PAGE_REMOVALS: usize = 512;
 const MAX_SPACES: usize = 64;
 
@@ -50,6 +50,26 @@ impl Default for NetworkConfig {
     }
 }
 impl NetworkConfig {
+    pub fn validate(self) -> Result<(), NetworkError> {
+        let config = self;
+        if config.maximum_pages == 0
+            || config.maximum_pages > 256
+            || config.near_radius > 3
+            || config.retain_radius < config.near_radius
+            || config.retain_radius > 4
+            || config.interest_radii(false)[1] > 3
+            || config.interest_radii(false)[1] > config.interest_radii(true)[1]
+            || config.interest_radii(true)[1] > 4
+            || config.input_lead_ticks == 0
+            || config.input_lead_ticks > 32
+            || config.simulation_steps_per_poll == 0
+            || config.simulation_steps_per_poll > 64
+            || config.requested_pages() > config.maximum_pages
+        {
+            return Err(NetworkError::Capacity);
+        }
+        Ok(())
+    }
     pub fn interest_radii(self, retained: bool) -> [u16; 3] {
         let horizontal = if retained {
             self.retain_radius
@@ -206,22 +226,7 @@ pub struct Connection {
 
 impl Connection {
     pub fn new(config: NetworkConfig) -> Result<Self, NetworkError> {
-        if config.maximum_pages == 0
-            || config.maximum_pages > 256
-            || config.near_radius > 3
-            || config.retain_radius < config.near_radius
-            || config.retain_radius > 4
-            || config.interest_radii(false)[1] > 3
-            || config.interest_radii(false)[1] > config.interest_radii(true)[1]
-            || config.interest_radii(true)[1] > 4
-            || config.input_lead_ticks == 0
-            || config.input_lead_ticks > 32
-            || config.simulation_steps_per_poll == 0
-            || config.simulation_steps_per_poll > 64
-            || config.requested_pages() > config.maximum_pages
-        {
-            return Err(NetworkError::Capacity);
-        }
+        config.validate()?;
         Ok(Self {
             config,
             welcome: None,
@@ -662,7 +667,7 @@ impl Connection {
         self.replies.pop_front()
     }
     pub fn take_page_updates(&mut self, limit: usize) -> Vec<PageUpdate> {
-        (0..limit.min(MAX_PAGE_UPDATES))
+        (0..limit.min(MAX_PAGE_UPDATES_PER_DRAIN))
             .filter_map(|_| self.page_updates.pop_front())
             .collect()
     }
@@ -705,6 +710,9 @@ impl Connection {
                 ClientMessage::RequestPage { page: a, .. },
                 ClientMessage::RequestPage { page: b, .. },
             ) => a == b,
+            (ClientMessage::ForgetPage(a), ClientMessage::ForgetPage(b)) => a == b,
+            (ClientMessage::ForgetPage(a), ClientMessage::RequestPage { page: b, .. })
+            | (ClientMessage::RequestPage { page: b, .. }, ClientMessage::ForgetPage(a)) => a == b,
             (ClientMessage::Entities(_), ClientMessage::Entities(_)) => true,
             (
                 ClientMessage::RequestHeight { key: a, .. }
@@ -924,13 +932,22 @@ impl Connection {
                 self.counters.authoritative_states += 1;
             }
             ServerMessage::Page(update) => {
-                if self.page_updates.len() >= MAX_PAGE_UPDATES {
-                    return Err(NetworkError::Capacity);
-                }
                 let (page, cells) = match &update {
                     PageUpdate::Snapshot(s) => (s.page, core_types::PAGE_VOLUME),
                     PageUpdate::Delta(d) => (d.page, d.changes.len()),
                 };
+                // A delayed packet for an evicted AOI cannot consume queue
+                // credit or repopulate the confirmed cache.
+                if !self.interest.contains_key(&page) {
+                    return Ok(());
+                }
+                let already_queued = self.page_updates.iter().any(|update| match update {
+                    PageUpdate::Snapshot(image) => image.page == page,
+                    PageUpdate::Delta(image) => image.page == page,
+                });
+                if !already_queued && self.page_updates.len() >= self.config.maximum_pages {
+                    return Err(NetworkError::Capacity);
+                }
                 let needed = usize::from(
                     !self
                         .outbox
@@ -944,10 +961,6 @@ impl Connection {
                 );
                 if self.outbox.len() + needed > MAX_OUTBOX {
                     return Err(NetworkError::Capacity);
-                }
-                // A delayed packet for an evicted AOI must not repopulate the cache.
-                if !self.interest.contains_key(&page) {
-                    return Ok(());
                 }
                 match self.replica.apply(update.clone()) {
                     Ok(net::ApplyResult::Applied) => {
@@ -1845,7 +1858,72 @@ impl Connection {
         for page in pages {
             self.request_page(page, now_ms)?;
         }
+        // An accepted no-op or coalesced ABA may have no new cell body to send.
+        // Ask for its causal watermark using the retained base; never turn a
+        // queued full repair into an ACK, or fail admission at a full outbox.
+        let mut causal_pages = [None; 4];
+        let mut causal_count = 0;
+        for (id, position) in self.overlay.awaiting_actions() {
+            let page = position.page();
+            let Some(interest) = self.interest.get(&page) else {
+                continue;
+            };
+            let Some(image) = self.replica.page(page) else {
+                continue;
+            };
+            if image.applied_action >= id
+                || now_ms.saturating_sub(interest.last_request) < 500
+                || causal_pages[..causal_count].contains(&Some(page))
+            {
+                continue;
+            }
+            causal_pages[causal_count] = Some(page);
+            causal_count += 1;
+            if causal_count == causal_pages.len() {
+                break;
+            }
+        }
+        for page in causal_pages.into_iter().flatten() {
+            if self
+                .outbox
+                .iter()
+                .any(|message| matches!(message,ClientMessage::RequestPage{page:p,..} if *p==page))
+            {
+                continue;
+            }
+            if self.outbox.len() == MAX_OUTBOX
+                && !self
+                    .outbox
+                    .iter()
+                    .any(|message| matches!(message,ClientMessage::ForgetPage(p) if *p==page))
+            {
+                continue;
+            }
+            let acknowledged = self.replica.page(page).map(|image| image.version);
+            self.queue(ClientMessage::RequestPage { page, acknowledged })?;
+            self.interest
+                .get_mut(&page)
+                .expect("causal page has current interest")
+                .last_request = now_ms;
+        }
         Ok(())
+    }
+    /// Change only the bounded raw interest; retain identity, prediction,
+    /// actions and the socket. The next I/O poll contracts/expands its leases.
+    pub fn set_near_profile(
+        &mut self,
+        profile: crate::near_profile::NearProfile,
+    ) -> Result<bool, NetworkError> {
+        let mut config = self.config;
+        profile.apply_network(&mut config);
+        config.validate()?;
+        let changed = self.config.interest_radii(false) != config.interest_radii(false)
+            || self.config.interest_radii(true) != config.interest_radii(true);
+        self.config = config;
+        Ok(changed)
+    }
+    pub fn near_profile_applied(&self, profile: crate::near_profile::NearProfile) -> bool {
+        profile.matches_network(self.config)
     }
     pub fn update_interest(&mut self, now_ms: u64) -> Result<(), NetworkError> {
         let Some(player) = self.player.as_ref() else {
@@ -1875,17 +1953,12 @@ impl Connection {
             .filter(|p| self.replica.page(**p).is_some())
             .count();
         if removals > MAX_PAGE_REMOVALS - self.page_removals.len() {
-            return Err(NetworkError::Capacity);
+            return Ok(());
         }
         for page in evict {
-            self.interest.remove(&page);
-            self.machine_packets.remove_page(page);
-            self.props.remove(&page);
-            self.props_updates.retain(|f| f.page != page);
-            if self.replica.remove(page) {
-                self.page_removals.push_back(page);
+            if !self.retire_page_interest(page)? {
+                return Ok(());
             }
-            self.counters.evicted_pages += 1;
         }
         let [horizontal, vertical, _] = self.config.interest_radii(false).map(i32::from);
         let mut candidates = Vec::new();
@@ -1927,26 +2000,62 @@ impl Connection {
                 .filter(|p| self.replica.page(**p).is_some())
                 .count();
             if removals > MAX_PAGE_REMOVALS - self.page_removals.len() {
-                return Err(NetworkError::Capacity);
+                return Ok(());
             }
             for page in selected {
-                self.interest.remove(&page);
-                self.machine_packets.remove_page(page);
-                self.props.remove(&page);
-                self.props_updates.retain(|f| f.page != page);
-                if self.replica.remove(page) {
-                    self.page_removals.push_back(page);
+                if !self.retire_page_interest(page)? {
+                    return Ok(());
                 }
-                self.counters.evicted_pages += 1;
             }
         }
         for (_, page) in candidates {
             if self.interest.len() >= self.config.maximum_pages {
                 break;
             }
+            if self.outbox.len() == MAX_OUTBOX && !self.outbox.iter().any(|message| matches!(message,ClientMessage::RequestPage {page:p,..}|ClientMessage::ForgetPage(p) if *p == page)) { break; }
             self.request_page(page, now_ms)?;
         }
         Ok(())
+    }
+    fn retire_page_interest(&mut self, page: PageId) -> Result<bool, NetworkError> {
+        let obsolete = |message: &ClientMessage| match message {
+            ClientMessage::RequestPage { page: p, .. }
+            | ClientMessage::AckPage { page: p, .. }
+            | ClientMessage::RequestProps { page: p, .. }
+            | ClientMessage::ForgetPage(p) => *p == page,
+            ClientMessage::RequestLight(request) => request.page == page,
+            ClientMessage::MachinePackets(request) => request.page() == page,
+            _ => false,
+        };
+        if self.outbox.len()
+            - self
+                .outbox
+                .iter()
+                .filter(|message| obsolete(message))
+                .count()
+            >= MAX_OUTBOX
+        {
+            return Ok(false);
+        }
+        self.outbox.retain(|message| !obsolete(message));
+        self.queue(ClientMessage::ForgetPage(page))?;
+        self.interest.remove(&page);
+        self.machine_packets.remove_page(page);
+        self.props.remove(&page);
+        self.props_updates.retain(|frame| frame.page != page);
+        self.lights.remove(page);
+        self.light_updates
+            .retain(|update| update.header().page != page);
+        self.page_updates.retain(|update| match update {
+            PageUpdate::Snapshot(snapshot) => snapshot.page != page,
+            PageUpdate::Delta(delta) => delta.page != page,
+        });
+        if self.replica.remove(page) {
+            self.page_removals.push_back(page);
+            self.world_changed = true;
+        }
+        self.counters.evicted_pages += 1;
+        Ok(true)
     }
 }
 fn key_state(bits: u8) -> Keys {

@@ -356,7 +356,9 @@ impl Fleet {
                     Ordering::Release,
                 );
                 worker_spectators.store(
-                    bots.iter().filter(|b| b.mode == 2).count(),
+                    bots.iter()
+                        .filter(|b| b.mode == sim::GameMode::Spectator as u8)
+                        .count(),
                     Ordering::Release,
                 );
                 std::thread::sleep(std::time::Duration::from_micros(500));

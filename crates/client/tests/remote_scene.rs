@@ -30,6 +30,7 @@ fn image(page: PageId, view: u64, source: u64, cell: Cell) -> PageUpdate {
         page,
         version: view,
         source_version: Version(source),
+        applied_action: Default::default(),
         cells: Box::new([cell; PAGE_VOLUME]),
     })
 }
@@ -96,6 +97,7 @@ fn confirmed_versions_are_separate_and_one_cell_delta_does_one_cell_work() {
         base: 10,
         version: 11,
         source_version: Version(501),
+        applied_action: Default::default(),
         changes: vec![(
             pos.local_index().get(),
             Cell::from_parts(rules::ids::STONE, 0),
@@ -135,6 +137,7 @@ fn malformed_or_missing_bases_are_atomic_and_confirmed_replica_can_repair() {
             base,
             version: 11,
             source_version: Version(501),
+            applied_action: Default::default(),
             changes,
         })
     };
@@ -179,6 +182,7 @@ fn ore_reveal_can_change_view_without_changing_authority_source_version() {
         base: 10,
         version: 11,
         source_version: Version(500),
+        applied_action: Default::default(),
         changes: vec![(pos.local_index().get(), ore)],
     });
     scene.import_authoritative_page(&update, Tick(1)).unwrap();
@@ -209,6 +213,7 @@ fn optimistic_edits_are_guarded_unsaved_and_ack_does_not_apply_twice() {
         base: 10,
         version: 11,
         source_version: Version(501),
+        applied_action: Default::default(),
         changes: vec![(pos.local_index().get(), stone)],
     });
     let accepted = scene.import_authoritative_page(&update, Tick(2)).unwrap();

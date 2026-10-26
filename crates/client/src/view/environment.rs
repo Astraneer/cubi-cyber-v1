@@ -67,6 +67,44 @@ impl Default for EnvironmentProfile {
     }
 }
 impl EnvironmentProfile {
+    /// Product AA choice. MSAA4 retains the original resources; single-sample
+    /// presentation prepares a physical-resolution morphological AA graph.
+    pub fn with_antialiasing(mut self, samples: u32) -> Result<Self, ViewEnvironmentError> {
+        self.graphics.post.smaa = match samples {
+            4 => None,
+            1 => Some(render::smaa::SmaaConfig::default()),
+            _ => return Err(ViewEnvironmentError::InvalidConfig),
+        };
+        Ok(self)
+    }
+    /// Loading-only visual choices. The optional automatic histogram is absent
+    /// in Manual; compensation remains the explicit percentage in both modes.
+    pub fn with_visual_choices(
+        mut self,
+        exposure_mode: u8,
+        sky_style: u8,
+    ) -> Result<Self, ViewEnvironmentError> {
+        if exposure_mode > 1 || sky_style > 2 {
+            return Err(ViewEnvironmentError::InvalidConfig);
+        }
+        if exposure_mode == 1 {
+            self.graphics.post.exposure = render::post::Exposure::Manual(1.);
+        } else {
+            self.graphics.post.exposure = render::post::PostConfig::default().exposure;
+        }
+        let (sun_style, moon_style, star_style) = match sky_style {
+            0 => (0, 0, 0),
+            1 => (1, 0, 1),
+            _ => (2, 1, 2),
+        };
+        self.celestials = Some(CelestialConfig {
+            sun_style,
+            moon_style,
+            star_style,
+            ..self.celestials.unwrap_or_default()
+        });
+        Ok(self)
+    }
     /// Prepare a bounded contact-visibility graph during loading. Mode zero
     /// keeps the original scene layout, targets and fragment entry points.
     pub fn with_contact_ao(mut self, mode: u8) -> Result<Self, ViewEnvironmentError> {

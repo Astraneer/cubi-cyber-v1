@@ -383,6 +383,7 @@ fn connected_raw_page() -> client::network::Connection {
                 page: page(),
                 version: 7,
                 source_version: Version(11),
+                applied_action: Default::default(),
                 cells: Box::new(
                     [core_types::Cell::from_parts(rules::ids::LOGISTICAL_TRANSPORTER, 0); 4096],
                 ),

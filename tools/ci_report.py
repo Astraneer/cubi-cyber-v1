@@ -63,11 +63,13 @@ class Context:
     run_attempt: str
     linux: str
     windows: str
+    server_scale: str
 
     def __post_init__(self):
         match = STAGE_BRANCH.fullmatch(self.branch)
         if (not SHA.fullmatch(self.sha) or not match or int(match[1]) != self.stage
                 or self.linux not in JOB_RESULTS or self.windows not in JOB_RESULTS
+                or self.server_scale not in JOB_RESULTS
                 or not re.fullmatch(r"[1-9][0-9]*", self.run_id)
                 or not re.fullmatch(r"[1-9][0-9]*", self.run_attempt)):
             raise ScopeError("invalid_context_fields")
@@ -94,13 +96,14 @@ class Context:
             raise ScopeError("invalid_run_identity")
         linux = environ.get("CI_REPORT_LINUX_RESULT", "")
         windows = environ.get("CI_REPORT_WINDOWS_RESULT", "")
-        if linux not in JOB_RESULTS or windows not in JOB_RESULTS:
+        server_scale = environ.get("CI_REPORT_SERVER_SCALE_RESULT", "")
+        if any(result not in JOB_RESULTS for result in (linux, windows, server_scale)):
             raise ScopeError("invalid_job_result")
-        return cls(sha, branch, int(match[1]), run_id, attempt, linux, windows)
+        return cls(sha, branch, int(match[1]), run_id, attempt, linux, windows, server_scale)
 
     @property
     def successful(self):
-        return self.linux == self.windows == "success"
+        return self.linux == self.windows == self.server_scale == "success"
 
     @property
     def run_url(self):
@@ -110,20 +113,21 @@ class Context:
 def make_report(context, delivery, now=None):
     if context.successful:
         conclusion = "success"
-    elif "failure" in (context.linux, context.windows):
+    elif "failure" in (context.linux, context.windows, context.server_scale):
         conclusion = "failure"
-    elif "cancelled" in (context.linux, context.windows):
+    elif "cancelled" in (context.linux, context.windows, context.server_scale):
         conclusion = "cancelled"
     else:
         conclusion = "incomplete"
     timestamp = now or datetime.now(timezone.utc)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "repository": REPOSITORY,
         "source": {"sha": context.sha, "branch": context.branch, "stage": f"M{context.stage}"},
         "workflow": {"name": "Acceptance", "run_id": context.run_id,
                      "run_attempt": context.run_attempt, "url": context.run_url},
-        "checks": {"linux": context.linux, "windows": context.windows},
+        "checks": {"linux": context.linux, "windows": context.windows,
+                   "server_scale": context.server_scale},
         "conclusion": conclusion,
         "delivery": delivery,
         "reported_at": timestamp.isoformat(),
@@ -302,7 +306,9 @@ class PullRequests:
             f"{change}\n\n"
             f"Проверен коммит `{context.sha}`:\n\n"
             "- Linux: workspace, программный Vulkan, native и браузерный WebGPU — success.\n"
-            "- Windows: сборка, D3D12 WARP и native smoke — success.\n\n"
+            "- Windows: сборка, D3D12 WARP и native smoke — success.\n"
+            "- Сервер: release Runtime, 32 UDP-клиента, 5000 существ, 10000 машин, "
+            "100000 событий воды и восстановление хранилища — success.\n\n"
             f"[Результаты Acceptance]({context.run_url}). "
             f"[Состояние и ограничения этапа](https://github.com/{REPOSITORY}/blob/{context.sha}/docs/STATUS.md).\n"
         )

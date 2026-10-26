@@ -433,6 +433,7 @@ fn authoritative_view_requires_light_bindings_and_cpu_ingest_never_writes_gpu() 
             page,
             version,
             source_version: Version(1),
+            applied_action: Default::default(),
             cells: values,
         })
     };

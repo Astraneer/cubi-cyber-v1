@@ -105,6 +105,9 @@ pub fn shader_source(ambient_mrt: bool) -> String {
     )
 }
 impl CelestialGpu {
+    pub fn config(&self) -> CelestialConfig {
+        self.config
+    }
     fn canonical_state(&self, mut state: CelestialState) -> CelestialState {
         if self.config.stars == 0 || state.sun[1] >= -0.08 || state.star_radiance == 0.0 {
             state.time_seconds = 0.0;

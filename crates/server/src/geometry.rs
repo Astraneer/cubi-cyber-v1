@@ -30,6 +30,7 @@ impl GeometryWorker {
         cold_enabled: bool,
     ) -> Result<Self, crate::ServerError> {
         let limits = cold_projection_owner::Limits {
+            completion_delay_ticks: delay,
             capture: crate::cold_projection::Limits {
                 allow_cold: cold_enabled,
                 ..Default::default()

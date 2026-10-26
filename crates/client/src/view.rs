@@ -15,6 +15,7 @@ use sim::{CameraMode, Keys, Permissions, Player, WorldQuery};
 use std::collections::{BTreeMap, VecDeque};
 use world::CellRead;
 mod clock;
+pub mod distant_shadows;
 mod entities;
 pub mod environment;
 pub mod horizon;
@@ -180,6 +181,7 @@ pub struct ClientView {
     water: Option<Box<water::ViewWater>>,
     environment: Option<Box<PreparedEnvironment>>,
     horizon: Option<Box<horizon_runtime::PreparedHorizon>>,
+    distant_shadows: Option<Box<distant_shadows::ViewDistantShadows>>,
     frame_upload_remaining: u64,
     frame_delta_seconds: f32,
     clock: clock::ClockState,
@@ -285,6 +287,7 @@ impl ClientView {
             water: None,
             environment: None,
             horizon: None,
+            distant_shadows: None,
             frame_upload_remaining: 0,
             frame_delta_seconds: 1. / 60.,
             clock: Default::default(),
@@ -398,6 +401,15 @@ impl ClientView {
         self.environment
             .as_ref()
             .map(|environment| environment.owner.gpu.post().compensation())
+    }
+    pub fn exposure_automatic(&self) -> Option<bool> {
+        self.environment
+            .as_ref()
+            .map(|environment| environment.owner.gpu.post().automatic())
+    }
+    pub fn celestial_styles(&self) -> Option<[u32; 3]> {
+        let config = self.environment.as_ref()?.owner.gpu.celestials()?.config();
+        Some([config.sun_style, config.moon_style, config.star_style])
     }
     pub fn gi_prepared(&self) -> bool {
         self.environment
@@ -1410,7 +1422,7 @@ impl ClientView {
                 .owner
                 .gpu
                 .post_mut()
-                .set_output_extent(width, height)
+                .set_output_extent_with_device(device, width, height)
                 .map_err(|error| error.to_string())?;
             environment.width = render_width;
             environment.height = render_height;
@@ -2248,10 +2260,34 @@ impl ClientView {
             self.frame_upload_remaining -= bytes;
         }
         let center = self.lighting_center();
+        if let (Some(distant), Some(horizon)) = (&mut self.distant_shadows, &self.horizon)
+            && distant
+                .synchronize(&horizon.owner)
+                .map_err(|error| error.to_string())?
+        {
+            self.renderer.invalidate();
+        }
         if let Some(lighting) = &mut self.lighting {
             self.encoded_shadows = true;
-            let work = if let (Some(entities), Some(props)) = (&mut self.entities, &mut self.props)
-            {
+            let work = if let Some(distant) = &mut self.distant_shadows {
+                let mut casters = render::distant_shadows::SceneShadowCasters {
+                    entities: self.entities.as_mut().map(|owner| {
+                        &mut owner.gpu as &mut dyn render::shadows::DynamicShadowCaster
+                    }),
+                    props: self.props.as_mut().map(|owner| {
+                        &mut owner.gpu as &mut dyn render::shadows::DynamicShadowCaster
+                    }),
+                    distant: &mut distant.gpu,
+                };
+                lighting.encode_models_with_sun(
+                    queue,
+                    encoder,
+                    &mut self.renderer,
+                    center,
+                    sun,
+                    &mut casters,
+                )
+            } else if let (Some(entities), Some(props)) = (&mut self.entities, &mut self.props) {
                 let mut pair = render::shadows::ShadowCasterPair {
                     first: &mut entities.gpu,
                     second: &mut props.gpu,

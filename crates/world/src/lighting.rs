@@ -14,6 +14,7 @@ use crate::{
 };
 use core_types::{BlockPos, ChannelMask, LocalIdx, PAGE_VOLUME, PageId, SpaceId, Tick};
 use std::{collections::BTreeMap, sync::Arc};
+pub mod durable;
 
 pub const LIGHT_INPUT_CHANNELS: ChannelMask =
     ChannelMask(ChannelMask::OPACITY.0 | ChannelMask::EMISSION.0);
@@ -41,7 +42,7 @@ impl LightPriority {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LightingLimits {
     pub max_frontier_cells: usize,
     pub reserved_interactive_cells: usize,
@@ -130,6 +131,7 @@ pub enum LightingError {
     CoordinateOverflow(PageId),
     Cursor(CursorError),
     Commit(CommitError),
+    Persistence(&'static str),
 }
 impl From<CursorError> for LightingError {
     fn from(error: CursorError) -> Self {
@@ -170,6 +172,8 @@ struct Frontier {
     ages: BTreeMap<Tick, usize>,
     chains: [Chain; 3],
     noninteractive: usize,
+    recording: bool,
+    operations: Vec<durable::FrontierOp>,
 }
 impl Frontier {
     fn new(capacity: usize) -> Self {
@@ -180,6 +184,8 @@ impl Frontier {
             ages: BTreeMap::new(),
             chains: [Chain::default(); 3],
             noninteractive: 0,
+            recording: false,
+            operations: Vec::new(),
         }
     }
     fn len(&self) -> usize {
@@ -207,6 +213,10 @@ impl Frontier {
         if let Some(&index) = self.positions.get(&position) {
             let old = self.entries[index].expect("indexed cell");
             if priority < old.priority || queued_at < old.queued_at {
+                if self.recording {
+                    self.operations
+                        .push(durable::FrontierOp::Insert(position, priority, queued_at));
+                }
                 if let Some(undo) = undo {
                     undo.push(Undo::Changed(index, old));
                 }
@@ -230,6 +240,10 @@ impl Frontier {
             return;
         }
         let index = self.free.pop().expect("capacity prechecked");
+        if self.recording {
+            self.operations
+                .push(durable::FrontierOp::Insert(position, priority, queued_at));
+        }
         self.entries[index] = Some(Entry {
             position,
             priority,
@@ -276,6 +290,9 @@ impl Frontier {
     }
     fn remove(&mut self, index: usize, undo: Option<&mut Vec<Undo>>) -> Entry {
         let entry = self.entries[index].expect("active cell");
+        if self.recording {
+            self.operations.push(durable::FrontierOp::Remove(index));
+        }
         self.detach(index);
         self.entries[index] = None;
         self.positions.remove(&entry.position);
@@ -305,6 +322,8 @@ impl Frontier {
         }
     }
     fn rollback(&mut self, mut undo: Vec<Undo>) {
+        let recording = self.recording;
+        self.recording = false;
         while let Some(operation) = undo.pop() {
             match operation {
                 Undo::Inserted(index) => {
@@ -330,8 +349,12 @@ impl Frontier {
                 }
             }
         }
+        self.recording = recording;
     }
     fn rotate(&mut self, index: usize, undo: &mut Vec<Undo>) {
+        if self.recording {
+            self.operations.push(durable::FrontierOp::Rotate(index));
+        }
         let entry = self.entries[index].expect("queued cell");
         undo.push(Undo::Changed(index, entry));
         self.detach(index);
@@ -402,13 +425,17 @@ struct PageSeed {
     priority: LightPriority,
 }
 struct PendingRecord {
-    change: Arc<WorldChange>,
+    change: InputChange,
     next: u64,
     page: usize,
     cell: usize,
     neighbor: usize,
     interested: Option<bool>,
     queued_at: Tick,
+}
+enum InputChange {
+    Journal(Arc<WorldChange>),
+    Durable(Arc<durable::InputRecord>),
 }
 
 pub struct LightingEngine {
@@ -418,6 +445,7 @@ pub struct LightingEngine {
     frontier: Frontier,
     seeds: BTreeMap<PageId, PageSeed>,
     record: Option<PendingRecord>,
+    durable: Option<durable::Owner>,
 }
 
 impl LightingEngine {
@@ -430,6 +458,7 @@ impl LightingEngine {
             frontier: Frontier::new(limits.max_frontier_cells),
             seeds: BTreeMap::new(),
             record: None,
+            durable: None,
         })
     }
     pub fn cursor(&self) -> CursorId {
@@ -445,10 +474,16 @@ impl LightingEngine {
         self.seeds.len()
     }
     pub fn is_idle(&self) -> bool {
-        self.frontier.len() == 0 && self.seeds.is_empty() && self.record.is_none()
+        self.frontier.len() == 0
+            && self.seeds.is_empty()
+            && self.record.is_none()
+            && self.durable.as_ref().is_none_or(|d| d.inputs.is_empty())
     }
     pub fn set_limits(&mut self, limits: LightingLimits) -> Result<(), LightingError> {
         validate_limits(limits)?;
+        if self.durable.is_some() && limits != self.limits {
+            return Err(LightingError::InvalidLimits);
+        }
         if limits.max_frontier_cells < self.frontier.len()
             || limits.max_seed_pages < self.seeds.len()
             || limits.max_frontier_cells - limits.reserved_interactive_cells
@@ -533,20 +568,35 @@ impl LightingEngine {
         let mut processed = 0;
         let mut backpressure = false;
         while processed < budget.max_records {
-            if self.record.is_none() && self.next_sequence == world.journal_next() {
+            if self.record.is_none()
+                && self
+                    .durable
+                    .as_ref()
+                    .map_or(self.next_sequence == world.journal_next(), |d| {
+                        d.inputs.is_empty()
+                    })
+            {
                 break;
             }
             let mut record = if let Some(record) = self.record.take() {
                 record
             } else {
-                let batch = world.read_cursor(self.cursor, 1)?;
-                let Some(change) = batch.changes.into_iter().next() else {
-                    break;
+                let (change, next) = if let Some(durable) = &self.durable {
+                    let Some(change) = durable.inputs.front() else {
+                        break;
+                    };
+                    (InputChange::Durable(Arc::clone(change)), 0)
+                } else {
+                    let batch = world.read_cursor(self.cursor, 1)?;
+                    let Some(change) = batch.changes.into_iter().next() else {
+                        break;
+                    };
+                    (InputChange::Journal(change), batch.next)
                 };
                 work.journal_records += 1;
                 PendingRecord {
                     change,
-                    next: batch.next,
+                    next,
                     page: 0,
                     cell: 0,
                     neighbor: 0,
@@ -557,6 +607,14 @@ impl LightingEngine {
             let result = self.ingest_record(world, &mut record, budget, &mut work);
             match result {
                 Ok(RecordStatus::Done) => {
+                    if let Some(durable) = &mut self.durable {
+                        let input = durable.inputs.pop_front().expect("owned input retained");
+                        durable.input_bytes -= input.encoded_len();
+                        durable.consumed += 1;
+                        durable.dirty = true;
+                        processed += 1;
+                        continue;
+                    }
                     // On an explicit cursor lag the record stays retained; callers
                     // install/reseed a snapshot before seeking the cursor again.
                     if let Err(error) = world.acknowledge_cursor(self.cursor, record.next) {
@@ -567,6 +625,9 @@ impl LightingEngine {
                     processed += 1;
                 }
                 Ok(status) => {
+                    if let Some(durable) = &mut self.durable {
+                        durable.dirty = true;
+                    }
                     backpressure = matches!(status, RecordStatus::Backpressure);
                     self.record = Some(record);
                     break;
@@ -600,14 +661,20 @@ impl LightingEngine {
         budget: LightIngestBudget,
         work: &mut LightWork,
     ) -> Result<RecordStatus, LightingError> {
-        if !record.change.channels.intersects(LIGHT_INPUT_CHANNELS) {
+        if matches!(record.change, InputChange::Durable(_)) {
+            return self.ingest_owned_record(world, record, budget, work);
+        }
+        let InputChange::Journal(change) = &record.change else {
+            unreachable!()
+        };
+        if !change.channels.intersects(LIGHT_INPUT_CHANNELS) {
             return Ok(RecordStatus::Done);
         }
-        while record.page < record.change.pages.len() {
+        while record.page < change.pages.len() {
             if work.journal_entries_examined >= budget.max_entries {
                 return Ok(RecordStatus::Budget);
             }
-            let page = &record.change.pages[record.page];
+            let page = &change.pages[record.page];
             work.journal_entries_examined += 1;
             if page.created || page.removed {
                 page_origin(page.page)?;
@@ -625,8 +692,8 @@ impl LightingEngine {
             }
             record.page += 1;
         }
-        while record.cell < record.change.cells.len() {
-            let cell = &record.change.cells[record.cell];
+        while record.cell < change.cells.len() {
+            let cell = &change.cells[record.cell];
             if record.interested.is_none() {
                 if work.journal_entries_examined >= budget.max_entries {
                     return Ok(RecordStatus::Budget);
@@ -692,6 +759,7 @@ impl LightingEngine {
         let mut backpressure = self.pump_seeds(world, tick, budget.max_seed_cells, &mut work)?;
         let mut overlay = BTreeMap::<BlockPos, LightSample>::new();
         let mut undo = Vec::new();
+        let operation_mark = self.frontier.operations.len();
         let mut active_space = None;
         let mut blocked_anchor = [None; 3];
         let mut blocked_chains = [false; 3];
@@ -854,6 +922,7 @@ impl LightingEngine {
             if changed {
                 if let Err(error) = world.commit(transaction) {
                     self.frontier.rollback(undo);
+                    self.frontier.operations.truncate(operation_mark);
                     return Err(error.into());
                 }
                 work.transactions = 1;
@@ -889,6 +958,9 @@ impl LightingEngine {
                 break;
             };
             let mut seed = self.seeds.remove(&key).expect("selected page seed");
+            if let Some(durable) = &mut self.durable {
+                durable.seeds_dirty = true;
+            }
             while work.seed_cells_examined < budget {
                 let position = match page_seed_position(seed) {
                     Ok(SeedPosition::End) => break,
@@ -1003,6 +1075,9 @@ impl LightingEngine {
     }
     fn queue_seed(&mut self, incoming: PageSeed) -> Result<(), LightingBackpressure> {
         if let Some(seed) = self.seeds.get_mut(&incoming.page) {
+            if let Some(durable) = &mut self.durable {
+                durable.seeds_dirty = true;
+            }
             seed.whole |= incoming.whole;
             seed.top |= incoming.top;
             seed.halo |= incoming.halo;
@@ -1015,6 +1090,9 @@ impl LightingEngine {
             return Err(LightingBackpressure::SeedPagesFull);
         }
         self.seeds.insert(incoming.page, incoming);
+        if let Some(durable) = &mut self.durable {
+            durable.seeds_dirty = true;
+        }
         Ok(())
     }
 }

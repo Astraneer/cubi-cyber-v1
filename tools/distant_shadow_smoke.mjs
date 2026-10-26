@@ -1,0 +1,46 @@
+// Exact production far shadow shaders/cull, independent f64 world-ray witnesses.
+import assert from 'node:assert/strict';
+import {readFile,writeFile} from 'node:fs/promises';
+import {withBrowser} from './browser.mjs';
+const root='.local/distant-shadow-oracle',input={sources:[],payloads:{}};
+for(const name of ['cull','height','opaque','cutout'])input.sources.push(await readFile(root+'/'+name+'.wgsl','utf8'));
+input.camera=Array.from(await readFile(root+'/camera.bin'));
+for(const name of ['opaque','cutout'])input.payloads[name]=Array.from(await readFile(root+'/'+name+'.pxp'));
+async function run(input){
+ const adapter=await navigator.gpu.requestAdapter();if(!adapter)throw Error('No WebGPU');const device=await adapter.requestDevice();const errors=[];device.addEventListener('uncapturederror',event=>errors.push(event.error.message));device.pushErrorScope('validation');
+ const B=GPUBufferUsage,T=GPUTextureUsage,N=128,results=[];
+ const buffer=(size,usage,data)=>{const value=device.createBuffer({size,usage});if(data)device.queue.writeBuffer(value,0,data);return value;};
+ const module=async code=>{const result=device.createShaderModule({code});const info=await result.getCompilationInfo();const bad=info.messages.filter(m=>m.type==='error');if(bad.length)throw Error(JSON.stringify(bad));return result;};
+ const [cm,hm,om,qm]=await Promise.all(input.sources.map(module));
+ const reset=await device.createComputePipelineAsync({layout:'auto',compute:{module:cm,entryPoint:'reset'}}),cull=await device.createComputePipelineAsync({layout:'auto',compute:{module:cm,entryPoint:'cull'}});
+ const pipeline=async(module,topology)=>device.createRenderPipelineAsync({layout:'auto',vertex:{module,entryPoint:'vertex'},fragment:{module,entryPoint:'fragment',targets:[]},primitive:{topology,cullMode:'none'},depthStencil:{format:'depth32float',depthCompare:'greater-equal',depthWriteEnabled:true}});
+ const [height,opaque,cutout]=await Promise.all([pipeline(hm,'triangle-list'),pipeline(om,'triangle-list'),pipeline(qm,'triangle-strip')]);
+ const readShader=await module('@group(0)@binding(0)var source:texture_depth_2d;@group(0)@binding(1)var<storage,read_write>output:array<f32>;@compute @workgroup_size(8,8)fn read(@builtin(global_invocation_id)p:vec3<u32>){if p.x<128u&&p.y<128u{output[p.x+128u*p.y]=textureLoad(source,vec2<i32>(p.xy),0);}}');
+ const readPipeline=await device.createComputePipelineAsync({layout:'auto',compute:{module:readShader,entryPoint:'read'}});
+ const cameraBytes=new Uint8Array(input.camera),camera=buffer(144,B.UNIFORM|B.COPY_DST,cameraBytes),matrix=new Float32Array(cameraBytes.buffer,0,16);
+ const headers=buffer(64,B.STORAGE|B.COPY_DST),tileData=buffer(819*4,B.STORAGE|B.COPY_DST),objects=buffer(256,B.STORAGE|B.COPY_DST),data=buffer(65536*4,B.STORAGE|B.COPY_DST);
+ const visible=buffer(512+131072,B.STORAGE),indirect=buffer(48,B.STORAGE|B.INDIRECT|B.COPY_SRC),footprint=buffer(256,B.STORAGE),near=buffer(4160,B.STORAGE|B.COPY_DST);
+ const atlas=device.createTexture({size:[16,16,1],format:'rgba8unorm-srgb',usage:T.COPY_DST|T.TEXTURE_BINDING}),sampler=device.createSampler({magFilter:'nearest',minFilter:'nearest',addressModeU:'repeat',addressModeV:'repeat'}),materials=buffer(16,B.STORAGE|B.COPY_DST,new Uint32Array(4));
+ const bind=(pipe,entries)=>device.createBindGroup({layout:pipe.getBindGroupLayout(0),entries});const e=(binding,buffer,offset=0,size=undefined)=>({binding,resource:{buffer,offset,size}});
+ const resetBind=bind(reset,[e(4,indirect)]),cullBind=bind(cull,[e(0,camera),e(1,headers),e(2,objects),e(3,visible),e(4,indirect),e(5,footprint)]);
+ const heightBind=bind(height,[e(0,camera),e(1,headers),e(2,tileData),e(3,visible,0,256),e(21,near)]),opaqueBind=bind(opaque,[e(0,camera),e(1,objects),e(2,data),e(3,visible,256,256)]);
+ const cutoutBind=bind(cutout,[e(0,camera),e(1,objects),e(2,data),e(3,visible,512,131072),{binding:4,resource:atlas.createView({dimension:'2d-array'})},{binding:6,resource:sampler},e(7,materials)]);
+ const cases=[['hill-building','opaque',255,true,'known'],['transparent0','cutout',0,false,'disabled'],['transparent127','cutout',127,false,'disabled'],['covered128','cutout',128,false,'disabled'],['covered255','cutout',255,false,'disabled'],['water','opaque',255,false,'water'],['protected','opaque',255,false,'protected'],['unknown','opaque',255,false,'unknown'],['near','opaque',255,false,'near']];
+ for(const [name,kind,alpha,hill,state]of cases){
+  const raw=new Uint8Array(input.payloads[kind]),header=new DataView(raw.buffer),words=new Uint32Array(raw.buffer,36);device.queue.writeBuffer(data,0,words);
+  const object=new ArrayBuffer(256),of=new Float32Array(object),ou=new Uint32Array(object);for(const base of[0,16])for(let i=0;i<4;i++)of[base+i*5]=1;of.set([32,16,16],12);of.set([-32,-16,-16],28);of.set([32,16,16,0],32);of.set([48,32,32,0],36);ou.set([0,header.getUint32(8,true),header.getUint32(12,true),1],40);ou.set([header.getUint32(32,true),header.getUint32(24,true),header.getUint32(28,true),0],48);device.queue.writeBuffer(objects,0,object);
+  const tile=new ArrayBuffer(64),tf=new Float32Array(tile),tu=new Uint32Array(tile);tf.set([32,0,0,1]);tu[4]=state==='disabled'?0:1;tf.set([32,32,0,0],8);tf.set([48,32,16,0],12);device.queue.writeBuffer(headers,0,tile);
+  const payload=new Uint32Array(819),pf=new Float32Array(payload.buffer);pf.fill(32,0,289);payload.fill(0xffffffff,289,299);payload[298]=1;if(state==='unknown')payload.fill(0,289,299);if(state==='water')payload.fill(1,299,555);if(state==='protected')payload.fill(0xffffffff,811,819);device.queue.writeBuffer(tileData,0,payload);
+  const cover=new ArrayBuffer(4160),cf=new Float32Array(cover),cu=new Uint32Array(cover);if(state==='near'){cf.set([32,16,0],0);cf.set([48,48,16],4);cu[3]=1;}device.queue.writeBuffer(near,0,cover);
+  const texels=new Uint8Array(16*16*4);for(let i=0;i<256;i++)texels.set([255,255,255,alpha],i*4);device.queue.writeTexture({texture:atlas},texels,{bytesPerRow:64},[16,16]);
+  const depth=device.createTexture({size:[N,N],format:'depth32float',usage:T.RENDER_ATTACHMENT|T.TEXTURE_BINDING}),values=buffer(N*N*4,B.STORAGE|B.COPY_SRC),readback=buffer(N*N*4+48,B.COPY_DST|B.MAP_READ),readBind=bind(readPipeline,[{binding:0,resource:depth.createView()},e(1,values)]);
+  const encoder=device.createCommandEncoder();let p=encoder.beginComputePass();p.setPipeline(reset);p.setBindGroup(0,resetBind);p.dispatchWorkgroups(1);p.setPipeline(cull);p.setBindGroup(0,cullBind);p.dispatchWorkgroups(1);p.end();
+  p=encoder.beginRenderPass({colorAttachments:[],depthStencilAttachment:{view:depth.createView(),depthClearValue:0,depthLoadOp:'clear',depthStoreOp:'store'}});for(const[pipe,binding,offset]of[[height,heightBind,0],[opaque,opaqueBind,16],[cutout,cutoutBind,32]]){p.setPipeline(pipe);p.setBindGroup(0,binding);p.drawIndirect(indirect,offset);}p.end();p=encoder.beginComputePass();p.setPipeline(readPipeline);p.setBindGroup(0,readBind);p.dispatchWorkgroups(16,16);p.end();encoder.copyBufferToBuffer(values,0,readback,0,N*N*4);encoder.copyBufferToBuffer(indirect,0,readback,N*N*4,48);device.queue.submit([encoder.finish()]);await readback.mapAsync(GPUMapMode.READ);const mapped=readback.getMappedRange(),actual=new Float32Array(mapped,0,N*N),commands=Array.from(new Uint32Array(mapped,N*N*4,12));
+  let dark=0,clear=0,errors=0;const building=kind==='opaque'||alpha>=128;
+  for(let z=0;z<128;z++)for(let x=0;x<128;x++){const wx=(x+.5)*.5,wz=(z+.5)*.5,blocked=hill&&wx>4&&wx<12&&wz>4&&wz<12||building&&wx>10&&wx<22&&wz>23&&wz<25,lit=wx>36&&wx<60||wz>36&&wz<60||wx>4&&wx<12&&wz>17&&wz<19;if(!blocked&&!lit)continue;const project=row=>matrix[row]*wx+matrix[8+row]*wz+matrix[12+row],sx=Math.floor((project(0)*.5+.5)*N),sy=Math.floor((.5-project(1)*.5)*N);if(sx<0||sy<0||sx>=N||sy>=N)throw Error('Receiver outside oracle footprint');const shadow=actual[sx+N*sy]>project(2)+0.0001;if(blocked){dark++;errors+=Number(!shadow);}if(lit){clear++;errors+=Number(shadow);}}
+  if((kind==='cutout'&&alpha<128)&&actual.some(v=>v!==0))throw Error('Transparent cutout wrote shadow depth');if(errors||dark!==(hill?352:building?96:0)||clear!==10048)throw Error(JSON.stringify({name,dark,clear,errors,commands}));results.push({name,dark,clear,errors,commands});readback.unmap();for(const resource of[depth,values,readback])resource.destroy();
+ }
+ const validation=await device.popErrorScope();if(validation||errors.length)throw Error(JSON.stringify({validation:validation?.message,errors}));device.destroy();return{shaderErrors:0,results};
+}
+const result=await withBrowser({path:'/distant-shadow-oracle',width:128,height:128},async({evaluate})=>evaluate('('+run.toString()+')('+JSON.stringify(input)+')'));
+assert.equal(result.results.length,9);await writeFile('.local/distant-shadow-dawn-proof.json',JSON.stringify(result,null,2)+'\n');console.log('DAWN_DISTANT_SHADOW_OK '+JSON.stringify(result));

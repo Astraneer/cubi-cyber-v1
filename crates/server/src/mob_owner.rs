@@ -25,7 +25,11 @@ pub(super) struct Owner {
     query: Vec<EntityId>,
 }
 impl Owner {
-    pub(super) fn new(seed: u64, store: &rules::entities::mob::EntityStore) -> Self {
+    pub(super) fn new(
+        seed: u64,
+        store: &rules::entities::mob::EntityStore,
+        remaining: Option<usize>,
+    ) -> Self {
         Self {
             pending: VecDeque::new(),
             active: store
@@ -37,8 +41,8 @@ impl Owner {
             activity: VecDeque::new(),
             centers: Vec::with_capacity(64),
             initialized: false,
-            due: !store.is_empty(),
-            remaining: store.active_len(),
+            due: remaining.map_or(!store.is_empty(), |r| r > 0),
+            remaining: remaining.unwrap_or_else(|| store.active_len()),
             seed,
             query: vec![EntityId(0); MAX_MOBS],
         }
@@ -96,32 +100,30 @@ impl Server {
         Ok(())
     }
     pub(super) fn mob_active_at(&self, space: SpaceId, position: [f64; 3]) -> bool {
-        self.peers.values().any(|p| {
-            p.ready
-                && p.space == space
+        self.any_tick_actor(|p| {
+            p.space == space
                 && p.player.mode != GameMode::Spectator
                 && (0..3).all(|a| (p.player.pos[a] - position[a]).abs() <= 128.)
         })
     }
     fn refresh_mob_activity(&mut self) -> Result<(), ServerError> {
-        let centers: Vec<_> = self
-            .peers
-            .values()
-            .filter(|p| p.ready && p.player.mode != GameMode::Spectator)
-            .map(|p| (p.identity, p.space, position_page(p.space, p.player.pos)))
+        let actors: Vec<_> = self
+            .tick_actor_refs()
+            .filter(|p| p.player.mode != GameMode::Spectator)
+            .map(|p| (p.identity, p.space, p.player.pos))
+            .collect();
+        let centers: Vec<_> = actors
+            .iter()
+            .map(|&(identity, space, position)| (identity, space, position_page(space, position)))
             .collect();
         if self.mob_owner.initialized && centers == self.mob_owner.centers {
             return Ok(());
         }
         let store = self.runtimes.mobs.entities();
         let mut desired = BTreeSet::new();
-        for peer in self
-            .peers
-            .values()
-            .filter(|p| p.ready && p.player.mode != GameMode::Spectator)
-        {
-            let low = peer.player.pos.map(|v| v - 128.);
-            let high = peer.player.pos.map(|v| v + 128.);
+        for &(_, space, position) in &actors {
+            let low = position.map(|v| v - 128.);
+            let high = position.map(|v| v + 128.);
             let (count, work) = store
                 .query_ids(
                     low,
@@ -140,7 +142,7 @@ impl Server {
                 return Ok(());
             }
             for id in &self.mob_owner.query[..count] {
-                if store.get(*id).is_some_and(|m| m.space == peer.space) {
+                if store.get(*id).is_some_and(|m| m.space == space) {
                     desired.insert(*id);
                 }
             }
@@ -152,7 +154,13 @@ impl Server {
                 self.mob_owner.activity.push_back((*id, active));
             }
         }
-        self.mob_owner.remaining = self.mob_owner.remaining.max(desired.len());
+        if self
+            .runtimes
+            .mob_progress
+            .is_none_or(|p| p.tick != self.tick)
+        {
+            self.mob_owner.remaining = self.mob_owner.remaining.max(desired.len());
+        }
         self.mob_owner.centers = centers;
         self.mob_owner.initialized = true;
         Ok(())
@@ -198,7 +206,7 @@ impl Server {
         self.refresh_mob_activity()?;
         let activity: Vec<_> = self.mob_owner.activity.iter().take(1024).copied().collect();
         let mut rows = Vec::new();
-        let mut living: BTreeMap<u64, Living> = BTreeMap::new();
+        let mut living: BTreeMap<PlayerId, Living> = BTreeMap::new();
         let mut transactions = Vec::new();
         let mut work = entities::Work::default();
         let selected = self
@@ -213,9 +221,7 @@ impl Server {
                 .map_err(|_| ServerError::Invalid("mob activity plan"))?
         } else if selected > 0 {
             let players: Vec<_> = self
-                .peers
-                .values()
-                .filter(|p| p.ready)
+                .tick_actor_refs()
                 .map(|p| {
                     let feet = p.player.pos.map(|v| v.floor() as i32);
                     PlayerProbe {
@@ -274,16 +280,14 @@ impl Server {
                 }
             }
             for attack in &plan.attacks {
-                let Some((connection, peer)) = self.peers.iter().find(|(_, p)| {
-                    p.ready
-                        && p.space == attack.space
-                        && runtime::player_entity(p.identity) == attack.target
+                let Some(peer) = self.tick_actor_refs().find(|p| {
+                    p.space == attack.space && runtime::player_entity(p.identity) == attack.target
                 }) else {
                     continue;
                 };
-                let patch = living.entry(*connection).or_insert_with(|| Living {
-                    health: peer.health,
-                    inventory: peer.inventory,
+                let patch = living.entry(peer.identity).or_insert_with(|| Living {
+                    health: *peer.health,
+                    inventory: *peer.inventory,
                     window: peer.window.clone(),
                     velocity: peer.player.vel,
                 });
@@ -449,24 +453,19 @@ impl Server {
                     .map_err(|_| ServerError::Invalid("mob grass transaction"))?,
             );
         }
-        for (connection, patch) in living {
-            let peer = self.peers.get_mut(&connection).expect("guarded mob victim");
-            peer.health = patch.health;
-            peer.inventory = patch.inventory;
-            peer.window = patch.window;
-            peer.player.vel = patch.velocity;
-            peer.player.health = peer.health.hp();
-            let saved = runtime::capture_peer(peer).map_err(ServerError::Invalid)?;
-            self.saved_players.insert(peer.identity, saved.clone());
-            if let Some(old) = batch
-                .players
-                .iter_mut()
-                .find(|p| p.state.identity == peer.identity)
-            {
-                *old = saved
-            } else {
-                batch.players.push(saved);
-            }
+        for (identity, patch) in living {
+            let saved = {
+                let actor = self
+                    .tick_actor_mut(identity)
+                    .ok_or(ServerError::Invalid("mob victim actor changed"))?;
+                *actor.health = patch.health;
+                *actor.inventory = patch.inventory;
+                *actor.window = patch.window;
+                actor.player.vel = patch.velocity;
+                actor.player.health = actor.health.hp();
+                actor.capture()?
+            };
+            self.record_tick_actor(saved, batch);
         }
         if let Some(payload) = item_encoded {
             let record = save::RuntimeRecord {
@@ -512,7 +511,14 @@ impl Server {
         self.counters.mob_waiting += work.waiting_world;
         self.counters.mob_drops += rows.len() as u64;
         self.counters.audio_cues_not_recorded += work.audio_cues_clipped;
-        if let Some(payload) = encoded {
+        if encoded.is_some() || selected > 0 || !activity.is_empty() || !births.is_empty() {
+            let progress = natural_records::Progress {
+                tick: self.tick,
+                remaining: self.mob_owner.remaining,
+            };
+            let payload =
+                natural_records::with_progress(encoded.unwrap_or_default(), Some(progress))
+                    .map_err(ServerError::Invalid)?;
             batch.runtimes.push(save::RuntimeRecord {
                 kind: save::RUNTIME_MOBS,
                 payload,
@@ -526,6 +532,7 @@ impl Server {
         }
         let mut batch = Batch::empty(self.tick);
         self.tick_mobs(&mut batch)?;
+        self.capture_yield_context(&mut batch)?;
         if !batch.is_empty() {
             if let Some(plan) = self
                 .runtimes

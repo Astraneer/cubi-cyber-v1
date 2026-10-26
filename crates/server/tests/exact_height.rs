@@ -205,18 +205,12 @@ fn column_manifest(h: &Harness, tile: &HeightTile) {
             .expect("manifest must reference actually published public geometry");
         assert_eq!(stamp.source, actual.source_version);
         assert_eq!(stamp.view, actual.view_version);
-        assert_eq!(
-            actual.source_version,
-            h.server.world().input_version(
-                stamp.page,
-                ChannelMask::SHAPE | ChannelMask::OPACITY | ChannelMask::FLUID
-            )
-        );
+        assert!(actual.source_version.0 > 0);
         actual.validate().unwrap();
     }
 }
 #[test]
-fn same_source_exact_request_promotes_canonical_height_to_real_eight_page_public_manifest() {
+fn exact_request_binds_public_heads_and_hidden_private_edits_preserve_them() {
     let d = Directory::new();
     let mut h = open(&d);
     let world_before: Vec<_> = (0..8)
@@ -236,19 +230,22 @@ fn same_source_exact_request_promotes_canonical_height_to_real_eight_page_public
     );
     assert_eq!(normal.protected, [0; 32]);
     assert!(h.geometry.is_empty());
-    let source = normal.source;
+    let normal_source = normal.source;
     let submitted = h.server.counters().geometry_published;
     h.send(ClientMessage::RequestExactHeight {
         key: key(),
-        known: Some(source),
+        known: Some(normal_source),
     });
     let exact = h.height();
-    assert_eq!(
-        exact.source, source,
-        "representation changes do not invent a source revision"
+    assert!(
+        exact.source > normal_source,
+        "a new complete public representation has a new public head"
     );
     assert_eq!(exact.heights, normal.heights);
     assert_eq!(exact.error, normal.error);
+    assert_eq!(exact.known, normal.known);
+    assert_eq!(exact.atlas, normal.atlas);
+    assert_eq!(exact.tint, normal.tint);
     column_manifest(&h, &exact);
     assert_eq!(h.server.counters().geometry_published - submitted, 8);
     assert_eq!(
@@ -258,32 +255,99 @@ fn same_source_exact_request_promotes_canonical_height_to_real_eight_page_public
         world_before,
         "exact representation is a read-only derived request"
     );
-    // A later ordinary refresh must retain the chosen exact representation even
-    // when its acknowledged source equals the original height-only source.
+    // A later full refresh retains the chosen exact representation and every
+    // public source/view, independently of the canonical World version.
     h.send(ClientMessage::RequestHeight {
         key: key(),
-        known: Some(source),
+        known: None,
     });
     let sticky = h.height();
-    assert_eq!(sticky.source, source);
+    assert_eq!(sticky.source, exact.source);
     column_manifest(&h, &sticky);
     assert_eq!(
         sticky.replacement, exact.replacement,
         "cached exact geometry keeps its actual source/view"
     );
     assert_eq!(h.geometry.len(), 8);
+
+    let geometry_before = h.geometry.clone();
+    let private_channels = ChannelMask::SHAPE | ChannelMask::OPACITY | ChannelMask::FLUID;
+    let ore = (0..8)
+        .find_map(|y| {
+            let p = page(y);
+            let cells = h.server.world().page(p).unwrap().cells();
+            cells.iter().enumerate().find_map(|(i, cell)| {
+                matches!(
+                    cell.id(),
+                    rules::ids::COAL_ORE
+                        | rules::ids::IRON_ORE
+                        | rules::ids::OSMIUM_ORE
+                        | rules::ids::COPPER_ORE
+                        | rules::ids::TIN_ORE
+                        | rules::ids::GOLD_ORE
+                        | rules::ids::REDSTONE_ORE
+                )
+                .then_some(BlockPos {
+                    space: p.space,
+                    x: p.x * 16 + (i % 16) as i32,
+                    y: p.y * 16 + (i / 256) as i32,
+                    z: p.z * 16 + (i / 16 % 16) as i32,
+                })
+            })
+        })
+        .expect("private canonical fixture contains an ore hidden as host stone");
+    let private_before = h.server.world().input_version(ore.page(), private_channels);
+    let stone = Cell::from_parts(rules::ids::STONE, 0);
+    let mut tx = Transaction::new(Tick(h.server.current_tick().0 + 1), SpaceId(0));
+    tx.set_cell(ore, stone);
+    assert!(h.server.queue_transaction(tx).is_ok());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while h.server.world().read(ore) != world::CellRead::Known(stone)
+        || h.server.awaiting_durability()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "private edit must become durable"
+        );
+        h.step();
+    }
+    assert!(h.server.world().input_version(ore.page(), private_channels) > private_before);
+    h.send(ClientMessage::RequestHeight {
+        key: key(),
+        known: None,
+    });
+    let hidden_edit = h.height();
+    column_manifest(&h, &hidden_edit);
+    assert_eq!(
+        hidden_edit, exact,
+        "private ore identity changes no public height head/body"
+    );
+    assert_eq!(
+        h.geometry, geometry_before,
+        "private ore identity changes no public geometry head/body"
+    );
+
     h.send(ClientMessage::ForgetHeight(key()));
     h.send(ClientMessage::RequestHeight {
         key: key(),
         known: None,
     });
     let released = h.height();
-    assert_eq!(released.source, source);
+    assert!(
+        released.source > exact.source,
+        "a forgotten public lease cannot reuse its identity"
+    );
     assert_eq!(released.replacement, Replacement::None);
+    let mut released_body = released;
+    released_body.source = normal.source;
+    assert_eq!(released_body, normal);
+    let mut canonical_after = world_before;
+    canonical_after[ore.page().y as usize][usize::from(ore.local_index().get())] = stone;
     assert_eq!(
         (0..8)
             .map(|y| h.server.world().page(page(y)).unwrap().cells())
             .collect::<Vec<_>>(),
-        world_before
+        canonical_after,
+        "derived requests preserve the one deliberately committed private edit"
     );
 }

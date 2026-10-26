@@ -132,6 +132,7 @@ fn actual_view_gi(contact_quality: Option<u8>) {
                     page,
                     version: 1,
                     source_version: Version(1),
+                    applied_action: Default::default(),
                     cells,
                 }),
                 Tick(1),

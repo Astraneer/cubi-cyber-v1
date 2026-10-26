@@ -165,6 +165,175 @@ fn accepted(reply: ActionReply) {
 }
 
 #[test]
+fn accepted_raw_aba_and_external_overwrite_retire_by_durable_action_prefix_across_restart() {
+    let directory = Directory::new();
+    let mut h = Harness::new(&directory);
+    let owner = directory.owner();
+    h.join(1, owner.clone());
+    accepted(h.action(1, 1, Action::Command("/gamemode creative".into())));
+    // Default horizontal aim hits the fixture wall at(8,2,11); place on its
+    // front face so the test exercises real authoritative reach/occlusion.
+    let target = pos(8, 2, 10);
+    let page = target.page();
+    let first = h.page(1, page, None);
+    let mut replica = Replica::new(1);
+    replica.apply(first).unwrap();
+    assert_eq!(replica.read(target), ReplicaRead::Known(Cell::AIR));
+    let mut overlay = net::PredictionOverlay::new(8);
+    overlay
+        .predict(ActionId(2), target, cell(rules::ids::STONE))
+        .unwrap();
+    let placed = h.action(
+        1,
+        2,
+        Action::Place {
+            position: target,
+            expected: Cell::AIR,
+            cell: cell(rules::ids::STONE),
+        },
+    );
+    accepted(placed);
+    overlay.predict(ActionId(3), target, Cell::AIR).unwrap();
+    h.send(
+        1,
+        ClientMessage::Inputs(vec![InputFrame {
+            sequence: 1,
+            target_tick: Tick(h.server.current_tick().0 + 1),
+            keys: InputFrame::ATTACK,
+            ..InputFrame::default()
+        }]),
+    );
+    let removed = h.action(
+        1,
+        3,
+        Action::Mine {
+            position: target,
+            expected: cell(rules::ids::STONE),
+            tool: 0,
+        },
+    );
+    accepted(removed);
+    h.send(
+        1,
+        ClientMessage::Inputs(vec![InputFrame {
+            sequence: 2,
+            target_tick: Tick(h.server.current_tick().0 + 1),
+            ..InputFrame::default()
+        }]),
+    );
+    h.outputs
+        .retain(|out| !matches!(out.message, ServerMessage::Page(_)));
+    let truth = h.page(1, page, None);
+    let image = match &truth {
+        PageUpdate::Snapshot(p) => p,
+        _ => panic!("explicit repair requires snapshot"),
+    };
+    assert_eq!(
+        image.cells[usize::from(target.local_index().get())],
+        Cell::AIR
+    );
+    assert!(image.applied_action >= ActionId(3));
+    replica.apply(truth).unwrap();
+    overlay.retire_applied(&replica);
+    assert_eq!(
+        overlay.len(),
+        2,
+        "Raw-before-reply cannot decide unconfirmed action outcomes"
+    );
+    overlay.reply(placed);
+    overlay.reply(removed);
+    overlay.retire_applied(&replica);
+    assert!(
+        overlay.is_empty(),
+        "both accepted ABA edits retire even though the first cell was overwritten"
+    );
+    assert_eq!(
+        overlay.read(target, &replica),
+        ReplicaRead::Known(Cell::AIR)
+    );
+
+    for _ in 0..25 {
+        h.advance();
+    }
+    overlay
+        .predict(ActionId(4), target, cell(rules::ids::STONE))
+        .unwrap();
+    let placed_again = h.action(
+        1,
+        4,
+        Action::Place {
+            position: target,
+            expected: Cell::AIR,
+            cell: cell(rules::ids::STONE),
+        },
+    );
+    accepted(placed_again);
+    overlay.reply(placed_again);
+    let mut external = Transaction::new(h.server.current_tick(), SpaceId(0));
+    external.set_cell(target, Cell::AIR);
+    assert!(h.server.queue_transaction(external).is_ok());
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while h.server.world().read(target) != CellRead::Known(Cell::AIR)
+        || h.server.awaiting_durability()
+    {
+        assert!(std::time::Instant::now() < deadline);
+        h.advance();
+    }
+    h.outputs
+        .retain(|out| !matches!(out.message, ServerMessage::Page(_)));
+    replica.apply(h.page(1, page, None)).unwrap();
+    overlay.retire_applied(&replica);
+    assert!(
+        overlay.is_empty(),
+        "an external overwrite is authoritative too"
+    );
+    assert_eq!(
+        overlay.read(target, &replica),
+        ReplicaRead::Known(Cell::AIR)
+    );
+    drop(h);
+
+    let mut h = Harness {
+        server: Server::open(directory.config()).unwrap(),
+        now: 0,
+        outputs: Vec::new(),
+    };
+    let welcome = h.join(3, owner);
+    assert_eq!(welcome.next_action, ActionId(5));
+    let PageUpdate::Snapshot(reconnected) = h.page(3, page, None) else {
+        panic!("new session snapshot")
+    };
+    assert_eq!(reconnected.version, 1);
+    assert!(reconnected.applied_action >= ActionId(4));
+    let mut replica = Replica::new(1);
+    replica.apply(PageUpdate::Snapshot(reconnected)).unwrap();
+    let mut overlay = net::PredictionOverlay::new(8);
+    overlay
+        .predict(ActionId(4), target, cell(rules::ids::STONE))
+        .unwrap();
+    let replayed = h.action(
+        3,
+        4,
+        Action::Place {
+            position: target,
+            expected: Cell::AIR,
+            cell: cell(rules::ids::STONE),
+        },
+    );
+    assert_eq!(
+        replayed, placed_again,
+        "saved Action v1 records remain valid and replay exactly once"
+    );
+    assert_eq!(h.server.world().read(target), CellRead::Known(Cell::AIR));
+    overlay.reply(replayed);
+    overlay.retire_applied(&replica);
+    assert!(
+        overlay.is_empty(),
+        "new public revision1 still carries the durable own prefix"
+    );
+}
+
+#[test]
 fn sealed_ore_reveal_confirmed_delta_duplicate_exact_once_and_restart() {
     let directory = Directory::new();
     let mut h = Harness::new(&directory);

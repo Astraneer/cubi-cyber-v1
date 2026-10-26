@@ -109,6 +109,12 @@ fn fixture() -> World {
     )
     .create_page(far(), arch)
     .create_page(unknown(), sentinel);
+    // This fixture tests an exposed public arch. Give its AIR a certified
+    // actual path to the outdoor baseline; Unknown above an isolated below-
+    // ground page must not certify an exterior opening under the sealing policy.
+    for y in 2..8 {
+        tx.create_page(PageId { y, ..far() }, vec![Cell::AIR; 4096]);
+    }
     world.commit(tx).unwrap();
     world
 }
@@ -406,6 +412,21 @@ fn selected_far_geometry_stays_public_and_converges_with_loss_and_stale_workers(
                 );
             }
             force_started = runtime.server().counters().geometry_submitted;
+            // A forced wire reply may reuse an already certified body without
+            // a worker. Change one private ore to its public host stone to
+            // capture a new immutable input while keeping the public arch open.
+            let mut transaction =
+                Transaction::new(Tick(runtime.server().current_tick().0 + 1), SpaceId(0));
+            transaction.set_cell(
+                BlockPos {
+                    x: far().x * 16,
+                    y: 1,
+                    z: far().z * 16 + 1,
+                    space: far().space,
+                },
+                Cell::from_parts(rules::ids::STONE, 0),
+            );
+            assert!(runtime.server_mut().queue_transaction(transaction).is_ok());
             phase = 2;
         }
         if phase == 2

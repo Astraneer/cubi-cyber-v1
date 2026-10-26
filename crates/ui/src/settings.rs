@@ -46,8 +46,10 @@ pub enum Setting {
     Hints,
     Animations,
     ViewTime,
+    ExposureMode,
+    SkyStyle,
 }
-pub const COUNT: usize = 30;
+pub const COUNT: usize = 32;
 const LEGACY_COUNT: usize = 29;
 #[derive(Clone, Copy)]
 pub enum Domain {
@@ -113,7 +115,7 @@ pub const SCHEMA: [Definition; COUNT] = [
     choice!(
         Near,
         Graphics,
-        "Подробные блоки",
+        "Ближняя область, минимум блоков",
         &[4, 8, 12, 16, 24, 32, 48, 64],
         32,
         64
@@ -126,7 +128,7 @@ pub const SCHEMA: [Definition; COUNT] = [
         32,
         4
     ),
-    choice!(Msaa, Graphics, "Сглаживание MSAA", &[1, 4], 4, 4),
+    choice!(Msaa, Graphics, "Сглаживание MSAA/SMAA", &[1, 4], 4, 4),
     choice!(Shadows, Graphics, "Тени", &[0, 1], 1, 1),
     choice!(
         ShadowResolution,
@@ -190,6 +192,8 @@ pub const SCHEMA: [Definition; COUNT] = [
         0,
         0
     ),
+    choice!(ExposureMode, Graphics, "Режим экспозиции", &[0, 1], 0, 0),
+    choice!(SkyStyle, Graphics, "Стиль неба", &[0, 1, 2], 0, 0),
 ];
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -263,7 +267,7 @@ impl Settings {
             return Err("unsupported settings format");
         }
         let stored = u16::from_le_bytes([bytes[5], bytes[6]]) as usize;
-        if ![LEGACY_COUNT, COUNT].contains(&stored) || bytes.len() != 7 + stored * 4 {
+        if ![LEGACY_COUNT, 30, COUNT].contains(&stored) || bytes.len() != 7 + stored * 4 {
             return Err("unsupported settings format");
         }
         let preset = match bytes[4] {

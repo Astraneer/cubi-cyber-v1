@@ -112,6 +112,7 @@ fn public_actor_light_is_dark_between_cell_view_invalidation_and_confirmed_rebin
             page: point.page(),
             version: view,
             source_version: core_types::Version(10),
+            applied_action: Default::default(),
             cells: Box::new([Cell::AIR; 4096]),
         })
     };

@@ -1,6 +1,7 @@
 //! Derived LIGHT shares the canonical WAL group and its publication barrier.
 use super::*;
 use crate::lighting::{LightingPhase, ServerLighting, ServerLightingConfig};
+mod durable;
 
 pub(super) struct LightOwner {
     engine: ServerLighting,
@@ -11,13 +12,15 @@ pub(super) struct LightOwner {
     sourced: BTreeSet<(i32, i32)>,
     source_pending: VecDeque<(i32, i32)>,
     sections_revision: u64,
+    sections_stamp: [u8; 32],
+    durable_ops: Vec<u8>,
 }
 impl LightOwner {
     pub(super) fn attach(
         world: &mut World,
         budget: world::lighting::LightBudget,
     ) -> Result<Self, ServerError> {
-        let engine = ServerLighting::attach(
+        let engine = ServerLighting::attach_durable(
             world,
             ServerLightingConfig {
                 max_bootstrap_pages: 65_536,
@@ -42,6 +45,8 @@ impl LightOwner {
             sourced: BTreeSet::new(),
             source_pending: VecDeque::new(),
             sections_revision: 0,
+            sections_stamp: [0; 32],
+            durable_ops: Vec::new(),
         })
     }
     pub(super) fn acknowledge(&mut self, world: &mut World) -> Result<(), ServerError> {
@@ -59,18 +64,39 @@ impl Server {
             return;
         }
         if self.lighting.sections_revision != self.runtimes.sections_revision() {
+            self.lighting.sections_revision = self.runtimes.sections_revision();
             let columns: BTreeSet<_> = self
                 .runtimes
                 .active_sections()
                 .filter(|p| p.space == SpaceId(0))
                 .map(|p| (p.x, p.z))
                 .collect();
-            self.lighting.sourced.retain(|c| columns.contains(c));
-            self.lighting.source_pending = columns
-                .into_iter()
-                .filter(|c| !self.lighting.sourced.contains(c))
-                .collect();
-            self.lighting.sections_revision = self.runtimes.sections_revision();
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"cubi lighting active columns v1");
+            for (x, z) in &columns {
+                hash.update(&x.to_le_bytes());
+                hash.update(&z.to_le_bytes());
+            }
+            let stamp = *hash.finalize().as_bytes();
+            if self.lighting.sections_stamp != stamp {
+                let removed: Vec<_> = self
+                    .lighting
+                    .sourced
+                    .iter()
+                    .filter(|c| !columns.contains(c))
+                    .copied()
+                    .collect();
+                for column in removed {
+                    self.lighting.sourced.remove(&column);
+                    self.lighting.record_column(5, column);
+                }
+                self.lighting.source_pending = columns
+                    .into_iter()
+                    .filter(|c| !self.lighting.sourced.contains(c))
+                    .collect();
+                self.lighting.sections_stamp = stamp;
+                self.lighting.record_sources();
+            }
         }
         let Some((x, z)) = self.lighting.source_pending.front().copied() else {
             return;
@@ -99,10 +125,12 @@ impl Server {
         if queued {
             self.lighting.source_pending.pop_front();
             self.lighting.sourced.insert((x, z));
+            self.lighting.record_column(6, (x, z));
             self.counters.light_profile_columns += 1;
         }
     }
     pub(super) fn tick_lighting(&mut self, batch: &mut Batch) -> Result<(), ServerError> {
+        self.lighting.observe_changes(&self.world, &batch.changes)?;
         self.source_light_profile();
         let plan = self
             .runtimes
@@ -117,40 +145,32 @@ impl Server {
                     .map_err(|_| ServerError::Invalid("height delta bounds"))?,
             });
         }
-        for change in batch.changes.iter().flat_map(|c| &c.pages) {
-            let key = (change.page.space, change.page.x, change.page.z);
-            if change.created {
-                self.lighting
-                    .columns
-                    .entry(key)
-                    .or_default()
-                    .insert(change.page);
-            }
-            if change.removed {
-                if let Some(pages) = self.lighting.columns.get_mut(&key) {
-                    pages.remove(&change.page);
-                    if pages.is_empty() {
-                        self.lighting.columns.remove(&key);
-                    }
-                }
-                self.lighting.sky_pending.remove(&change.page);
-            }
-        }
         let ready = self.height_ready();
         if ready && !self.lighting.sky_ready {
-            self.lighting.sky_pending.extend(
-                self.lighting
-                    .columns
-                    .values()
-                    .flat_map(|p| p.iter().copied()),
-            );
+            let pages: Vec<_> = self
+                .lighting
+                .columns
+                .values()
+                .flat_map(|p| p.iter().copied())
+                .collect();
+            for page in pages {
+                self.lighting.queue_sky(page);
+            }
         }
-        self.lighting.sky_ready = ready;
+        if self.lighting.sky_ready != ready {
+            self.lighting.sky_ready = ready;
+            self.lighting
+                .durable_ops
+                .extend_from_slice(&[1, u8::from(ready)]);
+        }
         if let Some(plan) = &plan {
             for edit in plan.edits().iter().filter(|e| e.position.y > 127) {
                 let page = edit.position.page();
                 if let Some(pages) = self.lighting.columns.get(&(page.space, page.x, page.z)) {
-                    self.lighting.sky_pending.extend(pages.iter().copied());
+                    let pages: Vec<_> = pages.iter().copied().collect();
+                    for page in pages {
+                        self.lighting.queue_sky(page);
+                    }
                 }
             }
         }
@@ -162,6 +182,7 @@ impl Server {
                 break;
             }
             self.lighting.sky_pending.remove(&page);
+            self.lighting.record_page(3, page);
         }
         // The immutable certificate overlays this not-yet-durable batch, so a
         // newly placed roof darkens the SAME group; missing migration stays dark.

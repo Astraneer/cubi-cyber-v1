@@ -1,6 +1,7 @@
 //! Incremental natural population owner: one immutable bounded worker and one
 //! global private RNG continuation; completed populations share the mob WAL.
 use super::*;
+use crate::machine_owner::actors::ActorRef;
 use jobs::{Finish, JobId, JobSpec, Priority, Scheduler, Take, WorkBudget, WorkCost};
 use mob_spawn::{Kind, Status};
 use natural::Column;
@@ -146,11 +147,11 @@ fn current(world: &World, page: PageId) -> Option<Version> {
         .page(page)
         .map(|_| world.input_version(page, mob_spawn::CHANNELS))
 }
-fn players_stamp(peers: &BTreeMap<u64, Peer>) -> [u8; 32] {
+fn players_stamp<'a>(actors: impl IntoIterator<Item = ActorRef<'a>>) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
-    for peer in peers
-        .values()
-        .filter(|p| p.ready && p.health.alive() && p.player.mode != GameMode::Spectator)
+    for peer in actors
+        .into_iter()
+        .filter(|p| p.health.alive() && p.player.mode != GameMode::Spectator)
     {
         hash.update(&peer.identity.0);
         hash.update(&peer.space.0.to_le_bytes());
@@ -192,9 +193,8 @@ impl Server {
         let mut centers = [None; 32];
         let mut count = 0;
         for peer in self
-            .peers
-            .values()
-            .filter(|p| p.ready && p.health.alive() && p.player.mode != GameMode::Spectator)
+            .tick_actor_refs()
+            .filter(|p| p.health.alive() && p.player.mode != GameMode::Spectator)
         {
             centers[count] = Some((
                 peer.space,
@@ -364,9 +364,8 @@ impl Server {
             day: self.tick.0 % 24000,
         };
         let players = self
-            .peers
-            .values()
-            .filter(|p| p.ready && p.health.alive() && p.player.mode != GameMode::Spectator)
+            .tick_actor_refs()
+            .filter(|p| p.health.alive() && p.player.mode != GameMode::Spectator)
             .map(|p| mob_spawn::Player {
                 space: p.space,
                 position: p.player.pos,
@@ -411,7 +410,7 @@ impl Server {
             Context {
                 column,
                 kind,
-                players: players_stamp(&self.peers),
+                players: players_stamp(self.tick_actor_refs()),
                 tick: self.tick,
             },
         ));
@@ -456,7 +455,7 @@ impl Server {
         } else {
             available
         };
-        let current_players = players_stamp(&self.peers);
+        let current_players = players_stamp(self.tick_actor_refs());
         if plan.kind != context.kind
             || plan.column != [context.column.x, context.column.z]
             || plan.space != context.column.space

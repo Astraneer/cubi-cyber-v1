@@ -332,7 +332,7 @@ impl Runtime {
                 {
                     self.counters.received_actions_123[index] += 1;
                 }
-                let outgoing = self.server.handle(connection, message, now_ms);
+                let outgoing = self.server.enqueue(connection, message, now_ms);
                 self.dispatch(outgoing, now_ms);
             }
             Err(_) => {
@@ -346,12 +346,8 @@ impl Runtime {
         // One extra byte detects and rejects truncated/oversize datagrams.
         let mut buffer = [0; MAX_DATAGRAM + 1];
         for _ in 0..RECEIVE_BUDGET {
-            // One UDP datagram completes at most one application frame. Do not
-            // acknowledge it until a canonical inbox slot can retain that frame.
-            if self.server.inbox_capacity() == 0 {
-                self.counters.ingress_backpressure += 1;
-                break;
-            }
+            // Frame pressure must not block authenticated channel ACKs.
+            let admit = self.server.inbox_capacity() > 0;
             let (length, address) = match self.udp_socket.recv_from(&mut buffer) {
                 Ok(received) => received,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -365,6 +361,10 @@ impl Runtime {
             }
             let bytes = &buffer[..length];
             if bytes.starts_with(b"CUBI") {
+                if !admit {
+                    self.counters.ingress_backpressure += 1;
+                    continue;
+                }
                 // Only Hello is permitted before authenticated establishment.
                 let Ok(ClientMessage::Hello(hello)) = net::decode_client(bytes) else {
                     self.counters.rejected_packets += 1;
@@ -399,7 +399,7 @@ impl Runtime {
                 self.counters.received_frames += 1;
                 let outgoing = self
                     .server
-                    .handle(connection, ClientMessage::Hello(hello), now_ms);
+                    .enqueue(connection, ClientMessage::Hello(hello), now_ms);
                 self.dispatch(outgoing, now_ms);
                 continue;
             }
@@ -414,7 +414,12 @@ impl Runtime {
                 self.counters.rejected_packets += 1;
                 continue;
             };
-            match channel.receive(bytes, now_ms) {
+            let received = if admit {
+                channel.receive(bytes, now_ms)
+            } else {
+                channel.receive_control(bytes, now_ms)
+            };
+            match received {
                 Ok(received) => {
                     peer.last_seen = now_ms;
                     // ACKs are sent even for retransmitted/deduplicated messages.
@@ -426,6 +431,7 @@ impl Runtime {
                         self.receive_frame(connection, &frame, now_ms);
                     }
                 }
+                Err(UdpError::Capacity) if !admit => self.counters.ingress_backpressure += 1,
                 Err(_) => self.counters.rejected_packets += 1,
             }
         }
@@ -1203,6 +1209,211 @@ mod tests {
             "transport retained each message before admission"
         );
         assert!(runtime.server.counters.inbox_high_water <= crate::MAX_INBOX);
+    }
+
+    #[test]
+    fn actual_udp_burst_only_advances_one_machine_portion_per_poll() {
+        use core_types::{BlockPos, Cell, ChannelMask, ComponentId, PageId, SpaceId, Tick};
+        use rules::{blocks::MekKind, ids::ENERGY_CUBE, machines::Machine};
+        use std::{collections::BTreeSet, net::UdpSocket, path::PathBuf, time::Duration};
+        use world::{Transaction, World};
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = Directory(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.local/tmp")
+                .join(format!("udp-one-portion-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(&directory.0).unwrap();
+        let mut world = World::new(rules::properties, 4096);
+        let mut tx = Transaction::new(Tick(1), SpaceId(0));
+        let mut pages = BTreeSet::new();
+        for z in 0..4 {
+            for x in 0..4 {
+                let page = PageId {
+                    space: SpaceId(0),
+                    x,
+                    y: 0,
+                    z,
+                };
+                pages.insert(page);
+                tx.create_page(page, vec![Cell::AIR; 4096]);
+            }
+        }
+        for i in 0..4097 {
+            let p = BlockPos {
+                space: SpaceId(0),
+                x: i % 64,
+                y: 5 + i / 4096,
+                z: i / 64 % 64,
+            };
+            tx.set_cell(p, Cell::from_parts(ENERGY_CUBE, 0));
+            tx.set_component(
+                ComponentId(i as u64 + 1),
+                crate::machines::machine_component(p, &Machine::new(MekKind::Cube)),
+                ChannelMask::CONTENTS,
+            );
+        }
+        world.commit(tx).unwrap();
+        let mut core =
+            crate::machines::MachineRuntime::new(crate::machines::Config::default()).unwrap();
+        let delta = core
+            .extend_registration(
+                core.noop_delta().unwrap(),
+                &world,
+                (1..=4097).map(ComponentId),
+                Tick(0),
+            )
+            .unwrap();
+        core.acknowledge(delta).unwrap();
+        let mut initial = core
+            .plan_tick(&world, Tick(1), crate::machines::Budget::default())
+            .unwrap();
+        assert!(!initial.owner_complete());
+        assert!(initial.transactions.is_empty());
+        initial.capture_activity(&pages).unwrap();
+        initial.capture_observers(&BTreeSet::new()).unwrap();
+        core.acknowledge(initial.delta).unwrap();
+        let mut config = crate::ServerConfig::new(&directory.0);
+        config.generation_enabled = false;
+        let mut server = crate::Server::open_with_world(config, world).unwrap();
+        server.runtimes.machines = core;
+        // Trusted domain fixture retains a real persisted core cohort. The
+        // transport-only session does not create a gameplay Player or Peer.
+        let local = "127.0.0.1:0".parse().unwrap();
+        let mut runtime = super::Runtime::bind(server, local, local).unwrap();
+        let socket = UdpSocket::bind(local).unwrap();
+        let address = socket.local_addr().unwrap();
+        let destination = runtime.udp_address().unwrap();
+        let key = SecretToken::new([31; 32]);
+        let mut client = Channel::new(321, key, Side::Client, Limits::default());
+        runtime.udp_addresses.insert(address, 1);
+        runtime.udp.insert(
+            1,
+            UdpPeer {
+                address,
+                channel: Some(Channel::new(321, key, Side::Server, Limits::default())),
+                session: Some(321),
+                outgoing: VecDeque::new(),
+                frames: VecDeque::new(),
+                queued_frame_bytes: 0,
+                last_seen: 0,
+            },
+        );
+        let before = runtime.server.counters();
+        for nonce in 0..32 {
+            let bytes = net::encode_client(&net::ClientMessage::Ping(nonce)).unwrap();
+            // Unreliable ingress avoids sender-credit artifacts; actual UDP,
+            // authentication and the same Frame admission code are exercised.
+            for packet in client.send(bytes, false, nonce).unwrap() {
+                socket.send_to(&packet, destination).unwrap();
+            }
+            runtime.receive_udp(nonce).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(runtime.counters.received_frames, 32);
+        assert_eq!(
+            runtime.server.counters.machine_prepared, before.machine_prepared,
+            "ingress must not execute even with a fast writer"
+        );
+        assert_eq!(runtime.server.counters.machine_steps, before.machine_steps);
+        runtime.poll(32).unwrap();
+        let after = runtime.server.counters();
+        assert_eq!(after.machine_prepared - before.machine_prepared, 2048);
+        assert!(after.machine_steps - before.machine_steps <= 2048);
+        assert_eq!(runtime.server.current_tick(), Tick(1));
+        assert!(runtime.server.runtimes.machines.owner_pending());
+        assert_eq!(runtime.counters.queue_overflows, 0);
+    }
+
+    #[test]
+    fn actual_udp_ack_is_serviced_while_canonical_inbox_has_no_slot() {
+        use std::{
+            net::UdpSocket,
+            path::PathBuf,
+            time::{Duration, Instant},
+        };
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = Directory(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.local/tmp")
+                .join(format!("udp-inbox-control-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(&directory.0).unwrap();
+        let mut config = crate::ServerConfig::new(&directory.0);
+        config.generation_enabled = false;
+        let server = crate::Server::open(config).unwrap();
+        let local = "127.0.0.1:0".parse().unwrap();
+        let mut runtime = super::Runtime::bind(server, local, local).unwrap();
+        let socket = UdpSocket::bind(local).unwrap();
+        let address = socket.local_addr().unwrap();
+        let key = SecretToken::new([29; 32]);
+        let mut channel = Channel::new(123, key, Side::Server, Limits::default());
+        let payload = vec![8; 101_819];
+        let packets = channel.send(payload.clone(), true, 0).unwrap();
+        let mut receiver = Channel::new(123, key, Side::Client, Limits::default());
+        let mut replies = Vec::new();
+        for packet in packets {
+            replies.extend(receiver.receive(&packet, 0).unwrap().replies);
+        }
+        assert_eq!(replies.len(), 1);
+        // A transport-only established channel; no ready gameplay Peer is
+        // fabricated or used by the ACK processing path.
+        runtime.udp_addresses.insert(address, 1);
+        runtime.udp.insert(
+            1,
+            UdpPeer {
+                address,
+                channel: Some(channel),
+                session: Some(123),
+                outgoing: VecDeque::new(),
+                frames: VecDeque::new(),
+                queued_frame_bytes: 0,
+                last_seen: 0,
+            },
+        );
+        for n in 0..crate::MAX_INBOX {
+            runtime
+                .server
+                .inbox
+                .push_back((1, net::ClientMessage::Ping(n as u64), 0));
+        }
+        let destination = runtime.udp_address().unwrap();
+        socket.send_to(&replies[0], destination).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        while runtime.udp[&1].channel.as_ref().unwrap().pending_messages() > 0 {
+            runtime.receive_udp(1).unwrap();
+            assert!(
+                Instant::now() < until,
+                "transport ACK blocked by application inbox"
+            );
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        assert_eq!(runtime.server.inbox.len(), crate::MAX_INBOX);
+        assert_eq!(runtime.counters.received_datagrams, 1);
+        assert_eq!(runtime.counters.received_frames, 0);
+        assert!(
+            runtime
+                .udp
+                .get_mut(&1)
+                .unwrap()
+                .channel
+                .as_mut()
+                .unwrap()
+                .tick(3000)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(runtime.counters.queue_overflows, 0);
     }
 
     #[test]

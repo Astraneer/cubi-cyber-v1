@@ -26,6 +26,7 @@ fn cells(view: u64) -> PageUpdate {
         page: page(),
         version: view,
         source_version: Version(100),
+        applied_action: Default::default(),
         cells: Box::new([Cell::from_parts(rules::ids::HEAT_GENERATOR, 0); 4096]),
     })
 }
@@ -150,6 +151,7 @@ fn confirmed_cube_machine_activity_is_audible_independent_of_its_geometry_owner(
             page: page(),
             version: 11,
             source_version: Version(200),
+            applied_action: Default::default(),
             cells: Box::new([Cell::from_parts(item, 0); 4096]),
         });
         scene.import_authoritative_page(&update, Tick(1)).unwrap();

@@ -12,6 +12,7 @@ const MAX_DROP_SOURCES: usize = 16_384;
 pub(super) struct Runtimes {
     pub(super) survival: survival::SurvivalRuntime,
     pub(super) mobs: entities::MobRuntime,
+    pub(super) mob_progress: Option<natural_records::Progress>,
     pub(super) natural: natural::State,
     pub(super) hostile_mobs: usize,
     pub(super) items: ItemRuntime,
@@ -36,6 +37,16 @@ pub(super) struct Runtimes {
     sections_revision: u64,
 }
 impl Runtimes {
+    pub(super) fn install_frozen_sections(&mut self, pages: &BTreeSet<PageId>) {
+        if self.active_sections != *pages {
+            self.active_sections.clone_from(pages);
+        }
+        if self.machine_activity != *pages {
+            self.machine_activity.clone_from(pages);
+        }
+        self.machine_activity_initialized = true;
+        self.machine_activity_revision = self.sections_revision;
+    }
     pub(super) fn new(entropy: &[u8; 32], public_seed: u32) -> Result<Self, ServerError> {
         let key = |domain: &str| {
             let hash = blake3::derive_key(domain, entropy);
@@ -53,6 +64,7 @@ impl Runtimes {
             })
             .map_err(|_| ServerError::Invalid("mob runtime initialization"))?,
             hostile_mobs: 0,
+            mob_progress: None,
             natural: natural::State::new(
                 u64::from(public_seed),
                 key("cubi natural spawning rng v1").max(1),
@@ -96,8 +108,11 @@ impl Runtimes {
                     .map_err(|_| ServerError::Invalid("survival snapshot state"))?
                 }
                 RUNTIME_MOBS => {
+                    let (inner, progress) =
+                        natural_records::progress(&record.payload).map_err(ServerError::Invalid)?;
                     let (snapshot, natural) =
-                        natural_records::restore(&record.payload).map_err(ServerError::Invalid)?;
+                        natural_records::restore(inner).map_err(ServerError::Invalid)?;
+                    self.mob_progress = progress;
                     let mobs = entities::MobRuntime::restore(
                         entities::Config {
                             maximum_entities: MAX_MOBS,
@@ -162,6 +177,8 @@ impl Runtimes {
                     self.chat =
                         chat::Ledger::restore(&record.payload).map_err(ServerError::Invalid)?
                 }
+                // LightOwner restores/replays its own state alongside World.
+                save::RUNTIME_LIGHT => {}
                 _ => {
                     return Err(ServerError::Invalid(
                         "runtime kind has no authoritative owner",
@@ -182,8 +199,21 @@ impl Runtimes {
                     )
                     .map_err(|_| ServerError::Invalid("survival delta state"))?,
                 RUNTIME_MOBS => {
-                    let (mobs, natural) = natural_records::decode_delta(&record.payload)
-                        .map_err(ServerError::Invalid)?;
+                    let (inner, progress) =
+                        natural_records::progress(&record.payload).map_err(ServerError::Invalid)?;
+                    let (mobs, natural) = if inner.is_empty() && progress.is_some() {
+                        (None, None)
+                    } else {
+                        natural_records::decode_delta(inner).map_err(ServerError::Invalid)?
+                    };
+                    if let Some(progress) = progress
+                        && self.mob_progress.is_some_and(|p| {
+                            p.tick > progress.tick
+                                || (p.tick == progress.tick && p.remaining < progress.remaining)
+                        })
+                    {
+                        return Err(ServerError::Invalid("mob owner progress regressed"));
+                    }
                     if let Some(ref mobs) = mobs {
                         self.mobs
                             .validate_owner_delta(mobs)
@@ -220,6 +250,9 @@ impl Runtimes {
                         self.natural
                             .apply(natural)
                             .map_err(|_| ServerError::Invalid("natural delta state"))?;
+                    }
+                    if let Some(progress) = progress {
+                        self.mob_progress = Some(progress);
                     }
                 }
                 RUNTIME_ITEMS => self
@@ -276,6 +309,9 @@ impl Runtimes {
                     .chat
                     .apply(&chat::decode_delta(&record.payload).map_err(ServerError::Invalid)?)
                     .map_err(ServerError::Invalid)?,
+                // The live foreground already owns these mutations; replay is
+                // only for Server::open, never a second application after fsync.
+                save::RUNTIME_LIGHT => {}
                 _ => {
                     return Err(ServerError::Invalid(
                         "runtime delta has no authoritative owner",
@@ -293,8 +329,12 @@ impl Runtimes {
             },
             RuntimeRecord {
                 kind: RUNTIME_MOBS,
-                payload: natural_records::snapshot(&self.mobs, &self.natural)
-                    .map_err(ServerError::Invalid)?,
+                payload: natural_records::with_progress(
+                    natural_records::snapshot(&self.mobs, &self.natural)
+                        .map_err(ServerError::Invalid)?,
+                    self.mob_progress,
+                )
+                .map_err(ServerError::Invalid)?,
             },
             RuntimeRecord {
                 kind: RUNTIME_ITEMS,
@@ -480,7 +520,7 @@ impl Server {
             };
         let mut identities = BTreeMap::new();
         let mut players = Vec::new();
-        for peer in self.peers.values().filter(|p| p.ready) {
+        for peer in self.tick_actor_refs() {
             let id = player_entity(peer.identity);
             if identities.insert(id, peer.identity).is_some() {
                 return Err(ServerError::Invalid("player entity identity collision"));
@@ -491,7 +531,7 @@ impl Server {
                 position: peer.player.pos,
                 crouching: peer.player.crouch,
                 alive: peer.player.health > 0.0,
-                inventory: peer.inventory,
+                inventory: *peer.inventory,
             });
         }
         let plan = self
@@ -513,11 +553,9 @@ impl Server {
                 .get(&patch.player)
                 .ok_or(ServerError::Invalid("item pickup identity"))?;
             let peer = self
-                .peers
-                .values()
-                .find(|p| p.identity == *identity)
-                .ok_or(ServerError::Invalid("item pickup peer"))?;
-            if peer.inventory != patch.before {
+                .tick_actor_ref(*identity)
+                .ok_or(ServerError::Invalid("item pickup actor"))?;
+            if *peer.inventory != patch.before {
                 return Err(ServerError::Invalid("item pickup inventory changed"));
             }
         }
@@ -531,23 +569,14 @@ impl Server {
             .map_err(|_| ServerError::Invalid("item physics delta bounds"))?;
         for patch in plan.inventories {
             let identity = identities[&patch.player];
-            let peer = self
-                .peers
-                .values_mut()
-                .find(|p| p.identity == identity)
-                .expect("validated peer");
-            peer.inventory = patch.after;
-            let saved = capture_peer(peer).map_err(ServerError::Invalid)?;
-            self.saved_players.insert(identity, saved.clone());
-            if let Some(existing) = batch
-                .players
-                .iter_mut()
-                .find(|p| p.state.identity == identity)
-            {
-                *existing = saved
-            } else {
-                batch.players.push(saved)
-            }
+            let saved = {
+                let actor = self
+                    .tick_actor_mut(identity)
+                    .ok_or(ServerError::Invalid("item pickup actor changed"))?;
+                *actor.inventory = patch.after;
+                actor.capture()?
+            };
+            self.record_tick_actor(saved, batch);
         }
         self.counters.item_steps += plan.work.entities;
         self.counters.item_pickups += plan.work.picked_items;
@@ -565,19 +594,12 @@ impl Server {
 }
 
 pub(super) fn capture_peer(peer: &Peer) -> Result<SavedPlayer, &'static str> {
-    let mut saved = actor::capture_living(
-        peer.identity,
-        peer.space,
-        peer.input_sequence,
-        &peer.player,
-        &peer.health,
-        &peer.combat,
-    )?;
-    saved.place_ready_at = peer.place_ready_at;
-    saved.break_ready_at = peer.break_ready_at;
-    saved.inventory = peer.inventory.encode().to_vec();
-    saved.window = peer.window.encode();
-    Ok(saved)
+    machine_owner::actors::ActorRef::from(peer)
+        .capture()
+        .map_err(|error| match error {
+            ServerError::Invalid(reason) => reason,
+            _ => "captured player state",
+        })
 }
 fn damage(
     peer: &mut Peer,
@@ -748,6 +770,12 @@ impl Server {
 
 impl Server {
     fn refresh_active_sections(&mut self) -> Result<(), ServerError> {
+        if let Some(context) = self.tick_context.as_ref().filter(|c| c.tick == self.tick) {
+            if self.runtimes.active_sections != context.pages {
+                self.runtimes.active_sections.clone_from(&context.pages);
+            }
+            return Ok(());
+        }
         fn center(peer: &Peer) -> PageId {
             BlockPos {
                 space: peer.space,
@@ -1023,6 +1051,18 @@ impl Server {
             spawn_admission.map_err(|_| ServerError::Invalid("machine spawn identity/row"))?;
             payload_admission.map_err(|_| ServerError::Invalid("machine payload admission"))?
         };
+        if !continuing && !plan.owner_complete() {
+            plan.capture_activity(&self.runtimes.active_sections)
+                .map_err(|_| ServerError::Invalid("captured machine activity bound"))?;
+            let observers = self
+                .peers
+                .values()
+                .filter(|p| p.ready)
+                .map(|p| p.identity)
+                .collect();
+            plan.capture_observers(&observers)
+                .map_err(|_| ServerError::Invalid("captured machine actors bound"))?;
+        }
         self.runtimes
             .machines
             .validate(&self.world, &plan)
@@ -1054,6 +1094,7 @@ impl Server {
         self.counters.machine_unknown += plan.work.unknown;
         self.counters.machine_deferred += plan.work.deferred;
         self.counters.machine_copy_bytes += plan.work.bytes;
+        self.counters.machine_payload_deferred += plan.work.payload_deferred;
         self.counters.machine_steps += plan.work.machines;
         self.counters.machine_reads += plan.work.reads;
         self.counters.machine_transfers += plan.work.transfers;

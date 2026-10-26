@@ -22,6 +22,7 @@ fn raw(view: u64) -> PageUpdate {
         page: page(),
         version: view,
         source_version: Version(view),
+        applied_action: Default::default(),
         cells: Box::new([Cell::AIR; 4096]),
     })
 }

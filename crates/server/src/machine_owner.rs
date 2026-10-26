@@ -1,6 +1,8 @@
 //! Bounded durable machine continuation before the late simulation phases.
 //! Core Machines -> Resources -> Transit barrier/cursors belong to kind4.
 use super::*;
+pub(super) mod actors;
+pub(super) mod context;
 mod wakes;
 
 pub(super) struct MachineTick {
@@ -39,7 +41,7 @@ impl Server {
     ) -> Result<(), ServerError> {
         if step.complete {
             // Closing kind4 and all late-phase effects become durable together.
-            self.late_tick_phases(batch, step.spawns)
+            self.late_tick_phases(batch, step.spawns)?;
         } else {
             // Transit may spill an item before the portion budget is exhausted.
             // Persist the birth with packet retirement, without stepping physics
@@ -59,8 +61,10 @@ impl Server {
                         .map_err(|_| ServerError::Invalid("partial machine height codec"))?,
                 });
             }
-            Ok(())
         }
+        self.capture_yield_context(batch)?;
+        // Seed/frontier progress is durable even when no LIGHT cell changed.
+        self.prepare_light_batch(batch)
     }
     fn late_tick_phases(
         &mut self,

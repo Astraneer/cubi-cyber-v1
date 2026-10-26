@@ -220,14 +220,33 @@ impl Replica {
 pub fn encode(update: &Update) -> Result<Vec<u8>, Error> {
     update.validate()?;
     let header = update.header();
+    let uniform = match update {
+        Update::Snapshot(snapshot)
+            if snapshot
+                .values
+                .iter()
+                .all(|value| *value == snapshot.values[0]) =>
+        {
+            Some(snapshot.values[0])
+        }
+        _ => None,
+    };
     let mut out = Vec::new();
     out.extend_from_slice(b"LGT1");
-    out.push(u8::from(matches!(update, Update::Delta(_))));
+    out.push(match (update, uniform) {
+        (Update::Snapshot(_), Some(_)) => 2,
+        (Update::Snapshot(_), None) => 0,
+        (Update::Delta(_), _) => 1,
+    });
     write_header(&mut out, header);
     match update {
         Update::Snapshot(s) => {
-            for value in s.values.iter() {
+            if let Some(value) = uniform {
                 out.extend_from_slice(&value.to_le_bytes());
+            } else {
+                for value in s.values.iter() {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
             }
         }
         Update::Delta(d) => {
@@ -276,6 +295,15 @@ pub fn decode(bytes: &[u8]) -> Result<Update, Error> {
                 header,
                 base,
                 changes,
+            })
+        }
+        2 => {
+            // This is a complete independently bound image, including an empty
+            // or all-dark page. Every packed32-bit value is valid:4+4+3*8bits.
+            let value = input.u32()?;
+            Update::Snapshot(Snapshot {
+                header,
+                values: Box::new([value; PAGE_VOLUME]),
             })
         }
         _ => return Err(Error::Malformed),

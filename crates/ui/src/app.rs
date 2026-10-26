@@ -430,7 +430,7 @@ impl UiApp {
         }
     }
     pub fn set_pending_settings(&mut self, mask: u32) {
-        let mask = mask & ((1u32 << crate::settings::COUNT) - 1);
+        let mask = mask & (u32::MAX >> (u32::BITS as usize - crate::settings::COUNT));
         if mask != self.pending_settings {
             self.pending_settings = mask;
             self.dirty();
@@ -1509,7 +1509,7 @@ impl UiApp {
         let old_clip = p.clip;
         p.clip = viewport;
         for def in SCHEMA {
-            if def.section != section {
+            if def.section != section || def.id == Setting::Animations {
                 continue;
             }
             let y = 108.0 + (row as f32 - self.scroll as f32) * 36.0;
@@ -1525,7 +1525,9 @@ impl UiApp {
             );
             let mut text = TextBuffer::default();
             let value = self.settings.get(def.id);
-            if def.id == Setting::ViewTime {
+            if def.id == Setting::Msaa {
+                let _ = write!(text, "{}", if value == 1 { "SMAA 1x" } else { "MSAA 4x" });
+            } else if def.id == Setting::ViewTime {
                 let _ = write!(
                     text,
                     "{}",
@@ -1536,6 +1538,26 @@ impl UiApp {
                         3 => "Рассвет",
                         4 => "Закат",
                         _ => "?",
+                    }
+                );
+            } else if def.id == Setting::ExposureMode {
+                let _ = write!(
+                    text,
+                    "{}",
+                    if value == 0 {
+                        "Авто"
+                    } else {
+                        "Ручной"
+                    }
+                );
+            } else if def.id == Setting::SkyStyle {
+                let _ = write!(
+                    text,
+                    "{}",
+                    match value {
+                        0 => "A",
+                        1 => "B",
+                        _ => "C",
                     }
                 );
             } else {

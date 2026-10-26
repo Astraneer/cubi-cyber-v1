@@ -84,3 +84,36 @@ fn byte_pressure_reclaims_only_authenticated_unreliable_partials() {
     assert_eq!(client.counters().discarded_unreliable_assemblies, 1);
     assert!(client.counters().peak_reassembly_bytes <= Limits::default().maximum_bytes);
 }
+
+#[test]
+fn frame_pressure_keeps_authenticated_transport_ack_and_duplicate_ack_alive() {
+    let (mut server, mut client) = pair();
+    let packet = server.send(vec![8; 27], true, 0).unwrap().pop().unwrap();
+    let delivered = client.receive(&packet, 1).unwrap();
+    let ack = &delivered.replies[0];
+    let mut invalid = ack.clone();
+    *invalid.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        server.receive_control(&invalid, 2).err(),
+        Some(UdpError::Authentication)
+    );
+    assert_eq!(server.pending_messages(), 1);
+    assert!(server.receive_control(ack, 3).unwrap().frames.is_empty());
+    assert_eq!(server.pending_messages(), 0);
+    assert!(server.tick(3000).unwrap().is_empty());
+    let duplicate = client.receive_control(&packet, 4).unwrap();
+    assert!(duplicate.frames.is_empty());
+    assert_eq!(duplicate.replies.len(), 1);
+    let fresh = server.send(vec![9; 2200], true, 5).unwrap();
+    for part in &fresh {
+        assert_eq!(
+            client.receive_control(part, 6).err(),
+            Some(UdpError::Capacity)
+        );
+    }
+    let mut frames = Vec::new();
+    for part in &fresh {
+        frames.extend(client.receive(part, 7).unwrap().frames);
+    }
+    assert_eq!(frames, vec![vec![9; 2200]]);
+}

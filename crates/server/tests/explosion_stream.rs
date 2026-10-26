@@ -8,7 +8,7 @@ use net::{
 };
 use server::transport::Runtime;
 use server::{Server, ServerConfig};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
@@ -21,6 +21,9 @@ const LINK_BYTES: usize = 524_288;
 const CELLS_PER_PAGE: usize = 1250;
 const BASELINE_FENCE: u64 = 1;
 const EXPLOSION_FENCE: u64 = 2;
+// This protocol/work fixture edits public construction, outside the private
+// generator profile. Closed underground AIR disclosure is tested separately.
+const BASE_Y: i32 = 256;
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
 struct Directory(PathBuf);
@@ -39,7 +42,7 @@ impl Directory {
     fn config(&self) -> ServerConfig {
         let mut config = ServerConfig::new(&self.0);
         config.generation_enabled = false;
-        config.spawn_override = Some([8.5, 2.0, 8.5]);
+        config.spawn_override = Some([8.5, 2.0 + f64::from(BASE_Y), 8.5]);
         config
     }
 }
@@ -59,7 +62,7 @@ fn pages() -> Vec<PageId> {
                 result.push(PageId {
                     space: SpaceId(0),
                     x,
-                    y,
+                    y: y + BASE_Y / 16,
                     z,
                 });
             }
@@ -77,7 +80,7 @@ fn position(page: PageId, index: usize) -> BlockPos {
 }
 fn protected_chamber(position: BlockPos) -> bool {
     (6..=10).contains(&position.x)
-        && (0..=6).contains(&position.y)
+        && (0..=6).contains(&(position.y - BASE_Y))
         && (6..=10).contains(&position.z)
 }
 fn fixture() -> (World, Vec<BlockPos>) {
@@ -89,7 +92,10 @@ fn fixture() -> (World, Vec<BlockPos>) {
         let mut cells = vec![stone; PAGE_VOLUME];
         for (index, cell) in cells.iter_mut().enumerate() {
             let pos = position(page, index);
-            if (7..=9).contains(&pos.x) && (2..=5).contains(&pos.y) && (7..=9).contains(&pos.z) {
+            if (7..=9).contains(&pos.x)
+                && (2..=5).contains(&(pos.y - BASE_Y))
+                && (7..=9).contains(&pos.z)
+            {
                 *cell = Cell::AIR;
             }
         }
@@ -152,6 +158,7 @@ struct Bot {
     traffic: Traffic,
     reordered: u64,
     last_packet: u64,
+    baseline_headers: BTreeMap<PageId, (u64, Version)>,
 }
 impl Bot {
     fn new(address: SocketAddr, id: u64) -> Self {
@@ -185,6 +192,7 @@ impl Bot {
             traffic: Traffic::default(),
             reordered: 0,
             last_packet: 0,
+            baseline_headers: BTreeMap::new(),
         }
     }
     fn enqueue(&mut self, message: ClientMessage) {
@@ -368,11 +376,16 @@ impl Bot {
             })
         })
     }
-    fn explosion_applied(&self, targets: &[BlockPos], version: Version) -> bool {
+    fn explosion_applied(&self, targets: &[BlockPos]) -> bool {
         self.replica.len() == 8
-            && pages()
-                .iter()
-                .all(|page| self.replica.page(*page).unwrap().source_version == version)
+            && pages().iter().all(|page| {
+                let current = self.replica.page(*page).unwrap();
+                self.baseline_headers
+                    .get(page)
+                    .is_some_and(|&(view, source)| {
+                        current.version > view && current.source_version > source
+                    })
+            })
             && targets
                 .iter()
                 .all(|position| self.replica.read(*position) == ReplicaRead::Known(Cell::AIR))
@@ -410,14 +423,20 @@ fn one_ten_thousand_cell_transaction_reaches_two_confirmed_lossy_udp_replicas() 
             bot.step(now);
         }
         if baseline.is_none() && bots.iter().all(|bot| bot.fence_received == BASELINE_FENCE) {
-            for bot in &bots {
+            for bot in &mut bots {
                 assert!(bot.snapshots >= 8);
                 assert!(
                     pages()
                         .iter()
-                        .all(|page| bot.replica.page(*page).unwrap().source_version
-                            == initial_version)
+                        .all(|page| bot.replica.page(*page).unwrap().source_version.0 > 0)
                 );
+                bot.baseline_headers = pages()
+                    .into_iter()
+                    .map(|page| {
+                        let image = bot.replica.page(page).unwrap();
+                        (page, (image.version, image.source_version))
+                    })
+                    .collect();
                 assert!(targets.iter().all(|position| bot.replica.read(*position)
                     == ReplicaRead::Known(Cell::from_parts(rules::ids::STONE, 0))));
             }
@@ -440,9 +459,8 @@ fn one_ten_thousand_cell_transaction_reaches_two_confirmed_lossy_udp_replicas() 
                 .unwrap_or_else(|_| panic!("owner transaction queue must accept one operation"));
         }
         if baseline.is_some() {
-            let version = Version(initial_version.0 + 1);
             for bot in &mut bots {
-                if bot.explosion_applied(&targets, version) && bot.lights_bound() {
+                if bot.explosion_applied(&targets) && bot.lights_bound() {
                     bot.fence(EXPLOSION_FENCE);
                 }
             }
@@ -452,6 +470,59 @@ fn one_ten_thousand_cell_transaction_reaches_two_confirmed_lossy_udp_replicas() 
             }
         }
         thread::sleep(Duration::from_micros(500));
+    }
+    if !finished {
+        for (index, bot) in bots.iter().enumerate() {
+            let air = targets
+                .iter()
+                .filter(|&&p| bot.replica.read(p) == ReplicaRead::Known(Cell::AIR))
+                .count();
+            let stone = targets
+                .iter()
+                .filter(|&&p| {
+                    bot.replica.read(p)
+                        == ReplicaRead::Known(Cell::from_parts(rules::ids::STONE, 0))
+                })
+                .count();
+            let advanced = pages()
+                .iter()
+                .filter(|&&p| {
+                    bot.replica.page(p).is_some_and(|raw| {
+                        bot.baseline_headers.get(&p).is_some_and(|&(view, source)| {
+                            raw.version > view && raw.source_version > source
+                        })
+                    })
+                })
+                .count();
+            eprintln!(
+                "explosion visibility diagnostic client{index} canonicalAir{} replicaAir{air} replicaStone{stone} advancedPages{advanced} tick{:?} rays{} pendingCells{}",
+                targets
+                    .iter()
+                    .filter(|&&p| runtime.server().world().read(p) == CellRead::Known(Cell::AIR))
+                    .count(),
+                runtime.server().current_tick(),
+                runtime.server().counters().visibility_rays,
+                runtime.server().counters().light_pending_cells
+            );
+        }
+        for position in [
+            [6, 3, 8],
+            [10, 3, 8],
+            [8, 3, 6],
+            [8, 3, 10],
+            [8, 1, 8],
+            [8, 6, 8],
+        ] {
+            eprintln!(
+                "explosion enclosure {position:?} {:?}",
+                runtime.server().world().read(BlockPos {
+                    space: SpaceId(0),
+                    x: position[0],
+                    y: position[1] + BASE_Y,
+                    z: position[2]
+                })
+            );
+        }
     }
     assert!(
         finished,

@@ -224,6 +224,70 @@ fn sample_light(h: &H, p: BlockPos) -> world::LightSample {
         .unwrap()
         .light(p.local_index())
 }
+
+#[test]
+fn hidden_raw_edit_cannot_change_encoded_public_source_after_forget_and_reentry() {
+    let (actual, baseline, component) = worlds();
+    let da = Directory::new();
+    let db = Directory::new();
+    let hidden = *component
+        .iter()
+        .find(|p| p.page() == page(2) && actual.read(**p) == CellRead::Known(Cell::AIR))
+        .unwrap();
+    let mut a = H::open(&da, actual, [24.5, 80., 8.5]);
+    let mut b = H::open(&db, baseline, [24.5, 80., 8.5]);
+    a.raw(page(2), None);
+    b.raw(page(2), None);
+    assert_eq!(
+        normalized_raw(a.replica.page(page(2)).unwrap().clone()),
+        normalized_raw(b.replica.page(page(2)).unwrap().clone())
+    );
+    let mut transaction = Transaction::new(a.server.current_tick(), SpaceId(0));
+    transaction.set_cell(hidden, Cell::from_parts(rules::ids::LAVA, 0));
+    a.commit(transaction);
+    // The client chooses the same public lease lifecycle in both worlds. Only
+    // one hidden authoritative edit differs; no own action ID was consumed.
+    for h in [&mut a, &mut b] {
+        h.send(ClientMessage::ForgetPage(page(2)));
+        h.replica.remove(page(2));
+        h.until(|m| matches!(m,ServerMessage::PageUnavailable(p) if *p==page(2)));
+        h.raw(page(2), None);
+    }
+    let a = a.replica.page(page(2)).unwrap().clone();
+    let b = b.replica.page(page(2)).unwrap().clone();
+    assert_eq!(
+        a.cells, b.cells,
+        "the closed component still has the same public body"
+    );
+    assert_eq!(
+        normalized_raw(a),
+        normalized_raw(b),
+        "history eviction must not expose the last private page mutation stamp"
+    );
+}
+
+#[test]
+fn first_raw_lease_does_not_serialize_a_preexisting_hidden_page_epoch() {
+    let (mut actual, baseline, component) = worlds();
+    let hidden = *component
+        .iter()
+        .find(|p| p.page() == page(2) && actual.read(**p) == CellRead::Known(Cell::AIR))
+        .unwrap();
+    let mut transaction = Transaction::new(Tick(1), SpaceId(0));
+    transaction.set_cell(hidden, Cell::from_parts(rules::ids::LAVA, 0));
+    actual.commit(transaction).unwrap();
+    let da = Directory::new();
+    let db = Directory::new();
+    let mut a = H::open(&da, actual, [24.5, 80., 8.5]);
+    let mut b = H::open(&db, baseline, [24.5, 80., 8.5]);
+    a.raw(page(2), None);
+    b.raw(page(2), None);
+    assert_eq!(
+        normalized_raw(a.replica.page(page(2)).unwrap().clone()),
+        normalized_raw(b.replica.page(page(2)).unwrap().clone()),
+        "the first lease must be independent of the private mutation history too"
+    );
+}
 #[test]
 fn closed_private_component_encoded_raw_and_light_equal_filled_baseline_with_no_partial_output() {
     let (aw, bw, component) = worlds();

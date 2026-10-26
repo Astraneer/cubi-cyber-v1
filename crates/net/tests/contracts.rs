@@ -159,12 +159,17 @@ fn snapshots_roundtrip_uniform_paletted_and_dense_storage() {
             page: page(-3),
             version: 1,
             source_version: Version(5),
+            applied_action: Default::default(),
             cells,
         }));
         let bytes = encode_server(&message).unwrap();
         assert_eq!(decode_server(&bytes).unwrap(), message);
         if distinct == 1 {
-            assert!(bytes.len() < 64);
+            assert_eq!(
+                bytes.len(),
+                64,
+                "v1 envelope18 + versioned Raw header41 + uniform cell5"
+            );
         }
         if distinct == 2 {
             assert!(bytes.len() < 600);
@@ -207,6 +212,7 @@ fn malformed_and_hostile_frames_reject_without_panicking() {
         base: 1,
         version: 2,
         source_version: Version(2),
+        applied_action: Default::default(),
         changes: vec![(3, Cell::AIR), (3, Cell::AIR)],
     };
     assert!(encode_server(&ServerMessage::Page(PageUpdate::Delta(delta))).is_err());
@@ -264,6 +270,7 @@ fn replication_uses_confirmed_base_and_falls_back_when_history_is_gone() {
         base: 999,
         version: 1000,
         source_version: Version(7),
+        applied_action: Default::default(),
         changes: vec![(1, Cell::AIR)],
     });
     let old = replica.page(page(0)).unwrap().clone();
@@ -282,6 +289,7 @@ fn prediction_waits_for_base_confirmation_and_reject_rolls_back() {
             page: page(0),
             version: 1,
             source_version: Version(1),
+            applied_action: Default::default(),
             cells: Box::new([Cell::from_raw(3); PAGE_VOLUME]),
         }))
         .unwrap();
@@ -318,6 +326,7 @@ fn prediction_waits_for_base_confirmation_and_reject_rolls_back() {
             base: 1,
             version: 2,
             source_version: Version(2),
+            applied_action: ActionId(2),
             changes: vec![(p.local_index().get(), Cell::AIR)],
         }))
         .unwrap();

@@ -305,6 +305,36 @@ impl PreparedHorizon {
 }
 
 impl ClientView {
+    pub fn prepare_distant_shadows(&mut self, device: &wgpu::Device) -> Result<(), String> {
+        if self.distant_shadows.is_some() || self.terrain_frames != 0 || !self.resident.is_empty() {
+            return Err("distant shadows must be prepared once during loading".into());
+        }
+        let horizon = self
+            .horizon
+            .as_ref()
+            .ok_or("distant shadows require a prepared horizon")?;
+        let lighting = self
+            .lighting
+            .as_mut()
+            .ok_or("distant shadows require prepared lighting")?;
+        let owner = super::distant_shadows::ViewDistantShadows::prepare(
+            device,
+            &horizon.owner,
+            lighting.owner.shadows(),
+        )
+        .map_err(|error| error.to_string())?;
+        // Switching from the legacy pair to four exact leaf keys must refresh
+        // an already rendered atlas once, even if numeric key values coincide.
+        lighting.owner.invalidate_all_shadows();
+        self.pipeline_compilations += u64::from(owner.stats().startup_pipelines);
+        self.distant_shadows = Some(Box::new(owner));
+        self.renderer.invalidate();
+        self.invalidate();
+        Ok(())
+    }
+    pub fn distant_shadow_stats(&self) -> Option<super::distant_shadows::Stats> {
+        self.distant_shadows.as_ref().map(|owner| owner.stats())
+    }
     pub fn prepare_far_water(
         &mut self,
         limits: crate::far_water_source::Limits,

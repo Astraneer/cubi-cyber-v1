@@ -1723,6 +1723,25 @@ impl ViewHorizon {
             && self.water_guard_ready()
             && self.cache.front_len() > 0
     }
+    /// Stable loading resources only. Active GPU headers exclude every staged
+    /// object; callers must use the committed gate for actual shadow encoding.
+    pub fn prepared_shadow_sources(
+        &self,
+    ) -> (
+        render::height_gpu::HeightShadowSource<'_>,
+        render::lod_gpu::ProxyShadowSource<'_>,
+    ) {
+        (self.height.shadow_source(), self.proxies.shadow_source())
+    }
+    pub fn committed_shadow_sources(
+        &self,
+    ) -> Option<(
+        render::height_gpu::HeightShadowSource<'_>,
+        render::lod_gpu::ProxyShadowSource<'_>,
+    )> {
+        self.has_committed_front()
+            .then(|| self.prepared_shadow_sources())
+    }
     pub fn front_source(&self, key: HeightKey) -> Option<u64> {
         self.cache.front_source(render_key(key))
     }
@@ -2041,6 +2060,87 @@ pub fn native_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cutout_proxy_worker_packet_and_result_fit_the_prepared_credit() {
+        let page = PageId {
+            space: SpaceId(0),
+            x: 0,
+            y: 0,
+            z: 0,
+        };
+        let stamp = GeometryStamp {
+            page,
+            source: core_types::Version(1),
+            view: 1,
+        };
+        let palette = (0..4096)
+            .map(|index| net::PublicSurface {
+                atlas_layer: 40,
+                tint: 0xff000000 | index,
+                kind: net::PublicSurfaceKind::Cutout,
+            })
+            .collect();
+        let mut indices = vec![0; 6144];
+        for index in 0..4096 {
+            for bit in 0..12 {
+                if index & (1 << bit) != 0 {
+                    let at = index * 12 + bit;
+                    indices[at / 8] |= 1 << (at % 8);
+                }
+            }
+        }
+        let task = BackgroundTask::Proxy(ProxyTask {
+            stamp,
+            revision: 1,
+            atlas_layers: 186,
+            input: Arc::new(net::PublicGeometry {
+                page,
+                source_version: stamp.source,
+                view_version: stamp.view,
+                known: [255; 512],
+                occupied: [255; 512],
+                palette,
+                index_bits: 12,
+                indices,
+            }),
+            separate_water: true,
+        });
+        let request = encode_background_task(&task).unwrap();
+        let response = execute_background_request(&request, || false).unwrap();
+        assert!(response.len() <= MAX_BACKGROUND_BYTES);
+        let BackgroundResult::Proxy(Ok(result)) = decode_background_result(&response).unwrap()
+        else {
+            panic!("valid bounded Cutout worker output");
+        };
+        let payload = result.built.payload;
+        assert_eq!(
+            payload.cutout_quads(),
+            render::terrain_mesh::MAX_PAGE_QUADS as u32
+        );
+        assert_eq!(
+            payload.encode_public().len(),
+            render::lod_gpu::MAX_PUBLIC_BYTES
+        );
+        assert!(task.retained_bytes() >= render::lod_gpu::MAX_RETAINED_BYTES + request.len());
+        assert_eq!(task.cost().cells, MAX_PROXY_WORK_CELLS);
+        assert_eq!(task.cost().bytes, 2 * 1024 * 1024);
+        assert_eq!(
+            payload.voxel([15, 15, 15]),
+            render::lod::PublicVoxel::Solid {
+                material: 40,
+                tint: 0xff000fff,
+                kind: render::lod::SurfaceKind::Cutout
+            }
+        );
+        println!(
+            "PXP2 maximum Cutout worker: request{}B response{}B payload{}B quads{} retainedCredit{}B",
+            request.len(),
+            response.len(),
+            payload.encode_public().len(),
+            payload.cutout_quads(),
+            task.retained_bytes()
+        );
+    }
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn public_lava_stays_opaque_when_physical_water_is_separated() {
@@ -2104,6 +2204,20 @@ mod tests {
             "only physical water leaves the opaque proxy"
         );
         assert_eq!(payload.palette_len(), 1);
+        assert_eq!(
+            payload.voxel([0, 0, 0]),
+            render::lod::PublicVoxel::Solid {
+                material: rules::blocks::layer_cell(
+                    rules::ids::LAVA,
+                    0,
+                    rules::blocks::mesh_face(1)
+                )
+                .0 as u16,
+                tint: u32::MAX,
+                kind: render::lod::SurfaceKind::Opaque,
+            }
+        );
+        assert_eq!(payload.voxel([1, 0, 0]), render::lod::PublicVoxel::Air);
     }
     #[test]
     fn adaptive_1024_plan_refines_known_protected_hints_and_balances_unknown_near_cutout() {

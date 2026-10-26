@@ -22,6 +22,7 @@ pub mod material_pack;
 pub mod multiple_scattering;
 pub mod post;
 pub mod shadows;
+pub mod smaa;
 pub mod terrain_gpu;
 pub mod terrain_mesh;
 pub mod terrain_unit;
@@ -403,5 +404,6 @@ impl Readback {
 
 mod ambient_mrt;
 pub mod contact_ao;
+pub mod distant_shadows;
 
 pub mod near_cover;

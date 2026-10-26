@@ -26,6 +26,8 @@ pub struct Limits {
     pub max_inflight: usize,
     pub cache_columns: usize,
     pub cache_bytes: usize,
+    /// Diagnostic-only acceptance delay; production remains zero.
+    pub completion_delay_ticks: u8,
     pub capture: crate::cold_projection::Limits,
 }
 impl Default for Limits {
@@ -36,6 +38,7 @@ impl Default for Limits {
             max_inflight: 4,
             cache_columns: 128,
             cache_bytes: 32 * 1024 * 1024,
+            completion_delay_ticks: 0,
             capture: crate::cold_projection::Limits::default(),
         }
     }
@@ -151,6 +154,7 @@ struct Cached {
 struct Running {
     column: ColumnKey,
     registration: u64,
+    submitted: Tick,
 }
 pub struct Owner {
     limits: Limits,
@@ -164,6 +168,7 @@ pub struct Owner {
     columns: BTreeMap<ColumnKey, Column>,
     queue: VecDeque<ColumnKey>,
     running: BTreeMap<jobs::JobId, Running>,
+    delayed: VecDeque<(Tick, jobs::Completion<Box<BuiltColumn>>)>,
     cache: BTreeMap<CacheKey, Cached>,
     lru: BTreeSet<(u64, CacheKey)>,
     cache_bytes: usize,
@@ -174,6 +179,7 @@ pub struct Owner {
     budget_tick: Option<Tick>,
     submissions: usize,
     completions: usize,
+    receipts: usize,
     probes: usize,
     public_ids: u64,
     witnesses: BTreeMap<PageId, ContentWitness>,
@@ -190,6 +196,7 @@ impl Owner {
             || limits.cache_columns > 1024
             || limits.cache_bytes == 0
             || limits.cache_bytes > 128 * 1024 * 1024
+            || limits.completion_delay_ticks > 20
         {
             return Err(Error::Bounds);
         }
@@ -215,6 +222,7 @@ impl Owner {
             columns: BTreeMap::new(),
             queue: VecDeque::new(),
             running: BTreeMap::new(),
+            delayed: VecDeque::with_capacity(limits.max_inflight),
             cache: BTreeMap::new(),
             lru: BTreeSet::new(),
             cache_bytes: 0,
@@ -225,6 +233,7 @@ impl Owner {
             budget_tick: None,
             submissions: 0,
             completions: 0,
+            receipts: 0,
             probes: 0,
             public_ids: 0,
             witnesses: BTreeMap::new(),
@@ -451,15 +460,25 @@ impl Owner {
             self.budget_tick = Some(now);
             self.submissions = 0;
             self.completions = 0;
+            self.receipts = 0;
             self.probes = 0;
         }
         let mut work = Work::default();
         while self.completions < max_complete.min(2) {
-            let Some(done) = self.pool.try_recv() else {
-                break;
-            };
-            self.completions += 1;
-            if let jobs::JobOutcome::Success(built) = &done.outcome {
+            let (done, received) =
+                if let Some(index) = self.delayed.iter().position(|(due, _)| *due <= now) {
+                    (self.delayed.remove(index).expect("due completion").1, false)
+                } else {
+                    if self.receipts >= max_complete.min(2) {
+                        break;
+                    }
+                    let Some(done) = self.pool.try_recv() else {
+                        break;
+                    };
+                    self.receipts += 1;
+                    (done, true)
+                };
+            if received && let jobs::JobOutcome::Success(built) = &done.outcome {
                 // Stale work still consumed real generator/packing resources.
                 work.generated_columns += built.work.generated_columns;
                 work.public_baseline_columns += built.work.public_baseline_columns;
@@ -482,6 +501,20 @@ impl Owner {
                 work.geometry_cells += built.work.projected_geometry_cells;
                 work.halo_samples += built.work.halo_samples;
             }
+            if received && let Some(running) = self.running.get(&done.id) {
+                let due = Tick(
+                    running
+                        .submitted
+                        .0
+                        .saturating_add(u64::from(self.limits.completion_delay_ticks)),
+                );
+                if now < due {
+                    debug_assert!(self.delayed.len() < self.limits.max_inflight);
+                    self.delayed.push_back((due, done));
+                    continue;
+                }
+            }
+            self.completions += 1;
             let Some(running) = self.running.remove(&done.id) else {
                 continue;
             };
@@ -592,6 +625,7 @@ impl Owner {
                 Running {
                     column: key,
                     registration: column.registration,
+                    submitted: now,
                 },
             );
             self.submissions += 1;

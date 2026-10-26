@@ -31,14 +31,28 @@ def component_profile(*,text,click,key,painted,wheel,wait):
         before=len(text());widget("Setting(Horizon)",False,3)
         wait(lambda:"NATIVE_UI_PAINTED" in text()[before:],"horizon preference paint missing",30)
     assert int(re.findall(r"NATIVE_UI_SAVED_EFFECTS [^\n]*horizon=(\d+)",text())[-1])==16
-    for name in ["Ssao","Reflections","Clouds","Gi"]:
+    for name in ["Ssao","Reflections","Clouds","Gi","Hold60"]:
         before=len(text());widget(f"Setting({name})",True,3)
         wait(lambda:"NATIVE_UI_PAINTED" in text()[before:],"manual component setting paint missing",30)
     latest=re.findall(r"NATIVE_UI_SAVED_EFFECTS clouds=(\d+) gi=(\d+) reflections=(\d+)",text())[-1]
     assert latest==("0","0","0"),("actual manual low-effects choices missing",latest)
     assert re.findall(r"NATIVE_UI_SAVED_EFFECTS [^\n]*ssao=(\d+)",text())[-1]=="0"
+    assert re.findall(r"NATIVE_UI_SAVED_EFFECTS [^\n]*hold60=(\d+)",text())[-1]=="0"
     widget("Back");painted("Welcome",before)
-    return {"actualWelcomeButtons":True,"saved":{"horizon":16,"ssao":0,"clouds":0,"gi":0,"reflections":0}}
+    return {"actualWelcomeButtons":True,"saved":{"horizon":16,"ssao":0,"clouds":0,"gi":0,"reflections":0,"hold60":0}}
+
+def horizon_profile(*,text,click,painted,wheel,wait):
+    """Literal1024 route: change only horizon, keep defaultNear32/LodError32."""
+    widget=widget_controls(text=text,click=click,wheel=wheel,wait=wait)
+    before=len(text());click(385,315);painted(r"Settings\(Graphics\)",before)
+    for _ in range(16):
+        value=int(re.findall(r"NATIVE_UI_SAVED_EFFECTS [^\n]*horizon=(\d+)",text())[-1])
+        if value==1024:break
+        before=len(text());widget("Setting(Horizon)")
+        wait(lambda:"NATIVE_UI_PAINTED" in text()[before:],"manual1024 horizon paint missing",30)
+    assert int(re.findall(r"NATIVE_UI_SAVED_EFFECTS [^\n]*horizon=(\d+)",text())[-1])==1024
+    widget("Back");painted("Welcome",before)
+    return {"actualWelcomeButtons":True,"horizon":1024,"near":32,"lodError":32,"otherDefaultChoicesRetained":True}
 
 def aim_pitch(*,target,motion,text,wait):
     """Closed-loop real XTest motion; X11 may report a synthetic delta once or twice."""
@@ -101,7 +115,7 @@ def run_graphics(*, text, click, key, painted, capture, motion, wheel, wait, ide
     leave();exposed=shot("exposure-after");exposure_changed=difference(baseline,exposed)
     assert exposure_changed>500,("actual exposure pixels unchanged",exposure_changed)
     menu("Settings");before=len(text());widget("Setting(Msaa)",True)
-    wait(lambda:"NATIVE_UI_STATE screen=Game" in text()[before:] and re.search(r"NATIVE_UI_TIME [^\n]* samples=1 ",text()[before:]),"selected MSAA1 View unavailable",120)
+    wait(lambda:"NATIVE_UI_STATE screen=Game" in text()[before:] and re.search(r"NATIVE_UI_TIME [^\n]* samples=1 ",text()[before:]) and re.search(r"NATIVE_UI_RENDER [^\n]*smaa=true smaa_bytes=[1-9][0-9]*",text()[before:]),"selected SMAA1x View unavailable",120)
     assert identity()==saved_identity,"graphics reprepare replaced owned identity/credential"
     wait(lambda:re.search(r"NATIVE_UI_WINDOW [^\n]*inventory_items="+str(owned_before)+r"(?: |\n|$)",text()[before:]),"graphics reprepare lost owned inventory")
     shot("msaa-one")
@@ -110,5 +124,13 @@ def run_graphics(*, text, click, key, painted, capture, motion, wheel, wait, ide
     assert identity()==saved_identity,"scale reprepare replaced owned identity/credential"
     wait(lambda:re.search(r"NATIVE_UI_WINDOW [^\n]*inventory_items="+str(owned_before)+r"(?: |\n|$)",text()[before:]),"scale reprepare lost owned inventory")
     scaled=shot("scale-85");assert scaled.size==(960,540),"UI surface must retain physical extent"
+    wait(lambda:re.search(r"NATIVE_UI_NEAR requested=32 effective=32 unsupported=false",text()[before:]),"actual minimum32 near profile unavailable",30)
+    menu("Settings");before=len(text());widget("Setting(Near)")
+    wait(lambda:re.search(r"NATIVE_UI_NEAR requested=48 effective=32 unsupported=true",text()[before:]),"unsupported Near48 did not retain actual32 profile",30)
+    assert "NATIVE_UI_STATE screen=Loading" not in text()[before:],"unsupported near request dropped the active View"
+    assert identity()==saved_identity,"unsupported near request replaced owned identity"
+    before=len(text());widget("Setting(Near)",False,3)
+    wait(lambda:re.search(r"NATIVE_UI_NEAR requested=32 effective=32 unsupported=false",text()[before:]),"supported Near32 did not clear explicit error",30)
+    leave()
     menu("Crossroads");widget("ServerTime");leave()
-    return {"scope":"graphics controls","fullProfileAccepted":False,"actualDayNightButtons":True,"dayNightChangedPixels":changed,"exposureBefore":initial,"exposureAfter":initial+25,"exposureChangedPixels":exposure_changed,"selectedSamples":1,"renderScale":85,"renderExtent":[816,459],"physicalUiExtent":[960,540],"asynchronousLoading":True,"sameIdentity":True,"ownedItemsPreserved":owned_before}
+    return {"scope":"graphics controls","fullProfileAccepted":False,"actualDayNightButtons":True,"dayNightChangedPixels":changed,"exposureBefore":initial,"exposureAfter":initial+25,"exposureChangedPixels":exposure_changed,"selectedSamples":1,"smaaPrepared":True,"renderScale":85,"renderExtent":[816,459],"physicalUiExtent":[960,540],"effectiveNearBlocks":32,"unsupportedNear48Retains32":True,"asynchronousLoading":True,"sameIdentity":True,"ownedItemsPreserved":owned_before}

@@ -27,6 +27,7 @@ def environment(**changes):
         "GITHUB_REF": "refs/heads/m2-terrain", "GITHUB_SHA": "a" * 40,
         "GITHUB_RUN_ID": "123456", "GITHUB_RUN_ATTEMPT": "2",
         "CI_REPORT_LINUX_RESULT": "success", "CI_REPORT_WINDOWS_RESULT": "success",
+        "CI_REPORT_SERVER_SCALE_RESULT": "success",
         "GITHUB_TOKEN": TOKEN,
     }
     env.update(changes)
@@ -69,6 +70,7 @@ class ScopeAndDeliveryTests(unittest.TestCase):
             {"GITHUB_REF": "refs/heads/m14-extra"}, {"GITHUB_REF": "refs/heads/m2-../escape"},
             {"GITHUB_REF": "refs/tags/m2-terrain"}, {"GITHUB_SHA": "../escape"},
             {"GITHUB_RUN_ID": "not-a-run"}, {"CI_REPORT_LINUX_RESULT": "green"},
+            {"CI_REPORT_SERVER_SCALE_RESULT": ""}, {"CI_REPORT_SERVER_SCALE_RESULT": "green"},
         ]
         for change in changes:
             with self.subTest(change=change), self.assertRaises(module.ScopeError):
@@ -79,11 +81,29 @@ class ScopeAndDeliveryTests(unittest.TestCase):
             ctx = context(CI_REPORT_WINDOWS_RESULT=result)
             factory = Mock()
             report = module.make_report(ctx, module.delivery(ctx, Mock(), TOKEN, True, factory))
-            self.assertEqual(report["checks"], {"linux": "success", "windows": result})
+            self.assertEqual(report["checks"], {"linux": "success", "windows": result, "server_scale": "success"})
             self.assertEqual(report["conclusion"], expected)
             self.assertEqual(report["delivery"], {"status": "blocked_checks"})
             factory.assert_not_called()
             self.assertNotIn(TOKEN, json.dumps(report))
+
+    def test_server_scale_is_required_for_report_success_and_delivery(self):
+        for result, expected in [("failure", "failure"), ("cancelled", "cancelled"), ("skipped", "incomplete")]:
+            with self.subTest(result=result):
+                ctx = context(CI_REPORT_SERVER_SCALE_RESULT=result)
+                factory = Mock()
+                delivery = module.delivery(ctx, Mock(), TOKEN, True, factory)
+                report = module.make_report(ctx, delivery)
+                self.assertFalse(ctx.successful)
+                self.assertEqual(report["schema_version"], 2)
+                self.assertEqual(report["checks"], {"linux": "success", "windows": "success", "server_scale": result})
+                self.assertEqual(report["conclusion"], expected)
+                self.assertEqual(delivery, {"status": "blocked_checks"})
+                factory.assert_not_called()
+        env = environment()
+        del env["CI_REPORT_SERVER_SCALE_RESULT"]
+        with self.assertRaises(module.ScopeError):
+            module.Context.from_environment(env)
 
     def test_advanced_branch_does_not_open_pr_for_untested_tip(self):
         relay = Mock()

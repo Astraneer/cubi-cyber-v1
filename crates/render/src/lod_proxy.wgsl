@@ -47,6 +47,6 @@ fn trace_fragment(input:VertexOut)->FragmentOut{
     record_trace(46u,false,true);return FragmentOut(vec4(0.,0.,0.,1.),-1.);
 }
 
-// The helper keeps discarded-lane alpha defined for hardware A2C. Negative
-// depth is a local MISS marker; valid far-plane hits at depth0 remain covered.
+// This pipeline returns opaque entries only; Cutout uses ordinary quad A2C.
+// Negative depth is a local MISS marker; valid far-plane hits at0 remain covered.
 @fragment fn fragment(input:VertexOut)->FragmentOut{let result=trace_fragment(input);if result.depth<0. {discard;}return result;}

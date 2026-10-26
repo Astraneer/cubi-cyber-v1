@@ -502,6 +502,10 @@ pub fn encode_client(message: &ClientMessage) -> Result<Vec<u8>, CodecError> {
             out.page(*page);
             out.u64(*version);
         }
+        ClientMessage::ForgetPage(page) => {
+            out.byte(21);
+            out.page(*page);
+        }
         ClientMessage::RequestSummary { page } => {
             out.byte(5);
             out.page(*page);
@@ -810,6 +814,7 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, CodecError> {
             page: input.page()?,
             version: input.u64()?,
         },
+        21 => ClientMessage::ForgetPage(input.page()?),
         5 => ClientMessage::RequestSummary {
             page: input.page()?,
         },
@@ -1102,21 +1107,23 @@ pub fn encode_server(message: &ServerMessage) -> Result<Vec<u8>, CodecError> {
             }
         }
         ServerMessage::Page(PageUpdate::Snapshot(value)) => {
-            out.byte(3);
+            out.byte(28);
             out.page(value.page);
             out.u64(value.version);
             out.u64(value.source_version.0);
+            out.u64(value.applied_action.0);
             write_cells(&mut out, &value.cells);
         }
         ServerMessage::Page(PageUpdate::Delta(value)) => {
             if value.changes.len() > PAGE_VOLUME {
                 return Err(CodecError::TooLarge);
             }
-            out.byte(4);
+            out.byte(29);
             out.page(value.page);
             out.u64(value.base);
             out.u64(value.version);
             out.u64(value.source_version.0);
+            out.u64(value.applied_action.0);
             out.u16(value.changes.len() as u16);
             for (index, cell) in &value.changes {
                 out.u16(*index);
@@ -1246,19 +1253,24 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, CodecError> {
             }
             ServerMessage::Players { tick, players }
         }
-        3 => {
+        // Legacy Raw layouts have no causal watermark. Other v1 payloads are
+        // also durable save/identity records and retain their envelope version.
+        3 | 4 => return Err(CodecError::Version),
+        28 => {
             let page = input.page()?;
             let version = input.u64()?;
             let source_version = Version(input.u64()?);
+            let applied_action = ActionId(input.u64()?);
             let cells = read_cells(&mut input)?;
             ServerMessage::Page(PageUpdate::Snapshot(PageSnapshot {
                 page,
                 version,
                 source_version,
+                applied_action,
                 cells,
             }))
         }
-        4 => {
+        29 => {
             let page = input.page()?;
             let base = input.u64()?;
             let version = input.u64()?;
@@ -1266,6 +1278,7 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, CodecError> {
                 return Err(CodecError::InvalidBounds);
             }
             let source_version = Version(input.u64()?);
+            let applied_action = ActionId(input.u64()?);
             let count = usize::from(input.u16()?);
             if count > PAGE_VOLUME {
                 return Err(CodecError::TooLarge);
@@ -1288,6 +1301,7 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, CodecError> {
                 base,
                 version,
                 source_version,
+                applied_action,
                 changes,
             }))
         }

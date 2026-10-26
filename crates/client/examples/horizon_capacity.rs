@@ -1,4 +1,5 @@
-//! Explicit capacity experiment; no GPU, private seed, World or live limit changes.
+//! Explicit offline capacity experiment. Optional projection mode uses only a
+//! fixed test authority seed in a native helper; no live settings or GPU change.
 use client::view::horizon::{Certificate, Config, Projection, PublicSelection, seam_error_q1024};
 use net::height::{HeightErrorBound, HeightKey};
 use render::height_tile::HeightTileKey;
@@ -7,9 +8,12 @@ use std::{collections::BTreeMap, time::Instant};
 fn main() -> Result<(), String> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let near_3d = arguments.iter().any(|argument| argument == "--near-3d");
+    let proxy_payloads = arguments
+        .iter()
+        .any(|argument| argument == "--proxy-payloads");
     let capacities = arguments
         .into_iter()
-        .filter(|argument| argument != "--near-3d")
+        .filter(|argument| argument != "--near-3d" && argument != "--proxy-payloads")
         .map(|value| value.parse::<usize>().map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     let capacities = if capacities.is_empty() {
@@ -149,6 +153,25 @@ fn main() -> Result<(), String> {
                         selected * 3276 * 2,
                         began.elapsed().as_secs_f64()
                     );
+                    if proxy_payloads {
+                        let keys = plan
+                            .plan
+                            .tiles
+                            .iter()
+                            .filter(|tile| {
+                                known
+                                    .get(&HeightKey {
+                                        space: tile.key.space,
+                                        level: tile.key.level,
+                                        x: tile.key.x,
+                                        z: tile.key.z,
+                                    })
+                                    .is_some_and(|certificate| certificate.exact_replacement)
+                            })
+                            .map(|tile| tile.key)
+                            .collect::<Vec<_>>();
+                        measure_proxies(seed, capacity, &keys)?;
+                    }
                     settled = true;
                     break;
                 }
@@ -159,4 +182,87 @@ fn main() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn measure_proxies(seed: u32, capacity: usize, keys: &[HeightTileKey]) -> Result<(), String> {
+    use render::lod::{MaskedRayProxy, PublicPage, PublicVoxel, SurfaceKind, protection_groups};
+    let began = Instant::now();
+    let authority = gen_authority::ServerGenerator::new(
+        terrain_gen::TerrainSeed(seed),
+        gen_authority::PrivateSeed::new([37; 32]),
+    );
+    let world = world::World::new(rules::properties, 16);
+    let index = server::height_index::HeightEditIndex::new(Default::default())
+        .map_err(|error| format!("{error:?}"))?;
+    let mut pages = 0;
+    let mut cutout_quads = 0;
+    let mut payload_bytes = 0;
+    let mut public_bytes = 0;
+    let mut maximum_payload = 0;
+    let mut generated_columns = 0;
+    for key in keys {
+        let snapshot = server::cold_projection::ColumnSnapshot::capture(
+            &world,
+            &index,
+            server::cold_projection::ColumnKey { x: key.x, z: key.z },
+            Default::default(),
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        let built = snapshot
+            .execute(&authority, || false)
+            .map_err(|error| format!("{error:?}"))?;
+        generated_columns += built.work.generated_columns;
+        for projected in built.pages {
+            let Some(geometry) = projected.geometry else {
+                return Err("Unknown canonical geometry in capacity fixture".into());
+            };
+            let page = PublicPage::from_exposed(|[x, y, z]| {
+                let at = usize::from(x) + 16 * (usize::from(z) + 16 * usize::from(y));
+                if geometry.known[at / 8] & (1 << (at % 8)) == 0 {
+                    return PublicVoxel::Unknown;
+                }
+                if geometry.occupied[at / 8] & (1 << (at % 8)) == 0 {
+                    return PublicVoxel::Air;
+                }
+                let material = geometry.palette[usize::from(
+                    geometry.palette_index(core_types::LocalIdx::new(at as u16).unwrap()),
+                )];
+                match material.kind {
+                    server::lod::PublicSurfaceKind::Water => PublicVoxel::Air,
+                    kind => PublicVoxel::Solid {
+                        material: material.atlas_layer,
+                        tint: material.tint,
+                        kind: if kind == server::lod::PublicSurfaceKind::Opaque {
+                            SurfaceKind::Opaque
+                        } else {
+                            SurfaceKind::Cutout
+                        },
+                    },
+                }
+            });
+            let proxy = MaskedRayProxy::from_public_page(&page, protection_groups(&page, 4));
+            let payload = render::lod_gpu::ProxyPayload::from_public(&proxy, 186)
+                .map_err(|error| error.to_string())?;
+            pages += 1;
+            cutout_quads += u64::from(payload.cutout_quads());
+            payload_bytes += payload.payload_bytes();
+            public_bytes += payload.encode_public().len();
+            maximum_payload = maximum_payload.max(payload.payload_bytes());
+        }
+    }
+    println!(
+        "{{\"seed\":{seed},\"capacity\":{capacity},\"proxyFormat\":\"PXP2\",\"exactColumns\":{},\"geometryPages\":{pages},\"cutoutQuads\":{cutout_quads},\"proxyPayloadBytes\":{payload_bytes},\"proxyDoubleBufferBytes\":{},\"proxyPublicBytes\":{public_bytes},\"maximumProxyPayload\":{maximum_payload},\"gpuArenaBytes\":16777216,\"fitsDoubleBuffer\":{},\"worldPages\":{},\"generatedTestColumns\":{generated_columns},\"projectionSeconds\":{}}}",
+        keys.len(),
+        payload_bytes * 2,
+        payload_bytes * 2 <= 16 * 1024 * 1024,
+        world.pages().count(),
+        began.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn measure_proxies(_: u32, _: usize, _: &[HeightTileKey]) -> Result<(), String> {
+    Err("the fixed test-authority projection is a native offline experiment".into())
 }

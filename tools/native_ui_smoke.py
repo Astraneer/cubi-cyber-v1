@@ -11,7 +11,8 @@ import subprocess as sp
 import tempfile
 import time
 from PIL import Image
-from native_graphics_controls import aim_pitch,component_profile,run_graphics
+from native_graphics_controls import aim_pitch,component_profile,horizon_profile,run_graphics
+from native_visual_controls import run_visual_choices
 
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = ROOT / ".local/artifacts"
@@ -189,6 +190,13 @@ EndSection
                 T.XTestFakeMotionEvent(dpy,-1,450,260,0)
                 T.XTestFakeButtonEvent(dpy,5,True,0);T.XTestFakeButtonEvent(dpy,5,False,0);X.XFlush(dpy)
             component_settings=component_profile(text=text,click=click,key=key,painted=painted,wheel=setup_wheel,wait=wait)
+        manual_horizon=None
+        if os.environ.get("CUBI_UI_HORIZON_1024")=="1":
+            assert component_settings is None,"manual1024 route retains default effects"
+            def horizon_wheel():
+                T.XTestFakeMotionEvent(dpy,-1,450,260,0)
+                T.XTestFakeButtonEvent(dpy,5,True,0);T.XTestFakeButtonEvent(dpy,5,False,0);X.XFlush(dpy)
+            manual_horizon=horizon_profile(text=text,click=click,painted=painted,wheel=horizon_wheel,wait=wait)
         click(450, 229)
         for _ in range(50):
             key("BackSpace")
@@ -207,7 +215,10 @@ EndSection
         wait(lambda: "screen=Game" in text(), "real native server scene unavailable", 120)
         component_only=os.environ.get("CUBI_UI_COMPONENT_ONLY")=="1"
         far_pattern="[0-9]+" if component_only else "[1-9][0-9]*"
-        profile = wait(lambda: re.search(r"NATIVE_UI_WORLD light_pages=([1-9][0-9]*) far_tiles=("+far_pattern+r") environment=true authoritative=true eye_sky=Some\(([0-9]+)\)", text()), "confirmed authoritative LIGHT/far cover unavailable", 120)
+        def confirmed_profile():
+            rows=list(re.finditer(r"NATIVE_UI_WORLD light_pages=([1-9][0-9]*) far_tiles=("+far_pattern+r") environment=true authoritative=true eye_sky=Some\(([0-9]+)\)",text()))
+            return rows[-1] if rows else None
+        profile = wait(confirmed_profile, "confirmed authoritative LIGHT/far cover unavailable", 120)
         if component_settings:
             def effective_receipt():
                 rows=re.findall(r"NATIVE_UI_SETTINGS applied=(\d+) pending=(\d+) reload=(\d+)",text())
@@ -229,7 +240,8 @@ EndSection
         chest_transfer=False
         configurator_cycle=False
         creative_grant=False
-        if owner:
+        visual_only=os.environ.get("CUBI_UI_VISUAL_ONLY")=="1"
+        if owner and not visual_only:
             assert "role=Owner" in text()
             def window_state(after=0,**expected):
                 rows=[dict((name,int(value)) for name,value in re.findall(r"(\w+)=(\d+)",line)) for line in text()[after:].splitlines() if line.startswith("NATIVE_UI_WINDOW ")]
@@ -314,6 +326,11 @@ EndSection
             capture("configurator")
             before=len(text());key("Escape");painted("Game",before)
             configurator_cycle=True
+        if visual_only:
+            assert owner,"visual-only owned-item preservation needs actual Owner"
+            before=len(text());key("t");painted("Game",before,extra="focus=Chat")
+            type_text("/give 9 1");key("Return")
+            wait(lambda:re.search(r"NATIVE_UI_WINDOW inventory_items=1(?: |\n|$)",text()[before:]),"visual fixture owned log missing")
         graphics=None
         if os.environ.get("CUBI_UI_GRAPHICS")=="1":
             def motion(dx,dy):
@@ -321,6 +338,11 @@ EndSection
             def wheel():
                 T.XTestFakeButtonEvent(dpy,5,True,0);T.XTestFakeButtonEvent(dpy,5,False,0);X.XFlush(dpy);time.sleep(.1)
             graphics=run_graphics(text=text,click=click,key=key,painted=painted,capture=capture,motion=motion,wheel=wheel,wait=wait,identity=lambda:next((folder/"config/CubiCyber").glob("identity-*.cubi")).read_bytes(),artifacts=ARTIFACTS)
+        visual_choices=None
+        if os.environ.get("CUBI_UI_VISUAL_CHOICES")=="1":
+            def visual_wheel():
+                T.XTestFakeButtonEvent(dpy,5,True,0);T.XTestFakeButtonEvent(dpy,5,False,0);X.XFlush(dpy);time.sleep(.1)
+            visual_choices=run_visual_choices(text=text,click=click,key=key,painted=painted,wheel=visual_wheel,wait=wait,identity=lambda:next((folder/"config/CubiCyber").glob("identity-*.cubi")).read_bytes())
         before=len(text())
         key("Tab", True)
         painted("Game",before, "tab=true")
@@ -362,8 +384,9 @@ EndSection
         click(480, 356)
         wait(lambda: native.poll() is not None, "native UI quit unavailable")
         assert native.returncode == 0, log.read_text()
-        result = {"graphics":graphics,"componentSettings":component_settings,"fullProfileAccepted":not component_only,"scope":"UI/audio/replay components; M5 excluded" if component_only else "full product profile","mainStackLimitKiB": stack_kib or None, "productProfile":{"authoritativeLightPages":int(profile[1]),"farHeightTiles":int(profile[2]),"knownEyeSky":int(profile[3]),"atmospherePost":True,"shadowResolution":2048}, "ownerAuthenticated":owner,"authoritativeCraft":crafted,"authoritativeChestTransfer":chest_transfer,"authorizedCreativeNeiGrant":creative_grant, "welcomePixels": welcome, "settingsPixels": settings, "inventoryPixels": inventory, "rosterPixels": roster, "profilerPixels": profiler, "authority": True, "guardedInventory": True, "chat": True, "serverMeasuredPing": True, "virtualAudioVoiceSamples": max(voices), "hardwareAudibilityProven": False, "movementReplaySteps": report["movementReplay"]["steps"], "offlineReplay": True, "persistedIdentityResumed": True, "freshViewReconnect": True}
+        result = {"visualChoices":visual_choices,"graphics":graphics,"componentSettings":component_settings,"fullProfileAccepted":not component_only,"scope":"UI/audio/replay components; M5 excluded" if component_only else "full product profile","mainStackLimitKiB": stack_kib or None, "productProfile":{"authoritativeLightPages":int(profile[1]),"farHeightTiles":int(profile[2]),"knownEyeSky":int(profile[3]),"atmospherePost":True,"shadowResolution":2048}, "ownerAuthenticated":owner,"authoritativeCraft":crafted,"authoritativeChestTransfer":chest_transfer,"authorizedCreativeNeiGrant":creative_grant, "welcomePixels": welcome, "settingsPixels": settings, "inventoryPixels": inventory, "rosterPixels": roster, "profilerPixels": profiler, "authority": True, "guardedInventory": True, "chat": True, "serverMeasuredPing": True, "virtualAudioVoiceSamples": max(voices), "hardwareAudibilityProven": False, "movementReplaySteps": report["movementReplay"]["steps"], "offlineReplay": True, "persistedIdentityResumed": True, "freshViewReconnect": True}
         result["authoritativeConfiguratorCycle"]=configurator_cycle
+        result["manualHorizonProfile"]=manual_horizon
         (ARTIFACTS / (("native-owner-ui-components.json" if owner else "native-product-ui-components.json") if component_only else ("native-owner-ui-smoke.json" if owner else "native-product-ui-smoke.json"))).write_text(json.dumps(result, indent=2) + "\n")
         (ARTIFACTS / ("native-owner-ui-smoke.log" if owner else "native-product-ui-smoke.log")).write_text(log.read_text())
         print(("NATIVE_PRODUCT_UI_COMPONENTS_OK " if component_only else "NATIVE_PRODUCT_UI_OK ") + json.dumps(result))

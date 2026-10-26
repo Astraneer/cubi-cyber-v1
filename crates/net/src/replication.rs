@@ -66,6 +66,13 @@ impl Replica {
                 {
                     return Ok(ApplyResult::Stale);
                 }
+                if self
+                    .pages
+                    .get(&snapshot.page)
+                    .is_some_and(|old| snapshot.applied_action < old.applied_action)
+                {
+                    return Err(ReplicaError::InvalidVersion);
+                }
                 if !self.pages.contains_key(&snapshot.page)
                     && self.pages.len() >= self.maximum_pages
                 {
@@ -89,6 +96,13 @@ impl Replica {
                         expected: delta.base,
                     });
                 }
+                if self
+                    .pages
+                    .get(&delta.page)
+                    .is_some_and(|old| delta.applied_action < old.applied_action)
+                {
+                    return Err(ReplicaError::InvalidVersion);
+                }
                 let mut seen = [false; PAGE_VOLUME];
                 for &(index, _) in &delta.changes {
                     let slot = seen
@@ -105,6 +119,7 @@ impl Replica {
                 }
                 page.version = delta.version;
                 page.source_version = delta.source_version;
+                page.applied_action = delta.applied_action;
                 Ok(ApplyResult::Applied)
             }
         }
@@ -177,6 +192,33 @@ impl ViewHistory {
         cells: Box<[Cell; PAGE_VOLUME]>,
         force_snapshot: bool,
     ) -> Result<Option<PageUpdate>, ReplicaError> {
+        self.build_inner(
+            page,
+            Some(source_version),
+            ActionId(0),
+            cells,
+            force_snapshot,
+        )
+    }
+    /// Public server-owner publication. Only public body/action changes advance
+    /// the source stamp; no private World revision is an input to this builder.
+    pub fn build_public(
+        &mut self,
+        page: PageId,
+        applied_action: ActionId,
+        cells: Box<[Cell; PAGE_VOLUME]>,
+        force_snapshot: bool,
+    ) -> Result<Option<PageUpdate>, ReplicaError> {
+        self.build_inner(page, None, applied_action, cells, force_snapshot)
+    }
+    fn build_inner(
+        &mut self,
+        page: PageId,
+        supplied_source: Option<Version>,
+        applied_action: ActionId,
+        cells: Box<[Cell; PAGE_VOLUME]>,
+        force_snapshot: bool,
+    ) -> Result<Option<PageUpdate>, ReplicaError> {
         if !self.pages.contains_key(&page) {
             if self.pages.len() >= self.maximum_pages {
                 let old = self.order.pop_front().expect("nonempty bounded history");
@@ -190,9 +232,15 @@ impl ViewHistory {
         let history = self.pages.get_mut(&page).expect("inserted");
         if history
             .back()
+            .is_some_and(|old| applied_action < old.applied_action)
+        {
+            return Err(ReplicaError::InvalidVersion);
+        }
+        if history
+            .back()
             // Private input revisions alone cannot create a public image or
             // reveal hidden edits through an empty delta and its source stamp.
-            .is_none_or(|old| old.cells != cells)
+            .is_none_or(|old| old.cells != cells || old.applied_action != applied_action)
         {
             let version = self.next_version;
             self.next_version = self
@@ -202,7 +250,8 @@ impl ViewHistory {
             history.push_back(PageSnapshot {
                 page,
                 version,
-                source_version,
+                source_version: supplied_source.unwrap_or(Version(version)),
+                applied_action,
                 cells,
             });
             while history.len() > self.versions_per_page {
@@ -230,6 +279,7 @@ impl ViewHistory {
                 base: base.version,
                 version: latest.version,
                 source_version: latest.source_version,
+                applied_action: latest.applied_action,
                 changes,
             };
             let delta_bytes = encode_server(&ServerMessage::Page(PageUpdate::Delta(delta.clone())))
@@ -251,7 +301,7 @@ impl ViewHistory {
 struct Predicted {
     position: BlockPos,
     value: Cell,
-    accepted: Option<Version>,
+    accepted: bool,
 }
 pub struct PredictionOverlay {
     edits: BTreeMap<ActionId, Predicted>,
@@ -278,7 +328,7 @@ impl PredictionOverlay {
             Predicted {
                 position,
                 value,
-                accepted: None,
+                accepted: false,
             },
         );
         Ok(())
@@ -300,7 +350,7 @@ impl PredictionOverlay {
             }
             ActionStatus::Accepted => {
                 if let Some(edit) = self.edits.get_mut(&reply.id) {
-                    edit.accepted = Some(reply.source_version);
+                    edit.accepted = true;
                     if let Some(cell) = reply.cell {
                         edit.value = cell;
                     }
@@ -309,14 +359,19 @@ impl PredictionOverlay {
         }
     }
     pub fn retire_applied(&mut self, replica: &Replica) {
-        self.edits.retain(|_, edit| {
-            !edit.accepted.is_some_and(|version| {
-                replica.page(edit.position.page()).is_some_and(|page| {
-                    page.source_version >= version
-                        && page.cells[usize::from(edit.position.local_index().get())] == edit.value
-                })
-            })
+        self.edits.retain(|id, edit| {
+            !(edit.accepted
+                && replica
+                    .page(edit.position.page())
+                    .is_some_and(|page| page.applied_action >= *id))
         });
+    }
+    /// Accepted predictions still needing an authoritative causal certificate.
+    pub fn awaiting_actions(&self) -> impl Iterator<Item = (ActionId, BlockPos)> + '_ {
+        self.edits
+            .iter()
+            .filter(|(_, edit)| edit.accepted)
+            .map(|(id, edit)| (*id, edit.position))
     }
     pub fn positions(&self) -> impl Iterator<Item = BlockPos> + '_ {
         self.edits.values().map(|edit| edit.position)

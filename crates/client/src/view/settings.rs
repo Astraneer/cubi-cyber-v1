@@ -2,6 +2,22 @@ use super::{ClientView, SettingsApplication};
 use render::terrain_gpu::UploadBudget;
 use ui::settings::{Section, Setting, Settings};
 impl ClientView {
+    pub fn requested_near_blocks(&self) -> Option<u16> {
+        self.requested_settings
+            .as_ref()
+            .map(|settings| settings.get(Setting::Near) as u16)
+    }
+    pub fn near_settings_error(&self) -> Option<crate::near_profile::Error> {
+        let settings = self.requested_settings.as_ref()?;
+        crate::near_profile::NearProfile::plan(
+            settings.get(Setting::Near) as u16,
+            Default::default(),
+        )
+        .err()
+    }
+    pub fn effective_near_blocks(&self) -> u16 {
+        u16::from(self.scene.config().horizontal_radius) * 16
+    }
     pub fn apply_settings(&mut self, settings: &Settings) -> SettingsApplication {
         self.requested_settings = Some(settings.clone());
         let fov = settings.get(Setting::Fov) as f32;
@@ -37,6 +53,18 @@ impl ClientView {
         };
         let mut applied = (1 << Setting::Fov as u32) | (1 << Setting::Bob as u32);
         let mut reload_required = 0;
+        if let Ok(profile) = crate::near_profile::NearProfile::plan(
+            settings.get(Setting::Near) as u16,
+            Default::default(),
+        ) {
+            if profile.matches_scene(&self.scene.config()) {
+                if self.is_ready() {
+                    applied |= 1 << Setting::Near as u32;
+                }
+            } else {
+                reload_required |= 1 << Setting::Near as u32;
+            }
+        }
         if self.horizon_setting_applied(settings.get(Setting::Horizon) as u32) {
             applied |= 1 << Setting::Horizon as u32;
         }
@@ -51,7 +79,8 @@ impl ClientView {
         // Permission for adaptive scaling is a controller policy, not another
         // render target. Its saved value is consumed by AutoQuality.
         applied |= 1 << Setting::AllowResolution as u32;
-        if self.render_sample_count() == settings.get(Setting::Msaa) as u32 {
+        let samples = settings.get(Setting::Msaa) as u32;
+        if self.render_sample_count() == samples && self.smaa_prepared() == (samples == 1) {
             applied |= 1 << Setting::Msaa as u32;
         } else {
             reload_required |= 1 << Setting::Msaa as u32;
@@ -116,6 +145,25 @@ impl ClientView {
         }) {
             applied |= 1 << Setting::Exposure as u32;
         }
+        if let Some(automatic) = self.exposure_automatic() {
+            if automatic == (settings.get(Setting::ExposureMode) == 0) {
+                applied |= 1 << Setting::ExposureMode as u32;
+            } else {
+                reload_required |= 1 << Setting::ExposureMode as u32;
+            }
+        }
+        if let Some(styles) = self.celestial_styles() {
+            let expected = match settings.get(Setting::SkyStyle) {
+                0 => [0, 0, 0],
+                1 => [1, 0, 1],
+                _ => [2, 1, 2],
+            };
+            if styles == expected {
+                applied |= 1 << Setting::SkyStyle as u32;
+            } else {
+                reload_required |= 1 << Setting::SkyStyle as u32;
+            }
+        }
         if self.environment.is_some() && self.sun_clock().is_some() {
             applied |= 1 << Setting::ViewTime as u32;
         }
@@ -131,6 +179,17 @@ impl ClientView {
             pending_render,
             reload_required,
         }
+    }
+    pub fn smaa_prepared(&self) -> bool {
+        self.environment
+            .as_ref()
+            .is_some_and(|environment| environment.owner.gpu.post().smaa().is_some())
+    }
+    pub fn smaa_reserved_bytes(&self) -> u64 {
+        self.environment
+            .as_ref()
+            .and_then(|environment| environment.owner.gpu.post().smaa())
+            .map_or(0, |smaa| smaa.reserved_bytes())
     }
     pub(super) fn flush_post_settings(
         &mut self,

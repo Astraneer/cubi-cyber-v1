@@ -26,16 +26,21 @@ pub enum Error {
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Range => "near distance must be between 4 and 64 blocks",
-            Self::RawCapacity => {
-                "near distance exceeds the 256-page profile; select 32 blocks or less"
-            }
-            Self::GpuCapacity => "near distance exceeds the prepared GPU object capacity",
-        })
+        f.write_str(self.message())
     }
 }
 impl std::error::Error for Error {}
+impl Error {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Range => "Ближняя область: выберите от 4 до 64 блоков.",
+            Self::RawCapacity => {
+                "Сейчас доступны ближние области до 32 блоков. Выберите 32 или меньше."
+            }
+            Self::GpuCapacity => "Ближняя область не помещается в текущем графическом профиле.",
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NearProfile {
     pub requested_blocks: u16,
@@ -264,6 +269,69 @@ mod tests {
                 .iter()
                 .all(|p| p.x.abs() <= 3 && p.z.abs() <= 3 && (p.y - 5).abs() <= 2)
         );
+        // Network I/O continues while a loading GUI consumes no page events.
+        // ACK/repair outbox credit is drained independently of that GUI queue.
+        let raw = |page, view| {
+            ServerMessage::Page(net::PageUpdate::Snapshot(net::PageSnapshot {
+                page,
+                version: view,
+                source_version: core_types::Version(view),
+                applied_action: Default::default(),
+                cells: Box::new([core_types::Cell::AIR; 4096]),
+            }))
+        };
+        for page in &initial {
+            connection.receive(raw(*page, 1), 1).unwrap();
+            connection.take_outgoing(256);
+        }
+        assert_eq!(connection.queue_depths().cells, 245);
+        let first = *initial.first().unwrap();
+        connection.receive(raw(first, 2), 2).unwrap();
+        connection.take_outgoing(256);
+        assert_eq!(
+            connection.queue_depths().cells,
+            245,
+            "same-page updates coalesce while the GUI is frozen"
+        );
+        let outside = PageId { x: 20, ..first };
+        connection.receive(raw(outside, 1), 3).unwrap();
+        assert!(connection.replica().page(outside).is_none());
+        let mut received = connection.take_page_updates(128);
+        received.extend(connection.take_page_updates(128));
+        assert_eq!(received.len(), 245);
+        assert!(received.iter().any(|update| matches!(update, net::PageUpdate::Snapshot(snapshot) if snapshot.page == first && snapshot.version == 2)));
+        assert_eq!(connection.queue_depths().cells, 0);
+        let identity = connection.welcome().unwrap().identity;
+        let predicted =
+            sim::prediction::PredictionState::capture(connection.player().unwrap()).unwrap();
+        let smaller = NearProfile::plan(16, Limits::default()).unwrap();
+        assert!(connection.set_near_profile(smaller).unwrap());
+        assert!(connection.near_profile_applied(smaller));
+        assert!(
+            connection
+                .set_near_profile(NearProfile::plan(32, Limits::default()).unwrap())
+                .unwrap()
+        );
+        assert_eq!(connection.welcome().unwrap().identity, identity);
+        assert_eq!(
+            sim::prediction::PredictionState::capture(connection.player().unwrap()).unwrap(),
+            predicted,
+            "a near profile change cannot reset the live session/prediction"
+        );
+        // A delayed Forget can retire the server lease after the camera has
+        // re-entered. Its explicit Unavailable echo must restart current interest.
+        connection
+            .receive(ServerMessage::PageUnavailable(first), 10)
+            .unwrap();
+        assert!(connection.replica().page(first).is_none());
+        connection.poll(600).unwrap();
+        assert!(connection.take_outgoing(256).iter().any(|message| matches!(message, ClientMessage::RequestPage { page, acknowledged: None } if *page == first)));
+        connection.receive(raw(first, 3), 601).unwrap();
+        connection.take_outgoing(256);
+        assert_eq!(connection.replica().page(first).unwrap().version, 3);
+        assert!(
+            matches!(connection.take_page_updates(128).as_slice(), [net::PageUpdate::Snapshot(snapshot)] if snapshot.page == first && snapshot.version == 3)
+        );
         authority.pos = [16.5, 80., 0.5];
         authority.prev = authority.pos;
         connection
@@ -279,11 +347,11 @@ mod tests {
                         .as_bytes()
                         .to_vec(),
                 },
-                50,
+                650,
             )
             .unwrap();
         connection.advance_to(core_types::Tick(2)).unwrap();
-        connection.update_interest(50).unwrap();
+        connection.update_interest(650).unwrap();
         let added = connection
             .take_outgoing(256)
             .into_iter()
@@ -306,5 +374,21 @@ mod tests {
                 .all(|p| p.x == 4 && p.z.abs() <= 3 && (p.y - 5).abs() <= 2)
         );
         assert!(connection.counters().peak_outbox <= 256);
+        assert!(
+            connection.replica().page(first).is_none(),
+            "the farthest old slab member must retire under the fixed256-page cap"
+        );
+        connection
+            .receive(ServerMessage::PageUnavailable(first), 700)
+            .unwrap();
+        connection.poll(1200).unwrap();
+        assert!(!connection.take_outgoing(256).iter().any(
+            |message| matches!(message, ClientMessage::RequestPage { page, .. } if *page == first)
+        ));
+        connection.receive(raw(first, 4), 1201).unwrap();
+        assert!(
+            connection.replica().page(first).is_none(),
+            "late old-lease images cannot repopulate retired interest"
+        );
     }
 }

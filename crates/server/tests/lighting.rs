@@ -328,3 +328,34 @@ fn idle_owner_has_no_allocations_cell_scans_or_derived_records() {
     assert_eq!(scope.finish().allocating_calls(), 0);
     owner.detach(&mut world).unwrap();
 }
+
+#[test]
+fn durable_idle_owner_emits_no_wal_delta_and_allocates_nothing() {
+    let mut world = fixture();
+    let mut owner = ServerLighting::attach_durable(&mut world, config()).unwrap();
+    let sky = proof(false, false, 1);
+    for _ in 0..10_000 {
+        let phase = owner.step(&mut world, Tick(100), &sky).unwrap();
+        owner.take_delta().unwrap();
+        if !phase.changes.is_empty() {
+            owner.acknowledge_after_durable(&mut world, &phase).unwrap();
+        }
+        if owner.is_idle() {
+            break;
+        }
+    }
+    assert!(owner.is_idle());
+    let scope = telemetry::AllocationScope::begin().unwrap();
+    for _ in 0..1000 {
+        owner.observe_changes(&world, &[]).unwrap();
+        let phase = owner.step(&mut world, Tick(101), &sky).unwrap();
+        assert!(phase.changes.is_empty());
+        assert_eq!(phase.progress.work.cells_examined, 0);
+        assert_eq!(phase.progress.work.neighbor_reads, 0);
+        assert_eq!(phase.progress.work.seed_cells_examined, 0);
+        assert_eq!(phase.work.foreground_cell_reads, 0);
+        assert!(owner.take_delta().unwrap().is_none());
+    }
+    assert_eq!(scope.finish().allocating_calls(), 0);
+    owner.detach(&mut world).unwrap();
+}

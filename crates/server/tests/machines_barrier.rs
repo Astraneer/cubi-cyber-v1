@@ -498,6 +498,259 @@ fn indivisible_route_over_production_bound_reports_capacity_without_extraction_o
     assert_eq!(w.canonical_hash(), before_world);
 }
 
+fn frozen_boundary_fixture() -> (World, MachineRuntime) {
+    use rules::{items::I_IRON_INGOT, survival::furnace::Chest};
+    let mut w = World::new(rules::properties, 128);
+    let mut tx = Transaction::new(Tick(0), SpaceId(0));
+    for x in 0..2 {
+        tx.create_page(p(x * 16, 0, 0).page(), vec![Cell::AIR; 4096]);
+    }
+    for id in 1..=3 {
+        let at = p(id as i32, 5, 8);
+        let mut m = Machine::new(MekKind::Smelter);
+        m.energy = 10_000;
+        m.slots[0] = Slot::new(ItemStack::new(I_DUST_IRON, 1).unwrap());
+        tx.set_cell(at, Cell::from_parts(ENERGIZED_SMELTER, 3));
+        tx.set_component(
+            ComponentId(id),
+            machine_component(at, &m),
+            ChannelMask::CONTENTS,
+        );
+    }
+    let mut source = Chest::default();
+    source
+        .set_trusted(0, ItemStack::new(I_IRON_INGOT, 3).unwrap())
+        .unwrap();
+    for (id, at, chest) in [(4, p(13, 2, 2), source), (5, p(17, 2, 2), Chest::default())] {
+        tx.set_cell(at, Cell::from_parts(CHEST, 0));
+        tx.set_component(
+            ComponentId(id),
+            server::survival::chest_component(at, &chest),
+            ChannelMask::CONTENTS,
+        );
+    }
+    for x in 14..=16 {
+        tx.set_cell(p(x, 2, 2), Cell::from_parts(LOGISTICAL_TRANSPORTER, 0));
+    }
+    w.commit(tx).unwrap();
+    let mut r = MachineRuntime::new(Config::default()).unwrap();
+    let d = r
+        .extend_registration(
+            r.noop_delta().unwrap(),
+            &w,
+            (1..=3).map(ComponentId),
+            Tick(0),
+        )
+        .unwrap();
+    r.acknowledge(d).unwrap();
+    let plan = r
+        .plan_topology(
+            &w,
+            &[p(14, 2, 2), p(15, 2, 2), p(16, 2, 2)],
+            Tick(0),
+            Budget::default(),
+        )
+        .unwrap();
+    commit(&mut w, &mut r, plan);
+    let plan = r
+        .plan_connections(
+            &w,
+            TransmitterConfig {
+                position: p(14, 2, 2),
+                block: LOGISTICAL_TRANSPORTER,
+                modes: 2 << (2 * 4),
+                color: 0,
+            },
+            Tick(0),
+            Budget::default(),
+        )
+        .unwrap();
+    commit(&mut w, &mut r, plan);
+    (w, r)
+}
+#[test]
+fn captured_aoi_survives_recovery_with_empty_or_broader_runtime_and_blocks_chest_outside_it() {
+    use std::collections::BTreeSet;
+    let active = BTreeSet::from([p(0, 0, 0).page()]);
+    let correct = |p: BlockPos| active.contains(&p.page());
+    let (mut expected_w, mut expected) = frozen_boundary_fixture();
+    let full = expected
+        .plan_tick_with_context(
+            &expected_w,
+            PhaseContext {
+                payloads: None,
+                active: Some(&correct),
+                activity: &[],
+            },
+            Tick(1),
+            Budget::default(),
+        )
+        .unwrap();
+    assert!(full.owner_complete());
+    commit(&mut expected_w, &mut expected, full);
+    for resumed_value in [false, true] {
+        let (mut w, mut r) = frozen_boundary_fixture();
+        let mut first = r
+            .plan_tick_with_context(
+                &w,
+                PhaseContext {
+                    payloads: None,
+                    active: Some(&correct),
+                    activity: &[],
+                },
+                Tick(1),
+                Budget {
+                    events: 1,
+                    ..Budget::default()
+                },
+            )
+            .unwrap();
+        assert!(first.capture_activity(&active).unwrap());
+        assert!(!first.capture_activity(&active).unwrap());
+        let observers = BTreeSet::from([net::PlayerId([1; 16]), net::PlayerId([2; 16])]);
+        assert!(first.capture_observers(&observers).unwrap());
+        assert!(
+            first
+                .delta
+                .encode()
+                .unwrap()
+                .windows(4)
+                .any(|b| b == b"XAO2")
+        );
+        commit(&mut w, &mut r, first);
+        r = recover(&r);
+        assert_eq!(
+            r.snapshot().owner.active_pages.as_ref(),
+            Some(&active.iter().copied().collect::<Vec<_>>())
+        );
+        let mut bad = r.snapshot();
+        bad.owner
+            .active_pages
+            .as_mut()
+            .unwrap()
+            .push(p(0, 0, 0).page());
+        assert!(MachineRuntime::restore(Config::default(), &bad).is_err());
+        let wrong = |_: BlockPos| resumed_value;
+        for batch in 0..12 {
+            let plan = r
+                .plan_tick_with_context(
+                    &w,
+                    PhaseContext {
+                        payloads: None,
+                        active: Some(&wrong),
+                        activity: &[],
+                    },
+                    Tick(1),
+                    Budget {
+                        events: 1,
+                        ..Budget::default()
+                    },
+                )
+                .unwrap();
+            assert!(
+                !plan
+                    .delta
+                    .encode()
+                    .unwrap()
+                    .windows(4)
+                    .any(|b| b == b"XAO2"),
+                "AOI image cannot repeat each microbatch"
+            );
+            let done = plan.owner_complete();
+            commit(&mut w, &mut r, plan);
+            r = recover(&r);
+            if done {
+                break;
+            }
+            assert!(batch < 11);
+        }
+        assert!(!r.owner_pending());
+        assert_eq!(r.owner_context_tick(), Some(Tick(1)));
+        assert_eq!(r.owner_active_pages(), Some([p(0, 0, 0).page()].as_slice()));
+        assert_eq!(
+            r.owner_observers(),
+            Some(observers.iter().copied().collect::<Vec<_>>().as_slice())
+        );
+        for id in 1..=3 {
+            assert_eq!(
+                read_machine(&w, ComponentId(id)).unwrap(),
+                read_machine(&expected_w, ComponentId(id)).unwrap()
+            );
+        }
+        assert_eq!(r.snapshot().transport, expected.snapshot().transport);
+        assert_eq!(
+            r.packet_count(),
+            0,
+            "outside-AOI chest is not an admissible route target"
+        );
+        for id in [4, 5] {
+            assert_eq!(
+                w.component(ComponentId(id)).unwrap().data.payload,
+                expected_w.component(ComponentId(id)).unwrap().data.payload
+            );
+        }
+    }
+}
+
+#[test]
+fn late_only_context_survives_no_machine_barrier_and_future_idle_ticks_write_no_kind4() {
+    use std::collections::BTreeSet;
+    let w = World::new(rules::properties, 16);
+    let mut r = MachineRuntime::new(Config::default()).unwrap();
+    let pages = BTreeSet::from([p(0, 0, 0).page()]);
+    let observers = BTreeSet::from([net::PlayerId([3; 16])]);
+    let mut d = r.noop_delta().unwrap();
+    assert!(d.capture_context(Tick(7), &pages, &observers).unwrap());
+    assert!(!d.is_empty());
+    r.acknowledge(RuntimeDelta::decode(&d.encode().unwrap(), Config::default()).unwrap())
+        .unwrap();
+    r = recover(&r);
+    assert!(!r.owner_pending());
+    assert_eq!(r.owner_context_tick(), Some(Tick(7)));
+    assert_eq!(r.owner_active_pages(), Some([p(0, 0, 0).page()].as_slice()));
+    assert_eq!(
+        r.owner_observers(),
+        Some([net::PlayerId([3; 16])].as_slice())
+    );
+    let before = r.snapshot();
+    let mut d = r.noop_delta().unwrap();
+    assert!(
+        !d.capture_context(Tick(7), &BTreeSet::new(), &BTreeSet::new())
+            .unwrap()
+    );
+    assert!(
+        d.is_empty(),
+        "same tick's captured observers cannot be replaced after disconnect"
+    );
+    for tick in 8..100 {
+        let plan = r.plan_tick(&w, Tick(tick), Budget::default()).unwrap();
+        assert!(plan.owner_complete() && plan.delta.is_empty());
+        assert_eq!(plan.work, Work::default());
+        assert!(
+            !plan
+                .delta
+                .encode()
+                .unwrap()
+                .windows(4)
+                .any(|b| b == b"XAO2")
+        );
+    }
+    assert_eq!(r.snapshot(), before);
+    let mut bad = r.snapshot();
+    bad.owner.observers.push(net::PlayerId([3; 16]));
+    assert!(MachineRuntime::restore(Config::default(), &bad).is_err());
+    let mut next = r.noop_delta().unwrap();
+    assert!(
+        next.capture_context(Tick(100), &BTreeSet::new(), &BTreeSet::new())
+            .unwrap()
+    );
+    r.acknowledge(next).unwrap();
+    r = recover(&r);
+    assert_eq!(r.owner_context_tick(), Some(Tick(100)));
+    assert_eq!(r.owner_active_pages(), Some([].as_slice()));
+    assert_eq!(r.owner_observers(), Some([].as_slice()));
+}
+
 #[test]
 fn real_store_reopens_each_prepare_machine_resource_and_transit_microbatch() {
     struct Directory(std::path::PathBuf);
@@ -537,10 +790,23 @@ fn real_store_reopens_each_prepare_machine_resource_and_transit_microbatch() {
         })
         .unwrap();
     let mut stages = std::collections::BTreeSet::new();
+    let captured = std::collections::BTreeSet::from([p(0, 0, 0).page()]);
+    let original = |at: BlockPos| captured.contains(&at.page());
+    let lost_after_recovery = |_: BlockPos| false;
     for i in 0..24 {
-        let plan = r
-            .plan_tick(
+        let continuing = r.owner_pending();
+        let mut plan = r
+            .plan_tick_with_context(
                 &w,
+                PhaseContext {
+                    payloads: None,
+                    active: Some(if continuing {
+                        &lost_after_recovery
+                    } else {
+                        &original
+                    }),
+                    activity: &[],
+                },
                 Tick(1),
                 Budget {
                     events: 1,
@@ -548,6 +814,9 @@ fn real_store_reopens_each_prepare_machine_resource_and_transit_microbatch() {
                 },
             )
             .unwrap();
+        if !continuing {
+            assert!(plan.capture_activity(&captured).unwrap());
+        }
         let done = plan.owner_complete();
         r.validate(&w, &plan).unwrap();
         let mut batch = save::Batch::empty(Tick(1));

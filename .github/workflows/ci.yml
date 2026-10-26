@@ -105,6 +105,12 @@ jobs:
           source tools/env.sh
           bash tools/check_one.sh 'Windows WARP shadow footprints' cargo test --locked -p render --test shadow_footprint -- --nocapture
           bash tools/check_one.sh 'Windows WARP sparse shadow depth' cargo test --locked -p render --test shadows shadow_sparse::gpu_projected_old_new_clear_matches_full_depth_for_sun_models_and_removal -- --exact --nocapture
+      - name: Validate SMAA and public distant shadows with D3D12 WARP
+        run: |
+          source tools/env.sh
+          bash tools/check_one.sh 'Windows WARP SMAA reference and post' cargo test --locked -p render --test smaa_gpu --test smaa_post -- --test-threads=1 --nocapture
+          bash tools/check_one.sh 'Windows WARP distant shadow backend' cargo test --locked -p render --test distant_shadows -- --test-threads=1 --nocapture
+          bash tools/check_one.sh 'Windows WARP complete visual owners' cargo test --locked -p client --test visual_settings_gpu --test view_far_shadows -- --test-threads=1 --nocapture
       - name: Present three native Windows frames
         run: bash tools/windows_native_smoke.sh
       - name: Build portable Windows bundle
@@ -117,9 +123,31 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
 
+  server_scale:
+    name: Canonical server load §8.6, release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Bootstrap locked toolchain and dependencies
+        run: bash tools/bootstrap.sh
+      - name: Required 32 UDP peers, 5000 actors, 10000 machines and 100000 fluid events
+        run: bash tools/check_server_scale.sh
+      - name: Preserve full owner counts, traffic, allocations and recovery evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: acceptance-server-scale-evidence
+          path: |
+            .local/artifacts/spec86-*.jsonl
+            .local/artifacts/spec86-source-sha.txt
+            .local/artifacts/check_Canonical_server_scale*.log
+          include-hidden-files: true
+          if-no-files-found: error
+
   report:
     name: Relay actual CI evidence and stage delivery
-    needs: [linux, windows]
+    needs: [linux, windows, server_scale]
     if: >-
       always() && github.event_name == 'push' &&
       github.repository == 'Astraneer/cubi-cyber-v1' &&
@@ -144,6 +172,7 @@ jobs:
         env:
           CI_REPORT_LINUX_RESULT: ${{ needs.linux.result }}
           CI_REPORT_WINDOWS_RESULT: ${{ needs.windows.result }}
+          CI_REPORT_SERVER_SCALE_RESULT: ${{ needs.server_scale.result }}
           CI_REPORT_CREATE_PR: "1"
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 tools/ci_report.py

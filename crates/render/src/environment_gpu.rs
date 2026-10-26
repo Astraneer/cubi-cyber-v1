@@ -687,6 +687,9 @@ impl EnvironmentGpu {
     pub fn atmosphere(&self) -> &AtmosphereGpu {
         &self.atmosphere
     }
+    pub fn celestials(&self) -> Option<&CelestialGpu> {
+        self.celestial.as_ref()
+    }
     pub fn post(&self) -> &PostGpu {
         &self.post
     }
@@ -1235,7 +1238,7 @@ impl EnvironmentGpu {
                         |kind| match kind {
                             1..=3 => 11,
                             4 => 12,
-                            5 => 13,
+                            5..=8 => 13,
                             _ => 255,
                         },
                     )

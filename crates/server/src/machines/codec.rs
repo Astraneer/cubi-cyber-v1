@@ -3,6 +3,11 @@ use super::*;
 use machines::grid::{Endpoint, NetworkSnapshot, NodeSnapshot, SlotSnapshot};
 use machines::grid::{IndexedSlot, TopologyEdit, TopologyRecords};
 const MAX_BYTES: usize = save::MAX_RUNTIME_BYTES;
+struct DecodedContext {
+    tick: Option<Tick>,
+    pages: Option<Vec<PageId>>,
+    observers: Vec<net::PlayerId>,
+}
 struct Writer {
     bytes: Vec<u8>,
     overflow: bool,
@@ -86,6 +91,34 @@ impl Writer {
                 self.u64(due.0);
                 self.u8(phase);
                 self.u64(order);
+            }
+        }
+    }
+    fn owner_context(
+        &mut self,
+        tick: Option<Tick>,
+        pages: Option<&[PageId]>,
+        observers: &[net::PlayerId],
+    ) {
+        if let Some(tick) = tick {
+            let Some(pages) = pages else {
+                self.overflow = true;
+                return;
+            };
+            self.raw(b"XAO2");
+            self.u64(tick.0);
+            self.count(pages.len());
+            for page in pages {
+                self.anchor(BlockPos {
+                    space: page.space,
+                    x: page.x,
+                    y: page.y,
+                    z: page.z,
+                });
+            }
+            self.count(observers.len());
+            for id in observers {
+                self.raw(&id.0);
             }
         }
     }
@@ -256,6 +289,52 @@ impl Reader<'_> {
             prepared_after,
         }))
     }
+    fn owner_context(&mut self, legacy_tick: Option<Tick>) -> Result<DecodedContext, MachineError> {
+        let modern = self.peek(b"XAO2");
+        if !modern && !self.peek(b"XAOP") {
+            return Ok(DecodedContext {
+                tick: None,
+                pages: None,
+                observers: Vec::new(),
+            });
+        }
+        self.raw::<4>()?;
+        let tick = if modern {
+            Tick(self.u64()?)
+        } else {
+            legacy_tick.ok_or(MachineError::Encoding)?
+        };
+        let count = self.count(barrier::MAX_ACTIVITY_PAGES, 16)?;
+        let mut pages = Vec::with_capacity(count);
+        for _ in 0..count {
+            let p = self.anchor()?;
+            pages.push(PageId {
+                space: p.space,
+                x: p.x,
+                y: p.y,
+                z: p.z,
+            });
+        }
+        if pages.windows(2).any(|p| p[0] >= p[1]) {
+            return Err(MachineError::Encoding);
+        }
+        let mut observers = Vec::new();
+        if modern {
+            let count = self.count(64, 16)?;
+            observers.reserve_exact(count);
+            for _ in 0..count {
+                observers.push(net::PlayerId(self.raw::<16>()?));
+            }
+            if observers.windows(2).any(|p| p[0] >= p[1]) {
+                return Err(MachineError::Encoding);
+            }
+        }
+        Ok(DecodedContext {
+            tick: Some(tick),
+            pages: Some(pages),
+            observers,
+        })
+    }
     fn reservoir(&mut self) -> Result<Reservoir, MachineError> {
         Ok(Reservoir {
             substance: self.u8()?,
@@ -419,6 +498,11 @@ impl RuntimeSnapshot {
             for &p in &self.owner.ready {
                 w.pending(p);
             }
+            w.owner_context(
+                self.owner.context_tick,
+                self.owner.active_pages.as_deref(),
+                &self.owner.observers,
+            );
         }
         w.finish()
     }
@@ -500,7 +584,18 @@ impl RuntimeSnapshot {
             for _ in 0..count {
                 ready.push(r.pending()?);
             }
-            OwnerSnapshot { state, ready }
+            let DecodedContext {
+                tick: context_tick,
+                pages: active_pages,
+                observers,
+            } = r.owner_context(state.map(|s| s.tick))?;
+            OwnerSnapshot {
+                state,
+                ready,
+                active_pages,
+                context_tick,
+                observers,
+            }
         } else {
             OwnerSnapshot::default()
         };
@@ -632,7 +727,10 @@ impl RuntimeDelta {
             w.count(bytes.len());
             w.raw(&bytes);
         }
-        if self.owner.before.is_some() || self.owner.after.is_some() || !self.owner.ready.is_empty()
+        if self.owner.before.is_some()
+            || self.owner.after.is_some()
+            || !self.owner.ready.is_empty()
+            || self.owner.context_tick.is_some()
         {
             w.raw(b"XPH1");
             w.owner_state(self.owner.before);
@@ -648,6 +746,11 @@ impl RuntimeDelta {
                     w.pending(p);
                 }
             }
+            w.owner_context(
+                self.owner.context_tick,
+                self.owner.active_pages.as_deref(),
+                self.owner.observers.as_deref().unwrap_or(&[]),
+            );
         }
         w.finish()
     }
@@ -807,10 +910,19 @@ impl RuntimeDelta {
                 }
                 ready.push(QueuePatch { before, after });
             }
+            let DecodedContext {
+                tick: context_tick,
+                pages: active_pages,
+                observers,
+            } = r.owner_context(after.or(before).map(|s| s.tick))?;
             barrier::OwnerDelta {
                 before,
                 after,
                 ready,
+                active_pages,
+                context_tick,
+                observers: context_tick.map(|_| observers),
+                prior_context_tick: None,
             }
         } else {
             barrier::OwnerDelta::default()

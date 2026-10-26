@@ -47,11 +47,19 @@ struct RemoteNative {
     last_light_bindings: u64,
 }
 impl RemoteNative {
-    fn new(options: ConnectOptions, clock_origin: Instant) -> Result<Self, String> {
-        let mut session = client::remote::RemoteSession::new(client::network::NetworkConfig {
+    fn new(
+        options: ConnectOptions,
+        clock_origin: Instant,
+        near: Option<client::near_profile::NearProfile>,
+    ) -> Result<Self, String> {
+        let mut network = client::network::NetworkConfig {
             input_lead_ticks: 2,
             ..client::network::NetworkConfig::remote_scene()
-        })?;
+        };
+        if let Some(near) = near {
+            near.apply_network(&mut network);
+        }
+        let mut session = client::remote::RemoteSession::new(network)?;
         let hello = remote_transport::load_identity(&options.identity)?.unwrap_or(net::Hello {
             identity: net::PlayerId::default(),
             name: options.name.clone(),
@@ -251,7 +259,21 @@ impl NativeState {
                     if let Err(error) = self.connect_product(address, name)
                         && let Some(product) = &mut self.product
                     {
-                        product.disconnected(&error);
+                        if self.remote.is_some() || self.view.is_some() {
+                            product.layer.app.set_status(&error);
+                            if client::near_profile::NearProfile::plan(
+                                product.settings_target().get(ui::settings::Setting::Near) as u16,
+                                Default::default(),
+                            )
+                            .is_err()
+                            {
+                                product.layer.app.open(ui::app::Screen::Settings(
+                                    ui::settings::Section::Graphics,
+                                ));
+                            }
+                        } else {
+                            product.disconnected(&error);
+                        }
                     }
                 }
                 product_ui::Command::BugReport => self.export_flight()?,
@@ -282,6 +304,16 @@ impl NativeState {
         if self.loading.is_some() {
             return Err("Дождитесь завершения загрузки мира".into());
         }
+        let settings = self
+            .product
+            .as_ref()
+            .map(|product| product.settings_target().clone())
+            .unwrap_or_default();
+        let near = client::near_profile::NearProfile::plan(
+            settings.get(ui::settings::Setting::Near) as u16,
+            Default::default(),
+        )
+        .map_err(|error| error.to_string())?;
         self.capture(false);
         self.remote = None;
         self.view = None;
@@ -297,6 +329,7 @@ impl NativeState {
                 name,
             },
             self.network_started,
+            Some(near),
         )?;
         if let Some(product) = &mut self.product {
             product.layer.app.name = remote.name.clone();
@@ -314,10 +347,7 @@ impl NativeState {
             materials: true,
             environment: true,
             horizon: true,
-            settings: self
-                .product
-                .as_ref()
-                .map(|product| product.settings_target().clone()),
+            settings: Some(settings),
         };
         let device = self.gpu.device.clone();
         let queue = self.gpu.queue.clone();
@@ -514,7 +544,25 @@ impl NativeState {
             modifiers: [false; 4],
             demo_mesh_delay_ticks: 0,
             remote: connection
-                .map(|options| RemoteNative::new(options, network_started))
+                .map(|options| {
+                    RemoteNative::new(
+                        options,
+                        network_started,
+                        if mode == SceneMode::Product {
+                            Some(
+                                client::near_profile::NearProfile::plan(
+                                    ui::settings::Settings::default()
+                                        .get(ui::settings::Setting::Near)
+                                        as u16,
+                                    Default::default(),
+                                )
+                                .map_err(|error| error.to_string())?,
+                            )
+                        } else {
+                            None
+                        },
+                    )
+                })
                 .transpose()?,
             network_started,
             flight,

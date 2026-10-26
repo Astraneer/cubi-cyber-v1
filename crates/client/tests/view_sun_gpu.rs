@@ -230,6 +230,7 @@ fn actual_view_public_day_night_shares_sun_with_shadow_and_keeps_raw_sky_certifi
                     page: *page,
                     version: 1,
                     source_version: Version(1),
+                    applied_action: Default::default(),
                     cells,
                 }),
                 Tick(0),

@@ -907,6 +907,9 @@ impl ClientLighting {
     pub fn invalidate_bounds(&mut self, bounds: WorldBounds) {
         self.shadows.invalidate_bounds(bounds);
     }
+    pub fn invalidate_all_shadows(&mut self) {
+        self.shadows.invalidate_all();
+    }
     pub fn needs_work(&self, world: &World) -> bool {
         self.pending_light_work(world) || self.shadows.needs_work()
     }

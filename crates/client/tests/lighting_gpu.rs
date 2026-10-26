@@ -540,6 +540,7 @@ fn scene_source_certificate_gates_zero_snapshot_and_revokes_high_rgb_on_cell_vie
                 page: page(),
                 version: view,
                 source_version: core_types::Version(500 + view),
+                applied_action: Default::default(),
                 cells: Box::new([Cell::AIR; 4096]),
             })
         };
@@ -715,6 +716,7 @@ fn cpu_ingest_retires_nonresident_metadata_without_losing_future_volume_snapshot
                     page: page(),
                     version: 1,
                     source_version: core_types::Version(1),
+                    applied_action: Default::default(),
                     cells: Box::new([Cell::AIR; 4096]),
                 }),
                 Tick(1),

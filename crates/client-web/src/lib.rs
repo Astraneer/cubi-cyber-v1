@@ -707,6 +707,30 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
     };
     match command {
         product_ui::Command::Connect { address, name } => {
+            let near = {
+                let mut borrowed = state.borrow_mut();
+                let settings = borrowed
+                    .product
+                    .as_ref()
+                    .map(|product| product.settings_target().clone())
+                    .unwrap_or_default();
+                match client::near_profile::NearProfile::plan(
+                    settings.get(ui::settings::Setting::Near) as u16,
+                    Default::default(),
+                ) {
+                    Ok(near) => near,
+                    Err(error) => {
+                        if let Some(product) = &mut borrowed.product {
+                            product.layer.app.set_status(error.message());
+                            product
+                                .layer
+                                .app
+                                .open(ui::app::Screen::Settings(ui::settings::Section::Graphics));
+                        }
+                        return;
+                    }
+                }
+            };
             let (fresh, epoch) = {
                 let mut state = state.borrow_mut();
                 state.connection_epoch = state.connection_epoch.wrapping_add(1);
@@ -826,9 +850,9 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                         settings.get(ui::settings::Setting::Msaa) as u32,
                     )
                     .map_err(js_error)?;
-                    let mut view =
-                        ClientView::new(renderer, client::remote::RemoteSession::scene_config())
-                            .map_err(js_error)?;
+                    let mut scene = client::remote::RemoteSession::scene_config();
+                    near.apply_scene(&mut scene);
+                    let mut view = ClientView::new(renderer, scene).map_err(js_error)?;
                     animation_frame().await?;
                     prepare_product_world(
                         &mut view, &device, &queue, width, height, &atlas, &settings,
@@ -1095,6 +1119,15 @@ fn prepare_product_world(
             .and_then(|profile| {
                 profile.with_contact_ao(settings.get(ui::settings::Setting::Ssao) as u8)
             })
+            .and_then(|profile| {
+                profile.with_antialiasing(settings.get(ui::settings::Setting::Msaa) as u32)
+            })
+            .and_then(|profile| {
+                profile.with_visual_choices(
+                    settings.get(ui::settings::Setting::ExposureMode) as u8,
+                    settings.get(ui::settings::Setting::SkyStyle) as u8,
+                )
+            })
             .map_err(js_error)?,
         atlas,
     )
@@ -1107,6 +1140,7 @@ fn prepare_product_world(
         .map_err(js_error)?;
     view.prepare_far_water(Default::default())
         .map_err(js_error)?;
+    view.prepare_distant_shadows(device).map_err(js_error)?;
     view.apply_settings(settings);
     Ok(())
 }
@@ -1128,8 +1162,31 @@ fn prepare_material_variant(
 }
 fn connect_socket(state: &Rc<RefCell<BrowserState>>, address: String, name: String) {
     let mut state = state.borrow_mut();
+    let settings = state
+        .product
+        .as_ref()
+        .map(|product| product.settings_target().clone())
+        .unwrap_or_default();
+    let near = match client::near_profile::NearProfile::plan(
+        settings.get(ui::settings::Setting::Near) as u16,
+        Default::default(),
+    ) {
+        Ok(near) => near,
+        Err(error) => {
+            if let Some(product) = &mut state.product {
+                product.layer.app.set_status(error.message());
+            }
+            return;
+        }
+    };
     match browser_network::BrowserSocket::connect(&address, &name, clock_ms() as u64) {
-        Ok(socket) => {
+        Ok(mut socket) => {
+            if let Err(error) = socket.session_mut().connection_mut().set_near_profile(near) {
+                if let Some(product) = &mut state.product {
+                    product.layer.app.set_status(&format!("{error:?}"));
+                }
+                return;
+            }
             state.socket = Some(socket);
         }
         Err(error) => {
@@ -1146,6 +1203,20 @@ fn connect_socket(state: &Rc<RefCell<BrowserState>>, address: String, name: Stri
 fn stats_object(view: &ClientView) -> JsValue {
     let stats = view.stats();
     let value = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &value,
+        &"requestedNear".into(),
+        &view
+            .requested_near_blocks()
+            .map_or(JsValue::NULL, |near| near.into()),
+    );
+    let _ = js_sys::Reflect::set(
+        &value,
+        &"nearSettingsError".into(),
+        &view
+            .near_settings_error()
+            .map_or(JsValue::NULL, |error| error.message().into()),
+    );
     let _ = js_sys::Reflect::set(
         &value,
         &"exposureGain".into(),
@@ -1173,6 +1244,8 @@ fn stats_object(view: &ClientView) -> JsValue {
         &view.sun_clock().is_some().into(),
     );
     let horizon = view.horizon_stats().unwrap_or_default();
+    let far_water = view.horizon_water_stats().unwrap_or_default();
+    let far_shadows = view.distant_shadow_stats().unwrap_or_default();
     let props = view.props_stats().unwrap_or_default();
     let jobs = view.horizon_job_stats().unwrap_or_default();
     for (name, number) in [
@@ -1231,11 +1304,26 @@ fn stats_object(view: &ClientView) -> JsValue {
         ("horizonLastPlanFailure", f64::from(jobs.last_plan_failure)),
         ("horizonProxyResults", jobs.proxy_results as f64),
         ("horizonWorkerFailures", jobs.worker_failures as f64),
+        ("farWaterWanted", far_water.wanted as f64),
+        ("farWaterRecords", far_water.records as f64),
+        ("farWaterQueued", far_water.queued as f64),
+        ("farWaterRunning", far_water.running as f64),
+        ("farWaterReadyQueue", far_water.ready_queue as f64),
+        ("farWaterStaged", far_water.staged as f64),
+        ("farWaterFront", far_water.front as f64),
+        ("farWaterUnknownHeld", far_water.unknown_held as f64),
+        ("farWaterFailures", far_water.failures as f64),
+        ("farWaterFrontQuads", far_water.front_quads as f64),
+        ("farWaterStagedQuads", far_water.staged_quads as f64),
+        ("farShadowSourceChanges", far_shadows.source_changes as f64),
+        ("farShadowBufferBytes", far_shadows.buffer_bytes as f64),
     ] {
         let _ = js_sys::Reflect::set(&value, &name.into(), &number.into());
     }
     for (name, flag) in [
         ("horizonNearGuardReady", horizon.near_guard_ready),
+        ("horizonCommittedFront", view.has_committed_far_front()),
+        ("farShadowsEnabled", far_shadows.enabled),
         ("propsPrepared", view.props_stats().is_some()),
         ("propsReady", props.ready),
         ("horizonEnabled", horizon.enabled),
@@ -1308,6 +1396,10 @@ fn stats_object(view: &ClientView) -> JsValue {
     }
     for (name, number) in [
         ("renderScale", f64::from(view.render_scale())),
+        (
+            "effectiveNearBlocks",
+            f64::from(view.effective_near_blocks()),
+        ),
         ("renderWidth", f64::from(view.render_extent()[0])),
         ("renderHeight", f64::from(view.render_extent()[1])),
         ("residentPages", stats.resident_pages as f64),
@@ -1813,11 +1905,28 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
     )
     .map_err(|error| js_error(error.to_string()))?;
     let params = web_sys::UrlSearchParams::new_with_str(&window.location().search()?)?;
-    let scene_config = if diagnostic {
+    let mut product = if diagnostic {
+        None
+    } else {
+        Some(product_ui::ProductUi::prepare(
+            &gpu.device,
+            &gpu.queue,
+            config.format,
+        )?)
+    };
+    let mut scene_config = if diagnostic {
         client::SceneConfig::forest()
     } else {
         client::remote::RemoteSession::scene_config()
     };
+    if let Some(product) = &product
+        && let Ok(near) = client::near_profile::NearProfile::plan(
+            product.settings_target().get(ui::settings::Setting::Near) as u16,
+            Default::default(),
+        )
+    {
+        near.apply_scene(&mut scene_config);
+    }
     let legacy = diagnostic
         && (params.get("unit_mesh").as_deref() == Some("1")
             || params.get("legacy_gpu_greedy").as_deref() == Some("1"));
@@ -1831,27 +1940,25 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
         ClientView::new(terrain, scene_config)
     }
     .map_err(js_error)?;
-    let mut product = if diagnostic {
-        None
-    } else {
-        Some(product_ui::ProductUi::prepare(
-            &gpu.device,
-            &gpu.queue,
-            config.format,
-        )?)
-    };
     if let Some(product) = &mut product {
         animation_frame().await?;
-        prepare_product_world(
-            &mut view,
-            &gpu.device,
-            &gpu.queue,
-            width,
-            height,
-            &atlas,
-            product.settings_target(),
-        )?;
-        prepare_material_variant(&mut view, &gpu.device, &gpu.queue, &atlas)?;
+        if let Err(error) = client::near_profile::NearProfile::plan(
+            product.settings_target().get(ui::settings::Setting::Near) as u16,
+            Default::default(),
+        ) {
+            product.layer.app.set_status(error.message());
+        } else {
+            prepare_product_world(
+                &mut view,
+                &gpu.device,
+                &gpu.queue,
+                width,
+                height,
+                &atlas,
+                product.settings_target(),
+            )?;
+            prepare_material_variant(&mut view, &gpu.device, &gpu.queue, &atlas)?;
+        }
         let applied = view.apply_settings(product.settings_target());
         product
             .layer

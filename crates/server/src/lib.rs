@@ -208,6 +208,7 @@ pub struct ServerCounters {
     pub machine_unknown: u64,
     pub machine_deferred: u64,
     pub machine_copy_bytes: u64,
+    pub machine_payload_deferred: u64,
     pub machine_steps: u64,
     pub machine_reads: u64,
     pub machine_transfers: u64,
@@ -348,6 +349,7 @@ pub struct Server {
     runtimes: runtime::Runtimes,
     mob_owner: mob_owner::Owner,
     natural_owner: natural_owner::Owner,
+    tick_context: Option<machine_owner::context::TickContext>,
     lighting: light_owner::LightOwner,
     light_stream: light_stream::LightStream,
     raw_sources: raw_sources::RawSources,
@@ -444,6 +446,7 @@ impl Server {
         let mut dedup = BTreeMap::new();
         let mut tick = Tick(0);
         let public_seed;
+        let mut recovered_lighting = None;
         let mut world = if let Some(snapshot) = recovery.snapshot {
             let snapshot = save::require_versions(
                 snapshot,
@@ -452,6 +455,11 @@ impl Server {
                 None,
             )?;
             runtimes.restore(&snapshot.runtimes)?;
+            recovered_lighting = snapshot
+                .runtimes
+                .into_iter()
+                .find(|r| r.kind == save::RUNTIME_LIGHT)
+                .map(|r| r.payload);
             public_seed = snapshot.public_seed;
             tick = snapshot.server_tick;
             identities.extend(snapshot.identities.into_iter().map(|i| (i.id, i)));
@@ -478,12 +486,34 @@ impl Server {
                     .map_err(|_| ServerError::Invalid("empty height baseline"))?;
             }
         }
+        let mut lighting = recovered_lighting
+            .as_deref()
+            .map(|bytes| light_owner::LightOwner::restore(&mut world, config.light_budget, bytes))
+            .transpose()?;
+        let legacy_lighting = recovered_lighting.is_none();
+        drop(recovered_lighting);
         for (_, batch) in recovery.batches {
             runtimes.replay(&batch.runtimes)?;
-            for change in batch.changes {
+            for change in &batch.changes {
                 world
-                    .apply_recovered_change(&change)
+                    .apply_recovered_change(change)
                     .map_err(|_| ServerError::Invalid("invalid WAL world transition"))?;
+            }
+            if let Some(owner) = &mut lighting {
+                owner.observe_columns(&batch.changes, false);
+                // Persisted operations below carry the exact semantic queues.
+                owner.clear_recovery_ops();
+                for record in batch
+                    .runtimes
+                    .iter()
+                    .filter(|r| r.kind == save::RUNTIME_LIGHT)
+                {
+                    owner.replay_delta(&record.payload)?;
+                }
+            } else if batch.runtimes.iter().any(|r| r.kind == save::RUNTIME_LIGHT) {
+                return Err(ServerError::Invalid(
+                    "lighting delta without snapshot baseline",
+                ));
             }
             for identity in batch.identities {
                 identities.insert(identity.id, identity);
@@ -509,13 +539,20 @@ impl Server {
         }
         config.public_seed = public_seed;
         tick = Tick(tick.0.max(world.tick().0));
+        if runtimes.mob_progress.is_some_and(|p| p.tick > tick) {
+            return Err(ServerError::Invalid("mob owner progress is in the future"));
+        }
         runtimes.bootstrap_drops(&world)?;
         runtimes.validate_owned_payloads(&world, &players)?;
+        let lighting = match lighting {
+            Some(owner) => owner,
+            None => light_owner::LightOwner::attach(&mut world, config.light_budget)?,
+        };
         // Fresh baselines, including fixture worlds, are saved before the first WAL
         // record. This also ensures private world bytes are never regenerated on load.
-        if store.last_sequence() == 0 {
+        if store.last_sequence() == 0 || legacy_lighting {
             store.checkpoint(&Snapshot {
-                record_sequence: 0,
+                record_sequence: store.last_sequence(),
                 server_tick: tick,
                 public_seed,
                 generator_version: r#gen::GENERATOR_VERSION,
@@ -524,7 +561,11 @@ impl Server {
                 identities: identities.values().cloned().collect(),
                 players: players.values().cloned().collect(),
                 dedup: dedup.iter().map(|(id, d)| (*id, d.clone())).collect(),
-                runtimes: runtimes.snapshots()?,
+                runtimes: {
+                    let mut records = runtimes.snapshots()?;
+                    records.push(lighting.snapshot()?);
+                    records
+                },
             })?;
         }
         let generator = std::sync::Arc::new(gen_authority::ServerGenerator::new(
@@ -595,13 +636,16 @@ impl Server {
         presence.set_chat_frontier(runtimes.chat.frontier());
         let height_migration =
             migration_owner::LegacyMigration::new(&world, &runtimes.height, generator.clone())?;
-        let lighting = light_owner::LightOwner::attach(&mut world, config.light_budget)?;
         let light_stream = light_stream::LightStream::new(&world);
         let raw_sources = raw_sources::RawSources::new(&world);
         let motion_key = blake3::derive_key("cubi living item motion v1", &entropy);
         let mob_owner = mob_owner::Owner::new(
             u64::from_le_bytes(motion_key[..8].try_into().expect("hash prefix")),
             runtimes.mobs.entities(),
+            runtimes
+                .mob_progress
+                .filter(|p| p.tick == tick)
+                .map(|p| p.remaining),
         );
         let natural_key = blake3::derive_key("cubi natural actor bodies v1", &entropy);
         let natural_owner = natural_owner::Owner::new(
@@ -611,7 +655,7 @@ impl Server {
         let height_worker = height_stream::HeightWorker::new(r#gen::Generator::new(
             r#gen::TerrainSeed(public_seed),
         ))?;
-        Ok(Self {
+        let mut server = Self {
             config,
             world,
             writer,
@@ -642,6 +686,7 @@ impl Server {
             runtimes,
             mob_owner,
             natural_owner,
+            tick_context: None,
             lighting,
             light_stream,
             raw_sources,
@@ -654,7 +699,9 @@ impl Server {
             now_ms: 0,
             recipe_book: rules::crafting::RecipeBook::standard()
                 .map_err(|_| ServerError::Invalid("standard crafting recipes"))?,
-        })
+        };
+        server.restore_tick_context()?;
+        Ok(server)
     }
     pub fn world(&self) -> &World {
         &self.world
@@ -729,6 +776,20 @@ impl Server {
         message: ClientMessage,
         now_ms: u64,
     ) -> Vec<Outgoing> {
+        let mut outgoing = self.enqueue(connection, message, now_ms);
+        if outgoing.is_empty() {
+            outgoing.extend(self.tick(now_ms));
+        }
+        outgoing
+    }
+    /// Transport admission never advances a domain phase. Runtime calls tick
+    /// once after its bounded ingress pass; direct callers retain handle().
+    pub(crate) fn enqueue(
+        &mut self,
+        connection: u64,
+        message: ClientMessage,
+        now_ms: u64,
+    ) -> Vec<Outgoing> {
         // Decode validation is also applied to in-process callers. This boundary
         // must not admit finite/length checks bypassed by a different transport.
         if let Err(error) = net::encode_client(&message) {
@@ -761,7 +822,7 @@ impl Server {
         }
         self.inbox.push_back((connection, message, now_ms));
         self.counters.inbox_high_water = self.counters.inbox_high_water.max(self.inbox.len());
-        self.tick(now_ms)
+        Vec::new()
     }
     pub fn tick(&mut self, now_ms: u64) -> Vec<Outgoing> {
         self.now_ms = self.now_ms.max(now_ms);
@@ -772,6 +833,10 @@ impl Server {
         }
         if self.pending.is_some() {
             self.counters.storage_stalls += 1;
+            return output;
+        }
+        if let Err(error) = self.restore_tick_context() {
+            self.fail_error("restore_tick_context", &error);
             return output;
         }
         // A large active actor cohort can fill the WAL before 200 ticks.
@@ -847,6 +912,7 @@ impl Server {
         }
         self.next_tick_at = now_ms.saturating_add(TICK_MILLIS);
         self.tick.0 = self.tick.0.saturating_add(1);
+        self.tick_context = None;
         self.counters.ticks += 1;
         self.mob_owner
             .start(self.runtimes.mobs.entities().active_len());
@@ -1245,7 +1311,11 @@ impl Server {
         }
         output
     }
-    fn submit_batch(&mut self, batch: Batch, outgoing: Vec<Outgoing>) {
+    fn submit_batch(&mut self, mut batch: Batch, outgoing: Vec<Outgoing>) {
+        if let Err(error) = self.prepare_light_batch(&mut batch) {
+            self.fail_error("lighting continuation capture", &error);
+            return;
+        }
         let ticket = self.next_ticket;
         self.next_ticket += 1;
         let changes = batch.changes.clone();
@@ -1282,13 +1352,20 @@ impl Server {
         }
         let ticket = self.next_ticket;
         self.next_ticket += 1;
-        let runtimes = match self.runtimes.snapshots() {
+        let mut runtimes = match self.runtimes.snapshots() {
             Ok(records) => records,
             Err(_) => {
                 self.fail("request_checkpoint");
                 return false;
             }
         };
+        match self.lighting.snapshot() {
+            Ok(record) => runtimes.push(record),
+            Err(error) => {
+                self.fail_error("checkpoint lighting continuation", &error);
+                return false;
+            }
+        }
         self.counters.checkpoint_requests += 1;
         self.counters.checkpoint_runtime_bytes +=
             runtimes.iter().map(|r| r.payload.len() as u64).sum::<u64>();
@@ -1547,6 +1624,39 @@ impl Server {
                     out.push(Outgoing::reliable(
                         connection,
                         ServerMessage::LightUnavailable(request.page),
+                    ));
+                }
+            }
+            ClientMessage::ForgetPage(page) => {
+                // Retire this observer's near lease, never canonical World data.
+                // All dependent streams keep their session-wide revision clocks.
+                let retired = peer.pages.remove(&page)
+                    || peer.history.latest_page(page).is_some()
+                    || peer
+                        .page_requests
+                        .iter()
+                        .any(|(pending, _)| *pending == page)
+                    || peer
+                        .raw_view
+                        .pending_request()
+                        .is_some_and(|(pending, _)| pending == page);
+                peer.history.remove(page);
+                peer.page_requests.retain(|(pending, _)| *pending != page);
+                peer.summaries.retain(|pending| *pending != page);
+                peer.raw_view.forget(page);
+                self.light_stream.forget(connection, page);
+                self.props_stream.forget(connection, page);
+                self.packet_stream.forget(connection, page);
+                if let Some(owner) = &mut self.geometry.projection {
+                    owner.forget_raw(connection, page);
+                }
+                if retired {
+                    // Reliable UDP messages may complete out of order. Echoing
+                    // retirement lets a currently renewed client lease repair
+                    // after an older in-flight ForgetPage arrives late.
+                    out.push(Outgoing::reliable(
+                        connection,
+                        ServerMessage::PageUnavailable(page),
                     ));
                 }
             }
@@ -2882,11 +2992,27 @@ impl Server {
                             }
                             continue;
                         };
-                        if let Ok(Some(update)) = peer.history.build(page, raw_source, cells, force)
+                        let applied_action = ActionId(
+                            self.dedup
+                                .get(&peer.identity)
+                                .map_or(0, |state| state.contiguous),
+                        );
+                        match peer
+                            .history
+                            .build_public(page, applied_action, cells, force)
                         {
-                            output
-                                .push(Outgoing::reliable(connection, ServerMessage::Page(update)));
-                            self.counters.page_images += 1;
+                            Ok(Some(update)) => {
+                                output.push(Outgoing::reliable(
+                                    connection,
+                                    ServerMessage::Page(update),
+                                ));
+                                self.counters.page_images += 1;
+                            }
+                            Ok(None) => {}
+                            Err(_) => {
+                                self.fail("public_raw_history");
+                                break;
+                            }
                         }
                         if let Some(latest) = peer.history.latest_page(page) {
                             peer.raw_view.admit(page, latest.version, raw_source);

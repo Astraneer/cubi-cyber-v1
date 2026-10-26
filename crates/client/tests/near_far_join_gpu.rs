@@ -10,6 +10,8 @@ use render::terrain_mesh::{CellMaterial, MeshScratch, PageHalo, PageMesh, mesh_p
 const SIZE: u32 = 128;
 const LOW: [[i32; 3]; 2] = [[-1, 0, -1], [2, 3, 2]];
 const HIGH: [[i32; 3]; 2] = [[-1, 5, -1], [2, 8, 2]];
+const WIDE_LOW: [[i32; 3]; 2] = [[-2, 0, -2], [3, 3, 3]];
+const WIDE_HIGH: [[i32; 3]; 2] = [[-2, 5, -2], [3, 8, 3]];
 #[path = "../../render/tests/common/msaa.rs"]
 mod sample_locations;
 fn page(x: i32, y: i32, z: i32) -> PageId {
@@ -227,6 +229,8 @@ fn horizon(
     (h, keys)
 }
 struct Readback {
+    samples: [[f64; 2]; 4],
+    ground_bounds: [f64; 4],
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     texture: wgpu::Texture,
@@ -235,7 +239,9 @@ struct Readback {
     color: wgpu::Buffer,
 }
 impl Readback {
-    fn new(device: &wgpu::Device) -> Self {
+    fn new(gpu: &render::Gpu) -> Self {
+        let device = &gpu.device;
+        let samples = sample_locations::locations(gpu);
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("independent joined depth probe"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -313,6 +319,11 @@ impl Readback {
             u64::from(SIZE * SIZE * 8),
         );
         Self {
+            samples,
+            ground_bounds: render::height_tile::HeightPlan::new(0, [0, 0], 0, 64)
+                .unwrap()
+                .outer_bounds_pages
+                .map(|page| page as f64 * 16.),
             layout,
             pipeline,
             texture,
@@ -448,12 +459,18 @@ impl Readback {
             .chunks_exact(8)
             .map(|c| u16::from_le_bytes(c[6..8].try_into().unwrap()))
             .collect();
-        Image {
+        let mut image = Image {
             depth,
             coverage,
             samples,
             color,
-        }
+            outside_support: 0,
+        };
+        // Terrain's raster guard may paint a sample just outside the finite
+        // source footprint. Compare only common geometric support, determined
+        // by independent f64 rays and measured hardware sample locations.
+        restrict_to_fixture_support(&mut image, camera, eye, self.samples, self.ground_bounds);
+        image
     }
 }
 
@@ -463,7 +480,7 @@ fn height_near_boundary_preserves_each_ground_sample_without_a_proxy() {
         let gpu = render::Gpu::request(&render::instance(), None, true)
             .await
             .unwrap();
-        let read = Readback::new(&gpu.device);
+        let read = Readback::new(&gpu);
         let mut full = terrain(&gpu);
         let mut joined = terrain(&gpu);
         near(&gpu, &mut joined, LOW, None);
@@ -527,6 +544,88 @@ struct Image {
     coverage: Vec<u16>,
     samples: Vec<[f32; 4]>,
     color: Vec<u8>,
+    outside_support: u32,
+}
+fn fixture_support(camera: Camera, eye: [f32; 3], sample: [f64; 2], bounds: [f64; 4]) -> bool {
+    let ndc = [
+        2. * sample[0] / f64::from(SIZE) - 1.,
+        1. - 2. * sample[1] / f64::from(SIZE),
+    ];
+    let a: [f64; 3] = std::array::from_fn(|axis| {
+        f64::from(camera.view_projection[axis][1])
+            - ndc[1] * f64::from(camera.view_projection[axis][3])
+    });
+    let b: [f64; 3] = std::array::from_fn(|axis| {
+        f64::from(camera.view_projection[axis][0])
+            - ndc[0] * f64::from(camera.view_projection[axis][3])
+    });
+    let mut ray = [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ];
+    if (0..3)
+        .map(|axis| ray[axis] * f64::from(camera.view_projection[axis][3]))
+        .sum::<f64>()
+        < 0.
+    {
+        ray = ray.map(|value| -value);
+    }
+    let eye = eye.map(f64::from);
+    if ray[1] != 0. {
+        let t = (8. - eye[1]) / ray[1];
+        let x = eye[0] + t * ray[0];
+        let z = eye[2] + t * ray[2];
+        if t >= 0. && x >= bounds[0] && x <= bounds[2] && z >= bounds[1] && z <= bounds[3] {
+            return true;
+        }
+    }
+    // Independent closed-box geometry for raw()'s one-block floating slab.
+    let mut enter = 0f64;
+    let mut exit = f64::INFINITY;
+    for (axis, (lo, hi)) in [(0., 16.), (71., 72.), (0., 16.)].into_iter().enumerate() {
+        if ray[axis] == 0. {
+            if eye[axis] < lo || eye[axis] > hi {
+                return false;
+            }
+        } else {
+            let a = (lo - eye[axis]) / ray[axis];
+            let b = (hi - eye[axis]) / ray[axis];
+            enter = enter.max(a.min(b));
+            exit = exit.min(a.max(b));
+        }
+    }
+    exit >= enter
+}
+fn restrict_to_fixture_support(
+    image: &mut Image,
+    camera: Camera,
+    eye: [f32; 3],
+    offsets: [[f64; 2]; 4],
+    bounds: [f64; 4],
+) {
+    // The fixture contains opaque surfaces only; these exact f16 encodings are
+    // the five possible MSAA resolve coverage values, not sample positions.
+    const COVERAGE: [u16; 5] = [0, 0x3400, 0x3800, 0x3a00, 0x3c00];
+    for (index, samples) in image.samples.iter_mut().enumerate() {
+        let count = samples.iter().filter(|depth| **depth > 0.).count();
+        assert_eq!(
+            image.coverage[index], COVERAGE[count],
+            "HDR alpha and final depth coverage disagree at pixel{index}"
+        );
+        for (sample, depth) in samples.iter_mut().enumerate() {
+            let position = [
+                (index % SIZE as usize) as f64 + offsets[sample][0],
+                (index / SIZE as usize) as f64 + offsets[sample][1],
+            ];
+            if !fixture_support(camera, eye, position, bounds) {
+                image.outside_support += u32::from(*depth != 0.);
+                *depth = 0.;
+            }
+        }
+        image.depth[index] = samples.iter().sum::<f32>() / 4.;
+        image.coverage[index] = COVERAGE[samples.iter().filter(|depth| **depth > 0.).count()];
+    }
 }
 fn mismatch(a: &Image, b: &Image) -> (usize, usize, f32) {
     let holes = a
@@ -537,8 +636,12 @@ fn mismatch(a: &Image, b: &Image) -> (usize, usize, f32) {
         .count();
     let mut bad = 0;
     let mut max = 0f32;
-    for (a, b) in a.depth.iter().zip(&b.depth) {
-        let d = (a - b).abs();
+    for (a, b) in a.samples.iter().zip(&b.samples) {
+        let d = a
+            .iter()
+            .zip(b)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
         max = max.max(d);
         if d > 1e-6 {
             bad += 1
@@ -572,7 +675,12 @@ fn save_difference(label: &str, expected: &Image, actual: &Image) {
         .iter()
         .zip(&actual.depth)
         .enumerate()
-        .filter(|(_, (a, b))| (*a - *b).abs() > 1e-6)
+        .filter(|(index, _)| {
+            expected.samples[*index]
+                .iter()
+                .zip(actual.samples[*index])
+                .any(|(a, b)| (a - b).abs() > 1e-6)
+        })
         .take(20)
     {
         eprintln!(
@@ -608,11 +716,8 @@ fn actual_three_dimensional_near_height_and_proxy_join_matches_independent_full_
         let gpu = render::Gpu::request(&render::instance(), None, true)
             .await
             .unwrap();
-        println!(
-            "joined oracle measured sample positions {:?}",
-            sample_locations::locations(&gpu)
-        );
-        let read = Readback::new(&gpu.device);
+        let mut read = Readback::new(&gpu);
+        println!("joined oracle measured sample positions {:?}", read.samples);
         let mut full = terrain(&gpu);
         let full_plan = render::height_tile::HeightPlan::new(0, [0, 0], 0, 64).unwrap();
         for t in &full_plan.tiles {
@@ -629,7 +734,37 @@ fn actual_three_dimensional_near_height_and_proxy_join_matches_independent_full_
             ("low", LOW, false),
             ("high", HIGH, false),
             ("high_with_old_low", HIGH, true),
+            ("near32_low", WIDE_LOW, false),
+            ("near32_high", WIDE_HIGH, false),
         ] {
+            let mut reference_pages = full_plan
+                .tiles
+                .iter()
+                .map(|tile| page(tile.key.x, 0, tile.key.z))
+                .collect::<std::collections::BTreeSet<_>>();
+            if volume[0][1] <= 0 && volume[1][1] > 0 {
+                for z in volume[0][2]..volume[1][2] {
+                    for x in volume[0][0]..volume[1][0] {
+                        reference_pages.insert(page(x, 0, z));
+                    }
+                }
+            }
+            read.ground_bounds = [
+                f64::from(reference_pages.iter().map(|page| page.x).min().unwrap()) * 16.,
+                f64::from(reference_pages.iter().map(|page| page.z).min().unwrap()) * 16.,
+                (f64::from(reference_pages.iter().map(|page| page.x).max().unwrap()) + 1.) * 16.,
+                (f64::from(reference_pages.iter().map(|page| page.z).max().unwrap()) + 1.) * 16.,
+            ];
+            let mut extended_reference = if reference_pages.len() > full_plan.tiles.len() {
+                let mut reference = terrain(&gpu);
+                for &page in &reference_pages {
+                    upload(&gpu, &mut reference, page);
+                }
+                upload(&gpu, &mut reference, page(0, 4, 0));
+                Some(reference)
+            } else {
+                None
+            };
             let mut joined = terrain(&gpu);
             if old_resident {
                 near(&gpu, &mut joined, LOW, None)
@@ -648,8 +783,20 @@ fn actual_three_dimensional_near_height_and_proxy_join_matches_independent_full_
             assert_eq!(h.stats().proxy_front, 8);
             for (eye, target, top) in cameras {
                 let c = camera(eye, target, top);
-                let expected = read.frame(&gpu, &mut full, None, c, eye);
+                let expected = read.frame(
+                    &gpu,
+                    extended_reference.as_mut().unwrap_or(&mut full),
+                    None,
+                    c,
+                    eye,
+                );
                 let actual = read.frame(&gpu, &mut joined, Some(&mut h), c, eye);
+                if expected.outside_support != 0 || actual.outside_support != 0 {
+                    println!(
+                        "{label} eye{eye:?} raster-only samples outside finite fixture support: reference{} joined{}",
+                        expected.outside_support, actual.outside_support
+                    );
+                }
                 let diff = mismatch(&expected, &actual);
                 if diff.0 != 0 || diff.1 != 0 {
                     save_difference(label, &expected, &actual);
@@ -725,7 +872,7 @@ fn actual_three_dimensional_near_height_and_proxy_join_matches_independent_full_
             "old whole-column mask retained the outside-Y platform unexpectedly"
         );
         println!(
-            "Near/far independent HDR+finalMSAAdepth PASS 4volumes×3cameras; old5×5negative {negative:?}; oldvertical {vertical_negative:?}"
+            "Near/far independent HDR+finalMSAAdepth PASS 6volumes×3cameras; old5×5negative {negative:?}; oldvertical {vertical_negative:?}"
         );
     });
 }

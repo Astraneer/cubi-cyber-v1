@@ -36,6 +36,7 @@ struct Driver {
     output: BufWriter<File>,
     totals: AllocationCounts,
     polls: u64,
+    peak_work: [u64; 3],
     phase: &'static str,
     report: PathBuf,
     directory: PathBuf,
@@ -59,6 +60,22 @@ impl Drop for Driver {
                 row.peak_link_bytes
             );
         }
+        let _ = writeln!(
+            self.output,
+            "{{\"kind\":\"per_poll_limits\",\"max_machine_prepared\":{},\"max_machine_steps\":{},\"max_mob_steps\":{}}}",
+            self.peak_work[0], self.peak_work[1], self.peak_work[2]
+        );
+        let c = self.runtime.counters();
+        let _ = writeln!(
+            self.output,
+            "{{\"kind\":\"transport_last_observation\",\"received_datagrams\":{},\"received_frames\":{},\"sent_datagrams\":{},\"sent_frames\":{},\"ingress_backpressure\":{},\"queue_overflows\":{}}}",
+            c.received_datagrams,
+            c.received_frames,
+            c.sent_datagrams,
+            c.sent_frames,
+            c.ingress_backpressure,
+            c.queue_overflows
+        );
         let _ = self.output.flush();
     }
 }
@@ -77,6 +94,21 @@ impl Driver {
         add(&mut self.totals, counts);
         self.polls += 1;
         let after = self.runtime.server().counters();
+        let work = [
+            after.machine_prepared - before.machine_prepared,
+            after.machine_steps - before.machine_steps,
+            after.mob_steps - before.mob_steps,
+        ];
+        for (peak, value) in self.peak_work.iter_mut().zip(work) {
+            *peak = (*peak).max(value);
+        }
+        assert!(
+            work[0] <= 2048 && work[1] <= 2048 && work[2] <= 1024,
+            "one Runtime poll must retain one owner portion: prepared={} machines={} mobs={}",
+            work[0],
+            work[1],
+            work[2]
+        );
         let load = self.runtime.server().load_metrics();
         if load.tick != tick_before
             || after.durable_batches != before.durable_batches
@@ -86,7 +118,7 @@ impl Driver {
             || after.machine_prepared != before.machine_prepared
             || after.survival_events != before.survival_events
         {
-            writeln!(self.output,"{{\"kind\":\"poll\",\"phase\":\"{}\",\"poll_micros_information_only\":{},\"before_tick\":{},\"tick\":{},\"mob_steps\":{},\"machine_steps\":{},\"machine_prepared\":{},\"machine_events\":{},\"machine_unknown\":{},\"machine_deferred\":{},\"machine_copy_bytes\":{},\"machine_stage\":\"{}\",\"machine_phase_pending\":{},\"fluid_events\":{},\"survival_reads\":{},\"survival_writes\":{},\"entity_overflows\":{},\"wal_bytes\":{},\"light_cells\":{},\"handoff_bytes\":{},\"replay_bytes\":{},\"checkpoints\":{},\"checkpoint_runtime_bytes\":{},\"alloc_calls\":{},\"allocated_bytes\":{},\"released_bytes\":{},\"live_mobs\":{},\"active_mobs\":{},\"registered_machines\":{},\"fluid_queue\":{},\"fluid_event_bytes\":{},\"fluid_oldest_ticks\":{},\"machine_queue\":{},\"machine_event_bytes\":{},\"machine_oldest_ticks\":{},\"pending_mob_actors\":{},\"light_pending\":{},\"light_bootstrap\":{}}}",self.phase,poll_micros,tick_before.0,load.tick.0,after.mob_steps-before.mob_steps,after.machine_steps-before.machine_steps,after.machine_prepared-before.machine_prepared,after.machine_events-before.machine_events,after.machine_unknown-before.machine_unknown,after.machine_deferred-before.machine_deferred,after.machine_copy_bytes-before.machine_copy_bytes,match load.machine_phase_stage {None=>"idle",Some(server::machines::OwnerStage::Prepare)=>"prepare",Some(server::machines::OwnerStage::Machines)=>"machines",Some(server::machines::OwnerStage::Resources)=>"resources",Some(server::machines::OwnerStage::Transit)=>"transit"},load.machine_phase_pending,after.survival_events-before.survival_events,after.survival_reads-before.survival_reads,after.survival_writes-before.survival_writes,after.entity_overflows-before.entity_overflows,load.durable_wal_bytes,after.light_cells-before.light_cells,after.runtime_handoff_bytes-before.runtime_handoff_bytes,after.runtime_replay_input_bytes-before.runtime_replay_input_bytes,after.checkpoint_requests-before.checkpoint_requests,after.checkpoint_runtime_bytes-before.checkpoint_runtime_bytes,counts.allocating_calls(),counts.allocated_bytes,counts.released_bytes,load.mobs,load.active_mobs,load.registered_machines,load.survival.entries,load.survival.event_payload_bytes,load.survival.oldest_overdue_ticks,load.machines.entries,load.machines.event_payload_bytes,load.machines.oldest_overdue_ticks,load.pending_mob_actors,after.light_pending_cells,after.light_pending_bootstrap_pages).unwrap();
+            writeln!(self.output,"{{\"kind\":\"poll\",\"phase\":\"{}\",\"poll_micros_information_only\":{},\"before_tick\":{},\"tick\":{},\"mob_steps\":{},\"machine_steps\":{},\"machine_prepared\":{},\"machine_events\":{},\"machine_unknown\":{},\"machine_deferred\":{},\"machine_copy_bytes\":{},\"machine_payload_deferred\":{},\"machine_stage\":\"{}\",\"machine_phase_pending\":{},\"fluid_events\":{},\"survival_reads\":{},\"survival_writes\":{},\"entity_overflows\":{},\"wal_bytes\":{},\"light_cells\":{},\"handoff_bytes\":{},\"replay_bytes\":{},\"checkpoints\":{},\"checkpoint_runtime_bytes\":{},\"alloc_calls\":{},\"allocated_bytes\":{},\"released_bytes\":{},\"live_mobs\":{},\"active_mobs\":{},\"registered_machines\":{},\"fluid_queue\":{},\"fluid_event_bytes\":{},\"fluid_oldest_ticks\":{},\"machine_queue\":{},\"machine_event_bytes\":{},\"machine_oldest_ticks\":{},\"pending_mob_actors\":{},\"light_pending\":{},\"light_bootstrap\":{}}}",self.phase,poll_micros,tick_before.0,load.tick.0,after.mob_steps-before.mob_steps,after.machine_steps-before.machine_steps,after.machine_prepared-before.machine_prepared,after.machine_events-before.machine_events,after.machine_unknown-before.machine_unknown,after.machine_deferred-before.machine_deferred,after.machine_copy_bytes-before.machine_copy_bytes,after.machine_payload_deferred-before.machine_payload_deferred,match load.machine_phase_stage {None=>"idle",Some(server::machines::OwnerStage::Prepare)=>"prepare",Some(server::machines::OwnerStage::Machines)=>"machines",Some(server::machines::OwnerStage::Resources)=>"resources",Some(server::machines::OwnerStage::Transit)=>"transit"},load.machine_phase_pending,after.survival_events-before.survival_events,after.survival_reads-before.survival_reads,after.survival_writes-before.survival_writes,after.entity_overflows-before.entity_overflows,load.durable_wal_bytes,after.light_cells-before.light_cells,after.runtime_handoff_bytes-before.runtime_handoff_bytes,after.runtime_replay_input_bytes-before.runtime_replay_input_bytes,after.checkpoint_requests-before.checkpoint_requests,after.checkpoint_runtime_bytes-before.checkpoint_runtime_bytes,counts.allocating_calls(),counts.allocated_bytes,counts.released_bytes,load.mobs,load.active_mobs,load.registered_machines,load.survival.entries,load.survival.event_payload_bytes,load.survival.oldest_overdue_ticks,load.machines.entries,load.machines.event_payload_bytes,load.machines.oldest_overdue_ticks,load.pending_mob_actors,after.light_pending_cells,after.light_pending_bootstrap_pages).unwrap();
         }
         if result.is_err() || self.runtime.server().is_failed() {
             let reason = self.runtime.server().failure_reason();
@@ -185,6 +217,7 @@ fn run_prepared(prepared: Prepared) -> PathBuf {
         output,
         totals: AllocationCounts::ZERO,
         polls: 0,
+        peak_work: [0; 3],
         phase: "live",
         report: path.clone(),
         directory: prepared.directory.0.clone(),

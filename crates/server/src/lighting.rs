@@ -1,5 +1,8 @@
 //! Authoritative CPU light adapter. Returned derived records belong to the same
 //! durable server phase as gameplay; no renderer or generation call is made here.
+#[cfg(test)]
+mod continuation_tests;
+mod durable;
 use core_types::{BlockPos, PageId, SpaceId, Tick, Version};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -140,6 +143,7 @@ impl ServerLightingError {
             Self::Engine(LightingError::TickWentBackwards) => "lighting tick order",
             Self::Engine(LightingError::CoordinateOverflow(_)) => "lighting coordinate overflow",
             Self::Engine(LightingError::Commit(_)) => "lighting commit",
+            Self::Engine(LightingError::Persistence(_)) => "lighting persistence",
         }
     }
 }
@@ -182,6 +186,8 @@ pub struct ServerLighting {
     awaiting: Option<(u64, u64)>,
     nonce: u64,
     work: ServerLightWork,
+    durable_revision: Option<u64>,
+    bootstrap_removed: Vec<PageId>,
 }
 impl ServerLighting {
     pub fn attach(
@@ -210,6 +216,8 @@ impl ServerLighting {
             awaiting: None,
             nonce: 0,
             work: ServerLightWork::default(),
+            durable_revision: None,
+            bootstrap_removed: Vec::new(),
         })
     }
     /// Supply cached loaded page keys affected by a new immutable sky proof.
@@ -254,10 +262,12 @@ impl ServerLighting {
         // Derived LIGHT can evict older input history while bounded page seeds
         // drain. Recover from retained current source metadata, never by seeking
         // past an opacity/emission change without a complete reseed obligation.
-        if matches!(
-            world.read_cursor(self.engine.cursor(), 0),
-            Err(CursorError::Lagged { .. })
-        ) {
+        if !self.engine.has_durable_inputs()
+            && matches!(
+                world.read_cursor(self.engine.cursor(), 0),
+                Err(CursorError::Lagged { .. })
+            )
+        {
             self.recover_inputs(world, boundary)?;
         }
         for _ in 0..self.config.bootstrap_pages_per_phase {
@@ -273,6 +283,9 @@ impl ServerLighting {
                 break;
             }
             self.bootstrap.pop_front();
+            if self.durable_revision.is_some() {
+                self.bootstrap_removed.push(page);
+            }
             self.work.bootstrap_pages_queued += 1;
         }
         let ingest = self.engine.ingest(world, tick, self.config.ingest)?;

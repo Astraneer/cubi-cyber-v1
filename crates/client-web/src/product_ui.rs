@@ -165,7 +165,9 @@ impl ProductUi {
             .quality
             .advance(&self.layer.app, view, now_ms, benchmark)
         {
-            if view.settings_application().reload_required != 0 {
+            if view.settings_application().reload_required != 0
+                && view.near_settings_error().is_none()
+            {
                 self.command = Some(Command::Connect {
                     address: self.layer.app.address.clone(),
                     name: self.layer.app.name.clone(),
@@ -413,13 +415,24 @@ impl ProductUi {
                     self.quality.update_saved(&self.layer.app.settings, now_ms);
                     self.apply_sound()?;
                     self.save_preferences();
+                    let previous_near_error = view.near_settings_error();
                     let applied = view.apply_settings(self.quality.target());
                     self.layer.app.set_pending_settings(
                         applied.pending_render & !(1 << ui::settings::Setting::Hold60 as u32),
                     );
                     self.layer.app.set_reload_settings(applied.reload_required);
                     view.invalidate();
-                    if applied.reload_required != 0 && self.layer.app.snapshot.connected {
+                    if let Some(error) = view.near_settings_error() {
+                        self.layer.app.set_status(error.message());
+                    } else if previous_near_error
+                        .is_some_and(|error| self.layer.app.status() == error.message())
+                    {
+                        self.layer.app.set_status("");
+                    }
+                    if applied.reload_required != 0
+                        && view.near_settings_error().is_none()
+                        && self.layer.app.snapshot.connected
+                    {
                         self.command = Some(Command::Connect {
                             address: self.layer.app.address.clone(),
                             name: self.layer.app.name.clone(),
@@ -565,7 +578,49 @@ pub fn product_ui_stats() -> JsValue {
                 "requestedScale",
                 app.settings.get(ui::settings::Setting::Scale) as u64,
             ),
+            (
+                "requestedExposureMode",
+                app.settings.get(ui::settings::Setting::ExposureMode) as u64,
+            ),
+            (
+                "requestedSkyStyle",
+                app.settings.get(ui::settings::Setting::SkyStyle) as u64,
+            ),
+            (
+                "exposureAutomatic",
+                u64::from(state.view.exposure_automatic().unwrap_or(false)),
+            ),
+            (
+                "celestialPrepared",
+                u64::from(state.view.celestial_styles().is_some()),
+            ),
+            (
+                "sunStyle",
+                state.view.celestial_styles().map_or(0, |v| u64::from(v[0])),
+            ),
+            (
+                "moonStyle",
+                state.view.celestial_styles().map_or(0, |v| u64::from(v[1])),
+            ),
+            (
+                "starStyle",
+                state.view.celestial_styles().map_or(0, |v| u64::from(v[2])),
+            ),
             ("renderScale", u64::from(state.view.render_scale())),
+            (
+                "requestedNear",
+                app.settings.get(ui::settings::Setting::Near) as u64,
+            ),
+            (
+                "effectiveNearBlocks",
+                u64::from(state.view.effective_near_blocks()),
+            ),
+            (
+                "nearUnsupported",
+                u64::from(state.view.near_settings_error().is_some()),
+            ),
+            ("smaaPrepared", u64::from(state.view.smaa_prepared())),
+            ("smaaReservedBytes", state.view.smaa_reserved_bytes()),
             ("renderWidth", u64::from(state.view.render_extent()[0])),
             ("renderHeight", u64::from(state.view.render_extent()[1])),
             (
@@ -591,6 +646,10 @@ pub fn product_ui_stats() -> JsValue {
             (
                 "requestedReflections",
                 app.settings.get(ui::settings::Setting::Reflections) as u64,
+            ),
+            (
+                "requestedHold60",
+                app.settings.get(ui::settings::Setting::Hold60) as u64,
             ),
             (
                 "settingsApplied",

@@ -157,6 +157,7 @@ fn manual_post_matches_numeric_tone_and_reuses_pipelines_on_resize() {
         let hdr = input(&gpu, 64, 48, &colors);
         let view = hdr.create_view(&Default::default());
         let config = PostConfig {
+            smaa: None,
             exposure: Exposure::Manual(0.5),
             bloom: None,
             histogram_stride: 2,
@@ -313,6 +314,7 @@ fn histogram_exposure_adapts_slowly_and_reuses_static_measurement() {
             .expect("software Vulkan required");
         let hdr = input(&gpu, 64, 48, &vec![[1.0; 4]; 64 * 48]);
         let config = PostConfig {
+            smaa: None,
             exposure: Exposure::Automatic {
                 key: 0.18,
                 min_ev: -4.0,
@@ -414,6 +416,7 @@ fn bloom_spreads_hdr_highlights_and_is_bitwise_stable() {
         let view = hdr.create_view(&Default::default());
         let mut budget = UploadBudget::new(4096);
         let config = PostConfig {
+            smaa: None,
             exposure: Exposure::Manual(1.0),
             bloom: Some(BloomConfig {
                 threshold: 1.0,
@@ -444,6 +447,7 @@ fn bloom_spreads_hdr_highlights_and_is_bitwise_stable() {
             wgpu::TextureFormat::Rgba8Unorm,
             OutputTransfer::ShaderSrgb,
             PostConfig {
+                smaa: None,
                 bloom: None,
                 ..config
             },
@@ -489,6 +493,7 @@ fn cached_hdr_present_keeps_histogram_bloom_and_adaptation_history_while_only_to
         wgpu::TextureFormat::Rgba8Unorm,
         OutputTransfer::ShaderSrgb,
         PostConfig {
+            smaa: None,
             bloom: Some(BloomConfig {
                 threshold: 1.,
                 knee: 0.5,
@@ -579,6 +584,7 @@ fn scaled_hdr_bilinear_matches_independent_f64_and_charges_the_native_output() {
         wgpu::TextureFormat::Rgba8Unorm,
         OutputTransfer::Attachment,
         PostConfig {
+            smaa: None,
             exposure: Exposure::Manual(1.),
             bloom: None,
             histogram_stride: 4,

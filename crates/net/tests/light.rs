@@ -34,7 +34,7 @@ fn actual_light_words_preserve_full_rgb_and_all_wire_prefixes_are_bounded() {
     assert!(pack(0, 16, [0; 3]).is_none());
     let full = snapshot(9, 10, 0);
     let bytes = encode(&full).unwrap();
-    assert_eq!(bytes.len(), 45 + 4096 * 4);
+    assert_eq!(bytes.len(), 49);
     assert_eq!(decode(&bytes).unwrap(), full);
     for end in 0..bytes.len() {
         assert!(decode(&bytes[..end]).is_err(), "prefix{end}");
@@ -60,6 +60,65 @@ fn actual_light_words_preserve_full_rgb_and_all_wire_prefixes_are_bounded() {
     assert_eq!(decode_request(&bytes).unwrap(), request);
     for end in 0..bytes.len() {
         assert!(decode_request(&bytes[..end]).is_err());
+    }
+}
+
+#[test]
+fn uniform_full_images_keep_binding_and_accept_every_packed_bit_without_a_base() {
+    for value in [0, u32::MAX, pack(2, 11, [8, 255, 193]).unwrap()] {
+        let image = Update::Snapshot(Snapshot {
+            header: header(17, 28, 31),
+            values: Box::new([value; 4096]),
+        });
+        let bytes = encode(&image).unwrap();
+        assert_eq!(&bytes[..5], b"LGT1\x02");
+        assert_eq!(bytes.len(), 49);
+        assert_eq!(&bytes[45..], &value.to_le_bytes());
+        assert_eq!(decode(&bytes).unwrap(), image);
+        let mut replica = Replica::new(1).unwrap();
+        assert_eq!(
+            replica.apply(decode(&bytes).unwrap(), Some(17)),
+            Ok(Apply::Applied)
+        );
+        assert_eq!(
+            replica.page(page()).unwrap().values.as_ref(),
+            &[value; 4096]
+        );
+        for n in 0..bytes.len() {
+            assert!(decode(&bytes[..n]).is_err());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(decode(&trailing), Err(Error::Trailing));
+        let mut bad = bytes.clone();
+        bad[4] = 3;
+        assert_eq!(decode(&bad), Err(Error::Malformed));
+        let mut bad = bytes.clone();
+        bad[21..29].fill(0);
+        assert_eq!(decode(&bad), Err(Error::InvalidVersion));
+    }
+}
+
+#[test]
+fn original_dense_snapshot_bytes_stay_identical_and_legacy_uniform_is_readable() {
+    let value = pack(15, 7, [255, 128, 17]).unwrap();
+    // Original LGT1 kind0 header for page(0,-1,8,1024), view9/revision10/source0.
+    let prefix = [
+        76, 71, 84, 49, 0, 0, 0, 0, 0, 255, 255, 255, 255, 8, 0, 0, 0, 0, 4, 0, 0, 9, 0, 0, 0, 0,
+        0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let mut legacy = prefix.to_vec();
+    for _ in 0..4096 {
+        legacy.extend_from_slice(&value.to_le_bytes());
+    }
+    assert_eq!(legacy.len(), 45 + 4096 * 4);
+    assert_eq!(decode(&legacy).unwrap(), snapshot(9, 10, 0));
+    let replacement = pack(0, 1, [18, 3, 4]).unwrap();
+    legacy[45 + 4095 * 4..].copy_from_slice(&replacement.to_le_bytes());
+    let dense = decode(&legacy).unwrap();
+    assert_eq!(encode(&dense).unwrap(), legacy);
+    for n in 0..legacy.len() {
+        assert!(decode(&legacy[..n]).is_err(), "legacy dense prefix{n}");
     }
 }
 #[test]

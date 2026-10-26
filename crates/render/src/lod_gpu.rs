@@ -40,6 +40,15 @@ impl std::fmt::Display for ProxyError {
     }
 }
 impl std::error::Error for ProxyError {}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProxyBuildWork {
+    pub source_samples: u32,
+    pub classifications: u32,
+    pub cached_material_lookups: u64,
+    pub ao_samples: u64,
+    pub generated_quads: u32,
+    pub retained_cutout_quads: u32,
+}
 #[derive(Clone, Debug)]
 pub struct ProxyPayload {
     words: Vec<u32>,
@@ -50,6 +59,7 @@ pub struct ProxyPayload {
     quad_offset: u32,
     quad_count: u32,
     classes: u32,
+    build_work: Option<ProxyBuildWork>,
 }
 impl ProxyPayload {
     /// Run in a background task. No registry, generator or authoritative cells
@@ -99,8 +109,12 @@ impl ProxyPayload {
         let palette_offset = INDEX_OFFSET + index_words;
         let quad_offset = palette_offset + palette.len() * 2;
         let mut mesh = PageMesh::default();
+        let mut build_work = ProxyBuildWork {
+            source_samples: 4096,
+            ..Default::default()
+        };
         if classes & 2 != 0 {
-            mesh_page(
+            let work = mesh_page(
                 &halo,
                 |raw| {
                     if raw == 0 {
@@ -126,8 +140,13 @@ impl ProxyPayload {
                 &mut MeshScratch::new(),
                 &mut mesh,
             );
+            build_work.classifications = work.work.cells_scanned as u32;
+            build_work.cached_material_lookups = work.cached_material_lookups;
+            build_work.ao_samples = work.ao_samples;
+            build_work.generated_quads = work.work.quads_emitted as u32;
         }
         let quad_count = mesh.cutout.len();
+        build_work.retained_cutout_quads = quad_count as u32;
         let mut words = vec![0; quad_offset + quad_count * 4];
         words[..128].copy_from_slice(&occupied);
         let mut rank = 0u32;
@@ -170,6 +189,7 @@ impl ProxyPayload {
             quad_offset: quad_offset as u32,
             quad_count: quad_count as u32,
             classes,
+            build_work: Some(build_work),
         })
     }
     /// Bounded browser-worker result. The decoder checks every rank/index before
@@ -324,6 +344,7 @@ impl ProxyPayload {
             quad_offset: quad_offset as u32,
             quad_count,
             classes,
+            build_work: None,
         })
     }
     pub fn materials_within(&self, atlas_layers: u32) -> bool {
@@ -345,6 +366,11 @@ impl ProxyPayload {
     }
     pub fn cutout_quads(&self) -> u32 {
         self.quad_count
+    }
+    /// Actual background-builder measurements. Decoded worker payloads do not
+    /// invent these counters; their owner may carry a separate work envelope.
+    pub fn build_work(&self) -> Option<ProxyBuildWork> {
+        self.build_work
     }
     pub fn voxel(&self, position: [u8; 3]) -> PublicVoxel {
         let index = usize::from(position[0])
@@ -1263,6 +1289,22 @@ impl LodProxyGpu {
     /// build their own list from the shared payload/object descriptors.
     pub fn cutout_visible_buffer(&self) -> &wgpu::Buffer {
         &self.cutout_visible
+    }
+    /// Requested buffer storage, including reserved arenas. Shared atlas and
+    /// driver pipeline allocations are owned/accounted separately.
+    pub fn buffer_bytes(&self) -> u64 {
+        [
+            &self.objects,
+            &self.payload,
+            &self.visible,
+            &self.cutout_visible,
+            &self.indirect,
+            &self.camera,
+        ]
+        .iter()
+        .map(|buffer| buffer.size())
+        .sum::<u64>()
+            + self.counters.as_ref().map_or(0, wgpu::Buffer::size)
     }
     pub fn shadow_source(&self) -> ProxyShadowSource<'_> {
         ProxyShadowSource {

@@ -624,6 +624,7 @@ mod tests {
                     page: point(8, 8, 8).page(),
                     version: 1,
                     source_version: Version(1),
+                    applied_action: Default::default(),
                     cells,
                 }),
                 Tick(1),

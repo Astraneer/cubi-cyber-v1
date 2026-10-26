@@ -27,6 +27,7 @@ fn cells(page: PageId, view: u64) -> PageUpdate {
         page,
         version: view,
         source_version: Version(500),
+        applied_action: Default::default(),
         cells: Box::new([Cell::AIR; 4096]),
     })
 }

@@ -1176,6 +1176,7 @@ fn water_cloud_post_graph_and_resize_reuse_resources_without_pipeline_compilatio
             wgpu::TextureFormat::Rgba8Unorm,
             OutputTransfer::Attachment,
             PostConfig {
+                smaa: None,
                 exposure: Exposure::Manual(1.),
                 bloom: None,
                 histogram_stride: 1,

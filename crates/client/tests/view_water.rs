@@ -58,6 +58,7 @@ fn image(page: PageId) -> PageUpdate {
         page,
         version: 1,
         source_version: Version(1),
+        applied_action: Default::default(),
         cells,
     })
 }

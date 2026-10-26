@@ -7,6 +7,9 @@ use render::{
         AtlasImage, Camera, CullingMode, GpuConfig, TerrainGpu, UploadBudget, translation,
     },
 };
+#[global_allocator]
+static ALLOCATOR: telemetry::CountingAllocator<std::alloc::System> =
+    telemetry::CountingAllocator::new(std::alloc::System);
 fn proxy(page: &PublicPage) -> MaskedRayProxy {
     MaskedRayProxy::from_protected(page, 4)
 }
@@ -637,6 +640,137 @@ fn mixed_cutout_retains_opaque_background_and_exact_far_plane_coverage() {
                 );
             }
         }
+    });
+}
+
+#[test]
+fn cutout_arena_publication_is_atomic_and_static_preparation_has_zero_work() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut terrain = terrain(&gpu);
+        let mut lod = LodProxyGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            terrain.geometry(),
+            ProxyConfig {
+                max_objects: 4,
+                max_payload_words: 65536,
+                atlas_layers: 186,
+                instrument: false,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(lod.take_work().pipeline_compilations, 4);
+        assert_eq!(lod.buffer_bytes(), 394400);
+        let page = PublicPage::from_exposed(|[x, y, z]| {
+            if !(2..14).contains(&x) || !(2..14).contains(&y) {
+                return PublicVoxel::Air;
+            }
+            match z {
+                7 => PublicVoxel::solid(3, u32::MAX),
+                8 => PublicVoxel::Solid {
+                    material: 3,
+                    tint: 0xff00ff00,
+                    kind: SurfaceKind::Cutout,
+                },
+                _ => PublicVoxel::Air,
+            }
+        });
+        let payload = ProxyPayload::from_public(&proxy(&page), 186).unwrap();
+        assert!(payload.cutout_quads() > 0);
+        let measured = payload.build_work().unwrap();
+        assert_eq!(measured.source_samples, 4096);
+        assert_eq!(measured.classifications, 5832);
+        assert!(measured.cached_material_lookups < 524288);
+        let (sky, _) = frame(&gpu, &mut terrain, None, camera());
+        assert_eq!(
+            lod.upload(
+                &gpu.queue,
+                None,
+                1,
+                translation([0.; 3]),
+                [0., 0., 0., 1.],
+                &payload,
+                &mut UploadBudget::new(payload.upload_bytes() - 1)
+            ),
+            Err(ProxyError::UploadBudget)
+        );
+        assert_eq!(frame(&gpu, &mut terrain, Some(&mut lod), camera()).0, sky);
+        let handle = lod
+            .upload(
+                &gpu.queue,
+                None,
+                1,
+                translation([0.; 3]),
+                [0., 0., 0., 1.],
+                &payload,
+                &mut UploadBudget::new(payload.upload_bytes()),
+            )
+            .unwrap();
+        assert_eq!(handle.slot, 0, "denied upload consumed an arena slot");
+        let before = frame(&gpu, &mut terrain, Some(&mut lod), camera()).0;
+        assert_ne!(before, sky);
+        assert_eq!(
+            lod.upload(
+                &gpu.queue,
+                Some(handle),
+                2,
+                translation([1., 0., 0.]),
+                [0., 0., 0., 1.],
+                &payload,
+                &mut UploadBudget::new(0)
+            ),
+            Err(ProxyError::UploadBudget)
+        );
+        assert_eq!(
+            frame(&gpu, &mut terrain, Some(&mut lod), camera()).0,
+            before
+        );
+        assert_eq!(
+            lod.set_enabled_batch(&gpu.queue, &[(handle, false)], &mut UploadBudget::new(3)),
+            Err(ProxyError::UploadBudget)
+        );
+        assert_eq!(
+            frame(&gpu, &mut terrain, Some(&mut lod), camera()).0,
+            before
+        );
+        lod.set_enabled_batch(&gpu.queue, &[(handle, false)], &mut UploadBudget::new(4))
+            .unwrap();
+        assert_eq!(frame(&gpu, &mut terrain, Some(&mut lod), camera()).0, sky);
+        lod.set_enabled_batch(&gpu.queue, &[(handle, true)], &mut UploadBudget::new(4))
+            .unwrap();
+        assert_eq!(
+            frame(&gpu, &mut terrain, Some(&mut lod), camera()).0,
+            before
+        );
+        lod.take_work();
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        let scope = telemetry::AllocationScope::begin().unwrap();
+        for _ in 0..1000 {
+            let work = lod
+                .prepare_frame(&gpu.queue, &mut encoder, camera())
+                .unwrap();
+            assert_eq!(work.cull_dispatches, 0);
+            assert_eq!(work.camera_upload_bytes, 0);
+            assert_eq!(work.upload_bytes, 0);
+            assert_eq!(work.pipeline_compilations, 0);
+        }
+        let allocations = scope.finish();
+        assert_eq!(allocations.allocating_calls(), 0);
+        assert_eq!(allocations.dealloc_calls, 0);
+        let scope = telemetry::AllocationScope::begin().unwrap();
+        let control = std::hint::black_box(vec![std::hint::black_box(1u8); 128]);
+        drop(control);
+        assert!(
+            scope.finish().allocating_calls() > 0,
+            "allocator instrumentation missing"
+        );
+        println!(
+            "PXP2Cutoutbuffer394400B startup4 framecompiles0 twoGroupedDraws,1000static0alloc/free/upload/cull; worker{measured:?}"
+        );
     });
 }
 

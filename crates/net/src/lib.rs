@@ -62,7 +62,7 @@ impl std::fmt::Debug for SecretToken {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PlayerId(pub [u8; 16]);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ActionId(pub u64);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -213,6 +213,8 @@ pub enum ClientMessage {
         page: PageId,
         acknowledged: Option<u64>,
     },
+    /// Release only this connection's public raw-page lease and dependants.
+    ForgetPage(PageId),
     AckPage {
         page: PageId,
         version: u64,
@@ -290,13 +292,15 @@ pub struct ActionReply {
     pub cell: Option<Cell>,
 }
 
-/// View revision is per peer, while source_version identifies authoritative
-/// inputs. Revealing an ore can change a peer's view without modifying that ore.
+/// View and public source revisions are independent of private World counters.
+/// `applied_action` is this identity's durable contiguous action watermark at
+/// capture; it proves prediction causality without exposing private page epochs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageSnapshot {
     pub page: PageId,
     pub version: u64,
     pub source_version: Version,
+    pub applied_action: ActionId,
     pub cells: Box<[Cell; PAGE_VOLUME]>,
 }
 
@@ -306,6 +310,7 @@ pub struct PageDelta {
     pub base: u64,
     pub version: u64,
     pub source_version: Version,
+    pub applied_action: ActionId,
     pub changes: Vec<(u16, Cell)>,
 }
 

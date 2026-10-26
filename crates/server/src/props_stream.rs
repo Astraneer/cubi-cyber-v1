@@ -3,6 +3,9 @@ use super::*;
 use core_types::{ChannelMask, ComponentId};
 use net::props::Frame;
 use std::sync::Arc;
+#[cfg(test)]
+#[path = "forget_page_tests.rs"]
+mod forget_page_tests;
 const MAX_HINTS_PER_PEER: usize = 8192;
 #[derive(Default)]
 struct PeerProps {
@@ -24,6 +27,14 @@ pub(super) struct PropsStream {
     last_tick: Option<Tick>,
 }
 impl PropsStream {
+    pub(super) fn forget(&mut self, connection: u64, page: PageId) {
+        if let Some(state) = self.peers.get_mut(&connection) {
+            if let Some(head) = state.heads.remove(&page) {
+                state.hints -= head.hints.len();
+            }
+            state.queue.retain(|(pending, _)| *pending != page);
+        }
+    }
     pub(super) fn queue(&mut self, connection: u64, page: PageId, force: bool) {
         if self.peers.len() >= MAX_CONNECTIONS && !self.peers.contains_key(&connection) {
             return;
