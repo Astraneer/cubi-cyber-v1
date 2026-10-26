@@ -459,14 +459,26 @@ impl Connection {
         self.geometry_removals.pop_front()
     }
     pub fn request_geometry(&mut self, page: PageId, now_ms: u64) -> Result<(), NetworkError> {
+        self.queue_geometry_request(page, now_ms, true)
+    }
+    fn queue_geometry_request(
+        &mut self,
+        page: PageId,
+        now_ms: u64,
+        promote_to_explicit: bool,
+    ) -> Result<(), NetworkError> {
         if !self.geometry_interest.contains_key(&page)
             && self.geometry_interest.len() >= net::MAX_PUBLIC_GEOMETRY_PAGES
         {
             return Err(NetworkError::Capacity);
         }
-        self.height_geometry_interest.remove(&page);
         let known = self.geometries.get(&page).map(|g| g.source_version);
         self.queue(ClientMessage::RequestGeometry { page, known })?;
+        // A repair does not acquire an independent lease. Explicit callers may
+        // promote a height-owned page only after the request is admitted.
+        if promote_to_explicit {
+            self.height_geometry_interest.remove(&page);
+        }
         self.geometry_interest.insert(
             page,
             PageInterest {
@@ -1209,6 +1221,10 @@ impl Connection {
                     self.geometries.remove(&page);
                     self.geometry_removals.push_back(page);
                 }
+                // Revocation must also retire undelivered images: the render
+                // courier drains removals before updates. This scans only the
+                // bounded public update queue, only on an explicit revocation.
+                self.geometry_updates.retain(|image| image.page != page);
             }
             ServerMessage::Summary(summary) => {
                 if self
@@ -1911,7 +1927,7 @@ impl Connection {
             .map(|(page, _)| *page)
             .collect();
         for page in geometry {
-            self.request_geometry(page, now_ms)?;
+            self.queue_geometry_request(page, now_ms, false)?;
         }
         let heights: Vec<_> = self
             .height_interest

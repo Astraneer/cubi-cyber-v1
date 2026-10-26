@@ -100,6 +100,14 @@ struct HorizonReceiptStamp {
     capacity: bool,
     leaf: u64,
     maximum_error_bits: u64,
+    inputs: [usize; 16],
+    candidate_missing: u64,
+    candidate_capacity: bool,
+    candidate_leaf: u64,
+    candidate_maximum_error_bits: u64,
+    near_guard: bool,
+    jobs: [u64; 10],
+    job_pending: [bool; 2],
 }
 pub fn data_path(name: &str) -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
@@ -635,6 +643,9 @@ impl ProductUi {
                 self.last_world_diagnostic = Some(stamp);
             }
             if let Some(horizon) = horizon {
+                // Reuse the already captured Horizon stats; scheduler counters
+                // are constant-time. No extra source/cell/cache scans or GPU work.
+                let jobs = view.horizon_job_stats().unwrap_or_default();
                 let stamp = HorizonReceiptStamp {
                     front: view.has_committed_far_front(),
                     candidate: horizon.candidate_plan_id,
@@ -648,10 +659,46 @@ impl ProductUi {
                     capacity: horizon.committed_selection_capacity_limited,
                     leaf: horizon.committed_selection_leaf_limited,
                     maximum_error_bits: horizon.committed_maximum_error_pixels.to_bits(),
+                    inputs: [
+                        horizon.desired_height_tiles,
+                        horizon.received_desired_heights,
+                        horizon.cached_height_tiles,
+                        horizon.wanted_geometry,
+                        horizon.known_geometry_sources,
+                        horizon.height_staged,
+                        horizon.height_front,
+                        horizon.proxy_staged,
+                        horizon.proxy_front,
+                        horizon.pending_height_confirmations,
+                        horizon.pending_exact_columns,
+                        horizon.unavailable_columns,
+                        horizon.failed_proxy_pages,
+                        horizon.pending_proxy_pages,
+                        horizon.proxy_jobs,
+                        horizon.wanted_refine_tiles,
+                    ],
+                    candidate_missing: horizon.missing_error_certificates,
+                    candidate_capacity: horizon.selection_capacity_limited,
+                    candidate_leaf: horizon.selection_leaf_limited,
+                    candidate_maximum_error_bits: horizon.maximum_error_pixels.to_bits(),
+                    near_guard: horizon.near_guard_ready,
+                    jobs: [
+                        jobs.queued as u64,
+                        jobs.running as u64,
+                        jobs.retained_bytes as u64,
+                        jobs.contexts as u64,
+                        jobs.plans_completed,
+                        jobs.plans_stale,
+                        jobs.plans_failed,
+                        u64::from(jobs.last_plan_failure),
+                        jobs.proxy_results,
+                        jobs.worker_failures,
+                    ],
+                    job_pending: [jobs.capture_pending, jobs.result_pending],
                 };
                 if self.last_horizon_diagnostic != Some(stamp) {
                     println!(
-                        "NATIVE_UI_HORIZON_RECEIPT front={} candidate_plan={} committed_plan={} projection={} requested_error_px={} committed_error_px={:?} committed_missing={} committed_capacity={} committed_leaf={} committed_max_px={}",
+                        "NATIVE_UI_HORIZON_RECEIPT front={} candidate_plan={} committed_plan={} projection={} requested_error_px={} committed_error_px={:?} committed_missing={} committed_capacity={} committed_leaf={} committed_max_px={} desired={} received={} cache={} wanted_geometry={} known_geometry={} height_staged={} height_front={} proxy_staged={} proxy_front={} pending_height={} pending_exact={} unavailable_columns={} proxy_failed={} proxy_pending={} proxy_running={} refine={} candidate_missing={} candidate_capacity={} candidate_leaf={} candidate_max_px={} near_guard={} jobs_queued={} jobs_running={} jobs_bytes={} jobs_contexts={} plans_completed={} plans_stale={} plans_failed={} last_plan_failure={} proxy_results={} worker_failures={} capture_pending={} result_pending={}",
                         stamp.front,
                         stamp.candidate,
                         stamp.committed,
@@ -662,6 +709,39 @@ impl ProductUi {
                         stamp.capacity,
                         stamp.leaf,
                         horizon.committed_maximum_error_pixels,
+                        stamp.inputs[0],
+                        stamp.inputs[1],
+                        stamp.inputs[2],
+                        stamp.inputs[3],
+                        stamp.inputs[4],
+                        stamp.inputs[5],
+                        stamp.inputs[6],
+                        stamp.inputs[7],
+                        stamp.inputs[8],
+                        stamp.inputs[9],
+                        stamp.inputs[10],
+                        stamp.inputs[11],
+                        stamp.inputs[12],
+                        stamp.inputs[13],
+                        stamp.inputs[14],
+                        stamp.inputs[15],
+                        stamp.candidate_missing,
+                        stamp.candidate_capacity,
+                        stamp.candidate_leaf,
+                        horizon.maximum_error_pixels,
+                        stamp.near_guard,
+                        stamp.jobs[0],
+                        stamp.jobs[1],
+                        stamp.jobs[2],
+                        stamp.jobs[3],
+                        stamp.jobs[4],
+                        stamp.jobs[5],
+                        stamp.jobs[6],
+                        stamp.jobs[7],
+                        stamp.jobs[8],
+                        stamp.jobs[9],
+                        stamp.job_pending[0],
+                        stamp.job_pending[1],
                     );
                     self.last_horizon_diagnostic = Some(stamp);
                 }

@@ -11,7 +11,7 @@ def widget_controls(*,text,click,wheel,wait):
         # Older diagnostic whitelists omit these two real controls. Locate
         # their adjacent rows from measured controls; only XTest clicks act.
         candidates=[(name,0)]
-        if name=="Setting(Hold60)":candidates.extend([("Setting(Gi)",72),("Setting(Exposure)",-72)])
+        if name=="Setting(Hold60)":candidates.extend([("Setting(Exposure)",-72),("Setting(Gi)",36)])
         if name=="Setting(Near)":candidates.append(("Setting(Horizon)",36))
         for candidate,dy in candidates:
             match=re.search(r"NATIVE_UI_WIDGET name="+re.escape(candidate)+r" x=([0-9.e+-]+) y=([0-9.e+-]+) width=([0-9.e+-]+) height=([0-9.e+-]+)",log[start:batches[-1].start()])

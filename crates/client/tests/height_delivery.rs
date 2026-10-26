@@ -26,6 +26,115 @@ fn geometry(y: i32) -> PublicGeometry {
         indices: Vec::new(),
     }
 }
+fn wire(client: &mut Connection, message: ServerMessage, now: u64) {
+    let encoded = net::encode_server(&message).unwrap();
+    client
+        .receive(net::decode_server(&encoded).unwrap(), now)
+        .unwrap();
+}
+fn implicit_page() -> Connection {
+    let mut client = Connection::new(NetworkConfig::default()).unwrap();
+    client.request_height(key(), 0).unwrap();
+    client.take_outgoing(256);
+    wire(
+        &mut client,
+        ServerMessage::Geometry(Box::new(geometry(0))),
+        1,
+    );
+    client.take_geometry_updates(32);
+    client
+}
+#[test]
+fn encoded_unavailable_retry_keeps_height_lease_until_retirement() {
+    let mut client = implicit_page();
+    let page = geometry(0).page;
+    wire(&mut client, ServerMessage::GeometryUnavailable(page), 2);
+    assert_eq!(client.take_geometry_removal(), Some(page));
+    client.poll(502).unwrap();
+    let retry = client.take_outgoing(256);
+    assert!(
+        retry
+            .iter()
+            .any(|m| matches!(m,ClientMessage::RequestGeometry{page:p,known:None} if *p==page))
+    );
+    wire(
+        &mut client,
+        ServerMessage::Geometry(Box::new(geometry(0))),
+        503,
+    );
+    assert!(client.geometry(page).is_some());
+    client.release_height(key()).unwrap();
+    assert!(client.geometry(page).is_none());
+    let retired = client.take_outgoing(256);
+    assert!(
+        retired
+            .iter()
+            .any(|m| matches!(m,ClientMessage::ForgetHeight(k) if *k==key()))
+    );
+    assert!(
+        retired
+            .iter()
+            .any(|m| matches!(m,ClientMessage::ForgetGeometry(p) if *p==page))
+    );
+    assert_eq!(client.take_geometry_removal(), Some(page));
+}
+#[test]
+fn admitted_explicit_promotion_outlives_height_interest() {
+    let mut client = implicit_page();
+    let page = geometry(0).page;
+    wire(&mut client, ServerMessage::GeometryUnavailable(page), 2);
+    client.take_geometry_removal();
+    client.request_geometry(page, 3).unwrap();
+    client.take_outgoing(256);
+    wire(
+        &mut client,
+        ServerMessage::Geometry(Box::new(geometry(0))),
+        4,
+    );
+    client.release_height(key()).unwrap();
+    assert!(client.geometry(page).is_some());
+    assert!(
+        !client
+            .take_outgoing(256)
+            .iter()
+            .any(|m| matches!(m,ClientMessage::ForgetGeometry(p) if *p==page))
+    );
+}
+#[test]
+fn full_outbox_cannot_disown_an_implicit_page_or_defer_its_retry_clock() {
+    let mut client = implicit_page();
+    let page = geometry(0).page;
+    for x in 1000..1256 {
+        client.request_geometry(PageId { x, ..page }, 100).unwrap();
+    }
+    assert!(matches!(
+        client.request_geometry(page, 101),
+        Err(NetworkError::Capacity)
+    ));
+    assert!(client.geometry(page).is_some());
+    wire(&mut client, ServerMessage::GeometryUnavailable(page), 102);
+    client.take_geometry_removal();
+    assert!(matches!(client.poll(602), Err(NetworkError::Capacity)));
+    assert_eq!(client.take_outgoing(256).len(), 256);
+    // The failed retry did not advance its clock: draining the outbox makes
+    // that exact same wall-time attempt eligible, before the two later pages.
+    client.poll(602).unwrap();
+    assert!(
+        client
+            .take_outgoing(256)
+            .iter()
+            .any(|m| matches!(m,ClientMessage::RequestGeometry{page:p,known:None} if *p==page)),
+        "failed admission cannot defer the original repair's retry clock"
+    );
+    client.release_height(key()).unwrap();
+    let retired = client.take_outgoing(256);
+    assert!(
+        retired
+            .iter()
+            .any(|m| matches!(m,ClientMessage::ForgetGeometry(p) if *p==page)),
+        "failed explicit/retry queue admission cannot discard the height-owned retirement obligation"
+    );
+}
 #[test]
 fn height_column_geometry_arriving_before_manifest_is_cached_without_raw_near_pages() {
     let mut client = Connection::new(NetworkConfig::default()).unwrap();
