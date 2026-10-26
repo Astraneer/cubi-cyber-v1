@@ -166,6 +166,7 @@ struct PendingAction {
 pub struct Connection {
     config: NetworkConfig,
     welcome: Option<Welcome>,
+    spawn_landmark: Option<net::spawn::Landmark>,
     credential: Option<SecretToken>,
     handshake: Option<Hello>,
     last_hello: u64,
@@ -231,6 +232,7 @@ impl Connection {
         Ok(Self {
             config,
             welcome: None,
+            spawn_landmark: None,
             credential: None,
             handshake: None,
             last_hello: 0,
@@ -315,6 +317,11 @@ impl Connection {
     }
     pub fn welcome(&self) -> Option<&Welcome> {
         self.welcome.as_ref()
+    }
+    /// Authority-advertised public square. No local generation or login-position
+    /// inference participates in locating its physical recipe boards.
+    pub fn spawn_landmark(&self) -> Option<net::spawn::Landmark> {
+        self.spawn_landmark
     }
     pub fn credential(&self) -> Option<SecretToken> {
         self.credential
@@ -836,6 +843,16 @@ impl Connection {
     pub fn receive(&mut self, message: ServerMessage, now_ms: u64) -> Result<(), NetworkError> {
         self.note_replay_time(now_ms);
         match message {
+            ServerMessage::SpawnLandmark(landmark) => {
+                landmark.validate().map_err(|_| NetworkError::Protocol)?;
+                let welcome = self.welcome.as_ref().ok_or(NetworkError::NotConnected)?;
+                if landmark.session != welcome.session
+                    || self.spawn_landmark.is_some_and(|old| old != landmark)
+                {
+                    return Err(NetworkError::Protocol);
+                }
+                self.spawn_landmark = Some(landmark);
+            }
             ServerMessage::AudioCue(cue) => {
                 self.audio_cues
                     .push(cue)

@@ -13,6 +13,7 @@ pub mod light;
 pub mod machine_packets;
 pub mod presence;
 pub mod props;
+pub mod spawn;
 pub mod water;
 pub mod window;
 pub use geometry::{PublicGeometry, PublicSurface, PublicSurfaceKind};
@@ -344,6 +345,7 @@ pub struct FarSummary {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ServerMessage {
     Welcome(Welcome),
+    SpawnLandmark(spawn::Landmark),
     State {
         tick: Tick,
         player: PlayerState,

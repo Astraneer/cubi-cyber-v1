@@ -1003,6 +1003,13 @@ fn read_cells(input: &mut Reader<'_>) -> Result<Box<[Cell; PAGE_VOLUME]>, CodecE
 pub fn encode_server(message: &ServerMessage) -> Result<Vec<u8>, CodecError> {
     let mut out = Writer(Vec::new());
     match message {
+        ServerMessage::SpawnLandmark(value) => {
+            value.validate()?;
+            out.byte(30);
+            out.u16(spawn::LAYOUT_VERSION);
+            out.u64(value.session);
+            out.position(value.center);
+        }
         ServerMessage::Welcome(value) => {
             out.byte(0);
             out.u64(value.session);
@@ -1468,6 +1475,17 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, CodecError> {
             audio_cue::Cue::decode(read_blob(&mut input, 64)?)
                 .map_err(|_| CodecError::InvalidBounds)?,
         ),
+        30 => {
+            if input.u16()? != spawn::LAYOUT_VERSION {
+                return Err(CodecError::Version);
+            }
+            let landmark = spawn::Landmark {
+                session: input.u64()?,
+                center: input.position()?,
+            };
+            landmark.validate()?;
+            ServerMessage::SpawnLandmark(landmark)
+        }
         _ => return Err(CodecError::InvalidEnum),
     };
     finish(input)?;
