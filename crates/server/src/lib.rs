@@ -27,6 +27,7 @@ mod packet_stream;
 pub mod presence;
 pub mod props;
 mod props_stream;
+mod raw_sources;
 mod runtime;
 pub mod survival;
 mod tool_owner;
@@ -301,6 +302,7 @@ pub struct Server {
     natural_owner: natural_owner::Owner,
     lighting: light_owner::LightOwner,
     light_stream: light_stream::LightStream,
+    raw_sources: raw_sources::RawSources,
     props_stream: props_stream::PropsStream,
     packet_stream: packet_stream::Owner,
     presence: presence::Presence,
@@ -497,6 +499,7 @@ impl Server {
             migration_owner::LegacyMigration::new(&world, &runtimes.height, generator.clone())?;
         let lighting = light_owner::LightOwner::attach(&mut world, config.light_budget)?;
         let light_stream = light_stream::LightStream::new(&world);
+        let raw_sources = raw_sources::RawSources::new(&world);
         let motion_key = blake3::derive_key("cubi living item motion v1", &entropy);
         let mob_owner = mob_owner::Owner::new(
             u64::from_le_bytes(motion_key[..8].try_into().expect("hash prefix")),
@@ -539,6 +542,7 @@ impl Server {
             natural_owner,
             lighting,
             light_stream,
+            raw_sources,
             props_stream: props_stream::PropsStream::default(),
             packet_stream: packet_stream::Owner::new(),
             presence,
@@ -906,6 +910,7 @@ impl Server {
                 self.failed = true;
                 break;
             }
+            self.raw_sources.observe(&pending.changes);
             self.observe_natural(&pending.changes);
             self.observe_props(&pending.changes);
             self.counters.durable_batches += 1;
@@ -2546,6 +2551,10 @@ impl Server {
                         continue;
                     }
                     if let Some(data) = self.world.page(page) {
+                        let Some(raw_source) = self.raw_sources.source(page) else {
+                            self.failed = true;
+                            break;
+                        };
                         if page.space != peer.space
                             && let Some(record) = self.world.space(page.space)
                         {
@@ -2567,8 +2576,7 @@ impl Server {
                         );
                         self.counters.view_cells += work.cells;
                         self.counters.visibility_segments += work.segments;
-                        if let Ok(Some(update)) =
-                            peer.history.build(page, data.version(), cells, force)
+                        if let Ok(Some(update)) = peer.history.build(page, raw_source, cells, force)
                         {
                             output
                                 .push(Outgoing::reliable(connection, ServerMessage::Page(update)));

@@ -128,6 +128,8 @@ pub struct Connection {
     pending_authority: Option<(Tick, u64, PredictionState)>,
     latest_tick: Tick,
     last_received_at: u64,
+    visual_tick: Tick,
+    visual_received_at: u64,
     replay_until: Tick,
     world_changed: bool,
     actions: BTreeMap<ActionId, PendingAction>,
@@ -203,6 +205,8 @@ impl Connection {
             pending_authority: None,
             latest_tick: Tick(0),
             last_received_at: 0,
+            visual_tick: Tick(0),
+            visual_received_at: 0,
             replay_until: Tick(0),
             world_changed: false,
             actions: BTreeMap::new(),
@@ -387,7 +391,9 @@ impl Connection {
         self.geometry_removals.pop_front()
     }
     pub fn request_geometry(&mut self, page: PageId, now_ms: u64) -> Result<(), NetworkError> {
-        if !self.geometry_interest.contains_key(&page) && self.geometry_interest.len() >= 128 {
+        if !self.geometry_interest.contains_key(&page)
+            && self.geometry_interest.len() >= net::MAX_PUBLIC_GEOMETRY_PAGES
+        {
             return Err(NetworkError::Capacity);
         }
         self.height_geometry_interest.remove(&page);
@@ -786,6 +792,8 @@ impl Connection {
                 self.next_action = welcome.next_action.0;
                 self.latest_tick = welcome.tick;
                 self.last_received_at = now_ms;
+                self.visual_tick = welcome.tick;
+                self.visual_received_at = now_ms;
                 self.presence.reset(welcome.identity);
                 self.welcome = Some(welcome);
                 self.handshake = None;
@@ -821,6 +829,7 @@ impl Connection {
                 self.last_authority = Some((tick, player.input_sequence, state));
                 self.latest_tick = tick;
                 self.last_received_at = now_ms;
+                self.observe_visual_tick(tick, now_ms);
                 self.input_history.acknowledge(player.input_sequence);
                 self.inputs
                     .retain(|sequence, _| *sequence > player.input_sequence);
@@ -857,7 +866,15 @@ impl Connection {
                     Ok(net::ApplyResult::Applied) => {
                         let version = self.replica.page(page).expect("applied page").version;
                         self.queue(ClientMessage::AckPage { page, version })?;
-                        let acknowledged = self.lights.page(page).map(|s| s.header.version);
+                        // A packet for a future binding may already have been
+                        // rejected before this cell image arrived. Request a
+                        // binding fallback rather than ACK an older binding
+                        // whose credit cannot acknowledge that discarded image.
+                        let acknowledged = self
+                            .lights
+                            .page(page)
+                            .filter(|s| s.header.cell_view == version)
+                            .map(|s| s.header.version);
                         self.queue(ClientMessage::RequestLight(net::light::Request {
                             page,
                             cell_view: version,
@@ -915,6 +932,17 @@ impl Connection {
                 self.machine_packets.remove_page(page);
                 self.props.remove(&page);
                 self.props_updates.retain(|f| f.page != page);
+                self.lights.remove(page);
+                self.light_updates.retain(|u| u.header().page != page);
+                self.page_updates.retain(|u| match u {
+                    PageUpdate::Snapshot(p) => p.page != page,
+                    PageUpdate::Delta(p) => p.page != page,
+                });
+                self.outbox.retain(|message| {
+                    !matches!(message,
+                    ClientMessage::AckPage { page: p, .. } if *p == page)
+                        && !matches!(message, ClientMessage::RequestLight(r) if r.page == page)
+                });
                 if self.replica.remove(page) {
                     self.page_removals.push_back(page);
                     self.world_changed = true;
@@ -983,7 +1011,7 @@ impl Connection {
                     if !height_column {
                         return Ok(());
                     }
-                    if self.geometry_interest.len() >= 128 {
+                    if self.geometry_interest.len() >= net::MAX_PUBLIC_GEOMETRY_PAGES {
                         return Err(NetworkError::Capacity);
                     }
                     self.geometry_interest.insert(
@@ -1009,7 +1037,7 @@ impl Connection {
                         return Ok(());
                     }
                 }
-                if self.geometry_updates.len() >= 128
+                if self.geometry_updates.len() >= net::MAX_PUBLIC_GEOMETRY_PAGES
                     && !self
                         .geometry_updates
                         .iter()
@@ -1253,13 +1281,44 @@ impl Connection {
                 };
                 self.queue(ClientMessage::Entities(request))?;
             }
-            ServerMessage::State { .. } | ServerMessage::Pong(_) => {}
+            ServerMessage::State { tick, player } => {
+                if self
+                    .welcome
+                    .as_ref()
+                    .is_some_and(|w| w.identity == player.identity)
+                {
+                    self.observe_visual_tick(tick, now_ms);
+                }
+            }
+            ServerMessage::Pong(_) => {}
         }
         Ok(())
     }
 
     pub fn server_tick_time(&self, now_ms: u64) -> f64 {
         self.latest_tick.0 as f64 + now_ms.saturating_sub(self.last_received_at) as f64 / 50.0
+    }
+    /// Presentation clock from confirmed authority, with at most two ticks of
+    /// extrapolation. Prediction keeps its separate input-lead clock.
+    pub fn visual_server_tick_time(&self, now_ms: u64) -> f64 {
+        let (tick, sub_tick) = self.visual_clock_sample(now_ms);
+        tick.0 as f64 + sub_tick
+    }
+    pub fn visual_clock_sample(&self, now_ms: u64) -> (Tick, f64) {
+        if self.welcome.is_none() {
+            return (Tick(0), 0.0);
+        }
+        let elapsed = now_ms.saturating_sub(self.visual_received_at).min(100);
+        (
+            Tick(self.visual_tick.0.saturating_add(elapsed / 50)),
+            (elapsed % 50) as f64 / 50.0,
+        )
+    }
+    fn observe_visual_tick(&mut self, tick: Tick, now_ms: u64) {
+        if tick > self.visual_tick {
+            self.visual_tick = tick;
+            self.visual_received_at = now_ms;
+        }
     }
     pub fn estimated_server_tick(&self, now_ms: u64) -> Tick {
         Tick(

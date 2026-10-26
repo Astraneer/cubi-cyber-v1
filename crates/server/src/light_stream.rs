@@ -552,3 +552,67 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod binding_fallback_contract {
+    use super::*;
+    #[test]
+    fn discarded_current_binding_image_is_recovered_by_an_explicit_no_ack_fallback() {
+        let page = PageId {
+            space: SpaceId(0),
+            x: 0,
+            y: 0,
+            z: 0,
+        };
+        let mut world = World::new(rules::properties, 64);
+        let mut tx = Transaction::new(Tick(1), SpaceId(0));
+        tx.create_page(page, vec![Cell::AIR; 4096]);
+        world.commit(tx).unwrap();
+        let mut stream = LightStream::new(&world);
+        let request = |cell_view, acknowledged| Request {
+            page,
+            cell_view,
+            acknowledged,
+        };
+        stream.request(1, request(1, None));
+        let a = stream
+            .build(1, request(1, None), world.page(page).unwrap())
+            .unwrap()
+            .unwrap();
+        stream.request(1, request(1, Some(a.header().version)));
+        stream.request(1, request(2, Some(a.header().version)));
+        let b = stream
+            .build(
+                1,
+                request(2, Some(a.header().version)),
+                world.page(page).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        // The receiver no longer has that raw binding and cannot accept B.
+        // Repeating the obsolete A ACK correctly cannot grant B stream credit.
+        stream.request(1, request(2, Some(a.header().version)));
+        assert!(
+            stream
+                .build(
+                    1,
+                    request(2, Some(a.header().version)),
+                    world.page(page).unwrap()
+                )
+                .unwrap()
+                .is_none()
+        );
+        // Once raw2 is restored, the client now sends None instead of A.
+        stream.request(1, request(2, None));
+        let repair = stream
+            .build(1, request(2, None), world.page(page).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&repair, Update::Snapshot(_)));
+        assert_eq!(repair.header(), b.header());
+        let mut replica = net::light::Replica::new(1).unwrap();
+        replica.apply(a, Some(1)).unwrap();
+        replica.apply(repair, Some(2)).unwrap();
+        assert_eq!(replica.page(page).unwrap().header.cell_view, 2);
+    }
+}

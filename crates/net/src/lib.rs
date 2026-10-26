@@ -32,6 +32,9 @@ pub const MAX_NAME_BYTES: usize = 64;
 pub const MAX_COMMAND_BYTES: usize = 256;
 pub const MAX_PREDICTION_BYTES: usize = 384;
 pub const MAX_COORDINATE: i32 = 30_000_000;
+/// Bounded public geometry interest: 32 near proxies plus up to 28 exact
+/// eight-page height columns. Product traces require at least 176 images.
+pub const MAX_PUBLIC_GEOMETRY_PAGES: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SecretToken([u8; 32]);

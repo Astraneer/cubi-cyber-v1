@@ -1,5 +1,6 @@
 //! Shared real-session pump. Platform sockets carry bounded binary frames;
 //! authority imports, prediction and visible overlays have one scene owner.
+pub mod diagnostics;
 use crate::{
     ClientScene, SceneConfig, SceneError,
     network::{Connection, NetworkConfig, NetworkError},

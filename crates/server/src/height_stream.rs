@@ -5,7 +5,7 @@ use height_tile::{PublicHeightTile, ReplacementRequirement};
 use net::height::{GeometryStamp, HeightKey, HeightTile, Replacement};
 type Pool = jobs::NativePool<TileEdits, PublicHeightTile>;
 pub(super) const MAX_TILES: usize = 512;
-pub(super) const MAX_GEOMETRY: usize = 128;
+pub(super) const MAX_GEOMETRY: usize = net::MAX_PUBLIC_GEOMETRY_PAGES;
 pub(super) struct HeightWorker {
     pool: Pool,
     inflight: BTreeMap<jobs::JobId, (u64, HeightKey, u64)>,

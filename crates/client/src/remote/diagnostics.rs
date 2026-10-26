@@ -6,6 +6,7 @@ pub struct LightBinding {
     pub scene_cells: Option<u64>,
     pub network_cells: Option<u64>,
     pub network_light: Option<net::light::Header>,
+    pub retained_scene_light: Option<crate::ConfirmedLightVersion>,
 }
 impl RemoteSession {
     /// Only loaded requested pages lacking a current source certificate. The
@@ -24,7 +25,8 @@ impl RemoteSession {
                 page,
                 scene_cells: scene.authoritative_version(page).map(|v| v.view),
                 network_cells: self.connection.replica().page(page).map(|p| p.version),
-                network_light: self.connection.light_replica().page(page).map(|p|p.header),
+                network_light: self.connection.light_replica().page(page).map(|p| p.header),
+                retained_scene_light: scene.retained_authoritative_light_version(page),
             })
         })
     }

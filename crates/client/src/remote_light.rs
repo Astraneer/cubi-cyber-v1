@@ -23,6 +23,14 @@ enum Samples<'a> {
     },
 }
 impl ClientScene {
+    /// Public retained header for diagnostics; this does not certify the current
+    /// cells. Rendering must continue to use `authoritative_light_version`.
+    pub fn retained_authoritative_light_version(
+        &self,
+        page: PageId,
+    ) -> Option<ConfirmedLightVersion> {
+        self.confirmed_lights.get(&page).copied()
+    }
     /// None also means that a newer public cell image invalidated the binding;
     /// callers must not label an old volume as confirmed for a newer page.
     pub fn authoritative_light_version(&self, page: PageId) -> Option<ConfirmedLightVersion> {
