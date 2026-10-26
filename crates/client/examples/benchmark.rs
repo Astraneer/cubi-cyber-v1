@@ -160,7 +160,7 @@ async fn run(options: Options) -> Result<(), String> {
     let mut recorder =
         FlightRecorder::new_full_capture(options.frames as usize + 1, options.frames as usize + 1)
             .map_err(str::to_owned)?;
-    let mut capture = FrameGpuCapture::new(&gpu.device);
+    let mut capture = FrameGpuCapture::new_with_queue(&gpu.device, &gpu.queue);
     let started = Instant::now();
     let mut previous = 0;
     let mut completed = 0;
@@ -188,6 +188,7 @@ async fn run(options: Options) -> Result<(), String> {
         let rendered = view.needs_redraw(options.width, options.height);
         if rendered {
             let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            capture.begin_frame(&mut encoder, gpu.queue.get_timestamp_period());
             view.encode(
                 &gpu.queue,
                 &mut encoder,
@@ -265,7 +266,8 @@ async fn run(options: Options) -> Result<(), String> {
         start_tick,
     );
     json.pop();
-    write!(json, ",\"benchmark\":{{\"route\":\"{}\",\"width\":{},\"height\":{},\"presentationIncluded\":false,\"framesRequested\":{},\"routeFrames\":{},\"routeComplete\":{},\"renderedFrames\":{},\"fixedStepHz\":60,\"blockingReadback\":true,\"scene\":\"generated-forest-fixture\",\"colorPassIncludesSky\":true,\"workerAllocationsMeasured\":false,\"oldestJobAgeMeasured\":false}}}}", benchmark::ROUTE, options.width, options.height, options.frames, benchmark::FRAMES, options.frames == benchmark::FRAMES, completed).map_err(|e| e.to_string())?;
+    let sample_count = view.render_sample_count();
+    write!(json, ",\"benchmark\":{{\"route\":\"{}\",\"width\":{},\"height\":{},\"presentationIncluded\":false,\"framesRequested\":{},\"routeFrames\":{},\"routeComplete\":{},\"renderedFrames\":{},\"fixedStepHz\":60,\"blockingReadback\":true,\"scene\":\"generated-forest-fixture\",\"colorPassIncludesSky\":true,\"sampleCount\":{sample_count},\"gpuTimeMeaning\":\"whole encoder interval; queue staging before encoder and recorder readback excluded\",\"workerAllocationsMeasured\":false,\"oldestJobAgeMeasured\":false}}}}", benchmark::ROUTE, options.width, options.height, options.frames, benchmark::FRAMES, options.frames == benchmark::FRAMES, completed).map_err(|e| e.to_string())?;
     view.movement_replay()
         .append_json(&mut json)
         .map_err(str::to_owned)?;

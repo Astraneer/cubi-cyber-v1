@@ -9,6 +9,7 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 use telemetry::flight::FlightRecorder;
+mod whole_frame;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CaptureStats {
@@ -19,6 +20,7 @@ pub struct CaptureStats {
     pub expired: u64,
     pub failed: u64,
     pub cancelled: u64,
+    pub whole_intervals: u64,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureTicket {
@@ -27,8 +29,8 @@ pub struct CaptureTicket {
 }
 #[derive(Clone, Copy)]
 struct FrameQueryGraph {
-    kinds: [u8; 64],
-    periods: [f32; 64],
+    kinds: [u8; 65],
+    periods: [f32; 65],
     count: usize,
 }
 struct Slot {
@@ -41,6 +43,7 @@ struct Slot {
 pub struct FrameGpuCapture {
     slots: [Slot; 2],
     stats: CaptureStats,
+    whole_frame: Option<whole_frame::WholeFrame>,
 }
 impl FrameGpuCapture {
     pub fn new(device: &wgpu::Device) -> Self {
@@ -48,7 +51,7 @@ impl FrameGpuCapture {
             slots: std::array::from_fn(|_| Slot {
                 buffer: device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("nonblocking frame timings"),
-                    size: 1024,
+                    size: 1040,
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
                 }),
@@ -58,7 +61,21 @@ impl FrameGpuCapture {
                 generation: 0,
             }),
             stats: CaptureStats::default(),
+            whole_frame: None,
         }
+    }
+    pub fn new_with_queue(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        let mut capture = Self::new(device);
+        capture.whole_frame = Some(whole_frame::WholeFrame::new(device, queue));
+        capture
+    }
+    /// Call before all scene, preparation and UI commands in this encoder. The
+    /// matching end is encoded by encode_sources; legacy callers retain the
+    /// explicitly partial sum until they opt into this complete interval.
+    pub fn begin_frame(&mut self, encoder: &mut wgpu::CommandEncoder, period: f32) -> bool {
+        self.whole_frame
+            .as_mut()
+            .is_some_and(|whole| whole.begin(encoder, period))
     }
     /// Call immediately after View.encode and before submission. If submission
     /// is abandoned, call cancel rather than leaving this slot reserved.
@@ -101,16 +118,19 @@ impl FrameGpuCapture {
         encoder: &mut wgpu::CommandEncoder,
         frame: u64,
     ) -> Option<CaptureTicket> {
+        if let Some(whole) = &mut self.whole_frame {
+            whole.end(encoder);
+        }
         let mut graph = FrameQueryGraph {
-            kinds: [255; 64],
-            periods: [0.0; 64],
+            kinds: [255; 65],
+            periods: [0.0; 65],
             count: 0,
         };
-        let mut buffers = [None; 16];
+        let mut buffers = [None; 17];
         let mut source_count = 0;
         for source in sources {
             let count = source.count as usize;
-            if source_count == buffers.len()
+            if source_count == 16
                 || count > 32
                 || graph.count + count > 64
                 || !source.period.is_finite()
@@ -127,6 +147,17 @@ impl FrameGpuCapture {
             graph.kinds[graph.count..graph.count + count].copy_from_slice(&source.kinds[..count]);
             graph.periods[graph.count..graph.count + count].fill(source.period);
             graph.count += count;
+            buffers[source_count] = Some(source);
+            source_count += 1;
+        }
+        if let Some(source) = self
+            .whole_frame
+            .as_ref()
+            .and_then(whole_frame::WholeFrame::source)
+        {
+            graph.kinds[graph.count] = 254;
+            graph.periods[graph.count] = source.period;
+            graph.count += 1;
             buffers[source_count] = Some(source);
             source_count += 1;
         }
@@ -193,6 +224,15 @@ impl FrameGpuCapture {
     /// Poll callbacks on native with device.poll(Poll); browsers invoke them via
     /// their event loop. This method never waits and creates no user containers.
     pub fn collect(&mut self, recorder: &mut FlightRecorder) {
+        self.collect_with(recorder, |_, _, _| {});
+    }
+    /// The callback identifies the original submitted frame. It runs only once
+    /// after a valid readback has completed a still retained recorder sample.
+    pub fn collect_with(
+        &mut self,
+        recorder: &mut FlightRecorder,
+        mut completed: impl FnMut(u64, u64, bool),
+    ) {
         for slot in &mut self.slots {
             match slot.state.load(Ordering::Acquire) {
                 3 => {
@@ -201,10 +241,13 @@ impl FrameGpuCapture {
                     drop(data);
                     slot.buffer.unmap();
                     match measurement {
-                        Some((total, passes)) => {
+                        Some((total, passes, complete)) => {
                             self.stats.completed += 1;
-                            if !recorder.complete_gpu(slot.frame, total, passes) {
+                            self.stats.whole_intervals += u64::from(complete);
+                            if !recorder.complete_gpu_scope(slot.frame, total, passes, complete) {
                                 self.stats.expired += 1;
+                            } else {
+                                completed(slot.frame, total, complete);
                             }
                         }
                         None => self.stats.failed += 1,
@@ -231,9 +274,10 @@ impl FrameGpuCapture {
         self.stats
     }
 }
-fn decode(data: &[u8], graph: FrameQueryGraph) -> Option<(u64, [Option<u64>; 16])> {
+fn decode(data: &[u8], graph: FrameQueryGraph) -> Option<(u64, [Option<u64>; 16], bool)> {
     let mut passes = [None; 16];
     let mut total = 0_u64;
+    let mut whole = None;
     for (index, pass) in graph.kinds[..graph.count].iter().enumerate() {
         let offset = index * 16;
         let begin = u64::from_le_bytes(data.get(offset..offset + 8)?.try_into().ok()?);
@@ -243,6 +287,12 @@ fn decode(data: &[u8], graph: FrameQueryGraph) -> Option<(u64, [Option<u64>; 16]
             return None;
         }
         let nanos = nanos as u64;
+        if *pass == 254 {
+            if whole.replace(nanos).is_some() {
+                return None;
+            }
+            continue;
+        }
         total = total.checked_add(nanos)?;
         if *pass == 255 {
             continue;
@@ -250,7 +300,7 @@ fn decode(data: &[u8], graph: FrameQueryGraph) -> Option<(u64, [Option<u64>; 16]
         let slot = *pass as usize;
         passes[slot] = Some(passes[slot].unwrap_or(0_u64).checked_add(nanos)?);
     }
-    Some((total, passes))
+    Some((whole.unwrap_or(total), passes, whole.is_some()))
 }
 
 fn terrain_kind(pass: GpuPassKind) -> u8 {

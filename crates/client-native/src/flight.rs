@@ -3,6 +3,7 @@
 use client::{benchmark, capture::FrameGpuCapture, view::ClientView};
 use std::{fmt::Write, path::PathBuf, time::Instant};
 use telemetry::flight::{FlightRecorder, Observations, ReplayInput, Sample};
+mod continuations;
 
 #[derive(Clone)]
 pub struct BenchmarkOptions {
@@ -26,6 +27,7 @@ pub struct NativeFlight {
     frame: u64,
     route: Option<Route>,
     presented: u64,
+    continuations: continuations::CpuContinuations,
 }
 impl NativeFlight {
     pub fn begin_scene(&mut self) -> Result<(), String> {
@@ -36,7 +38,11 @@ impl NativeFlight {
     pub fn recorder(&self) -> &FlightRecorder {
         &self.recorder
     }
-    pub fn new(device: &wgpu::Device, options: Option<BenchmarkOptions>) -> Result<Self, String> {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        options: Option<BenchmarkOptions>,
+    ) -> Result<Self, String> {
         if options
             .as_ref()
             .is_some_and(|options| options.frames == 0 || options.frames > benchmark::FRAMES)
@@ -45,11 +51,12 @@ impl NativeFlight {
         }
         Ok(Self {
             recorder: FlightRecorder::new(4096, 4096).map_err(str::to_owned)?,
-            capture: FrameGpuCapture::new(device),
+            capture: FrameGpuCapture::new_with_queue(device, queue),
             started: Instant::now(),
             previous_ns: 0,
             frame: 0,
             presented: 0,
+            continuations: continuations::CpuContinuations::default(),
             route: options.map(|options| Route {
                 options,
                 started: false,
@@ -94,6 +101,7 @@ impl NativeFlight {
         self.started = Instant::now();
         self.previous_ns = 0;
         self.presented = 0;
+        self.continuations = continuations::CpuContinuations::default();
         let _ = view.take_frame_work();
         println!(
             "NATIVE_BENCH_START route={} frames={} presentation_included=true",
@@ -123,7 +131,13 @@ impl NativeFlight {
         self.route.as_ref().is_some_and(|route| route.exported)
     }
     pub fn collect(&mut self) {
-        self.capture.collect(&mut self.recorder)
+        self.collect_with(|_, _, _| {});
+    }
+    pub fn collect_with(&mut self, completed: impl FnMut(u64, u64, bool)) {
+        self.capture.collect_with(&mut self.recorder, completed);
+    }
+    pub fn begin_gpu_frame(&mut self, encoder: &mut wgpu::CommandEncoder, period: f32) -> bool {
+        self.capture.begin_frame(encoder, period)
     }
     pub fn encode(
         &mut self,
@@ -137,9 +151,18 @@ impl NativeFlight {
     }
     pub fn record(
         &mut self,
+        sample: Sample,
+        view: Option<&ClientView>,
+        presented: bool,
+    ) -> Result<(), String> {
+        self.record_with(sample, view, presented, |_| {})
+    }
+    pub fn record_with(
+        &mut self,
         mut sample: Sample,
         view: Option<&ClientView>,
         presented: bool,
+        mut recorded: impl FnMut(&Sample),
     ) -> Result<(), String> {
         // A benchmark sample always includes one real window presentation.
         // Main-thread polling while its preceding frame is pending is excluded;
@@ -147,6 +170,11 @@ impl NativeFlight {
         if self.route_active() && !presented {
             return Ok(());
         }
+        if !presented {
+            self.continuations.push(sample);
+            return Ok(());
+        }
+        self.continuations.finish(&mut sample);
         self.frame = self
             .frame
             .checked_add(1)
@@ -173,6 +201,7 @@ impl NativeFlight {
         self.recorder
             .record_frame(sample)
             .map_err(|error| format!("frame recorder: {error:?}"))?;
+        recorded(&sample);
         self.previous_ns = now;
         self.presented += u64::from(presented);
         if presented
@@ -276,7 +305,9 @@ impl NativeFlight {
             }
         });
         let object_limit = view.map_or(0, ClientView::gpu_object_limit);
-        write!(json, ",\"benchmark\":{{\"route\":\"{}\",\"width\":{},\"height\":{},\"presentationIncluded\":true,\"presentationMeaning\":\"surface.present plus completed GPU submission; scanout is not instrumented\",\"framesRequested\":{},\"routeFrames\":{},\"routeComplete\":{},\"renderedFrames\":{},\"fixedStepHz\":{},\"blockingReadback\":false,\"scene\":\"{}\",\"colorPassIncludesSky\":true,\"nearRasterization\":\"{}\",\"quadStorage\":\"greedy-16B\",\"gpuObjectCapacity\":{},\"workerAllocationsMeasured\":false,\"oldestJobAgeMeasured\":false,\"checkpointStateEmbedded\":false,\"warmupExcluded\":{},\"gpuTimeMeaning\":\"sum of nonoverlapping measured GPU scopes, including complete shadow work; uninstrumented work between scopes and scanout excluded\",\"forcePresentation\":{},\"allocatorScope\":\"simulation jobs upload encode present; loading and callback polling excluded\"}},\"gpuCapture\":{{\"completed\":{},\"unsupported\":{},\"full\":{},\"failed\":{},\"expired\":{}}}}}",
+        let sample_count = view.map_or(0, ClientView::render_sample_count);
+        let whole_intervals = self.capture.stats().whole_intervals;
+        write!(json, ",\"benchmark\":{{\"route\":\"{}\",\"width\":{},\"height\":{},\"presentationIncluded\":true,\"presentationMeaning\":\"surface.present plus completed GPU submission; scanout is not instrumented\",\"framesRequested\":{},\"routeFrames\":{},\"routeComplete\":{},\"renderedFrames\":{},\"fixedStepHz\":{},\"blockingReadback\":false,\"scene\":\"{}\",\"colorPassIncludesSky\":true,\"nearRasterization\":\"{}\",\"quadStorage\":\"greedy-16B\",\"gpuObjectCapacity\":{},\"sampleCount\":{sample_count},\"workerAllocationsMeasured\":false,\"oldestJobAgeMeasured\":false,\"checkpointStateEmbedded\":false,\"warmupExcluded\":{},\"gpuTimeMeaning\":\"whole encoder interval when gpuTotalComplete is true, otherwise partial pass sum; queue staging before the encoder, capture readback and scanout excluded\",\"forcePresentation\":{},\"allocatorScope\":\"simulation jobs upload encode present; loading and callback polling excluded\"}},\"gpuCapture\":{{\"wholeIntervals\":{whole_intervals},\"completed\":{},\"unsupported\":{},\"full\":{},\"failed\":{},\"expired\":{}}}}}",
             route_name, width, height, requested, route_frames, complete, self.presented, step_hz, scene, raster, object_limit, requested != 0, requested != 0,
             self.capture.stats().completed, self.capture.stats().unsupported, self.capture.stats().full,
             self.capture.stats().failed, self.capture.stats().expired).map_err(|error| error.to_string())?;

@@ -50,6 +50,9 @@ pub struct Sample {
     pub interval_ns: u64,
     pub cpu_ns: Option<u64>,
     pub gpu_ns: Option<u64>,
+    /// True only for an outer timestamp interval enclosing the submitted scene
+    /// and UI commands. False preserves the legacy sum of measured subscopes.
+    pub gpu_total_complete: bool,
     pub cpu_stages_ns: [Option<u64>; 8],
     pub gpu_passes_ns: [Option<u64>; 16],
     pub work: WorkCounts,
@@ -132,6 +135,15 @@ impl FlightRecorder {
         total_ns: u64,
         passes_ns: [Option<u64>; 16],
     ) -> bool {
+        self.complete_gpu_scope(frame, total_ns, passes_ns, false)
+    }
+    pub fn complete_gpu_scope(
+        &mut self,
+        frame: u64,
+        total_ns: u64,
+        passes_ns: [Option<u64>; 16],
+        complete: bool,
+    ) -> bool {
         let Some(sample) = self.frames.iter_mut().find(|sample| sample.frame == frame) else {
             return false;
         };
@@ -139,6 +151,7 @@ impl FlightRecorder {
             return false;
         }
         sample.gpu_ns = Some(total_ns);
+        sample.gpu_total_complete = complete;
         sample.gpu_passes_ns = passes_ns;
         true
     }
@@ -295,6 +308,7 @@ impl FlightRecorder {
             optional(&mut out, s.cpu_ns);
             out.push_str(",\"gpuNs\":");
             optional(&mut out, s.gpu_ns);
+            let _ = write!(out, ",\"gpuTotalComplete\":{}", s.gpu_total_complete);
             out.push_str(",\"cpu\":[");
             numbers(&mut out, &s.cpu_stages_ns);
             out.push_str("],\"gpu\":[");

@@ -55,6 +55,10 @@ def validate(value):
         for key in ("cpuNs", "gpuNs"):
             if frame.get(key) is not None:
                 integer(frame[key], key)
+        if "gpuTotalComplete" in frame and type(frame["gpuTotalComplete"]) is not bool:
+            raise ValueError("Некорректная область GPU-измерения")
+        if frame.get("gpuTotalComplete") and frame.get("gpuNs") is None:
+            raise ValueError("Полный GPU-интервал не измерен")
         for key, count in (("cpu", 8), ("gpu", 16)):
             times = frame.get(key)
             if not isinstance(times, list) or len(times) != count:
@@ -104,6 +108,8 @@ def summarize(value):
         raise ValueError("Несовместимая таблица подсистем CPU")
     stages = [{"name": name, **distribution([f["cpu"][index] for f in frames])}
               for index, name in enumerate(stage_names)]
+    complete_gpu = [f["gpuNs"] for f in frames if f.get("gpuTotalComplete") and f.get("gpuNs") is not None]
+    partial_gpu = [f["gpuNs"] for f in frames if not f.get("gpuTotalComplete") and f.get("gpuNs") is not None]
     return {"backend": value["backend"], "frames": len(frames),
             "durationSeconds": (frames[-1]["timeNs"] - frames[0]["timeNs"]) / 1e9,
             "completeWindow": value["completeWindow"], "lostFrames": value["lostFrames"],
@@ -112,7 +118,8 @@ def summarize(value):
             "hitches50": sum(f["intervalNs"] > 50_000_000 for f in frames),
             "frame": distribution([f["intervalNs"] or None for f in frames]),
             "cpu": distribution([f.get("cpuNs") for f in frames]),
-            "gpu": distribution([f.get("gpuNs") for f in frames]), "work": work,
+            "gpu": distribution(complete_gpu or partial_gpu), "gpuScope": gpu_scope(value),
+            "gpuPartial": distribution(partial_gpu if complete_gpu else []), "work": work,
             "passes": passes, "stages": stages,
             "observations": {name: sum(bool(f["observations"] & (1 << bit)) for f in frames)
                              for bit, name in enumerate(OBSERVATIONS)},
@@ -121,11 +128,18 @@ def summarize(value):
                               for f in frames if f["allocations"] is not None),
             "timeline": [[f["timeNs"] / 1e6, f["intervalNs"] / 1e6,
                           None if f.get("cpuNs") is None else f["cpuNs"] / 1e6,
-                          None if f.get("gpuNs") is None else f["gpuNs"] / 1e6] for f in frames]}
+                          None if f.get("gpuNs") is None or (complete_gpu and not f.get("gpuTotalComplete")) else f["gpuNs"] / 1e6] for f in frames]}
 
 
 def fmt(value):
     return "не измерено" if value is None else f"{value:.3f}"
+
+
+def gpu_scope(record):
+    kinds = {frame.get("gpuTotalComplete", False) for frame in record["frames"]
+             if frame.get("gpuNs") is not None}
+    return ("unmeasured" if not kinds else "mixed" if len(kinds) > 1 else
+            "complete-encoder" if True in kinds else "partial-pass-sum")
 
 
 def compatible(a, b):
@@ -133,12 +147,15 @@ def compatible(a, b):
         return False
     if len(a["frames"]) != len(b["frames"]) or a.get("initialHash") != b.get("initialHash"):
         return False
+    if gpu_scope(a) != gpu_scope(b) or gpu_scope(a) == "mixed":
+        return False
     left, right = a.get("benchmark"), b.get("benchmark")
     if not isinstance(left, dict) or not isinstance(right, dict):
         return False
     return all(left.get(k) is not None and left[k] == right.get(k)
                for k in ("route", "width", "height", "presentationIncluded")) and all(
-                   left.get(k) == right.get(k) for k in ("blockingReadback", "framesRequested", "scene"))
+                   left.get(k) == right.get(k) for k in ("blockingReadback", "framesRequested", "scene",
+                   "sampleCount", "nearRasterization", "gpuObjectCapacity"))
 
 
 def render(records):
@@ -156,10 +173,15 @@ def render(records):
                 details += "<p>Этот прогон ожидает завершения GPU между кадрами; длительность включает ожидание readback.</p>"
             if metadata.get("colorPassIncludesSky"):
                 details += "<p>Проход terrain объединяет небо и геометрию; отдельное время неба не измерено.</p>"
+        gpu_label = "GPU — интервал команд" if summary["gpuScope"] in ("complete-encoder", "mixed") else "GPU — сумма проходов"
+        metrics = [("Кадр", "frame"), ("CPU", "cpu"), (gpu_label, "gpu")]
+        if summary["gpuScope"] == "mixed":
+            metrics.append(("GPU — отдельные суммы проходов", "gpuPartial"))
+            details += "<p>Полные интервалы GPU и частичные суммы проходов показаны раздельно.</p>"
         rows = "".join(f"<tr><td>{label}</td><td>{fmt(summary[key]['p50'])}</td>"
                        f"<td>{fmt(summary[key]['p95'])}</td><td>{fmt(summary[key]['p99'])}</td>"
                        f"<td>{summary[key]['samples']}</td></tr>"
-                       for label, key in (("Кадр", "frame"), ("CPU", "cpu"), ("GPU", "gpu")))
+                       for label, key in metrics)
         passes = "".join(f"<tr><td>{html.escape(p['name'])}</td><td>{fmt(p['p50'])}</td>"
                          f"<td>{fmt(p['p95'])}</td><td>{fmt(p['p99'])}</td><td>{p['samples']}</td></tr>"
                          for p in summary["passes"])

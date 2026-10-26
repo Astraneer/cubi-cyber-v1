@@ -407,7 +407,10 @@ impl BrowserState {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("shared forest frame"),
             });
-        let ticket = if draw_world {
+        if let Some(capture) = &mut self.gpu_capture {
+            capture.begin_frame(&mut encoder, self.gpu.queue.get_timestamp_period());
+        }
+        if draw_world {
             self.view
                 .encode(
                     &self.gpu.queue,
@@ -417,10 +420,6 @@ impl BrowserState {
                     self.config.height,
                 )
                 .map_err(js_error)?;
-            self.gpu_capture.as_mut().and_then(|capture| {
-                self.view
-                    .encode_gpu_capture(capture, &mut encoder, u64::from(self.submitted) + 1)
-            })
         } else {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("product menu background"),
@@ -442,11 +441,22 @@ impl BrowserState {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            None
-        };
+        }
         if let Some(product) = &mut self.product {
             product.layer.encode(&mut encoder, &output);
         }
+        let ticket = self.gpu_capture.as_mut().and_then(|capture| {
+            if draw_world {
+                self.view
+                    .encode_gpu_capture(capture, &mut encoder, u64::from(self.submitted) + 1)
+            } else {
+                capture.encode_sources(
+                    std::iter::empty(),
+                    &mut encoder,
+                    u64::from(self.submitted) + 1,
+                )
+            }
+        });
         let encode_end = clock_ms();
         self.gpu.queue.submit([encoder.finish()]);
         self.ui_pending = false;
@@ -1557,7 +1567,10 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
     let gpu_capture = if diagnostic {
         None
     } else {
-        Some(client::capture::FrameGpuCapture::new(&gpu.device))
+        Some(client::capture::FrameGpuCapture::new_with_queue(
+            &gpu.device,
+            &gpu.queue,
+        ))
     };
     if diagnostic && params.get("unit_mesh").as_deref() == Some("1") {
         view.set_demo_unit_mesh(true).map_err(js_error)?;

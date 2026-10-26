@@ -103,3 +103,29 @@ class BenchReportTests(TestCase):
             first.write_text(first.read_text().replace('"cpuNs": 5000000', '"cpuNs": NaN'))
             with self.assertRaises(ValueError):
                 load(first)
+
+    def test_complete_gpu_spans_and_partial_pass_sums_are_not_mixed_or_compared(self):
+        complete = fixture()
+        for frame in complete["frames"]:
+            frame["gpuNs"] = 8_000_000
+            frame["gpuTotalComplete"] = True
+        partial = deepcopy(complete)
+        for frame in partial["frames"]:
+            frame.pop("gpuTotalComplete")
+            frame["gpuNs"] = 2_000_000
+        self.assertTrue(compatible(complete, deepcopy(complete)))
+        self.assertFalse(compatible(complete, partial))
+        mixed = deepcopy(complete)
+        mixed["frames"][0].pop("gpuTotalComplete")
+        mixed["frames"][0]["gpuNs"] = 1_000_000
+        result = summarize(mixed)
+        self.assertEqual(result["gpu"]["samples"], 4)
+        self.assertEqual(result["gpu"]["p50"], 8)
+        self.assertEqual(result["gpuPartial"]["samples"], 1)
+        self.assertIsNone(result["timeline"][0][3])
+        self.assertFalse(compatible(mixed, deepcopy(mixed)))
+        self.assertIn("показаны раздельно", render([mixed]))
+        bad = fixture()
+        bad["frames"][0]["gpuTotalComplete"] = True
+        with self.assertRaises(ValueError):
+            validate(bad)

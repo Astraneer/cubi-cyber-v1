@@ -328,7 +328,7 @@ impl NativeState {
             .create_surface(window.clone())
             .map_err(|error| error.to_string())?;
         let gpu = render::Gpu::request(&instance, Some(&surface), software).await?;
-        let flight = flight::NativeFlight::new(&gpu.device, benchmark)?;
+        let flight = flight::NativeFlight::new(&gpu.device, &gpu.queue, benchmark)?;
         let size = window.inner_size();
         let mut config = surface
             .get_default_config(&gpu.adapter, size.width.max(1), size.height.max(1))
@@ -665,6 +665,8 @@ impl NativeState {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("shared terrain frame"),
                     });
+            self.flight
+                .begin_gpu_frame(&mut encoder, self.gpu.queue.get_timestamp_period());
             view.encode(
                 &self.gpu.queue,
                 &mut encoder,

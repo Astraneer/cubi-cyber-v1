@@ -199,3 +199,131 @@ fn actual_readbacks_have_bounded_backpressure_frame_identity_and_stale_ticket_gu
     assert_eq!(capture.stats().failed, 1);
     assert_eq!(capture.pending(), 0);
 }
+
+#[test]
+fn complete_gpu_interval_includes_unclassified_commands_without_double_counting_passes() {
+    use render::gpu_time::{GpuPassTimer, TimingSource};
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let mut capture = FrameGpuCapture::new_with_queue(&gpu.device, &gpu.queue);
+    let timer = GpuPassTimer::<1>::new(&gpu.device, &gpu.queue, "independent inner pass");
+    let data = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("actual unclassified and classified GPU work"),
+        size: 4096,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("real timestamp interval workload"),
+        source: wgpu::ShaderSource::Wgsl("@group(0)@binding(0)var<storage,read_write> values:array<u32>;@compute @workgroup_size(64)fn main(@builtin(global_invocation_id)i:vec3<u32>){if i.x>=1024u{return;}var x=values[i.x];for(var n=0u;n<256u;n++){x=x*1664525u+1013904223u;}values[i.x]=x;}".into()),
+    });
+    let pipeline = gpu
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("real timestamp work"),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+    let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("timestamp workload data"),
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: data.as_entire_binding(),
+        }],
+    });
+    let output = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("independent completed-work oracle"),
+        size: 4096,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut abandoned = gpu.device.create_command_encoder(&Default::default());
+    assert!(capture.begin_frame(&mut abandoned, gpu.queue.get_timestamp_period()));
+    drop(abandoned);
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    assert!(capture.begin_frame(&mut encoder, gpu.queue.get_timestamp_period()));
+    timer.begin();
+    for phase in 0..3 {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("complete interval includes this actual work"),
+            timestamp_writes: (phase == 1).then(|| timer.compute(0)).flatten(),
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(if phase == 1 { 1 } else { 16 }, 1, 1);
+    }
+    timer.finish(&mut encoder);
+    encoder.copy_buffer_to_buffer(&data, 0, &output, 0, 4096);
+    let (buffer, period) = timer.timestamp_buffer().unwrap();
+    let ticket = capture
+        .encode_sources(
+            [TimingSource {
+                buffer,
+                period,
+                kinds: [0; 32],
+                count: 1,
+            }],
+            &mut encoder,
+            1,
+        )
+        .unwrap();
+    gpu.queue.submit([encoder.finish()]);
+    capture.submitted(ticket);
+    let mut recorder = FlightRecorder::new(8, 8).unwrap();
+    recorder
+        .record_frame(Sample {
+            frame: 1,
+            monotonic_ns: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    output
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+    gpu.device.poll(wgpu::PollType::Wait).unwrap();
+    rx.recv().unwrap().unwrap();
+    let bytes = output.slice(..).get_mapped_range();
+    let advance = |mut x: u32| {
+        for _ in 0..256 {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+        }
+        x
+    };
+    for index in [0, 63, 64, 1023] {
+        let actual = u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap());
+        let expected = if index < 64 {
+            advance(advance(advance(0)))
+        } else {
+            advance(advance(0))
+        };
+        assert_eq!(actual, expected, "actual ordered workload at {index}");
+    }
+    drop(bytes);
+    output.unmap();
+    capture.collect(&mut recorder);
+    let frame = recorder.frames().last().unwrap();
+    assert!(frame.gpu_total_complete);
+    assert!(frame.gpu_ns.unwrap() > frame.gpu_passes_ns[0].unwrap());
+    assert_eq!(frame.gpu_passes_ns.iter().flatten().count(), 1);
+    assert_eq!(capture.stats().whole_intervals, 1);
+    assert!(
+        recorder
+            .export_json("test", 0, 0, 0)
+            .contains("\"gpuTotalComplete\":true")
+    );
+    // Reusing the collector without a begin must not expose the old full span.
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    assert!(capture.encode_sources([], &mut encoder, 2).is_none());
+    assert_eq!(capture.pending(), 0);
+    assert!(!capture.begin_frame(&mut encoder, f32::NAN));
+    assert!(capture.encode_sources([], &mut encoder, 3).is_none());
+    println!(
+        "COMPLETE_GPU_INTERVAL_OK total={}ns classified={}ns unclassified_work=2passes exact_outputs=true",
+        frame.gpu_ns.unwrap(),
+        frame.gpu_passes_ns[0].unwrap()
+    );
+}

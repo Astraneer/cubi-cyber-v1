@@ -366,6 +366,9 @@ impl ClientView {
     pub fn renderer_mut(&mut self) -> &mut TerrainGpu {
         &mut self.renderer
     }
+    pub fn render_sample_count(&self) -> u32 {
+        self.renderer.geometry().sample_count
+    }
     /// Attach the CPU light owner and all GPU pipelines during loading. Callers
     /// choose the standalone sky proof or the remote Unknown-is-dark policy.
     pub fn prepare_lighting(
