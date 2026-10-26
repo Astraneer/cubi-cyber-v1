@@ -93,12 +93,39 @@ def payload(kind, directory, platform):
         raise ValueError("Формат программы не соответствует выбранной платформе")
     files["bench_report.py"] = file_bytes(ROOT / "tools/bench_report.py")
     prefix = ".\\" if platform == "windows" else "./"
-    files["ЗАПУСК.txt"] = (f"Сервер: {prefix}server{extension} --data saves/world\n"
-                            f"Клиент: {prefix}client-native{extension} --connect ws://127.0.0.1:25565\n"
-                            f"Маршрут без окна: {prefix}benchmark{extension} --out measurements/run.json\n"
-                            f"Повтор движения из F8: {prefix}movement-replay{extension} F8.json\n"
-                            "HTML: python bench_report.py report measurements/run.json --out measurements/report.html\n"
-                            "Ограничения текущей сборки и критерии приёмки: docs/STATUS.md.\n").encode()
+    shell = "PowerShell" if platform == "windows" else "терминал"
+    files["ЗАПУСК.txt"] = (
+        f"Полностью распакуйте ZIP и откройте {shell} в его каталоге.\n"
+        "Для создания HTML нужен Python 3; Rust и исходники не нужны.\n"
+        "Ограничения этой сборки: docs/STATUS.md. Подробности измерений: docs/M13.md.\n"
+        "\nИгра: сервер и клиент запускаются в отдельных окнах терминала.\n"
+        f"{prefix}server{extension} --data saves/world\n"
+        f"{prefix}client-native{extension} --connect ws://127.0.0.1:25565\n"
+        "\nОконный маршрут для измерения на вашей видеокарте:\n"
+        f"{prefix}client-native{extension} --benchmark measurements/route-a.json\n"
+        "Он сам завершится после 1800 кадров. Это отдельный лесной маршрут;\n"
+        "не добавляйте --connect или --smoke-frames и не меняйте размер окна во время прогона.\n"
+        "python bench_report.py report measurements/route-a.json --out measurements/route-a.html\n"
+        "\nПовтор B: сохраните то же разрешение, backend/GPU и сравнимые настройки.\n"
+        f"{prefix}client-native{extension} --benchmark measurements/route-b.json\n"
+        "python bench_report.py report measurements/route-b.json --out measurements/route-b.html\n"
+        "python bench_report.py compare measurements/route-a.json measurements/route-b.json --out measurements/compare.html\n"
+        "Несовместимые маршрут, размер или область измерения будут отклонены.\n"
+        "\nF8 в игре: после загрузки дайте записи накопить не менее 10 секунд и нажмите F8.\n"
+        "JSON находится в .local/artifacts/flight/native-*.json. Скопируйте нужную запись в F8.json:\n"
+        "python bench_report.py report F8.json --out measurements/f8.html\n"
+        f"{prefix}movement-replay{extension} F8.json\n"
+        "\nДополнительная проверка без окна (отдельная область измерения):\n"
+        f"{prefix}benchmark{extension} --out measurements/offscreen.json\n"
+        "Не сравнивайте её с оконным маршрутом: она ожидает GPU между кадрами.\n"
+        "\nЧто прислать: route-a.json и route-a.html; для A/B также route-b.json,\n"
+        "route-b.html и compare.html; для игрового рывка — F8.json и f8.html; BUILD.json.\n"
+        "Укажите backend из JSON, модель GPU, версию драйвера, режим питания, разрешение,\n"
+        "рендер-масштаб, MSAA, дальность и включённые эффекты; опишите, когда был рывок.\n"
+        "Не присылайте saves/, identity, .local/client/, .minecraft, ресурс-паки\n"
+        "или пути к личным ресурсам. Эти файлы не нужны для отчёта.\n"
+        "Измерения сохраняются локально и автоматически никуда не отправляются.\n"
+    ).encode()
     return files
 
 

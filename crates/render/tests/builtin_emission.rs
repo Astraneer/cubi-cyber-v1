@@ -134,6 +134,8 @@ struct Scene {
     ao: ContactAoGpu,
     camera: Camera,
     metadata: [u32; 4],
+    samples: u32,
+    frame: u32,
 }
 impl Scene {
     fn new(gpu: &render::Gpu, samples: u32) -> Self {
@@ -275,15 +277,16 @@ impl Scene {
             ao,
             camera,
             metadata: prepared(None).material_metadata()[LAVA],
+            samples,
+            frame: 0,
         }
     }
-    fn frame(&mut self, gpu: &render::Gpu) -> Vec<u8> {
+    fn encode_scene(&mut self, gpu: &render::Gpu, encoder: &mut wgpu::CommandEncoder) {
         self.terrain.invalidate();
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
         self.proxy
             .prepare_frame_extent(
                 &gpu.queue,
-                &mut encoder,
+                encoder,
                 ProxyCamera {
                     camera: self.camera,
                     eye: [16., 24., 8.],
@@ -296,13 +299,18 @@ impl Scene {
         self.terrain
             .encode_scene_with_extra(
                 &gpu.queue,
-                &mut encoder,
+                encoder,
                 &self.camera,
                 CullingMode::Frustum,
                 false,
                 |pass| self.proxy.draw(pass),
             )
             .unwrap();
+    }
+    fn frame(&mut self, gpu: &render::Gpu) -> Vec<u8> {
+        self.frame += 1;
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        self.encode_scene(gpu, &mut encoder);
         let work = self
             .ao
             .encode(
@@ -318,10 +326,7 @@ impl Scene {
         gpu.queue.submit([encoder.finish()]);
         let before = read(gpu, self.terrain.resolved_hdr_texture());
         let after = read(gpu, self.ao.resolved_texture());
-        assert_eq!(
-            before, after,
-            "contact AO must not remove emitted radiance in a known-dark scene"
-        );
+        exact_image(&before, &after, self.samples, self.frame, "shipping AO");
         after
     }
     fn replace(&mut self, gpu: &render::Gpu, alpha: Option<u8>, enabled: bool) {
@@ -354,6 +359,286 @@ impl Scene {
         assert_eq!(work.upload_bytes, expected_bytes);
         self.metadata = metadata;
     }
+}
+fn exact_image(before: &[u8], after: &[u8], samples: u32, frame: u32, label: &str) {
+    assert!(
+        compare_image(before, after, samples, frame, label),
+        "contact AO must not remove emitted radiance in a known-dark scene; AA{samples} frame{frame} {label}"
+    );
+}
+fn compare_image(before: &[u8], after: &[u8], samples: u32, frame: u32, label: &str) -> bool {
+    let first = before.iter().zip(after).position(|(a, b)| a != b);
+    let differing = before.iter().zip(after).filter(|(a, b)| a != b).count();
+    if before == after {
+        eprintln!(
+            "::notice title=BUILTIN_EMISSION_CONTROL::AA{samples} frame{frame} {label} exact"
+        );
+        return true;
+    }
+    eprintln!(
+        "::error title=BUILTIN_EMISSION_CONTROL::AA{samples} frame{frame} {label}: byteDiff={differing} firstByte={first:?} sourceNonzero={} outputNonzero={} sourceHead={:?} outputHead={:?}",
+        before.iter().filter(|&&byte| byte != 0).count(),
+        after.iter().filter(|&&byte| byte != 0).count(),
+        &before[..before.len().min(16)],
+        &after[..after.len().min(16)],
+    );
+    false
+}
+struct CopyControl {
+    pipeline: wgpu::RenderPipeline,
+    bind: wgpu::BindGroup,
+    color: wgpu::TextureView,
+    resolved_view: wgpu::TextureView,
+    resolved: wgpu::Texture,
+    samples: u32,
+    label: &'static str,
+}
+impl CopyControl {
+    fn new(gpu: &render::Gpu, scene: &Scene, uv: bool, builtin: bool) -> Self {
+        let samples = scene.samples;
+        let label = match (uv, builtin) {
+            (false, false) => "SV_Position fixed mip0",
+            (true, false) => "UV fixed mip0",
+            (true, true) => "UV builtin sample index",
+            (false, true) => "SV_Position builtin sample index",
+        };
+        let source = r#"
+@group(0)@binding(0)var source:TEXTURE_TYPE<f32>;
+struct V{@builtin(position)position:vec4<f32>,@location(0)@interpolate(linear,sample)uv:vec2<f32>};
+@vertex fn vertex(@builtin(vertex_index)i:u32)->V{
+ let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));
+ var out:V;out.position=vec4(p[i],0.,1.);out.uv=vec2(p[i].x*.5+.5,.5-p[i].y*.5);return out;
+}
+@fragment fn fragment(input:V,@builtin(sample_index)sample:u32)->@location(0)vec4<f32>{
+ return textureLoad(source,PIXEL,INDEX);
+}
+"#
+        .replace(
+            "TEXTURE_TYPE",
+            if samples == 1 {
+                "texture_2d"
+            } else {
+                "texture_multisampled_2d"
+            },
+        )
+        .replace(
+            "PIXEL",
+            if uv {
+                "vec2<i32>(input.uv*vec2(128.,64.))"
+            } else {
+                "vec2<i32>(input.position.xy)"
+            },
+        )
+        .replace("INDEX", if builtin { "i32(sample)" } else { "0" });
+        let layout = gpu
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(label),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: samples > 1,
+                    },
+                    count: None,
+                }],
+            });
+        let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(
+                    scene.terrain.scene_color_msaa_view().unwrap(),
+                ),
+            }],
+        });
+        let pipeline_layout = gpu
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[&layout],
+                push_constant_ranges: &[],
+            });
+        let shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        let pipeline = gpu
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vertex"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: samples,
+                    ..Default::default()
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fragment"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+                cache: None,
+            });
+        let make = |count| {
+            gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: W,
+                    height: H,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: count,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | if count == 1 {
+                        wgpu::TextureUsages::COPY_SRC
+                    } else {
+                        wgpu::TextureUsages::empty()
+                    },
+                view_formats: &[],
+            })
+        };
+        let texture = make(samples);
+        let resolved = if samples == 1 {
+            texture.clone()
+        } else {
+            make(1)
+        };
+        Self {
+            pipeline,
+            bind,
+            color: texture.create_view(&Default::default()),
+            resolved_view: resolved.create_view(&Default::default()),
+            resolved,
+            samples,
+            label,
+        }
+    }
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(self.label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.color,
+                depth_slice: None,
+                resolve_target: (self.samples > 1).then_some(&self.resolved_view),
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 1.,
+                        g: 0.,
+                        b: 1.,
+                        a: 1.,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+fn source_passthrough_controls(samples: u32) {
+    let instance = render::instance();
+    let gpu = pollster::block_on(render::Gpu::request(&instance, None, true))
+        .expect("actual GPU required");
+    let mut scene = Scene::new(&gpu, samples);
+    let mut controls = Vec::new();
+    if samples == 1 {
+        controls.push(CopyControl::new(&gpu, &scene, false, false));
+        controls.push(CopyControl::new(&gpu, &scene, true, false));
+    }
+    controls.push(CopyControl::new(&gpu, &scene, false, true));
+    controls.push(CopyControl::new(&gpu, &scene, true, true));
+    let mut zero = ContactAoGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        W,
+        H,
+        samples,
+        ContactAoConfig {
+            strength: 0.,
+            ..Default::default()
+        },
+        ContactAoInputs {
+            hdr: scene.terrain.scene_color_msaa_view().unwrap(),
+            ambient: scene.terrain.ambient_msaa_view().unwrap(),
+            depth: scene.terrain.scene_depth_msaa_view(),
+            statistics: None,
+        },
+        &mut UploadBudget::new(10000),
+    )
+    .unwrap()
+    .unwrap();
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    scene.encode_scene(&gpu, &mut encoder);
+    for control in &controls {
+        control.encode(&mut encoder);
+    }
+    zero.encode(
+        &gpu.queue,
+        &mut encoder,
+        scene.camera,
+        scene.terrain.hdr_revision(),
+        &mut UploadBudget::new(10000),
+        10_000_000,
+    )
+    .unwrap();
+    gpu.queue.submit([encoder.finish()]);
+    let before = read(&gpu, scene.terrain.resolved_hdr_texture());
+    assert_eq!(energy(&before, 1.), 192);
+    let mut exact = true;
+    for control in &controls {
+        exact &= compare_image(
+            &before,
+            &read(&gpu, &control.resolved),
+            samples,
+            0,
+            control.label,
+        );
+    }
+    exact &= compare_image(
+        &before,
+        &read(&gpu, zero.resolved_texture()),
+        samples,
+        0,
+        "shipping AO strength0",
+    );
+    assert!(
+        exact,
+        "AA{samples} actual same-frame passthrough controls differ"
+    );
+}
+#[test]
+fn contact_ao_source_passthrough_aa1_controls() {
+    source_passthrough_controls(1);
+}
+#[test]
+fn contact_ao_source_passthrough_aa4_controls() {
+    source_passthrough_controls(4);
 }
 fn energy(bytes: &[u8], expected: f32) -> usize {
     let mut witnesses = 0;

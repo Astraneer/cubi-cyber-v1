@@ -83,6 +83,12 @@ Emissive-слагаемое не входит в удаляемую ambient-delt
 обновляется ровно на 2976 Б только при изменении effective metadata; повторная
 эквивалентная metadata не загружается. CPU проверяет оба sentinel и коэффициенты;
 Naga→HLSL, Clippy и WASM проходят. Это компонентная проверка, не GPU benchmark.
+Windows/WARP в текущем CI обнаружил нулевой выход ContactAO при ненулевом
+входном HDR; причина ещё не установлена. Строгое сравнение сохранено, сообщение
+содержит AA/frame/первое отличие. Два независимых AA1/AA4-контроля проверяют
+`SV_Position`, UV, фиксированный mip0, sample index и AO strength0 в том же
+encoder; восемь случаев побитно проходят Vulkan. Это диагностика границы
+платформы, а не подтверждённое исправление или ослабление эмиссионной проверки.
 
 Четыре теста `cargo test -p render --test material_pack` прошли на настоящем software Vulkan:
 повреждения/budgets/atomic publication; GPU каналы/DirectX/sentinels/POM; реальное
