@@ -6,7 +6,7 @@ use render::{
     height_tile::{HeightTile, HeightTileKey},
     lod::{MaskedRayProxy, PublicPage, PublicVoxel, SurfaceKind},
     lod_gpu::{LodProxyGpu, ProxyConfig, ProxyPayload},
-    shadows::{ShadowConfig, ShadowGpu, ShadowWork},
+    shadows::{ShadowConfig, ShadowGpu, ShadowNode, ShadowNodeTimings, ShadowWork},
     terrain_gpu::{AtlasImage, GpuConfig, TerrainGpu, UploadBudget, translation},
 };
 #[global_allocator]
@@ -60,17 +60,27 @@ fn read(gpu: &render::Gpu, buffer: &wgpu::Buffer) -> Vec<u8> {
     result
 }
 fn frame(gpu: &render::Gpu, shadow: &mut ShadowGpu, far: &mut DistantShadowGpu) -> ShadowWork {
-    frame_timed(gpu, shadow, far, None)
+    frame_timed(gpu, shadow, far, None, None)
 }
 fn frame_timed(
     gpu: &render::Gpu,
     shadow: &mut ShadowGpu,
     far: &mut DistantShadowGpu,
     timing: Option<(&wgpu::Buffer, u64)>,
+    nodes: Option<(&ShadowNodeTimings, &wgpu::Buffer, u64)>,
 ) -> ShadowWork {
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    if let Some((nodes, _, _)) = nodes {
+        nodes.begin_frame();
+    }
+    far.set_diagnostic_timings(nodes.map(|(nodes, _, _)| nodes.clone()));
     let work = shadow
-        .encode_dynamic(&gpu.queue, &mut encoder, far)
+        .encode_dynamic_with_diagnostics(
+            &gpu.queue,
+            &mut encoder,
+            far,
+            nodes.map(|(nodes, _, _)| nodes),
+        )
         .unwrap();
     if let Some((target, offset)) = timing {
         let source = shadow
@@ -79,9 +89,107 @@ fn frame_timed(
         assert_eq!(source.count, 1);
         encoder.copy_buffer_to_buffer(source.buffer, 0, target, offset, 16);
     }
+    if let Some((nodes, target, offset)) = nodes {
+        nodes.copy_into(&mut encoder, target, offset);
+    }
     gpu.queue.submit([encoder.finish()]);
     gpu.device.poll(wgpu::PollType::Wait).unwrap();
     work
+}
+// Only this diagnostic test requests native in-pass timestamps. When unavailable,
+// the original whole-graph/functional/cost assertions still run unchanged.
+async fn diagnostic_gpu(instance: &wgpu::Instance) -> render::Gpu {
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: true,
+            compatible_surface: None,
+        })
+        .await
+        .unwrap();
+    let features = if adapter.features().contains(ShadowNodeTimings::FEATURES) {
+        ShadowNodeTimings::FEATURES
+    } else {
+        adapter.features() & wgpu::Features::TIMESTAMP_QUERY
+    };
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("far shadow diagnostic GPU"),
+            required_features: features,
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+        })
+        .await
+        .unwrap();
+    render::Gpu {
+        adapter,
+        device,
+        queue,
+    }
+}
+fn report_nodes(gpu: &render::Gpu, data: &[u8], masks: &[[u32; 2]; 12], total: [f64; 2]) {
+    let period = f64::from(gpu.queue.get_timestamp_period());
+    for (mode, name) in ["sparse", "full"].into_iter().enumerate() {
+        let mut ns = [0f64; ShadowNode::ALL.len()];
+        let mut samples = [0u32; ShadowNode::ALL.len()];
+        for (frame, masks) in masks.iter().enumerate() {
+            for cascade in 0..3 {
+                for (index, node) in ShadowNode::ALL.into_iter().enumerate() {
+                    let slot = node.slot(cascade);
+                    if masks[mode] & (1 << slot) == 0 {
+                        continue;
+                    }
+                    let offset = ((frame * 2 + mode) * ShadowNodeTimings::SLOTS + slot) * 16;
+                    let start = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                    let end = u64::from_le_bytes(data[offset + 8..offset + 16].try_into().unwrap());
+                    assert!(
+                        end >= start,
+                        "{name} {node:?} timestamp order at frame{frame}/cascade{cascade}"
+                    );
+                    ns[index] += (end - start) as f64 * period;
+                    samples[index] += 1;
+                }
+            }
+        }
+        let value = |node: ShadowNode| ns[node as usize];
+        let details = ShadowNode::ALL
+            .into_iter()
+            .map(|node| {
+                format!(
+                    "{}={:.0}/{}",
+                    node.label(),
+                    value(node),
+                    samples[node as usize]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "\n::notice title=H5 diagnostic SOME nodes {name}::total_ns={:.0} clear_ns={:.0} restore_ns={:.0} cull_ns={:.0} draw_ns={:.0} nodes_ns={:.0} {details}",
+            total[mode],
+            value(ShadowNode::Clear),
+            value(ShadowNode::Restore),
+            value(ShadowNode::StaticCull) + value(ShadowNode::Cull),
+            value(ShadowNode::StaticDraw)
+                + value(ShadowNode::HeightDraw)
+                + value(ShadowNode::OpaqueDraw)
+                + value(ShadowNode::CutoutDraw),
+            ns.iter().sum::<f64>(),
+        );
+    }
+}
+fn whole_ns(gpu: &render::Gpu, timings: &wgpu::Buffer) -> [f64; 2] {
+    let mut ns = [0f64; 2];
+    for row in read(gpu, timings).chunks_exact(32) {
+        for (k, sum) in ns.iter_mut().enumerate() {
+            let start = u64::from_le_bytes(row[k * 16..k * 16 + 8].try_into().unwrap());
+            let end = u64::from_le_bytes(row[k * 16 + 8..k * 16 + 16].try_into().unwrap());
+            *sum += (end - start) as f64 * f64::from(gpu.queue.get_timestamp_period());
+        }
+    }
+    assert!(ns.iter().all(|v| v.is_finite() && *v > 0.));
+    ns
 }
 fn depth(gpu: &render::Gpu, shadow: &ShadowGpu) -> Vec<u8> {
     let n = shadow.cache().config().resolution;
@@ -244,7 +352,7 @@ fn visibility_witnesses(values: &[f32], hill: bool) -> (usize, usize) {
 fn active_public_hill_and_building_cast_on_near_receivers_and_sparse_matches_full() {
     pollster::block_on(async {
         let instance = render::instance();
-        let gpu = render::Gpu::request(&instance, None, true).await.unwrap();
+        let gpu = diagnostic_gpu(&instance).await;
         let mut atlas = AtlasImage::donor().unwrap();
         for mip in &mut atlas.mips {
             let bytes = mip.size as usize * mip.size as usize * 4;
@@ -529,6 +637,8 @@ fn active_public_hill_and_building_cast_on_near_receivers_and_sparse_matches_ful
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Keep the original cost oracle free of all optional node queries.
+        let mut original_work = [[ShadowWork::default(); 2]; 12];
         for i in 0u32..12 {
             let angle = std::f64::consts::FRAC_PI_4 + f64::from(i) * 0.0004;
             let sun = [angle.cos() as f32, angle.sin() as f32, 0.];
@@ -540,14 +650,17 @@ fn active_public_hill_and_building_cast_on_near_receivers_and_sparse_matches_ful
                 &mut sparse,
                 &mut a,
                 Some((&timings, u64::from(i) * 32)),
+                None,
             );
+            original_work[i as usize][0] = work;
             assert_eq!(work.pending_cascades, 0);
             assert_eq!(work.dynamic_copy_bytes, 0);
-            frame_timed(
+            original_work[i as usize][1] = frame_timed(
                 &gpu,
                 &mut full,
                 &mut b,
                 Some((&timings, u64::from(i) * 32 + 16)),
+                None,
             );
             assert_eq!(
                 depth(&gpu, &sparse),
@@ -556,26 +669,113 @@ fn active_public_hill_and_building_cast_on_near_receivers_and_sparse_matches_ful
             );
             visibility_witnesses(&receiver.capture(&gpu), true);
         }
-        let mut ns = [0f64; 2];
-        for row in read(&gpu, &timings).chunks_exact(32) {
-            for (k, sum) in ns.iter_mut().enumerate() {
-                let start = u64::from_le_bytes(row[k * 16..k * 16 + 8].try_into().unwrap());
-                let end = u64::from_le_bytes(row[k * 16 + 8..k * 16 + 16].try_into().unwrap());
-                *sum += (end - start) as f64 * f64::from(gpu.queue.get_timestamp_period());
+        let ns = whole_ns(&gpu, &timings);
+        let adapter = gpu.adapter.get_info();
+        println!(
+            "\n::notice title=H5 original NONE TOTAL::backend={:?} adapter={} currentSun12 resolution2048 maps96MiB whole_ns_sparse={} whole_ns_full={} ratio={:.6} exactDepth=BITWISE independentReceivers=PASS copies=0 strictOracle=ORIGINAL",
+            adapter.backend,
+            adapter.name,
+            ns[0],
+            ns[1],
+            ns[1] / ns[0]
+        );
+        if let Some(nodes) = ShadowNodeTimings::new(&gpu.device) {
+            let diagnostic_total = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("separate diagnostic shadow whole timestamps"),
+                size: 12 * 32,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let node_readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("separate disjoint shadow node timestamp readback"),
+                size: 12 * 2 * ShadowNodeTimings::CAPTURE_BYTES,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            // Restore the original starting Sun and empty prior caster depth.
+            // This second, explicitly warm sweep must execute the same work,
+            // but its query overhead never enters the original 2x assertion.
+            let angle = std::f64::consts::FRAC_PI_4;
+            let sun = [angle.cos() as f32, angle.sin() as f32, 0.];
+            sparse.update_view([16., 0., 16.], sun).unwrap();
+            full.update_view([16., 0., 16.], sun).unwrap();
+            frame(&gpu, &mut sparse, &mut a);
+            frame(&gpu, &mut full, &mut b);
+            a.set_enabled(false);
+            b.set_enabled(false);
+            frame(&gpu, &mut sparse, &mut a);
+            frame(&gpu, &mut full, &mut b);
+            a.set_enabled(true);
+            b.set_enabled(true);
+            let mut node_masks = [[0u32; 2]; 12];
+            for i in 0u32..12 {
+                let angle = std::f64::consts::FRAC_PI_4 + f64::from(i) * 0.0004;
+                let sun = [angle.cos() as f32, angle.sin() as f32, 0.];
+                sparse.update_view([16., 0., 16.], sun).unwrap();
+                full.update_view([16., 0., 16.], sun).unwrap();
+                full.invalidate_all();
+                let work = frame_timed(
+                    &gpu,
+                    &mut sparse,
+                    &mut a,
+                    Some((&diagnostic_total, u64::from(i) * 32)),
+                    Some((
+                        &nodes,
+                        &node_readback,
+                        u64::from(i) * 2 * ShadowNodeTimings::CAPTURE_BYTES,
+                    )),
+                );
+                node_masks[i as usize][0] = nodes.written_slots();
+                assert_eq!(
+                    work, original_work[i as usize][0],
+                    "sparse diagnostic changed work at frame{i}"
+                );
+                let work = frame_timed(
+                    &gpu,
+                    &mut full,
+                    &mut b,
+                    Some((&diagnostic_total, u64::from(i) * 32 + 16)),
+                    Some((
+                        &nodes,
+                        &node_readback,
+                        (u64::from(i) * 2 + 1) * ShadowNodeTimings::CAPTURE_BYTES,
+                    )),
+                );
+                node_masks[i as usize][1] = nodes.written_slots();
+                assert_eq!(
+                    work, original_work[i as usize][1],
+                    "full diagnostic changed work at frame{i}"
+                );
+                assert_eq!(
+                    depth(&gpu, &sparse),
+                    depth(&gpu, &full),
+                    "diagnostic current-Sun depth mismatch at frame{i}"
+                );
+                visibility_witnesses(&receiver.capture(&gpu), true);
             }
+            let diagnostic_ns = whole_ns(&gpu, &diagnostic_total);
+            println!(
+                "\n::notice title=H5 diagnostic SOME TOTAL::warm_reset sameSun12 sameWork=EXACT whole_ns_sparse={} whole_ns_full={} ratio={:.6} strictOracle=NOT_USED queryOverhead=MEASURED_SEPARATELY",
+                diagnostic_ns[0],
+                diagnostic_ns[1],
+                diagnostic_ns[1] / diagnostic_ns[0]
+            );
+            report_nodes(
+                &gpu,
+                &read(&gpu, &node_readback),
+                &node_masks,
+                diagnostic_ns,
+            );
+        } else {
+            println!(
+                "\n::notice title=H5 far shadow nodes::UNKNOWN: adapter lacks native inside-pass timestamp features; TOTAL and all original assertions retained"
+            );
         }
-        assert!(ns.iter().all(|v| v.is_finite() && *v > 0.));
         assert!(
             ns[1] >= 2. * ns[0],
             "far fixture failed H5 cost: sparse{} full{}",
             ns[0],
             ns[1]
-        );
-        println!(
-            "far_shadow currentSun12 resolution2048 maps96MiB whole_ns_sparse={} whole_ns_full={} ratio={:.6} exactDepth=BITWISE independentReceivers=PASS copies=0",
-            ns[0],
-            ns[1],
-            ns[1] / ns[0]
         );
         println!(
             "far_shadow hill_building dark={} clear={} buffers={} startup=5 first_draws=9 removal_restore_mask={} static1000=0alloc/0upload/0draw",

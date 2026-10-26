@@ -6,6 +6,9 @@ mod damage;
 #[path = "shadow_footprint.rs"]
 pub(crate) mod footprint;
 pub(crate) use damage::ShadowDamageTracker;
+#[path = "shadow_diagnostics.rs"]
+mod diagnostics;
+pub use diagnostics::{ShadowNode, ShadowNodeTimings};
 
 pub const CASCADES: usize = 3;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -1275,6 +1278,17 @@ impl ShadowGpu {
         encoder: &mut wgpu::CommandEncoder,
         caster: &mut impl DynamicShadowCaster,
     ) -> Result<ShadowWork, ShadowError> {
+        self.encode_dynamic_with_diagnostics(queue, encoder, caster, None)
+    }
+    /// Optional native timestamp scopes preserve the existing passes. Ordinary
+    /// callers use `encode_dynamic`, with no diagnostic resources or commands.
+    pub fn encode_dynamic_with_diagnostics(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        caster: &mut impl DynamicShadowCaster,
+        diagnostics: Option<&ShadowNodeTimings>,
+    ) -> Result<ShadowWork, ShadowError> {
         self.timer.begin();
         self.total_timer.begin_frame();
         if self.combined.is_none() {
@@ -1286,9 +1300,9 @@ impl ShadowGpu {
         if self.cache.pending() != 0 {
             self.total_timer.start(encoder);
         }
-        let mut work = self.encode_static(queue, encoder);
+        let mut work = self.encode_static(queue, encoder, diagnostics);
         if self.footprints.is_some() {
-            self.encode_sparse_dynamic(queue, encoder, caster, &mut work);
+            self.encode_sparse_dynamic(queue, encoder, caster, &mut work, diagnostics);
             self.total_timer.finish(encoder);
             self.timer.finish(encoder);
             return Ok(work);
@@ -1335,6 +1349,9 @@ impl ShadowGpu {
                 continue;
             };
             self.total_timer.start(encoder);
+            if let Some(timing) = diagnostics {
+                timing.encoder_begin(encoder, cascade, ShadowNode::Cull);
+            }
             let prepared = caster.prepare_shadow_region(
                 queue,
                 encoder,
@@ -1347,6 +1364,9 @@ impl ShadowGpu {
             );
             work.dynamic_cull_dispatches += prepared.dispatches;
             work.uniform_upload_bytes += prepared.upload_bytes;
+            if let Some(timing) = diagnostics {
+                timing.encoder_end(encoder, cascade, ShadowNode::Cull);
+            }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("localized combined restore and current model depth"),
                 color_attachments: &[],
@@ -1362,9 +1382,15 @@ impl ShadowGpu {
                 occlusion_query_set: None,
             });
             pass.set_scissor_rect(rect.x, rect.y, rect.width, rect.height);
+            if let Some(timing) = diagnostics {
+                timing.render_begin(&mut pass, cascade, ShadowNode::Restore);
+            }
             pass.set_pipeline(&combined.restore);
             pass.set_bind_group(0, &combined.restore_binds[cascade], &[]);
             pass.draw(0..3, 0..1);
+            if let Some(timing) = diagnostics {
+                timing.render_end(&mut pass, cascade, ShadowNode::Restore);
+            }
             work.dynamic_restore_pixels += rect.pixels();
             work.dynamic_restore_draws += 1;
             work.dynamic_draw_calls += caster.draw_shadow(&mut pass, cascade);
@@ -1385,6 +1411,7 @@ impl ShadowGpu {
         encoder: &mut wgpu::CommandEncoder,
         caster: &mut impl DynamicShadowCaster,
         work: &mut ShadowWork,
+        diagnostics: Option<&ShadowNodeTimings>,
     ) {
         let sampling = self.cache.sampling();
         let revision = caster.shadow_key();
@@ -1404,6 +1431,9 @@ impl ShadowGpu {
                 continue;
             }
             self.total_timer.start(encoder);
+            if let Some(timing) = diagnostics {
+                timing.encoder_begin(encoder, cascade, ShadowNode::Cull);
+            }
             if work.static_updated_mask & bit == 0 {
                 fp.seed_combined(encoder, cascade);
                 work.footprint_dispatches += 1;
@@ -1425,6 +1455,9 @@ impl ShadowGpu {
                 prepared.bounds_complete && self.last_force_full_mask & bit == 0,
             );
             work.footprint_dispatches += 1;
+            if let Some(timing) = diagnostics {
+                timing.encoder_end(encoder, cascade, ShadowNode::Cull);
+            }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("GPU old/new footprint restore and current model depth"),
                 color_attachments: &[],
@@ -1439,9 +1472,15 @@ impl ShadowGpu {
                 timestamp_writes: self.timer.render(3),
                 occlusion_query_set: None,
             });
+            if let Some(timing) = diagnostics {
+                timing.render_begin(&mut pass, cascade, ShadowNode::Restore);
+            }
             pass.set_pipeline(&combined.restore);
             pass.set_bind_group(0, &combined.restore_binds[cascade], &[]);
             pass.draw(0..6, 0..1);
+            if let Some(timing) = diagnostics {
+                timing.render_end(&mut pass, cascade, ShadowNode::Restore);
+            }
             work.gpu_restore_mask |= bit;
             work.dynamic_restore_draws += 1;
             work.dynamic_draw_calls += caster.draw_shadow(&mut pass, cascade);
@@ -1468,7 +1507,7 @@ impl ShadowGpu {
         if self.cache.pending() != 0 || self.last_dynamic.is_some() {
             self.total_timer.start(encoder);
         }
-        let mut work = self.encode_static(queue, encoder);
+        let mut work = self.encode_static(queue, encoder, None);
         if let Some(combined) = &self.combined {
             let sampling = self.cache.sampling();
             let mask = if self.last_dynamic.take().is_some() {
@@ -1515,6 +1554,7 @@ impl ShadowGpu {
         &mut self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        diagnostics: Option<&ShadowNodeTimings>,
     ) -> ShadowWork {
         let mut work = ShadowWork::default();
         self.last_static_rects.fill(None);
@@ -1524,6 +1564,9 @@ impl ShadowGpu {
                 break;
             };
             let config = self.cache.config;
+            if let Some(timing) = diagnostics {
+                timing.encoder_begin(encoder, update.cascade, ShadowNode::StaticCull);
+            }
             #[repr(C)]
             #[derive(Clone, Copy, Pod, Zeroable)]
             struct CameraUniform {
@@ -1575,6 +1618,9 @@ impl ShadowGpu {
                 pass.set_pipeline(&self.cull);
                 pass.dispatch_workgroups(self.max_pages.div_ceil(64), 1, 1);
             }
+            if let Some(timing) = diagnostics {
+                timing.encoder_end(encoder, update.cascade, ShadowNode::StaticCull);
+            }
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("cached directional depth dirty region"),
@@ -1596,15 +1642,25 @@ impl ShadowGpu {
                     update.rect
                 };
                 pass.set_scissor_rect(rect.x, rect.y, rect.width, rect.height);
+                if let Some(timing) = diagnostics {
+                    timing.render_begin(&mut pass, update.cascade, ShadowNode::Clear);
+                }
                 pass.set_pipeline(&self.clear);
                 if let Some(binds) = &self.clear_binds {
                     pass.set_bind_group(0, &binds[update.cascade], &[]);
                 }
                 pass.draw(0..if self.footprints.is_some() { 6 } else { 3 }, 0..1);
+                if let Some(timing) = diagnostics {
+                    timing.render_end(&mut pass, update.cascade, ShadowNode::Clear);
+                    timing.render_begin(&mut pass, update.cascade, ShadowNode::StaticDraw);
+                }
                 pass.set_pipeline(&self.depth);
                 pass.set_bind_group(0, &self.render_binds[update.cascade], &[]);
                 for bucket in [0, 1, 3, 4] {
                     pass.draw_indirect(&self.indirect, bucket * 16);
+                }
+                if let Some(timing) = diagnostics {
+                    timing.render_end(&mut pass, update.cascade, ShadowNode::StaticDraw);
                 }
             }
             self.last_static_rects[update.cascade] = Some(update.rect);

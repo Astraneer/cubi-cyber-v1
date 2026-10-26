@@ -80,6 +80,7 @@ jobs:
       - name: Bootstrap locked toolchain
         run: bash tools/bootstrap.sh
       - name: Compile Windows shell and all native targets
+        id: windows_targets
         run: |
           source tools/env.sh
           bash tools/check_one.sh 'Windows native targets' cargo check --locked --workspace --all-targets
@@ -105,12 +106,25 @@ jobs:
           source tools/env.sh
           bash tools/check_one.sh 'Windows WARP shadow footprints' cargo test --locked -p render --test shadow_footprint -- --nocapture
           bash tools/check_one.sh 'Windows WARP sparse shadow depth' cargo test --locked -p render --test shadows shadow_sparse::gpu_projected_old_new_clear_matches_full_depth_for_sun_models_and_removal -- --exact --nocapture
-      - name: Validate SMAA and public distant shadows with D3D12 WARP
+      - name: Validate SMAA with D3D12 WARP
+        if: ${{ !cancelled() && steps.windows_targets.outcome == 'success' }}
         run: |
           source tools/env.sh
           bash tools/check_one.sh 'Windows WARP SMAA reference and post' cargo test --locked -p render --test smaa_gpu --test smaa_post -- --test-threads=1 --nocapture
+      - name: Validate public distant shadows with D3D12 WARP
+        if: ${{ !cancelled() && steps.windows_targets.outcome == 'success' }}
+        run: |
+          source tools/env.sh
           bash tools/check_one.sh 'Windows WARP distant shadow backend' cargo test --locked -p render --test distant_shadows -- --test-threads=1 --nocapture
+      - name: Validate builtin and imported emission with D3D12 WARP
+        if: ${{ !cancelled() && steps.windows_targets.outcome == 'success' }}
+        run: |
+          source tools/env.sh
           bash tools/check_one.sh 'Windows WARP builtin and imported emission' cargo test --locked -p render --test builtin_emission -- --test-threads=1 --nocapture
+      - name: Validate complete visual owners with D3D12 WARP
+        if: ${{ !cancelled() && steps.windows_targets.outcome == 'success' }}
+        run: |
+          source tools/env.sh
           bash tools/check_one.sh 'Windows WARP complete visual owners' cargo test --locked -p client --test visual_settings_gpu --test view_far_shadows -- --test-threads=1 --nocapture
       - name: Present three native Windows frames
         run: bash tools/windows_native_smoke.sh

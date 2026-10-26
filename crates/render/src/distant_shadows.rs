@@ -4,8 +4,8 @@ use crate::{
     height_gpu::HeightShadowSource,
     lod_gpu::ProxyShadowSource,
     shadows::{
-        DynamicShadowCaster, ShadowGpu, ShadowPrepareWork, ShadowRect, WorldBounds, crop_camera,
-        footprint,
+        DynamicShadowCaster, ShadowGpu, ShadowNode, ShadowNodeTimings, ShadowPrepareWork,
+        ShadowRect, WorldBounds, crop_camera, footprint,
     },
     terrain_gpu::Camera,
 };
@@ -86,6 +86,7 @@ pub struct DistantShadowGpu {
     opaque: wgpu::RenderPipeline,
     cutout: wgpu::RenderPipeline,
     projected: bool,
+    diagnostics: Option<ShadowNodeTimings>,
 }
 impl DistantShadowGpu {
     /// Prepare during loading, after the public render arenas and ShadowGpu.
@@ -414,6 +415,7 @@ impl DistantShadowGpu {
                 wgpu::PrimitiveTopology::TriangleStrip,
             ),
             projected,
+            diagnostics: None,
         })
     }
     /// Caller must additionally certify the actual committed front/near cover.
@@ -449,6 +451,10 @@ impl DistantShadowGpu {
     }
     pub fn startup_pipeline_compilations(&self) -> u32 {
         5
+    }
+    /// Native diagnostic scopes only; default `None` owns no extra GPU resources.
+    pub fn set_diagnostic_timings(&mut self, timings: Option<ShadowNodeTimings>) {
+        self.diagnostics = timings;
     }
     /// Requested buffers only; source arenas, maps and driver pipeline memory are
     /// shared and are accounted by their respective owners.
@@ -565,14 +571,35 @@ impl DynamicShadowCaster for DistantShadowGpu {
         if !self.enabled {
             return 0;
         }
-        for (pipeline, bind, offset) in [
-            (&self.height, &self.height_binds[cascade], 0),
-            (&self.opaque, &self.opaque_binds[cascade], 16),
-            (&self.cutout, &self.cutout_binds[cascade], 32),
+        for (pipeline, bind, offset, node) in [
+            (
+                &self.height,
+                &self.height_binds[cascade],
+                0,
+                ShadowNode::HeightDraw,
+            ),
+            (
+                &self.opaque,
+                &self.opaque_binds[cascade],
+                16,
+                ShadowNode::OpaqueDraw,
+            ),
+            (
+                &self.cutout,
+                &self.cutout_binds[cascade],
+                32,
+                ShadowNode::CutoutDraw,
+            ),
         ] {
+            if let Some(timing) = &self.diagnostics {
+                timing.render_begin(pass, cascade, node);
+            }
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bind, &[]);
             pass.draw_indirect(&self.indirect, offset);
+            if let Some(timing) = &self.diagnostics {
+                timing.render_end(pass, cascade, node);
+            }
         }
         3
     }
