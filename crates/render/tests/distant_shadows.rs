@@ -6,7 +6,9 @@ use render::{
     height_tile::{HeightTile, HeightTileKey},
     lod::{MaskedRayProxy, PublicPage, PublicVoxel, SurfaceKind},
     lod_gpu::{LodProxyGpu, ProxyConfig, ProxyPayload},
-    shadows::{ShadowConfig, ShadowGpu, ShadowNode, ShadowNodeTimings, ShadowWork},
+    shadows::{
+        DynamicShadowCaster, ShadowConfig, ShadowGpu, ShadowNode, ShadowNodeTimings, ShadowWork,
+    },
     terrain_gpu::{AtlasImage, GpuConfig, TerrainGpu, UploadBudget, translation},
 };
 #[global_allocator]
@@ -522,12 +524,12 @@ fn active_public_hill_and_building_cast_on_near_receivers_and_sparse_matches_ful
             Err(render::distant_shadows::Error::SourceNeedsReprepare)
         );
         assert_eq!(a.source_key(), source_key);
-        assert_eq!(a.startup_pipeline_compilations(), 5);
+        assert_eq!(a.startup_pipeline_compilations(), 6);
         let first = frame(&gpu, &mut sparse, &mut a);
         frame(&gpu, &mut full, &mut b);
         assert_eq!(depth(&gpu, &sparse), depth(&gpu, &full));
         assert_eq!(first.dynamic_cull_dispatches, 6);
-        assert_eq!(first.dynamic_draw_calls, 9);
+        assert_eq!(first.dynamic_draw_calls, 12);
         let receiver = Receiver::new(&gpu, &sparse);
         let witnesses = visibility_witnesses(&receiver.capture(&gpu), true);
         // Updates to the primary camera's compacted lists cannot affect shadow work.
@@ -781,10 +783,12 @@ fn active_public_hill_and_building_cast_on_near_receivers_and_sparse_matches_ful
             ns[1]
         );
         println!(
-            "far_shadow hill_building dark={} clear={} buffers={} startup=5 first_draws=9 removal_restore_mask={} static1000=0alloc/0upload/0draw",
+            "far_shadow hill_building dark={} clear={} buffers={} startup={} first_draws={} removal_restore_mask={} static1000=0alloc/0upload/0draw",
             witnesses.0,
             witnesses.1,
             a.buffer_bytes(),
+            a.startup_pipeline_compilations(),
+            first.dynamic_draw_calls,
             removal.gpu_restore_mask
         );
         let before = depth(&gpu, &sparse);
@@ -1061,6 +1065,7 @@ fn mip0_alpha_specialization_is_bitwise_and_inplace_atlas_revokes_both_shadow_ca
             )
             .unwrap();
             let before = fast.terrain.geometry().shadow_alpha_state.revision();
+            let cull_before = fast.far.cull_key();
             render::material_pack::apply_albedo_in_place(
                 &gpu.queue,
                 fast.terrain.geometry(),
@@ -1079,6 +1084,52 @@ fn mip0_alpha_specialization_is_bitwise_and_inplace_atlas_revokes_both_shadow_ca
             );
             assert!(fast.shadow.needs_work());
             assert!(!fast.shadow.presentation_ready());
+            // The old sampler-free PASS list is unusable even before the owner
+            // synchronizes its unchanged geometry/front keys.
+            let empty = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("stale alpha cull rejection"),
+                size: wgpu::Extent3d {
+                    width: 128,
+                    height: 128,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let mut stale = gpu.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = stale.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &empty.create_view(&Default::default()),
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                assert_eq!(
+                    fast.far.draw_shadow(&mut pass, 0),
+                    0,
+                    "stale PASS list survived atlas upload"
+                );
+            }
+            gpu.queue.submit([stale.finish()]);
+            assert!(
+                fast.far
+                    .synchronize_sources(fast.heights.shadow_source(), fast.proxies.shadow_source())
+                    .unwrap()
+            );
+            assert_eq!(fast.far.cull_key().0, cull_before.0);
+            assert_eq!(fast.far.cull_key().1, cull_before.1 + 1);
             let work = fast.frame(&gpu);
             reference.shadow.invalidate_all();
             reference.frame(&gpu);

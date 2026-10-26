@@ -8,7 +8,7 @@
 | M1 | Версии/Unknown,4 PROBE_REF, native/WASM детерминизм;100000 правок→1 производная задача. |
 | M2 | Лес9915квадов×16Б; FLIP=0, Hi-Z66→54объекта без изменения кадра. |
 | M3 | Правка видна за1завершённый кадр; физика/полёт/откат проверены. |
-| M4 | Sun: побитная глубина sparse/full. Windows/WARP1,49× вместо≥2×; Cutout≈531мс. Новый sampler-free PASS/MIXED вариант проверяется. |
+| M4 | Sun: побитная глубина sparse/full. Windows/WARP1,49× вместо≥2×; Cutout≈531мс. Sampler-free PASS/MIXED: native/Dawn13 PASS; новый WARP замер впереди. |
 | M5 | H4:50построек/8,29млн проверок; два seed≤31,98px при цели32. JOIN18Dawn/обаMesa прошли. Полный1024/Near32: native Game+FarFront получены, подтверждение LOD Error ещё отсутствует. |
 | M6 | UDP75±20мс/2%:0коррекций; Raw/LIGHT privacy, Forget/ABA/restart. Взрыв10000блоков: оба клиента точны,28770/29275Б. Очередь Raw исправлена, реальные socket-тесты прошли. |
 | M7 | GPU-инстансинг, ИИ/PvP/смерть/дропы/respawn/WAL;7 owner-сценариев. |
@@ -23,8 +23,8 @@
 
 **Сейчас исправляется:**
 
-1. Тени: последний Windows H5=1,4916×; точность глубины, SMAA, AO/emission и complete View прошли. PASS-материалам подготовлен отдельный проход без fragment shader; mixed сохраняет исходный alpha-test. Windows-результат нового варианта ещё не получен.
+1. Тени: последний Windows H5=1,4916×; точность глубины, SMAA, AO/emission и complete View прошли. PASS-материалы рисуются без fragment shader; mixed сохраняет исходный alpha-test. Native6,23×; Dawn13 и независимый bounded-stress PASS. Смешанный парный LVP замер0,848× также сохранён; Windows-результат ещё не получен.
 2. Полный профиль: native release достиг Game95,11с/FarFront106,40с; маска настроек3/7, отсутствует LOD Error. Browser за120с остался Loading: producer сошёлся, GPU-staging не завершился. Новый gate ждёт реальные LIGHT-upload до тяжёлого первого HDR; условие физического HDR+HUD completion сохранено. Следующая свежая пара проверит исправление и показатели опубликованного LOD.
-3. Геймплей: точное подтверждение еды/вёдер, отмена/отказ/повтор/WAL и причинные Owner-звуки покрыты тестами. Готовится проверка мышью/клавиатурой в настоящей Owner-сессии. Слышимость на аппаратном аудиовыходе ещё не подтверждена.
+3. Геймплей: точное подтверждение еды/вёдер, отмена/отказ/повтор/WAL и причинные Owner-звуки покрыты тестами. Готовится проверка мышью/клавиатурой в настоящей Owner-сессии. Аудит выявил отсутствующие физическую витрину/доски спавна и звук чужих Mine/Place; они добавлены в работу. Слышимость на аппаратном аудиовыходе ещё не подтверждена.
 
 [Последний CI50e5f65](https://github.com/Astraneer/cubi-cyber-v1/actions/runs/40379269839): Linux — последний ProductUI Loading timeout; Windows — H5 cost; server_scale PASS. [Последний принятый Linux+Windows CI](https://github.com/Astraneer/cubi-cyber-v1/actions/runs/40240830659). PR отсутствуют: GitHub HTTP403; main не менялся. Подробности: [история](STATUS_HISTORY.md), M4–M13, PUBLIC-PRIVACY.md, SERVER_SCALE.md. VPS/DNS/секреты не менялись.

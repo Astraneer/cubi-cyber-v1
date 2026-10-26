@@ -39,7 +39,7 @@ impl ViewDistantShadows {
         &mut self,
         horizon: &ViewHorizon,
     ) -> Result<bool, render::distant_shadows::Error> {
-        let old = self.gpu.source_key();
+        let old = self.gpu.cull_key();
         if let Some((height, proxy)) = horizon.committed_shadow_sources() {
             if let Err(error) = self.gpu.synchronize_sources(height, proxy) {
                 self.gpu.set_enabled(false);
@@ -52,7 +52,7 @@ impl ViewDistantShadows {
             self.gpu.set_enabled(false);
             self.stats.enabled = false;
         }
-        let changed = old != self.gpu.source_key();
+        let changed = old != self.gpu.cull_key();
         if changed {
             self.stats.source_changes = self.stats.source_changes.saturating_add(1);
         }

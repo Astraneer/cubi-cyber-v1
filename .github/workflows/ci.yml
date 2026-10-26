@@ -120,6 +120,11 @@ jobs:
         run: |
           source tools/env.sh
           bash tools/check_one.sh 'Windows WARP SMAA reference and post' cargo test --locked -p render --test smaa_gpu --test smaa_post -- --test-threads=1 --nocapture
+      - name: Validate actual shadow alpha metadata with D3D12 WARP
+        if: ${{ !cancelled() && steps.windows_targets.outcome == 'success' }}
+        run: |
+          source tools/env.sh
+          bash tools/check_one.sh 'Windows WARP actual shadow alpha metadata' cargo test --locked -p render --test shadow_alpha_audit -- --test-threads=1 --nocapture
       - name: Validate public distant shadows with D3D12 WARP
         if: ${{ !cancelled() && steps.windows_targets.outcome == 'success' }}
         run: |

@@ -1185,6 +1185,12 @@ impl ShadowGpu {
     pub fn footprint_metrics_buffer(&self) -> Option<&wgpu::Buffer> {
         self.footprints.as_ref().map(|fp| &fp.buffer)
     }
+    pub(crate) fn uses_atlas_state(
+        &self,
+        state: &std::sync::Arc<crate::shadow_alpha::AtlasState>,
+    ) -> bool {
+        std::sync::Arc::ptr_eq(&self.atlas_state, state)
+    }
     pub fn cache(&self) -> &ShadowCache {
         &self.cache
     }

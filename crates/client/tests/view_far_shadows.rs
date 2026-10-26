@@ -302,7 +302,7 @@ fn shared_view_publishes_far_casters_revokes_guard_and_retains_static_cache() {
     )
     .unwrap();
     view.prepare_distant_shadows(&gpu.device).unwrap();
-    assert_eq!(view.distant_shadow_stats().unwrap().startup_pipelines, 5);
+    assert_eq!(view.distant_shadow_stats().unwrap().startup_pipelines, 6);
     assert!(!view.distant_shadow_stats().unwrap().enabled);
     for page in view.scene.requested_pages().collect::<Vec<_>>() {
         let mut cells = Box::new([Cell::AIR; 4096]);

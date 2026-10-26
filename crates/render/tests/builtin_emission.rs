@@ -744,7 +744,7 @@ fn source_passthrough_controls(samples: u32) {
     let stats = read_counters(&gpu, &counters);
     let expected_fragments = W * H * samples;
     eprintln!(
-        "::notice title=AO_CONTROL_MATRIX::AA{samples} sourceNonzero={} {} counters={stats:?} expectedFragments={expected_fragments}",
+        "\n::notice title=AO_CONTROL_MATRIX::AA{samples} sourceNonzero={} {} counters={stats:?} expectedFragments={expected_fragments}",
         before.iter().filter(|&&byte| byte != 0).count(),
         matrix.join("; "),
     );

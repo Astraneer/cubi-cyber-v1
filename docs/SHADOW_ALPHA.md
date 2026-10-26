@@ -67,9 +67,71 @@ public source keys не изменились. Готовность ждёт об
 Разброс и mixed-контроль не позволяют объявить общее ускорение по этим
 коротким Linux прогонам. В частности, mixed по-прежнему читает texture.
 Предыдущий Windows WARP baseline проваливал H5 (1.380× в node diagnostic,
-позднее 1.64×); общий Cutout занимал около554 ms из660 ms sparse. Новый WARP
-результат с данным кандидатом ещё требуется. Ускорение продукта с сотнями
-дальних объектов и смешанной листвой не доказано.
+позднее 1.64×); общий Cutout занимал около554 ms из660 ms sparse. Новый actual
+Windows `50e5f65` с данным кандидатом также провалил исходный порог 2×:
+None sparse609.9895 ms/full909.8766 ms (1.4916×). Отдельный Some diagnostic
+по-прежнему показывает Cutout530.9567/514.6134 ms. Это отрицательный результат
+специализации через helper: нельзя считать, что чтение texture фактически
+устранено данным D3D12 compiler path. Проверка GPU metadata/quad histogram
+готовится отдельно, чтобы отличить неверную публикацию flags от исполнения
+дорогого пути. Ускорение продукта с сотнями дальних объектов и смешанной
+листвой не доказано.
 
 Кандидат public occupied BBox остаётся отдельным CPU proof и не включён:
 actual WARP Opaque был менее1 ms и не объясняет доминирующий Cutout.
+
+## Структурный кандидат после отрицательного WARP результата
+
+После `50e5f65` Alpha-помощник больше не является единственным механизмом
+ускорения. GPU cull читает живую shared metadata каждого публичного quad:
+
+- невалидный material/layer или FAIL (в том числе противоречивые flags6)
+  не попадает в draw;
+- PASS попадает в depth-only pipeline с `fragment: None`: fragment shader,
+  sampler и texture fetch в этом draw отсутствуют структурно;
+- MIXED выполняет исходный mip0 sampler и альфа-тест.
+
+Две группы используют прежнюю pair-арену: PASS растёт от начала, MIXED — от
+конца. При непересекающихся валидированных payload spans P+M<=Q<=C; поэтому
+atomic reservations не пересекаются. C определяется размером visible span,
+не физическим размером payload binding. VS сохраняет исходную математику
+позиции; отдельный partial entry меняет только индекс tail-list.
+
+Учёт изменений явный: compute storage bindings5→7 (лимит8), indirect48→64 B,
+startup pipelines5→6, сгруппированные Far draws3→4. Арена, PXP2, texture/map
+размеры и лимиты payload не растут. PASS и MIXED входят в ОДИН CutoutDraw
+query interval; исходный TOTAL порог H5 2× не изменён.
+
+Proxy owner сохраняет Arc общего atlas epoch. Distant owner имеет точный
+`cull_key=(front_pair,atlas_epoch)` и per-cascade epoch готовых списков.
+Даже прямой draw со старым PASS list после upload запрещён до нового cull.
+При этом ShadowGpu по-прежнему инвалидирует static+combined карты; одних
+новых списков для смены alpha недостаточно. Foreground cull не читает World,
+не строит vertices и не вызывает generation.
+
+Новые доказательства:
+
+- Native stress128×8 descriptors: полная1024-pair арена, точные множества
+  PASS/MIXED и их уникальность, oversized payload binding, invalid IDs/layers,
+  flags6, tint, collect lowbit и повторные empty resets — PASS0.40 s.
+- Native lifecycle2.04 s: исходные пять alpha cases, real imports/reset,
+  Target rejection, inactive cascades, запрет stale PASS, точный cull epoch
+  при неизменной геометрии, 1000idle0alloc/upload/draw — PASS.
+- Dawn13: production compute и обе graphics pipeline против ИСХОДНОГО
+  ordinary-quad VS + sampler reference. Полные depth images BITWISE, включая
+  public fixture544 quads с одновременно272 PASS и272 MIXED. PASS128/255
+  подают64 quads без fragment shader, FAIL/invalid/flags6 — 0. После import
+  с отключёнными фактами все64 идут в MIXED, старый PASS не возвращается.
+  Логи `.local/shadow-buckets-{alpha,coexisting}-dawn.log`.
+- Исходный Native None TOTAL currentSun12/2048/96 MiB: sparse192.386 ms,
+  full1198.413 ms,6.229×; depth BITWISE и352dark/10048clear сохранены.
+  Отдельный Some Cutout interval включает ОБЕ группы:11.920/12.432 ms.
+- Парный чередующий порядок, один fixture/6currentSun кадров/64 quads,
+  work EXACT иdepth BITWISE: uniform fragmentNone49.125 ms / sampling59.391 ms
+  (1.209×); mixed90.890/77.109 ms (0.848×, отрицательный результат сохранён).
+  Для mixed обе стороны выполняют тот же sampler. Короткие вариативные LVP
+  числа не подтверждают производительность всего продукта.
+
+Actual Windows WARP для СТРУКТУРНОГО кандидата ещё требуется; приведённый выше
+fail1.4916× относится к предыдущему helper-only `50e5f65`. Приёмка полного
+профиля с сотнями public casters и смешанной листвой остаётся отдельной.

@@ -68,6 +68,10 @@ pub struct DistantShadowGpu {
     max_objects: u32,
     max_payload_words: u32,
     atlas_layers: [u32; 2],
+    color_layers: u32,
+    alpha_state: std::sync::Arc<crate::shadow_alpha::AtlasState>,
+    alpha_revision: u64,
+    cull_alpha: [Option<u64>; 3],
     source: [u64; 2],
     enabled: bool,
     policy: HeightShadowPolicy,
@@ -85,6 +89,7 @@ pub struct DistantShadowGpu {
     height: wgpu::RenderPipeline,
     opaque: wgpu::RenderPipeline,
     cutout: wgpu::RenderPipeline,
+    pass_all: wgpu::RenderPipeline,
     projected: bool,
     diagnostics: Option<ShadowNodeTimings>,
 }
@@ -106,6 +111,7 @@ impl DistantShadowGpu {
         let total = height_span + opaque_span + cutout_span;
         if heights.max_tiles == 0
             || !shadows.cache().config().dynamic_casters
+            || !shadows.uses_atlas_state(proxies.alpha_state)
             || proxies.max_objects == 0
             || proxies.max_payload_words < 4
             || heights.atlas_layers == 0
@@ -136,8 +142,8 @@ impl DistantShadowGpu {
             wgpu::BufferUsages::STORAGE,
         );
         let indirect = make(
-            "distant height opaque cutout shadow draws",
-            48,
+            "distant height opaque partial and known-pass shadow draws",
+            64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
         );
         let cameras = std::array::from_fn(|_| {
@@ -188,6 +194,8 @@ impl DistantShadowGpu {
                 buffer(3, c, false, false),
                 buffer(4, c, false, false),
                 buffer(5, c, false, false),
+                buffer(6, c, false, true),
+                buffer(7, c, false, true),
             ],
         });
         let height_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -265,6 +273,8 @@ impl DistantShadowGpu {
                                 .as_entire_binding()
                         }),
                     ),
+                    entry(6, proxies.payload.as_entire_binding()),
+                    entry(7, proxies.materials.as_entire_binding()),
                 ],
             })
         });
@@ -337,41 +347,42 @@ impl DistantShadowGpu {
                 cache: None,
             })
         };
-        let depth_pipeline = |label, layout: &wgpu::BindGroupLayout, source, topology| {
-            let module = module(label, source);
-            let layout = pipeline_layout(label, layout);
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("vertex"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some("fragment"),
-                    compilation_options: Default::default(),
-                    targets: &[],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::GreaterEqual,
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: Default::default(),
-                multiview: None,
-                cache: None,
-            })
-        };
+        let depth_pipeline =
+            |label, layout: &wgpu::BindGroupLayout, source, topology, vertex, fragment: bool| {
+                let module = module(label, source);
+                let layout = pipeline_layout(label, layout);
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some(vertex),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: fragment.then_some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some("fragment"),
+                        compilation_options: Default::default(),
+                        targets: &[],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology,
+                        cull_mode: None,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: true,
+                        depth_compare: wgpu::CompareFunction::GreaterEqual,
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: Default::default(),
+                    multiview: None,
+                    cache: None,
+                })
+            };
         Ok(Self {
             height_headers: heights.headers.clone(),
             height_payload: heights.payload.clone(),
@@ -382,6 +393,10 @@ impl DistantShadowGpu {
             max_objects: proxies.max_objects,
             max_payload_words: proxies.max_payload_words,
             atlas_layers: [heights.atlas_layers, proxies.atlas_layers],
+            color_layers: proxies.colors.texture().depth_or_array_layers(),
+            alpha_state: std::sync::Arc::clone(proxies.alpha_state),
+            alpha_revision: proxies.alpha_state.revision(),
+            cull_alpha: [None; 3],
             source: [heights.revision, proxies.revision],
             enabled: false,
             policy,
@@ -401,18 +416,32 @@ impl DistantShadowGpu {
                 &height_layout,
                 height_source,
                 wgpu::PrimitiveTopology::TriangleList,
+                "vertex",
+                true,
             ),
             opaque: depth_pipeline(
                 "public opaque shadow depth",
                 &opaque_layout,
                 opaque_source,
                 wgpu::PrimitiveTopology::TriangleList,
+                "vertex",
+                true,
             ),
             cutout: depth_pipeline(
                 "public cutout shadow depth",
                 &cutout_layout,
+                cutout_source.clone(),
+                wgpu::PrimitiveTopology::TriangleStrip,
+                "partial_vertex",
+                true,
+            ),
+            pass_all: depth_pipeline(
+                "known-pass cutout depth without fragment or sampler",
+                &cutout_layout,
                 cutout_source,
                 wgpu::PrimitiveTopology::TriangleStrip,
+                "vertex",
+                false,
             ),
             projected,
             diagnostics: None,
@@ -435,22 +464,44 @@ impl DistantShadowGpu {
             || self.max_objects != proxies.max_objects
             || self.max_payload_words != proxies.max_payload_words
             || self.atlas_layers != [heights.atlas_layers, proxies.atlas_layers]
+            || !std::sync::Arc::ptr_eq(&self.alpha_state, proxies.alpha_state)
+            || self.color_layers != proxies.colors.texture().depth_or_array_layers()
         {
             return Err(Error::SourceNeedsReprepare);
         }
         let source = [heights.revision, proxies.revision];
         let changed = self.source != source;
         self.source = source;
-        Ok(changed)
+        let alpha_changed = self.synchronize_alpha();
+        if changed {
+            self.cull_alpha.fill(None);
+        }
+        Ok(changed || alpha_changed)
     }
     pub fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled != enabled {
+            self.cull_alpha.fill(None);
+        }
         self.enabled = enabled;
+    }
+    fn synchronize_alpha(&mut self) -> bool {
+        let revision = self.alpha_state.revision();
+        if self.alpha_revision == revision {
+            return false;
+        }
+        self.alpha_revision = revision;
+        self.cull_alpha.fill(None);
+        true
+    }
+    /// Exact local cull dependency; atlas changes never hash into front versions.
+    pub fn cull_key(&self) -> ([u64; 2], u64) {
+        (self.source_key(), self.alpha_revision)
     }
     pub fn source_key(&self) -> [u64; 2] {
         if self.enabled { self.source } else { [0; 2] }
     }
     pub fn startup_pipeline_compilations(&self) -> u32 {
-        5
+        6
     }
     /// Native diagnostic scopes only; default `None` owns no extra GPU resources.
     pub fn set_diagnostic_timings(&mut self, timings: Option<ShadowNodeTimings>) {
@@ -473,6 +524,7 @@ impl DistantShadowGpu {
         region: (ShadowRect, u32),
         collect: bool,
     ) -> ShadowPrepareWork {
+        self.synchronize_alpha();
         let (rect, resolution) = region;
         let matrix = camera.view_projection;
         let direction = [-matrix[0][2], -matrix[1][2], -matrix[2][2], 0.];
@@ -494,7 +546,7 @@ impl DistantShadowGpu {
                         if self.enabled { self.max_tiles } else { 0 },
                         if self.enabled { self.max_objects } else { 0 },
                         resolution,
-                        u32::from(collect && self.projected),
+                        (self.color_layers << 1) | u32::from(collect && self.projected),
                     ],
                     opaque: self.policy.opaque,
                 }),
@@ -511,6 +563,8 @@ impl DistantShadowGpu {
             pass.set_pipeline(&self.cull);
             pass.dispatch_workgroups(self.max_tiles.max(self.max_objects).div_ceil(64), 1, 1);
         }
+        drop(pass);
+        self.cull_alpha[cascade] = Some(self.alpha_revision);
         ShadowPrepareWork {
             dispatches: if self.enabled { 2 } else { 1 },
             upload_bytes: CAMERA_BYTES * 2,
@@ -527,7 +581,7 @@ impl DynamicShadowCaster for DistantShadowGpu {
     }
     fn shadow_key(&self) -> [u64; 4] {
         let key = self.source_key();
-        [key[0], key[1], 0, 0]
+        [key[0], key[1], self.alpha_state.revision(), 0]
     }
     fn prepare_shadow(
         &mut self,
@@ -568,7 +622,7 @@ impl DynamicShadowCaster for DistantShadowGpu {
         )
     }
     fn draw_shadow(&self, pass: &mut wgpu::RenderPass<'_>, cascade: usize) -> u32 {
-        if !self.enabled {
+        if !self.enabled || self.cull_alpha[cascade] != Some(self.alpha_state.revision()) {
             return 0;
         }
         for (pipeline, bind, offset, node) in [
@@ -584,12 +638,6 @@ impl DynamicShadowCaster for DistantShadowGpu {
                 16,
                 ShadowNode::OpaqueDraw,
             ),
-            (
-                &self.cutout,
-                &self.cutout_binds[cascade],
-                32,
-                ShadowNode::CutoutDraw,
-            ),
         ] {
             if let Some(timing) = &self.diagnostics {
                 timing.render_begin(pass, cascade, node);
@@ -601,7 +649,20 @@ impl DynamicShadowCaster for DistantShadowGpu {
                 timing.render_end(pass, cascade, node);
             }
         }
-        3
+        // One disjoint query interval includes both cutout buckets; do not
+        // overwrite the fixed per-cascade timestamp slots with a second scope.
+        if let Some(timing) = &self.diagnostics {
+            timing.render_begin(pass, cascade, ShadowNode::CutoutDraw);
+        }
+        for (pipeline, offset) in [(&self.pass_all, 48), (&self.cutout, 32)] {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.cutout_binds[cascade], &[]);
+            pass.draw_indirect(&self.indirect, offset);
+        }
+        if let Some(timing) = &self.diagnostics {
+            timing.render_end(pass, cascade, ShadowNode::CutoutDraw);
+        }
+        4
     }
 }
 
@@ -744,8 +805,11 @@ pub fn shader_sources(opaque_start: u32, cutout_start: u32) -> [String; 4] {
         .next()
         .expect("cutout shader prefix")
         .replace(LOD_CAMERA, CAMERA_SHADER);
+    let cutout=cutout
+        .replace("@vertex fn vertex(@builtin(vertex_index)corner:u32,@builtin(instance_index)instance:u32)","fn shadow_cutout_pose(corner:u32,instance:u32,partial:bool)")
+        .replace("let entry=visible[instance];","let entry=visible[select(instance,arrayLength(&visible)-1u-instance,partial)];");
     let cutout = format!(
-        "{cutout}\n{}\n@fragment fn fragment(input:VertexOut){{if !shadow_alpha_pass(input.material,input.uv){{discard;}}}}",
+        "{cutout}\n{}\n@vertex fn vertex(@builtin(vertex_index)corner:u32,@builtin(instance_index)instance:u32)->VertexOut{{return shadow_cutout_pose(corner,instance,false);}}\n@vertex fn partial_vertex(@builtin(vertex_index)corner:u32,@builtin(instance_index)instance:u32)->VertexOut{{return shadow_cutout_pose(corner,instance,true);}}\n@fragment fn fragment(input:VertexOut){{if !shadow_alpha_pass(input.material,input.uv){{discard;}}}}",
         crate::shadow_alpha::WGSL
     );
     [cull, height, opaque, cutout]
