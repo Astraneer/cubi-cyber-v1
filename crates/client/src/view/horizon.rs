@@ -36,6 +36,33 @@ pub fn orientation_certificate(
     selection::orientation_certificate(yaw, pitch, yaw_step, pitch_step)
 }
 
+// Shared by live View and the captured-public-input regression. Each immutable
+// box/bin certifies every interpolated pose until the next boundary crossing.
+pub(super) struct HorizonCameraBins {
+    pub(super) eye_min: [f64; 3],
+    pub(super) eye_max: [f64; 3],
+    pub(super) view_direction: [f64; 3],
+    pub(super) margin: f64,
+    pub(super) max_abs_forward_y: f64,
+}
+pub(super) fn horizon_camera_bins(
+    eye: [f32; 3],
+    actual_yaw: f64,
+    actual_pitch: f64,
+) -> Result<HorizonCameraBins, Error> {
+    let eye_min = eye.map(|v| (f64::from(v) / 8.).floor() * 8.);
+    let eye_max = eye_min.map(|v| v + 8.);
+    let (view_direction, margin, max_abs_forward_y) =
+        orientation_certificate(actual_yaw, actual_pitch, 10., 10.)?;
+    Ok(HorizonCameraBins {
+        eye_min,
+        eye_max,
+        view_direction,
+        margin,
+        max_abs_forward_y,
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub max_tiles: usize,

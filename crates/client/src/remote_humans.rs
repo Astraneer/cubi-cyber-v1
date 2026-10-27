@@ -55,6 +55,46 @@ impl RemoteHumans {
         origin: [i64; 3],
         output: &mut [Instance],
     ) -> Result<usize, Error> {
+        self.write_inner(tick, render_tick, players, own, space, origin, output, None)
+    }
+    /// Optional exact identities for temporal presentation. These16-byte IDs
+    /// follow the very same validated/filtering order as the instance suffix;
+    /// no hash or instance64-bit display ID becomes a temporal identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_with_identities<'a>(
+        &mut self,
+        tick: Tick,
+        render_tick: f64,
+        players: impl Iterator<Item = &'a PlayerState>,
+        own: PlayerId,
+        space: SpaceId,
+        origin: [i64; 3],
+        output: &mut [Instance],
+        identities: &mut [PlayerId],
+    ) -> Result<usize, Error> {
+        self.write_inner(
+            tick,
+            render_tick,
+            players,
+            own,
+            space,
+            origin,
+            output,
+            Some(identities),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn write_inner<'a>(
+        &mut self,
+        tick: Tick,
+        render_tick: f64,
+        players: impl Iterator<Item = &'a PlayerState>,
+        own: PlayerId,
+        space: SpaceId,
+        origin: [i64; 3],
+        output: &mut [Instance],
+        mut identities: Option<&mut [PlayerId]>,
+    ) -> Result<usize, Error> {
         if tick < self.tick {
             return Err(Error::Stale);
         }
@@ -67,7 +107,10 @@ impl RemoteHumans {
             if player.identity == own || player.space != space || player.mode == 3 {
                 continue;
             }
-            if count == self.maximum || count == output.len() {
+            if count == self.maximum
+                || count == output.len()
+                || identities.as_ref().is_some_and(|ids| count == ids.len())
+            {
                 return Err(Error::Capacity);
             }
             if player.mode > 3
@@ -157,6 +200,9 @@ impl RemoteHumans {
             }
         }
         for (index, player) in source[..count].iter().flatten().enumerate() {
+            if let Some(identities) = identities.as_deref_mut() {
+                identities[index] = player.identity;
+            }
             let row = self
                 .rows
                 .iter()

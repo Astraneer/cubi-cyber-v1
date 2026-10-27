@@ -79,8 +79,21 @@ impl ClientView {
         // Permission for adaptive scaling is a controller policy, not another
         // render target. Its saved value is consumed by AutoQuality.
         applied |= 1 << Setting::AllowResolution as u32;
-        let samples = settings.get(Setting::Msaa) as u32;
-        if self.render_sample_count() == samples && self.smaa_prepared() == (samples == 1) {
+        let antialiasing = match settings.get(Setting::Msaa) {
+            1 => {
+                self.render_sample_count() == 1 && self.smaa_prepared() && !self.temporal_prepared()
+            }
+            2 => {
+                self.render_sample_count() == 1 && !self.smaa_prepared() && self.temporal_prepared()
+            }
+            4 => {
+                self.render_sample_count() == 4
+                    && !self.smaa_prepared()
+                    && !self.temporal_prepared()
+            }
+            _ => false,
+        };
+        if antialiasing {
             applied |= 1 << Setting::Msaa as u32;
         } else {
             reload_required |= 1 << Setting::Msaa as u32;

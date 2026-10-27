@@ -86,6 +86,18 @@ pub struct LightVolumeGpu {
     upload_bytes: u64,
 }
 impl LightVolumeGpu {
+    /// Exact queued-slot identity for an owner's last successful full image.
+    /// A uniform revocation, alias, reused generation or later patch cannot
+    /// match the owner's stored full-upload revision.
+    pub fn retains_full_image(&self, handle: PageHandle, version: u64) -> bool {
+        self.slots.get(handle.slot as usize).is_some_and(|slot| {
+            slot.initialized
+                && slot.generation == handle.generation
+                && slot.version == version
+                && slot.alias.is_none()
+                && !slot.uniform
+        })
+    }
     pub fn new(device: &wgpu::Device, max_pages: u32) -> Result<Self, LightUploadError> {
         let size = u64::from(max_pages) * LIGHT_PAGE_BYTES;
         if max_pages == 0

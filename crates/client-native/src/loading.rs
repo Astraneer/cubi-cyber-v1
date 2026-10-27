@@ -21,12 +21,51 @@ pub struct Preparation {
     pub horizon: bool,
     pub settings: Option<ui::settings::Settings>,
 }
+impl Preparation {
+    pub fn antialiasing_plan(
+        &self,
+        device: &wgpu::Device,
+    ) -> Result<client::antialiasing::Plan, String> {
+        let settings = self.settings.clone().unwrap_or_default();
+        let value = self
+            .settings
+            .as_ref()
+            .map_or(4, |settings| settings.get(ui::settings::Setting::Msaa));
+        if value == 2 && !self.environment {
+            return Err(client::antialiasing::Error::TemporalUnavailable.to_string());
+        }
+        let mut caps = client::antialiasing::product_capacities();
+        if !self.entities {
+            caps.entity_instances = None;
+        }
+        if !self.props {
+            caps.prop_instances = None;
+        }
+        if !self.horizon {
+            caps.far = None;
+        }
+        caps.optical_mask = self.environment;
+        client::antialiasing::preflight_graph(
+            value,
+            [self.width, self.height],
+            if self.environment {
+                settings.get(ui::settings::Setting::Scale) as u32
+            } else {
+                100
+            },
+            device.limits().max_texture_dimension_2d,
+            device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
+            caps,
+        )
+    }
+}
 
 pub fn prepare(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     preparation: Preparation,
 ) -> Result<Box<ClientView>, String> {
+    let antialiasing = preparation.antialiasing_plan(device)?;
     let mut scene = preparation.scene;
     let settings = preparation.settings.clone().unwrap_or_default();
     if scene.authoritative_remote && preparation.environment {
@@ -38,7 +77,7 @@ pub fn prepare(
         .apply_scene(&mut scene);
     }
     let atlas = AtlasImage::donor()?;
-    let sample_count = preparation.settings.as_ref().map_or(4, |settings| {
+    let antialiasing_mode = preparation.settings.as_ref().map_or(4, |settings| {
         settings.get(ui::settings::Setting::Msaa) as u32
     });
     let terrain = TerrainGpu::new_with_samples(
@@ -50,7 +89,7 @@ pub fn prepare(
         render::OutputTransfer::Attachment,
         client::view::terrain_gpu_config(),
         &atlas,
-        sample_count,
+        antialiasing.samples,
     )
     .map_err(|error| error.to_string())?;
     let mut view = ClientView::new_with_rasterization(terrain, scene, preparation.raster)?;
@@ -93,7 +132,7 @@ pub fn prepare(
                     settings.get(ui::settings::Setting::Ssao) as u8
                 }))
             })
-            .and_then(|profile| profile.with_antialiasing(sample_count))
+            .and_then(|profile| profile.with_antialiasing(antialiasing_mode))
             .and_then(|profile| {
                 profile.with_visual_choices(
                     settings.map_or(0, |settings| {
@@ -140,6 +179,10 @@ pub fn prepare(
     view.prepare_recipe_boards_from_assets(device, queue)?;
     if let Some(settings) = &preparation.settings {
         view.apply_settings(settings);
+    }
+    view.resize(device, preparation.width, preparation.height)?;
+    if antialiasing.mode == client::antialiasing::Mode::Temporal {
+        view.prepare_temporal(device, queue)?;
     }
     Ok(Box::new(view))
 }

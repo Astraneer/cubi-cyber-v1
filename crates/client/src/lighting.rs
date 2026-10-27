@@ -540,11 +540,58 @@ impl SkyAccess for SkyProof {
         (known.y >= ceiling).then_some(15)
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LightSampleSupport {
+    present: bool,
+    known: bool,
+    // Whole-page revisions include raw state mutations with ChannelMask::NONE.
+    // LIGHT or mesh channel stamps alone cannot prove the same local image.
+    version: Version,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FullLightProof {
+    // Like ClientLighting's journal cursor, this belongs to the constructor's
+    // Scene/World. Product reconnect replaces that Scene and lighting owner.
+    handle: PageHandle,
+    upload_revision: u64,
+    support: [Option<LightSampleSupport>; 27],
+}
+// At most256KiB even for512 residents; no retained18³ sample copy per page.
+const _: () = assert!(std::mem::size_of::<Option<FullLightProof>>() <= 512);
+fn light_sample_support(
+    world: &World,
+    page: PageId,
+    known: &impl Fn(PageId) -> bool,
+) -> [Option<LightSampleSupport>; 27] {
+    let mut support = [None; 27];
+    let mut index = 0;
+    for dy in -1..=1 {
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if let (Some(x), Some(y), Some(z)) = (
+                    page.x.checked_add(dx),
+                    page.y.checked_add(dy),
+                    page.z.checked_add(dz),
+                ) {
+                    let source = PageId { x, y, z, ..page };
+                    support[index] = Some(LightSampleSupport {
+                        present: world.page(source).is_some(),
+                        known: known(source),
+                        version: world.page_version(source),
+                    });
+                }
+                index += 1;
+            }
+        }
+    }
+    support
+}
 struct ResidentLight {
     handle: PageHandle,
     bounds: WorldBounds,
     upload_revision: u64,
     bindings: [Option<u64>; 27],
+    full_proof: Option<FullLightProof>,
 }
 struct OverlayLight {
     page: PageId,
@@ -590,6 +637,8 @@ pub struct ClientLightingWork {
     pub provenance_page_reads: u64,
     pub coalesced_light_changes: u64,
     pub retired_dirty_pages: usize,
+    /// Actual new certificates retagged an unchanged successful full GPU image.
+    pub source_retags: usize,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LightingReadyDiagnostics {
@@ -754,6 +803,7 @@ impl ClientLighting {
                 bounds,
                 upload_revision: 0,
                 bindings: [None; 27],
+                full_proof: None,
             },
         ) {
             self.shadows.invalidate_bounds(old.bounds);
@@ -1026,6 +1076,8 @@ impl ClientLighting {
     pub fn shadows(&self) -> &ShadowGpu {
         &self.shadows
     }
+    /// Pump the same Scene used by prepare_scene. A replacement world requires
+    /// a new owner, including a fresh journal cursor and GPU upload proofs.
     pub fn pump_scene(
         &mut self,
         queue: &wgpu::Queue,
@@ -1064,6 +1116,32 @@ impl ClientLighting {
                 }
             }
             if bindings != resident.bindings {
+                // Only a real current certificate contributes known=true. An old
+                // certificate is never locally rebound to a newer cell view.
+                let unchanged_full = resident.full_proof.is_some_and(|proof| {
+                    work.provenance_page_reads += 27;
+                    let support = light_sample_support(scene.world(), page, &|source| {
+                        scene.authoritative_light_version(source).is_some()
+                    });
+                    proof.handle == resident.handle
+                        && proof.upload_revision == resident.upload_revision
+                        && proof.support == support
+                        && self
+                            .lights
+                            .retains_full_image(proof.handle, proof.upload_revision)
+                });
+                if unchanged_full
+                    && self.dirty.pending_version(page).is_none()
+                    && self.record.is_none()
+                    && self.next_sequence == scene.world().journal_next()
+                {
+                    resident.bindings = bindings;
+                    work.source_retags += 1;
+                    continue;
+                }
+                // An observed unknown/revocation, dirty image or unproved patch
+                // cannot later resurrect this proof when metadata becomes equal.
+                resident.full_proof = None;
                 if self
                     .dirty
                     .mark_full(page, scene.world().page_version(page))
@@ -1630,6 +1708,14 @@ impl ClientLighting {
                 .upload_revision
                 .checked_add(1)
                 .ok_or(ClientLightingError::CoordinateOverflow)?;
+            let full_support = if self.config.source == LightSource::Authoritative
+                && matches!(&prepared, PreparedLight::Full { .. })
+            {
+                work.provenance_page_reads += 27;
+                Some(light_sample_support(world, page, &known))
+            } else {
+                None
+            };
             let uploaded = match prepared {
                 PreparedLight::Full {
                     samples,
@@ -1652,12 +1738,17 @@ impl ClientLighting {
             };
             match uploaded {
                 Ok(bytes) => {
+                    let resident = self.residents.get_mut(&page).expect("resident upload");
                     if bytes > 0 {
-                        self.residents
-                            .get_mut(&page)
-                            .expect("resident upload")
-                            .upload_revision = gpu_version;
+                        resident.upload_revision = gpu_version;
                     }
+                    // Patches invalidate this conservative full-image witness;
+                    // a current World stamp may include work not in the patch.
+                    resident.full_proof = full_support.map(|support| FullLightProof {
+                        handle: resident.handle,
+                        upload_revision: resident.upload_revision,
+                        support,
+                    });
                     work.upload_bytes += bytes;
                     work.gpu_pages += usize::from(bytes > 0);
                     self.dirty.acknowledge(page, version);

@@ -403,6 +403,13 @@ impl ProductUi {
             self.layer.app.text(text);
         }
     }
+    // TAA validates its complete optional allocation before changing the
+    // active session or input-admission gate in the platform shell.
+    fn connecting_request(&mut self) {
+        if self.settings_target().get(ui::settings::Setting::Msaa) != 2 {
+            self.connecting();
+        }
+    }
     pub fn connecting(&mut self) {
         self.presentation.reset();
         self.intent_sender.clear();
@@ -468,7 +475,7 @@ impl ProductUi {
                     address: self.layer.app.address.clone(),
                     name: self.layer.app.name.clone(),
                 });
-                self.connecting();
+                self.connecting_request();
                 let _ = self
                     .quality
                     .advance(&self.layer.app, view, now_ms, benchmark);
@@ -850,11 +857,11 @@ impl ProductUi {
         self.report_state();
         Ok(())
     }
-    pub fn observe_completed(&mut self, id: u64) {
+    pub fn observe_completed(&mut self, id: u64, source_epoch: u64) {
         if self.diagnostics {
             self.factory_diagnostics.completed(id);
         }
-        match self.presentation.completed(id) {
+        match self.presentation.completed_with_source(id, source_epoch) {
             Some(client::presentation_gate::Event::PrepareGameUi) => {
                 if self.diagnostics {
                     println!("NATIVE_INITIAL_PRESENT stage=world_gpu_complete frame={id}");
@@ -872,7 +879,7 @@ impl ProductUi {
             None => {}
         }
     }
-    pub fn submitted(&mut self, id: u64, world: bool, game_ui: bool) {
+    pub fn submitted(&mut self, id: u64, world: bool, game_ui: bool, source_epoch: u64) {
         if self.diagnostics {
             self.factory_diagnostics
                 .submitted(id, world, self.layer.uploaded_revision());
@@ -887,7 +894,8 @@ impl ProductUi {
                 }
             );
         }
-        self.presentation.submitted(id, world, game_ui);
+        self.presentation
+            .submitted_with_source(id, world, game_ui, source_epoch);
     }
     pub fn needs_game_ui(&self) -> bool {
         self.presentation.needs_game_ui()
@@ -986,7 +994,7 @@ impl ProductUi {
             match intent {
                 Intent::Connect { address, name } => {
                     self.save_preferences();
-                    self.connecting();
+                    self.connecting_request();
                     self.command(Command::Connect { address, name });
                 }
                 Intent::Disconnect => {
@@ -1024,7 +1032,7 @@ impl ProductUi {
                                 address: self.layer.app.address.clone(),
                                 name: self.layer.app.name.clone(),
                             });
-                            self.connecting();
+                            self.connecting_request();
                         }
                     }
                 }

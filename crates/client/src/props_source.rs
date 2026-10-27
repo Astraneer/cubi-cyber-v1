@@ -10,12 +10,25 @@ use render::{
 };
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use world::{CursorError, CursorId, Page, World, WorldChange};
 #[path = "props_wire.rs"]
 mod wire;
 pub use wire::{PropsWireError, execute_props_request};
+static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
+/// Exact GPU-slot identity, emitted only after a successful record update.
+/// Consumers retain this beside the actual GPU bank, never infer it from
+/// float positions or CPU slots which may already have been retired/reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PropsPublication {
+    pub slot: u32,
+    pub position: Option<BlockPos>,
+    pub registration: u64,
+}
 const CHANNELS: ChannelMask = ChannelMask(
     ChannelMask::SHAPE.0
         | ChannelMask::OPACITY.0
@@ -102,6 +115,10 @@ impl From<BlockError> for PropsError {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PropsWork {
     pub journal_entries: u64,
+    pub cursor_recoveries: u64,
+    pub recovery_headers: u64,
+    pub recovery_slots: u64,
+    pub recovery_pages: u64,
     pub jobs_submitted: u64,
     pub jobs_stale: u64,
     pub worker_mask_words: u64,
@@ -131,6 +148,9 @@ pub struct PropsStats {
     pub public_pages: usize,
     pub retirements: usize,
     pub oldest_age_ticks: u64,
+    pub recovering_cursor: bool,
+    pub recovery_slots_remaining: usize,
+    pub recovery_pages_remaining: usize,
     pub caught_up: bool,
     pub settled: bool,
     pub overdue: bool,
@@ -288,14 +308,21 @@ struct Ready {
     built: Box<PropsBuilt>,
     next: usize,
 }
+struct CursorRecovery {
+    slot: usize,
+    page: usize,
+}
 pub struct PropsSource {
     limits: PropsLimits,
     cursor: CursorId,
     sequence: u64,
     pending: Option<Pending>,
+    recovery: Option<CursorRecovery>,
+    recovery_pages: Vec<PageId>,
     pages: HashMap<PageId, PageState>,
     positions: HashMap<BlockPos, u32>,
     slots: Vec<Slot>,
+    registrations: Option<Vec<u64>>,
     free: Vec<u32>,
     dirty: VecDeque<u32>,
     light_jobs: VecDeque<PageId>,
@@ -310,6 +337,7 @@ pub struct PropsSource {
     running: HashMap<u64, (PageId, Version)>,
     ready: VecDeque<Ready>,
     next_job: u64,
+    recovery_job_floor: u64,
     work: PropsWork,
     region: Option<VisibleRegion>,
     retiring: VecDeque<(PageId, usize)>,
@@ -405,9 +433,12 @@ impl PropsSource {
             cursor,
             sequence,
             pending: None,
+            recovery: None,
+            recovery_pages: Vec::with_capacity(limits.max_pages),
             pages: HashMap::with_capacity(limits.max_pages * 2),
             positions: HashMap::with_capacity(limits.max_instances),
             slots: (0..limits.max_instances).map(|_| Slot::empty()).collect(),
+            registrations: None,
             free: (0..limits.max_instances as u32).rev().collect(),
             dirty: VecDeque::with_capacity(limits.max_instances),
             light_jobs: VecDeque::with_capacity(limits.max_pages * 2),
@@ -422,6 +453,7 @@ impl PropsSource {
             running: HashMap::with_capacity(limits.max_running),
             ready: VecDeque::with_capacity(limits.max_ready),
             next_job: 1,
+            recovery_job_floor: 0,
             work: PropsWork::default(),
             region: None,
             retiring: VecDeque::with_capacity(limits.max_pages * 2),
@@ -432,6 +464,38 @@ impl PropsSource {
             }
         }
         Ok(source)
+    }
+    /// Loading-only optional lifetime bank. Ordinary profiles retain no array
+    /// and do not allocate or advance temporal registration IDs.
+    pub fn prepare_temporal_publications(&mut self) -> Result<bool, PropsError> {
+        if self.registrations.is_some() {
+            return Ok(false);
+        }
+        let count = self
+            .slots
+            .iter()
+            .filter(|slot| slot.sample.is_some())
+            .count() as u64;
+        let first = NEXT_REGISTRATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(count)
+            })
+            .map_err(|_| PropsError::RevisionOverflow)?;
+        let mut bank = vec![0; self.slots.len()];
+        let mut next = first;
+        for (slot, registration) in self.slots.iter().zip(&mut bank) {
+            if slot.sample.is_some() {
+                *registration = next;
+                next += 1;
+            }
+        }
+        self.registrations = Some(bank);
+        Ok(true)
+    }
+    pub fn temporal_registration_bytes(&self) -> usize {
+        self.registrations
+            .as_ref()
+            .map_or(0, |bank| bank.len() * std::mem::size_of::<u64>())
     }
     pub fn watch_page(&mut self, page: PageId, tick: Tick) -> Result<(), PropsError> {
         if page.space != SpaceId(0) {
@@ -468,6 +532,23 @@ impl PropsSource {
     }
     fn set(&mut self, sample: BlockSample, tick: Tick) -> Result<(), PropsError> {
         let selected = eligible(sample.cell);
+        let registration = if self.registrations.is_some()
+            && selected
+            && self
+                .positions
+                .get(&sample.position)
+                .is_none_or(|slot| self.slots[*slot as usize].sample.is_none())
+        {
+            Some(
+                NEXT_REGISTRATION
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                        next.checked_add(1)
+                    })
+                    .map_err(|_| PropsError::RevisionOverflow)?,
+            )
+        } else {
+            None
+        };
         let slot = if let Some(&slot) = self.positions.get(&sample.position) {
             slot
         } else {
@@ -497,6 +578,11 @@ impl PropsSource {
             };
             slot
         };
+        if let Some(registration) = registration {
+            self.registrations
+                .as_mut()
+                .expect("prepared temporal registrations")[slot as usize] = registration;
+        }
         let state = &mut self.slots[slot as usize];
         let mut sample = sample;
         if let Some(old) = state.sample
@@ -807,6 +893,100 @@ impl PropsSource {
             }
         }
     }
+    /// A lagged journal cannot describe this derived cache any longer. Capture
+    /// only current bounded page HEADERS, then reconcile existing indexed slots
+    /// incrementally and rediscover new models on immutable worker snapshots.
+    /// No gameplay consumer is advanced and no cell traversal runs here.
+    fn recover_lagged_cursor(&mut self, world: &mut World) -> Result<(), PropsError> {
+        let revision = self
+            .public_revision
+            .checked_add(1)
+            .ok_or(PropsError::RevisionOverflow)?;
+        if world.loaded_pages() > self.limits.max_pages {
+            return Err(PropsError::Capacity);
+        }
+        self.recovery_pages.clear();
+        let region = self.region;
+        for (page, _) in world.pages() {
+            self.work.recovery_headers += 1;
+            if page.space == SpaceId(0) && region.is_none_or(|r| r.contains(page)) {
+                self.recovery_pages.push(page);
+            }
+        }
+        let boundary = world.journal_next();
+        self.pending = None;
+        // Keep old running reservations: ViewProps retains their contexts,
+        // retry slots or pending terminal results until normal completion.
+        self.recovery_job_floor = self.next_job;
+        self.ready.clear();
+        self.jobs.clear();
+        self.light_jobs.clear();
+        self.public_jobs.clear();
+        // A discarded removal can leave a frame outside the current bindings.
+        // Restore only frames the connection can rebind to current public Raw.
+        self.work.recovery_headers += self.public_frames.len() as u64;
+        self.public_frames.clear();
+        self.public_hint_count = 0;
+        self.public_revision = revision;
+        self.retiring.clear();
+        self.work.recovery_headers += self.pages.len() as u64;
+        self.pages.retain(|_, page| {
+            page.known = false;
+            page.queued = false;
+            // Existing running flags retain exactly their old reservations.
+            page.light_next = None;
+            page.public_next = None;
+            page.retiring = false;
+            page.first = Some(world.tick());
+            page.live > 0 || page.running
+        });
+        self.recovery = Some(CursorRecovery { slot: 0, page: 0 });
+        world.recover_cursor(self.cursor, boundary)?;
+        self.sequence = boundary;
+        self.work.cursor_recoveries += 1;
+        Ok(())
+    }
+    fn advance_cursor_recovery(
+        &mut self,
+        world: &World,
+        mut tint: impl FnMut(BlockPos) -> u32,
+    ) -> Result<bool, PropsError> {
+        let Some(recovery) = &self.recovery else {
+            return Ok(false);
+        };
+        if recovery.slot < self.slots.len() {
+            let next = recovery.slot;
+            if let Some(position) = self.slots[next].position {
+                // A missing journal can contain remove/recreate ABA. Revoke the
+                // former optional temporal registration even for equal cells.
+                self.remove(position, world.tick())?;
+                self.slots[next].ports = None;
+                self.slots[next].wind = None;
+                self.set_from_world(world, position, tint(position))?;
+            }
+            self.recovery.as_mut().expect("cursor snapshot").slot += 1;
+            self.work.recovery_slots += 1;
+            return Ok(true);
+        }
+        if let Some(&page) = self.recovery_pages.get(recovery.page) {
+            match self.watch_page(page, world.tick()) {
+                Ok(()) => {}
+                Err(PropsError::Capacity) => {
+                    // Normal hidden-record GPU publication releases old slots
+                    // and page headers. Retain this exact snapshot request.
+                    self.work.backpressure = true;
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
+            self.recovery.as_mut().expect("cursor snapshot").page += 1;
+            self.work.recovery_pages += 1;
+            return Ok(true);
+        }
+        self.recovery = None;
+        self.recovery_pages.clear();
+        Ok(false)
+    }
     /// Entry credits include created/removed pages, individual cells/lights and ACK.
     pub fn ingest(
         &mut self,
@@ -814,7 +994,25 @@ impl PropsSource {
         max_entries: usize,
         mut tint: impl FnMut(BlockPos) -> u32,
     ) -> Result<usize, PropsError> {
+        if max_entries == 0 {
+            return Ok(0);
+        }
+        if self.sequence < world.journal_oldest() {
+            self.recover_lagged_cursor(world)?;
+        }
         let mut used = 0;
+        while used < max_entries && self.recovery.is_some() {
+            if !self.advance_cursor_recovery(world, &mut tint)? {
+                if self.recovery.is_some() {
+                    return Ok(used);
+                }
+                break;
+            }
+            used += 1;
+        }
+        if self.recovery.is_some() {
+            return Ok(used);
+        }
         while used < max_entries && self.advance_retirement(world.tick())? {
             used += 1;
         }
@@ -982,6 +1180,7 @@ impl PropsSource {
                 true
             });
         let current = valid
+            && built.id >= self.recovery_job_floor
             && self
                 .running
                 .get(&built.id)
@@ -1005,6 +1204,7 @@ impl PropsSource {
                 if world.page(page).is_some() {
                     let _ = self.watch_page(page, world.tick());
                 }
+                self.prune_released_page(page);
                 return Ok(false);
             }
         } else {
@@ -1014,6 +1214,15 @@ impl PropsSource {
         self.ready.push_back(Ready { built, next: 0 });
         Ok(true)
     }
+    fn prune_released_page(&mut self, page: PageId) {
+        if self
+            .pages
+            .get(&page)
+            .is_some_and(|p| !p.known && !p.queued && !p.running && p.live == 0)
+        {
+            self.pages.remove(&page);
+        }
+    }
     pub fn fail_job(&mut self, world: &World, id: u64) {
         if let Some((page, _)) = self.running.remove(&id) {
             if let Some(state) = self.pages.get_mut(&page) {
@@ -1022,6 +1231,7 @@ impl PropsSource {
             if world.page(page).is_some() {
                 let _ = self.watch_page(page, world.tick());
             }
+            self.prune_released_page(page);
         }
     }
     /// Copies only bounded model records; full-cell traversal stayed on worker.
@@ -1078,7 +1288,15 @@ impl PropsSource {
         budget: &mut UploadBudget,
         max_records: usize,
     ) -> Result<usize, PropsError> {
-        self.flush_inner(queue, gpu, origin, budget, max_records, |sample| sample)
+        self.flush_inner(
+            queue,
+            gpu,
+            origin,
+            budget,
+            max_records,
+            |sample| sample,
+            |_| {},
+        )
     }
     /// Rebind only indexed models after a public LIGHT certificate changes,
     /// including zero snapshots and raw-view revocations without a WorldChange.
@@ -1137,17 +1355,46 @@ impl PropsSource {
         origin: [i64; 3],
         budget: &mut UploadBudget,
         max_records: usize,
+        light_at: impl FnMut(BlockPos) -> Option<world::LightSample>,
+    ) -> Result<usize, PropsError> {
+        self.flush_sampled_with_publications(
+            queue,
+            gpu,
+            origin,
+            budget,
+            max_records,
+            light_at,
+            |_| {},
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn flush_sampled_with_publications(
+        &mut self,
+        queue: &wgpu::Queue,
+        gpu: &mut BlockModelsGpu,
+        origin: [i64; 3],
+        budget: &mut UploadBudget,
+        max_records: usize,
         mut light_at: impl FnMut(BlockPos) -> Option<world::LightSample>,
+        published: impl FnMut(PropsPublication),
     ) -> Result<usize, PropsError> {
         let mut reads = 0;
-        let result = self.flush_inner(queue, gpu, origin, budget, max_records, |mut sample| {
-            reads += 1;
-            sample.light = light_at(sample.position)
-                .and_then(|light| PackedLight::new(light.sky, light.block, light.rgb))
-                .unwrap_or_default()
-                .raw();
-            sample
-        });
+        let result = self.flush_inner(
+            queue,
+            gpu,
+            origin,
+            budget,
+            max_records,
+            |mut sample| {
+                reads += 1;
+                sample.light = light_at(sample.position)
+                    .and_then(|light| PackedLight::new(light.sky, light.block, light.rgb))
+                    .unwrap_or_default()
+                    .raw();
+                sample
+            },
+            published,
+        );
         self.work.owner_light_reads += reads;
         result
     }
@@ -1160,6 +1407,7 @@ impl PropsSource {
         budget: &mut UploadBudget,
         max_records: usize,
         mut sample_at: impl FnMut(BlockSample) -> BlockSample,
+        mut published: impl FnMut(PropsPublication),
     ) -> Result<usize, PropsError> {
         if gpu.reserved_slots() < self.limits.max_instances {
             return Err(PropsError::InvalidLimits);
@@ -1196,6 +1444,14 @@ impl PropsSource {
                 BlockInstance::hidden()
             };
             let work = gpu.update(queue, index, value, budget)?;
+            published(PropsPublication {
+                slot: index,
+                position: slot.sample.map(|sample| sample.position),
+                registration: self
+                    .registrations
+                    .as_ref()
+                    .map_or(0, |bank| bank[index as usize]),
+            });
             self.work.upload_bytes += work.upload_bytes;
             self.work.records_uploaded += u64::from(work.upload_bytes > 0);
             self.work.changed |= work.upload_bytes > 0;
@@ -1235,7 +1491,9 @@ impl PropsSource {
         }
     }
     pub fn stats(&self, world: &World) -> PropsStats {
-        let caught = self.sequence == world.journal_next() && self.pending.is_none();
+        let caught = self.sequence == world.journal_next()
+            && self.pending.is_none()
+            && self.recovery.is_none();
         let oldest = self
             .slots
             .iter()
@@ -1261,6 +1519,15 @@ impl PropsSource {
             retirements: self.retiring.len(),
             oldest_age_ticks: oldest,
             overdue: oldest > self.limits.max_age_ticks,
+            recovering_cursor: self.recovery.is_some(),
+            recovery_slots_remaining: self
+                .recovery
+                .as_ref()
+                .map_or(0, |r| self.slots.len().saturating_sub(r.slot)),
+            recovery_pages_remaining: self
+                .recovery
+                .as_ref()
+                .map_or(0, |r| self.recovery_pages.len().saturating_sub(r.page)),
             caught_up: caught,
             settled: caught
                 && self.dirty.is_empty()
@@ -1284,6 +1551,8 @@ impl PropsSource {
     }
     /// Before detach, queue/flush every model removal if GPU owner is retained.
     pub fn clear(&mut self, tick: Tick) -> Result<(), PropsError> {
+        self.recovery = None;
+        self.recovery_pages.clear();
         self.retiring.clear();
         let revision = self
             .public_revision
@@ -1452,5 +1721,454 @@ mod revision_tests {
         assert_eq!(owner.public_frames().count(), 2);
         assert_eq!(owner.stats(&world).queued, 0);
         owner.detach(&mut world);
+    }
+}
+
+#[cfg(test)]
+mod cursor_recovery_tests {
+    use super::*;
+    use world::{GameplayEvent, JournalLimits, Transaction};
+    fn position(x: i32) -> BlockPos {
+        BlockPos {
+            space: SpaceId(0),
+            x,
+            y: 4,
+            z: 8,
+        }
+    }
+    fn fixture() -> (World, PropsSource) {
+        let mut world = World::with_limits(
+            rules::properties,
+            JournalLimits {
+                max_records: 2,
+                ..JournalLimits::default()
+            },
+        );
+        let mut tx = Transaction::new(Tick(1), SpaceId(0));
+        tx.create_page(position(0).page(), vec![Cell::AIR; 4096]);
+        tx.set_cell(position(2), Cell::from_parts(rules::ids::CHEST, 0));
+        world.commit(tx).unwrap();
+        let mut owner = PropsSource::attach(
+            &mut world,
+            PropsLimits {
+                max_pages: 4,
+                max_instances: 16,
+                max_running: 2,
+                max_ready: 2,
+                max_age_ticks: 40,
+            },
+        )
+        .unwrap();
+        finish(&mut owner, &world);
+        (world, owner)
+    }
+    fn finish(owner: &mut PropsSource, world: &World) {
+        while let Some(job) = owner.take_job(world, |_| Box::new([u32::MAX; 256])) {
+            assert!(
+                owner
+                    .complete(world, job.execute(|| false).unwrap())
+                    .map_err(|_| ())
+                    .unwrap()
+            );
+            owner.pump_ready(world, 16).unwrap();
+        }
+    }
+    fn event(world: &mut World, tick: u64) {
+        let mut tx = Transaction::new(Tick(tick), SpaceId(0));
+        tx.event(GameplayEvent {
+            kind: 7,
+            subject: None,
+            position: Some(position(1)),
+            payload: vec![tick as u8],
+        });
+        world.commit(tx).unwrap();
+    }
+    fn recover(owner: &mut PropsSource, world: &mut World) {
+        for _ in 0..64 {
+            assert!(owner.ingest(world, 1, |_| u32::MAX).unwrap() <= 1);
+            if owner.stats(world).caught_up {
+                return;
+            }
+        }
+        panic!("bounded snapshot did not converge");
+    }
+    #[test]
+    fn lagged_partial_record_installs_current_snapshot_with_one_slot_credit() {
+        let (mut world, mut owner) = fixture();
+        let mut tx = Transaction::new(Tick(2), SpaceId(0));
+        tx.set_cell(position(2), Cell::AIR);
+        tx.set_cell(position(3), Cell::from_parts(rules::ids::STONE, 0));
+        world.commit(tx).unwrap();
+        owner.ingest(&mut world, 1, |_| u32::MAX).unwrap();
+        assert!(owner.pending.is_some());
+        event(&mut world, 3);
+        event(&mut world, 4);
+        event(&mut world, 5);
+        assert!(owner.sequence < world.journal_oldest());
+        owner.take_work();
+        assert_eq!(owner.ingest(&mut world, 1, |_| u32::MAX).unwrap(), 1);
+        assert!(owner.pending.is_none());
+        assert!(owner.stats(&world).recovering_cursor);
+        assert!(!owner.stats(&world).caught_up);
+        let work = owner.take_work();
+        assert_eq!(work.cursor_recoveries, 1);
+        assert_eq!(work.recovery_slots, 1);
+        assert!(work.recovery_headers <= (owner.limits.max_pages * 5) as u64);
+        recover(&mut owner, &mut world);
+        finish(&mut owner, &world);
+        assert!(owner.slots.iter().all(|s| s.sample.is_none()));
+    }
+    #[test]
+    fn vanished_models_and_new_current_models_reconcile_without_replaying_old_rows() {
+        let (mut world, mut owner) = fixture();
+        let mut tx = Transaction::new(Tick(2), SpaceId(0));
+        tx.set_cell(position(2), Cell::AIR);
+        world.commit(tx).unwrap();
+        let mut tx = Transaction::new(Tick(3), SpaceId(0));
+        tx.set_cell(position(4), Cell::from_parts(rules::ids::WIND_GENERATOR, 0));
+        world.commit(tx).unwrap();
+        event(&mut world, 4);
+        event(&mut world, 5);
+        recover(&mut owner, &mut world);
+        finish(&mut owner, &world);
+        let alive: Vec<_> = owner
+            .slots
+            .iter()
+            .filter_map(|s| s.sample.map(|s| (s.position, s.cell.id())))
+            .collect();
+        assert_eq!(alive, vec![(position(4), rules::ids::WIND_GENERATOR)]);
+        assert!(
+            owner
+                .dirty
+                .iter()
+                .any(|&i| owner.slots[i as usize].position == Some(position(2))
+                    && owner.slots[i as usize].sample.is_none()),
+            "old GPU record remains queued for an actual hidden publication"
+        );
+    }
+    #[test]
+    fn old_worker_with_unchanged_world_source_is_rejected_after_snapshot_boundary() {
+        let (mut world, mut owner) = fixture();
+        owner.watch_page(position(2).page(), world.tick()).unwrap();
+        let old = owner
+            .take_job(&world, |_| Box::new([u32::MAX; 256]))
+            .unwrap();
+        let source = old.source;
+        event(&mut world, 2);
+        event(&mut world, 3);
+        event(&mut world, 4);
+        owner.ingest(&mut world, 1, |_| u32::MAX).unwrap();
+        assert_eq!(source, world.input_version(position(2).page(), CHANNELS));
+        assert!(
+            !owner
+                .complete(&world, old.execute(|| false).unwrap())
+                .map_err(|_| ())
+                .unwrap()
+        );
+    }
+    #[test]
+    fn snapshot_recovery_resets_optional_registration_even_for_equal_current_cells() {
+        let (mut world, mut owner) = fixture();
+        owner.prepare_temporal_publications().unwrap();
+        let slot = owner.positions[&position(2)] as usize;
+        let old = owner.registrations.as_ref().unwrap()[slot];
+        event(&mut world, 2);
+        event(&mut world, 3);
+        event(&mut world, 4);
+        recover(&mut owner, &mut world);
+        assert!(owner.registrations.as_ref().unwrap()[slot] > old);
+        assert_eq!(
+            owner.slots[slot].sample.unwrap().cell.id(),
+            rules::ids::CHEST
+        );
+    }
+    #[test]
+    fn own_recovery_never_advances_another_consumer_or_discards_live_gameplay_events() {
+        let (mut world, mut owner) = fixture();
+        let lagged = world.register_cursor();
+        event(&mut world, 2);
+        event(&mut world, 3);
+        event(&mut world, 4);
+        recover(&mut owner, &mut world);
+        assert!(matches!(
+            world.read_cursor(lagged, 1),
+            Err(CursorError::Lagged { .. })
+        ));
+        let live = world.register_cursor();
+        event(&mut world, 5);
+        owner.ingest(&mut world, 16, |_| u32::MAX).unwrap();
+        let batch = world.read_cursor(live, 1).unwrap();
+        assert_eq!(batch.changes[0].events[0].kind, 7);
+        assert_eq!(batch.changes[0].events[0].payload, vec![5]);
+    }
+    #[test]
+    fn zero_credit_call_does_not_capture_or_recover_a_lagged_cursor() {
+        let (mut world, mut owner) = fixture();
+        event(&mut world, 2);
+        event(&mut world, 3);
+        event(&mut world, 4);
+        let sequence = owner.sequence;
+        owner.take_work();
+        assert_eq!(owner.ingest(&mut world, 0, |_| u32::MAX).unwrap(), 0);
+        assert_eq!(owner.sequence, sequence);
+        assert!(owner.recovery.is_none());
+        assert_eq!(owner.take_work(), PropsWork::default());
+    }
+
+    #[test]
+    fn missed_page_removal_discards_its_public_frame_and_notifies_dependents() {
+        let (mut world, mut owner) = fixture();
+        let frame = Arc::new(net::props::Frame {
+            page: position(2).page(),
+            cell_view: 10,
+            view: 1,
+            source: Version(1),
+            tick: Tick(1),
+            hints: vec![
+                net::props::Hint::from_visual(
+                    position(2).local_index(),
+                    net::props::Kind::Chest,
+                    None,
+                    false,
+                    Some(1.),
+                    None,
+                )
+                .unwrap(),
+            ],
+        });
+        owner.publish_public_frame(frame, 10).unwrap();
+        let old_revision = owner.public_revision();
+        let mut tx = Transaction::new(Tick(2), SpaceId(0));
+        tx.remove_page(position(2).page());
+        world.commit(tx).unwrap();
+        event(&mut world, 3);
+        event(&mut world, 4);
+        event(&mut world, 5);
+        owner.ingest(&mut world, 1, |_| u32::MAX).unwrap();
+        assert!(owner.public_frames.is_empty());
+        assert_eq!(owner.public_hint_count, 0);
+        assert_eq!(owner.public_revision(), old_revision + 1);
+        recover(&mut owner, &mut world);
+        assert!(owner.slots.iter().all(|s| s.sample.is_none()));
+    }
+    #[test]
+    fn recovery_public_revision_overflow_rejects_before_mutating_owned_state() {
+        let (mut world, mut owner) = fixture();
+        owner.public_revision = u64::MAX;
+        event(&mut world, 2);
+        event(&mut world, 3);
+        event(&mut world, 4);
+        let sequence = owner.sequence;
+        assert!(matches!(
+            owner.ingest(&mut world, 1, |_| u32::MAX),
+            Err(PropsError::RevisionOverflow)
+        ));
+        assert_eq!(owner.sequence, sequence);
+        assert!(owner.recovery.is_none());
+        assert_eq!(owner.slots.iter().filter(|s| s.sample.is_some()).count(), 1);
+    }
+
+    #[test]
+    fn repeated_recovery_keeps_running_reservations_until_terminal_results() {
+        let (mut world, mut owner) = fixture();
+        let other = PageId {
+            x: 1,
+            ..position(2).page()
+        };
+        let mut cells = vec![Cell::AIR; 4096];
+        cells[0] = Cell::from_parts(rules::ids::CHEST, 0);
+        let mut tx = Transaction::new(Tick(2), SpaceId(0));
+        tx.create_page(other, cells);
+        world.commit(tx).unwrap();
+        owner.ingest(&mut world, 16, |_| u32::MAX).unwrap();
+        owner.watch_page(position(2).page(), world.tick()).unwrap();
+        let a = owner
+            .take_job(&world, |_| Box::new([u32::MAX; 256]))
+            .unwrap();
+        let b = owner
+            .take_job(&world, |_| Box::new([u32::MAX; 256]))
+            .unwrap();
+        assert_eq!(owner.running.len(), owner.limits.max_running);
+        for base in [3, 6, 9] {
+            for tick in base..base + 3 {
+                event(&mut world, tick);
+            }
+            recover(&mut owner, &mut world);
+            assert_eq!(owner.running.len(), owner.limits.max_running);
+            assert!(
+                owner
+                    .take_job(&world, |_| Box::new([u32::MAX; 256]))
+                    .is_none(),
+                "old external contexts still reserve the existing admission capacity"
+            );
+        }
+        assert!(
+            !owner
+                .complete(&world, a.execute(|| false).unwrap())
+                .map_err(|_| ())
+                .unwrap()
+        );
+        let fresh = owner
+            .take_job(&world, |_| Box::new([u32::MAX; 256]))
+            .unwrap();
+        assert!(fresh.id >= owner.recovery_job_floor);
+        assert_eq!(owner.running.len(), owner.limits.max_running);
+        assert!(
+            !owner
+                .complete(&world, b.execute(|| false).unwrap())
+                .map_err(|_| ())
+                .unwrap()
+        );
+        assert!(owner.running.contains_key(&fresh.id));
+    }
+    #[test]
+    fn old_terminal_result_releases_a_removed_empty_page_header() {
+        for failed in [false, true] {
+            let mut world = World::with_limits(
+                rules::properties,
+                JournalLimits {
+                    max_records: 2,
+                    ..JournalLimits::default()
+                },
+            );
+            let page = position(0).page();
+            let mut tx = Transaction::new(Tick(1), SpaceId(0));
+            tx.create_page(page, vec![Cell::AIR; 4096]);
+            world.commit(tx).unwrap();
+            let mut owner = PropsSource::attach(
+                &mut world,
+                PropsLimits {
+                    max_pages: 4,
+                    max_instances: 16,
+                    ..PropsLimits::default()
+                },
+            )
+            .unwrap();
+            let old = owner
+                .take_job(&world, |_| Box::new([u32::MAX; 256]))
+                .unwrap();
+            let mut tx = Transaction::new(Tick(2), SpaceId(0));
+            tx.remove_page(page);
+            world.commit(tx).unwrap();
+            event(&mut world, 3);
+            event(&mut world, 4);
+            event(&mut world, 5);
+            recover(&mut owner, &mut world);
+            assert!(owner.pages.contains_key(&page));
+            if failed {
+                owner.fail_job(&world, old.id)
+            } else {
+                assert!(
+                    !owner
+                        .complete(&world, old.execute(|| false).unwrap())
+                        .map_err(|_| ())
+                        .unwrap()
+                );
+            }
+            assert!(owner.running.is_empty());
+            assert!(
+                !owner.pages.contains_key(&page),
+                "the released reservation must not leak a stale empty page header"
+            );
+        }
+    }
+
+    #[test]
+    fn running_ghost_headers_backpressure_exact_snapshot_page_until_release() {
+        let mut world = World::with_limits(
+            rules::properties,
+            JournalLimits {
+                max_records: 2,
+                ..JournalLimits::default()
+            },
+        );
+        let a = position(0).page();
+        let b = PageId { x: 1, ..a };
+        let c = PageId { x: 2, ..a };
+        let mut tx = Transaction::new(Tick(1), SpaceId(0));
+        tx.create_page(a, vec![Cell::AIR; 4096]);
+        world.commit(tx).unwrap();
+        let mut owner = PropsSource::attach(
+            &mut world,
+            PropsLimits {
+                max_pages: 1,
+                max_instances: 16,
+                max_running: 2,
+                max_ready: 2,
+                max_age_ticks: 40,
+            },
+        )
+        .unwrap();
+        let old_a = owner
+            .take_job(&world, |_| Box::new([u32::MAX; 256]))
+            .unwrap();
+        let mut tx = Transaction::new(Tick(2), SpaceId(0));
+        tx.remove_page(a);
+        tx.create_page(b, vec![Cell::AIR; 4096]);
+        world.commit(tx).unwrap();
+        event(&mut world, 3);
+        event(&mut world, 4);
+        recover(&mut owner, &mut world);
+        let old_b = owner
+            .take_job(&world, |_| Box::new([u32::MAX; 256]))
+            .unwrap();
+        assert_eq!(owner.running.len(), 2);
+        let mut cells = vec![Cell::AIR; 4096];
+        cells[0] = Cell::from_parts(rules::ids::CHEST, 0);
+        let mut tx = Transaction::new(Tick(5), SpaceId(0));
+        tx.remove_page(b);
+        tx.create_page(c, cells);
+        world.commit(tx).unwrap();
+        event(&mut world, 6);
+        event(&mut world, 7);
+        for _ in 0..32 {
+            assert!(owner.ingest(&mut world, 1, |_| u32::MAX).unwrap() <= 1);
+        }
+        assert_eq!(owner.pages.len(), 2);
+        assert_eq!(owner.running.len(), 2);
+        assert!(owner.work.backpressure);
+        assert!(!owner.pages.contains_key(&c));
+        assert!(
+            owner
+                .take_job(&world, |_| Box::new([u32::MAX; 256]))
+                .is_none()
+        );
+        let recovery = owner.recovery.as_ref().unwrap();
+        assert_eq!(
+            recovery.page, 0,
+            "blocked C must retain its exact snapshot index"
+        );
+        assert_eq!(owner.recovery_pages, vec![c]);
+        owner.fail_job(&world, old_a.id);
+        assert!(!owner.pages.contains_key(&a));
+        recover(&mut owner, &mut world);
+        assert!(owner.pages.contains_key(&c));
+        let current = owner
+            .take_job(&world, |_| Box::new([u32::MAX; 256]))
+            .unwrap();
+        assert_eq!(current.page, c);
+        assert_eq!(owner.running.len(), 2);
+        assert!(
+            !owner
+                .complete(&world, old_b.execute(|| false).unwrap())
+                .map_err(|_| ())
+                .unwrap()
+        );
+        assert!(!owner.pages.contains_key(&b));
+        assert!(
+            owner
+                .complete(&world, current.execute(|| false).unwrap())
+                .map_err(|_| ())
+                .unwrap()
+        );
+        owner.pump_ready(&world, 16).unwrap();
+        assert!(owner.pages.len() <= owner.limits.max_pages * 2);
+        let alive: Vec<_> = owner
+            .slots
+            .iter()
+            .filter_map(|s| s.sample.map(|s| s.position.page()))
+            .collect();
+        assert_eq!(alive, vec![c]);
+        drop(old_a);
     }
 }

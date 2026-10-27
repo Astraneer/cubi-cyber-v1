@@ -1,8 +1,10 @@
 //! Histogram exposure, cached bloom pyramid and final HDR transfer for M10.
 use crate::{OutputTransfer, terrain_gpu::UploadBudget};
 use bytemuck::{Pod, Zeroable};
+mod temporal;
 mod timer;
 use crate::smaa::{SmaaConfig, SmaaGpu};
+pub use temporal::{PostFrameToken, PostRestoreToken};
 use timer::PostTimer;
 
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +58,7 @@ pub enum PostError {
     InvalidConfig,
     UploadBudget,
     WorkBudget,
+    InvalidPresentation,
 }
 impl std::fmt::Display for PostError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -65,6 +68,7 @@ impl std::fmt::Display for PostError {
 impl std::error::Error for PostError {}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PostWork {
+    pub state_copy_bytes: u64,
     pub histogram_samples: u64,
     pub bloom_texels: u64,
     pub tone_pixels: u64,
@@ -123,6 +127,7 @@ pub struct PostGpu {
     output_requested: bool,
     adaptation_remaining: f32,
     timer: PostTimer,
+    temporal: Option<temporal::TemporalPost>,
 }
 
 fn buffer_entry(binding: u32, uniform: bool, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -603,6 +608,7 @@ impl PostGpu {
             output_requested: false,
             adaptation_remaining: 0.0,
             timer: PostTimer::new(device, queue, config.smaa.is_some()),
+            temporal: None,
         })
     }
 
@@ -830,6 +836,7 @@ impl PostGpu {
             .map(|smaa| smaa.pending_work())
             .unwrap_or_default();
         PostWork {
+            state_copy_bytes: 0,
             histogram_samples: histogram,
             aa_pixels: aa.pixels,
             aa_search_reads_bound: aa.search_reads_bound,
@@ -850,6 +857,24 @@ impl PostGpu {
     pub fn has_cached_source(&self) -> bool {
         self.last_source.is_some()
     }
+    pub fn pending_cached_work(&self) -> PostWork {
+        let aa = self
+            .smaa
+            .as_ref()
+            .map(|smaa| smaa.pending_work())
+            .unwrap_or_default();
+        let restore = self.temporal_restore_work();
+        PostWork {
+            state_copy_bytes: restore.state_copy_bytes,
+            histogram_samples: restore.histogram_samples,
+            bloom_texels: restore.bloom_texels,
+            tone_pixels: u64::from(self.output_extent[0]) * u64::from(self.output_extent[1]),
+            aa_pixels: aa.pixels,
+            aa_search_reads_bound: aa.search_reads_bound,
+            passes: 1 + aa.passes + restore.passes,
+            draws: 1 + aa.draws,
+        }
+    }
     /// Present the retained HDR only. Geometry admission can pause without
     /// advancing exposure, histogram, bloom or the retained source revision.
     pub fn present_cached(
@@ -861,29 +886,25 @@ impl PostGpu {
         if !self.has_cached_source() {
             return Err(PostError::InvalidConfig);
         }
-        let tone_pixels = u64::from(self.output_extent[0]) * u64::from(self.output_extent[1]);
-        let aa = self
-            .smaa
+        if self
+            .temporal
             .as_ref()
-            .map(|smaa| smaa.pending_work())
-            .unwrap_or_default();
-        let pixels = tone_pixels + aa.pixels;
+            .is_some_and(|owner| owner.candidate.is_some())
+        {
+            return Err(PostError::InvalidPresentation);
+        }
+        let work = self.pending_cached_work();
+        let pixels = work.pixels();
         if pixels > *remaining_pixels {
             return Err(PostError::WorkBudget);
         }
         self.timer.begin();
+        self.encode_temporal_restore(encoder)?;
         self.encode_output(encoder, output);
         self.timer.finish(encoder);
         self.output_requested = false;
         *remaining_pixels -= pixels;
-        Ok(PostWork {
-            tone_pixels,
-            aa_pixels: aa.pixels,
-            aa_search_reads_bound: aa.search_reads_bound,
-            passes: 1 + aa.passes,
-            draws: 1 + aa.draws,
-            ..PostWork::default()
-        })
+        Ok(work)
     }
     fn encode_output(&self, encoder: &mut wgpu::CommandEncoder, output: &wgpu::TextureView) {
         {
@@ -917,6 +938,18 @@ impl PostGpu {
         source_revision: u64,
         remaining_pixels: &mut u64,
     ) -> Result<PostWork, PostError> {
+        if self.temporal.is_some() {
+            return Err(PostError::InvalidPresentation);
+        }
+        self.encode_inner(encoder, output, source_revision, remaining_pixels)
+    }
+    fn encode_inner(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        output: &wgpu::TextureView,
+        source_revision: u64,
+        remaining_pixels: &mut u64,
+    ) -> Result<PostWork, PostError> {
         let work = self.pending_work(source_revision);
         if work.pixels() > *remaining_pixels {
             return Err(PostError::WorkBudget);
@@ -925,32 +958,7 @@ impl PostGpu {
         let changed = self.last_source != Some(source_revision);
         if let Some(auto) = &self.auto {
             if changed {
-                {
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("clear exposure histogram"),
-                        timestamp_writes: self.timer.compute(1),
-                    });
-                    pass.set_pipeline(&auto.reset);
-                    pass.set_bind_group(0, &auto.bind, &[]);
-                    pass.dispatch_workgroups(1, 1, 1);
-                }
-                {
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("measure log luminance"),
-                        timestamp_writes: self.timer.compute(2),
-                    });
-                    pass.set_pipeline(&auto.measure);
-                    pass.set_bind_group(0, &auto.bind, &[]);
-                    pass.dispatch_workgroups(
-                        self.parameters.image[0]
-                            .div_ceil(self.config.histogram_stride)
-                            .div_ceil(8),
-                        self.parameters.image[1]
-                            .div_ceil(self.config.histogram_stride)
-                            .div_ceil(8),
-                        1,
-                    );
-                }
+                self.encode_histogram(encoder);
                 self.adaptation_remaining =
                     8.0 * self.parameters.adaptation[1].max(self.parameters.adaptation[2]);
             }
@@ -964,16 +972,8 @@ impl PostGpu {
                 pass.dispatch_workgroups(1, 1, 1);
             }
         }
-        if changed && let Some(bloom) = &self.bloom {
-            for level in &bloom.levels {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("bounded bloom mip"),
-                    timestamp_writes: self.timer.compute(4),
-                });
-                pass.set_pipeline(self.bloom_pipeline.as_ref().expect("prepared bloom"));
-                pass.set_bind_group(0, &level.bind, &[]);
-                pass.dispatch_workgroups(level.width.div_ceil(8), level.height.div_ceil(8), 1);
-            }
+        if changed {
+            self.encode_bloom(encoder);
         }
         self.encode_output(encoder, output);
         self.timer.finish(encoder);
@@ -984,6 +984,50 @@ impl PostGpu {
         self.output_requested = false;
         *remaining_pixels -= work.pixels();
         Ok(work)
+    }
+    fn encode_histogram(&self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(auto) = &self.auto else {
+            return;
+        };
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("clear exposure histogram"),
+                timestamp_writes: self.timer.compute(1),
+            });
+            pass.set_pipeline(&auto.reset);
+            pass.set_bind_group(0, &auto.bind, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("measure log luminance"),
+                timestamp_writes: self.timer.compute(2),
+            });
+            pass.set_pipeline(&auto.measure);
+            pass.set_bind_group(0, &auto.bind, &[]);
+            pass.dispatch_workgroups(
+                self.parameters.image[0]
+                    .div_ceil(self.config.histogram_stride)
+                    .div_ceil(8),
+                self.parameters.image[1]
+                    .div_ceil(self.config.histogram_stride)
+                    .div_ceil(8),
+                1,
+            );
+        }
+    }
+    fn encode_bloom(&self, encoder: &mut wgpu::CommandEncoder) {
+        if let Some(bloom) = &self.bloom {
+            for level in &bloom.levels {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("bounded bloom mip"),
+                    timestamp_writes: self.timer.compute(4),
+                });
+                pass.set_pipeline(self.bloom_pipeline.as_ref().expect("prepared bloom"));
+                pass.set_bind_group(0, &level.bind, &[]);
+                pass.dispatch_workgroups(level.width.div_ceil(8), level.height.div_ceil(8), 1);
+            }
+        }
     }
 }
 

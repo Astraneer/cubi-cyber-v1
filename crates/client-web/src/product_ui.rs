@@ -193,7 +193,7 @@ impl ProductUi {
                     address: self.layer.app.address.clone(),
                     name: self.layer.app.name.clone(),
                 });
-                self.connecting();
+                self.connecting_request();
                 let _ = self
                     .quality
                     .advance(&self.layer.app, view, now_ms, benchmark);
@@ -297,8 +297,8 @@ impl ProductUi {
         }
         Ok(())
     }
-    pub fn observe_completed(&mut self, id: u64) {
-        match self.presentation.completed(id) {
+    pub fn observe_completed(&mut self, id: u64, source_epoch: u64) {
+        match self.presentation.completed_with_source(id, source_epoch) {
             Some(client::presentation_gate::Event::PrepareGameUi) => {
                 client::presentation_gate::prepare_game_ui(&mut self.layer.app);
             }
@@ -306,8 +306,9 @@ impl ProductUi {
             None => {}
         }
     }
-    pub fn submitted(&mut self, id: u64, world: bool, game_ui: bool) {
-        self.presentation.submitted(id, world, game_ui);
+    pub fn submitted(&mut self, id: u64, world: bool, game_ui: bool, source_epoch: u64) {
+        self.presentation
+            .submitted_with_source(id, world, game_ui, source_epoch);
     }
     pub fn needs_game_ui(&self) -> bool {
         self.presentation.needs_game_ui()
@@ -338,6 +339,13 @@ impl ProductUi {
         let result = self.layer.upload(queue, width, height);
         self.layer.app.screen = screen;
         result
+    }
+    // TAA validates its complete optional allocation before changing the
+    // active session or input-admission gate in the platform shell.
+    fn connecting_request(&mut self) {
+        if self.settings_target().get(ui::settings::Setting::Msaa) != 2 {
+            self.connecting();
+        }
     }
     pub fn connecting(&mut self) {
         self.presentation.reset();
@@ -448,7 +456,7 @@ impl ProductUi {
             match intent {
                 Intent::Connect { address, name } => {
                     self.save_preferences();
-                    self.connecting();
+                    self.connecting_request();
                     self.command = Some(Command::Connect { address, name });
                 }
                 Intent::Disconnect => {
@@ -495,7 +503,7 @@ impl ProductUi {
                             address: self.layer.app.address.clone(),
                             name: self.layer.app.name.clone(),
                         });
-                        self.connecting();
+                        self.connecting_request();
                     }
                 }
                 Intent::SavePreferences => self.save_preferences(),

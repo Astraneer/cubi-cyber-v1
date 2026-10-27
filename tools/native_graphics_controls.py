@@ -122,7 +122,7 @@ def run_graphics(*, text, click, key, painted, capture, motion, wheel, wait, ide
     wait(lambda:f"exposure_percent={initial+25}" in text()[before:],"actual exposure upload missing")
     leave();exposed=shot("exposure-after");exposure_changed=difference(baseline,exposed)
     assert exposure_changed>500,("actual exposure pixels unchanged",exposure_changed)
-    menu("Settings");before=len(text());widget("Setting(Msaa)",True)
+    menu("Settings");before=len(text());widget("Setting(Msaa)",True,3)
     wait(lambda:"NATIVE_UI_STATE screen=Game" in text()[before:] and re.search(r"NATIVE_UI_TIME [^\n]* samples=1 ",text()[before:]) and re.search(r"NATIVE_UI_RENDER [^\n]*smaa=true smaa_bytes=[1-9][0-9]*",text()[before:]),"selected SMAA1x View unavailable",120)
     assert identity()==saved_identity,"graphics reprepare replaced owned identity/credential"
     wait(lambda:re.search(r"NATIVE_UI_WINDOW [^\n]*inventory_items="+str(owned_before)+r"(?: |\n|$)",text()[before:]),"graphics reprepare lost owned inventory")

@@ -51,6 +51,7 @@ impl RemoteNative {
         options: ConnectOptions,
         clock_origin: Instant,
         near: Option<client::near_profile::NearProfile>,
+        temporal: bool,
     ) -> Result<Self, String> {
         let mut network = client::network::NetworkConfig {
             input_lead_ticks: 2,
@@ -60,6 +61,7 @@ impl RemoteNative {
             near.apply_network(&mut network);
         }
         let mut session = client::remote::RemoteSession::new(network)?;
+        session.configure_temporal_identities(temporal);
         let hello = remote_transport::load_identity(&options.identity)?.unwrap_or(net::Hello {
             identity: net::PlayerId::default(),
             name: options.name.clone(),
@@ -183,6 +185,7 @@ struct NativeState {
     in_flight: Arc<AtomicU32>,
     completed_submission: Arc<AtomicU64>,
     drawable: bool,
+    rejected_resize: Option<([u32; 2], u32, u64)>,
     product: Option<Box<product_ui::ProductUi>>,
     ui_loading: Option<mpsc::Receiver<Result<Box<product_ui::Prepared>, String>>>,
     ui_loading_thread: Option<std::thread::JoinHandle<()>>,
@@ -315,6 +318,26 @@ impl NativeState {
             Default::default(),
         )
         .map_err(|error| error.to_string())?;
+        let preparation = loading::Preparation {
+            format: self.config.format,
+            width: self.config.width,
+            height: self.config.height,
+            scene: client::remote::RemoteSession::scene_config(),
+            raster: self.raster,
+            entities: true,
+            props: true,
+            lighting: Some(loading::product_lighting()),
+            materials: true,
+            environment: true,
+            horizon: true,
+            settings: Some(settings),
+        };
+        let antialiasing = preparation.antialiasing_plan(&self.gpu.device)?;
+        if antialiasing.mode == client::antialiasing::Mode::Temporal
+            && let Some(product) = &mut self.product
+        {
+            product.connecting();
+        }
         self.capture(false);
         self.remote = None;
         self.view = None;
@@ -331,25 +354,12 @@ impl NativeState {
             },
             self.network_started,
             Some(near),
+            antialiasing.mode == client::antialiasing::Mode::Temporal,
         )?;
         if let Some(product) = &mut self.product {
             product.layer.app.name = remote.name.clone();
             product.save_preferences();
         }
-        let preparation = loading::Preparation {
-            format: self.config.format,
-            width: self.config.width,
-            height: self.config.height,
-            scene: client::remote::RemoteSession::scene_config(),
-            raster: self.raster,
-            entities: true,
-            props: true,
-            lighting: Some(loading::product_lighting()),
-            materials: true,
-            environment: true,
-            horizon: true,
-            settings: Some(settings),
-        };
         let device = self.gpu.device.clone();
         let queue = self.gpu.queue.clone();
         let (retired_sender, retired_receiver) = mpsc::sync_channel(1);
@@ -562,6 +572,7 @@ impl NativeState {
                         } else {
                             None
                         },
+                        false,
                     )
                 })
                 .transpose()?,
@@ -570,6 +581,7 @@ impl NativeState {
             in_flight: Arc::new(AtomicU32::new(0)),
             completed_submission: Arc::new(AtomicU64::new(0)),
             drawable: size.width != 0 && size.height != 0,
+            rejected_resize: None,
             product: None,
             ui_loading,
             ui_loading_thread,
@@ -586,6 +598,100 @@ impl NativeState {
         if !self.drawable {
             return Ok(());
         }
+        // Keep the candidate's targets alive until its actual presentation is
+        // committed. The next draw retries the window's current dimensions.
+        if self
+            .view
+            .as_deref()
+            .is_some_and(|view| view.pending_presentation_frame().is_some())
+        {
+            return Ok(());
+        }
+        if self.rejected_resize.is_some()
+            && width == self.config.width
+            && height == self.config.height
+        {
+            self.rejected_resize = None;
+            self.surface.configure(&self.gpu.device, &self.config);
+            return Ok(());
+        }
+        let scale = self.product.as_ref().map_or_else(
+            || self.view.as_deref().map_or(100, ClientView::render_scale),
+            |product| product.settings_target().get(ui::settings::Setting::Scale) as u32,
+        );
+        let resize_key = (
+            [width, height],
+            scale,
+            self.view
+                .as_deref()
+                .map_or(0, ClientView::temporal_allocation_bytes),
+        );
+        let temporal = self
+            .view
+            .as_deref()
+            .is_some_and(ClientView::temporal_prepared);
+        let loading_temporal = self.loading.is_some()
+            && self.product.as_ref().is_some_and(|product| {
+                product.settings_target().get(ui::settings::Setting::Msaa) == 2
+            });
+        if (temporal || loading_temporal) && self.rejected_resize == Some(resize_key) {
+            return Ok(());
+        }
+        let rejection = if temporal {
+            self.view
+                .as_deref()
+                .expect("temporal view")
+                .validate_resize(&self.gpu.device, width, height)
+                .err()
+        } else if loading_temporal {
+            let settings = self
+                .product
+                .as_ref()
+                .expect("product loading")
+                .settings_target();
+            client::antialiasing::preflight_graph(
+                2,
+                [width, height],
+                settings.get(ui::settings::Setting::Scale) as u32,
+                self.gpu.device.limits().max_texture_dimension_2d,
+                self.gpu
+                    .device
+                    .features()
+                    .contains(wgpu::Features::TIMESTAMP_QUERY),
+                client::antialiasing::product_capacities(),
+            )
+            .err()
+        } else {
+            None
+        };
+        if let Some(error) = rejection {
+            self.rejected_resize = Some(resize_key);
+            eprintln!(
+                "NATIVE_TAA_RESIZE_REJECTED requested={width}x{height} retained={}x{}: {error}",
+                self.config.width, self.config.height
+            );
+            if let Some(product) = &mut self.product {
+                product.layer.app.set_status(&error);
+                if matches!(
+                    product.layer.app.screen,
+                    ui::app::Screen::Game | ui::app::Screen::Pause | ui::app::Screen::Settings(_)
+                ) {
+                    product
+                        .layer
+                        .app
+                        .open(ui::app::Screen::Settings(ui::settings::Section::Graphics));
+                }
+            }
+            self.window.set_maximized(false);
+            let _ = self
+                .window
+                .request_inner_size(winit::dpi::PhysicalSize::new(
+                    self.config.width,
+                    self.config.height,
+                ));
+            return Ok(());
+        }
+        self.rejected_resize = None;
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.gpu.device, &self.config);
@@ -663,11 +769,9 @@ impl NativeState {
             .device
             .poll(wgpu::PollType::Poll)
             .map_err(|error| error.to_string())?;
+        self.complete_temporal_presentations()?;
         self.collect_quality();
         let mut stages = [None; telemetry::flight::CPU_STAGES.len()];
-        if let Some(product) = &mut self.product {
-            product.observe_completed(self.completed_submission.load(Ordering::Acquire));
-        }
         if let Some(remote) = &mut self.remote
             && let Err(error) = remote.pump_socket()
         {
@@ -712,6 +816,7 @@ impl NativeState {
                 return Err(error.to_string());
             }
         }
+        self.observe_initial_presentation();
         self.cpu_continuations = self.cpu_continuations.saturating_add(1);
         if let Some(product) = &self.product {
             product.report_cpu_continuation(self.cpu_continuations);
@@ -734,11 +839,21 @@ impl NativeState {
             .device
             .poll(wgpu::PollType::Poll)
             .map_err(|error| error.to_string())?;
+        self.complete_temporal_presentations()?;
+        if self
+            .view
+            .as_deref()
+            .is_some_and(ClientView::temporal_prepared)
+        {
+            let size = self.window.inner_size();
+            if size.width != self.config.width || size.height != self.config.height {
+                self.resize(size.width, size.height)?;
+            } else {
+                self.rejected_resize = None;
+            }
+        }
         self.collect_quality();
         self.poll_product_loading()?;
-        if let Some(product) = &mut self.product {
-            product.observe_completed(self.completed_submission.load(Ordering::Acquire));
-        }
         self.poll_loading()?;
         if let Some(product) = &mut self.product {
             product.poll_import(&self.gpu.device, &self.gpu.queue, self.view.as_deref_mut());
@@ -856,6 +971,7 @@ impl NativeState {
                 stages[4] = Some(flight::nanos(upload_started.elapsed()));
             }
         }
+        self.observe_initial_presentation();
         let busy = self.in_flight.load(Ordering::Acquire)
             >= if self.mode != SceneMode::Sky {
                 1
@@ -931,6 +1047,7 @@ impl NativeState {
         let mut used_cached = false;
         let encode_started = Instant::now();
         let mut work = if let Some(view) = self.view.as_deref_mut() {
+            view.set_presentation_frame_id(submission)?;
             let mut encoder =
                 self.gpu
                     .device
@@ -945,28 +1062,38 @@ impl NativeState {
                 .is_some_and(|product| product.displayed_screen() == ui::app::Screen::Loading)
                 && !view.has_cached_present()
                 && !view.initial_scene_inputs_ready();
-            if initial_loading {
-                view.encode_loading_clear(&mut encoder, &output);
-            } else if cached_background && view.encode_cached_present(&mut encoder, &output)? {
-                used_cached = true;
-            } else {
-                let hdr_before = view.renderer_mut().hdr_revision();
-                view.encode(
-                    &self.gpu.queue,
-                    &mut encoder,
-                    &output,
-                    self.config.width,
-                    self.config.height,
-                )?;
-                world_ready = view.renderer_mut().hdr_revision() != hdr_before
-                    && view.is_ready()
-                    && view.has_cached_present();
+            let encoded = (|| -> Result<(), String> {
+                if initial_loading {
+                    view.encode_loading_clear(&mut encoder, &output);
+                } else if cached_background && view.encode_cached_present(&mut encoder, &output)? {
+                    used_cached = true;
+                } else {
+                    let hdr_before = view.renderer_mut().hdr_revision();
+                    view.encode(
+                        &self.gpu.queue,
+                        &mut encoder,
+                        &output,
+                        self.config.width,
+                        self.config.height,
+                    )?;
+                    world_ready = view.renderer_mut().hdr_revision() != hdr_before
+                        && view.is_ready()
+                        && view.has_cached_present();
+                }
+                Ok(())
+            })();
+            if let Err(error) = encoded {
+                view.discard_presentation(submission).map_err(|rollback| {
+                    format!("{error}; presentation rollback failed: {rollback}")
+                })?;
+                return Err(error);
             }
             if let Some(product) = &mut self.product {
                 product.layer.encode(&mut encoder, &output);
             }
             let ticket = self.flight.encode(view, &mut encoder);
             self.gpu.queue.submit([encoder.finish()]);
+            view.mark_presentation_submitted(submission)?;
             if let Some(ticket) = ticket {
                 self.flight.submitted(ticket);
             }
@@ -1016,6 +1143,9 @@ impl NativeState {
                 submission,
                 world_ready && product.layer.app.snapshot.connected,
                 game_ui,
+                self.view
+                    .as_deref()
+                    .map_or(0, ClientView::props_source_epoch),
             );
         }
         stages[6] = Some(flight::nanos(present_started.elapsed()));
@@ -1047,6 +1177,30 @@ impl NativeState {
             }
         }
         Ok(Some(ready))
+    }
+    /// Network/derived CPU progress must discover source revocations before a
+    /// completed initial World/HUD submission can admit input.
+    fn observe_initial_presentation(&mut self) {
+        let source_epoch = self
+            .view
+            .as_deref()
+            .map_or(0, ClientView::props_source_epoch);
+        if let Some(product) = &mut self.product {
+            product.observe_completed(
+                self.completed_submission.load(Ordering::Acquire),
+                source_epoch,
+            );
+        }
+    }
+    fn complete_temporal_presentations(&mut self) -> Result<(), String> {
+        let completed = self.completed_submission.load(Ordering::Acquire);
+        if let Some(view) = self.view.as_deref_mut()
+            && let Some(frame) = view.pending_presentation_frame()
+            && frame <= completed
+        {
+            view.commit_presentation(frame)?;
+        }
+        Ok(())
     }
     fn collect_quality(&mut self) {
         if let Some(product) = &mut self.product {

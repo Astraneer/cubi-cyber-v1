@@ -1558,7 +1558,15 @@ impl UiApp {
             let mut text = TextBuffer::default();
             let value = self.settings.get(def.id);
             if def.id == Setting::Msaa {
-                let _ = write!(text, "{}", if value == 1 { "SMAA 1x" } else { "MSAA 4x" });
+                let _ = write!(
+                    text,
+                    "{}",
+                    match value {
+                        1 => "SMAA 1x",
+                        2 => "TAA 1x",
+                        _ => "MSAA 4x",
+                    }
+                );
             } else if def.id == Setting::ViewTime {
                 let _ = write!(
                     text,

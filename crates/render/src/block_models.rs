@@ -201,6 +201,7 @@ pub enum BlockError {
     InvalidCamera,
     UploadBudget,
     InvalidIndex,
+    RevisionOverflow,
 }
 impl std::fmt::Display for BlockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -235,6 +236,9 @@ struct ShadowResources {
 }
 pub struct BlockModelsGpu {
     config: BlockConfig,
+    sample_count: u32,
+    shader_features: [bool; 4],
+    temporal_raster: bool,
     instances: wgpu::Buffer,
     vertices: wgpu::Buffer,
     indirect: wgpu::Buffer,
@@ -252,6 +256,9 @@ pub struct BlockModelsGpu {
     shadow_kind_counts: [u32; MODEL_KINDS],
     revision: u64,
     shadow_revision: u64,
+    source_valid: bool,
+    source_epoch: u64,
+    shadow_damage_unknown: bool,
     shadow_damage: ShadowDamageTracker,
     model_bounds: [ModelRange; MODEL_KINDS],
     last: Option<(Camera, u64)>,
@@ -525,15 +532,7 @@ impl BlockModelsGpu {
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("GPU static block frustum buckets"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!(
-                    "{}\n{}\n{}",
-                    crate::shadows::footprint::COMMON,
-                    crate::shadows::footprint::MODEL,
-                    include_str!("block_models_cull.wgsl")
-                )
-                .into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(cull_shader_source().into()),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("block model compute"),
@@ -609,6 +608,14 @@ impl BlockModelsGpu {
         };
         Ok(Self {
             config,
+            sample_count,
+            shader_features: [
+                shadows.is_some(),
+                atmosphere.is_some(),
+                gi.is_some(),
+                geometry.ambient_mrt,
+            ],
+            temporal_raster: false,
             instances,
             vertices,
             indirect,
@@ -626,6 +633,9 @@ impl BlockModelsGpu {
             shadow_kind_counts: [0; MODEL_KINDS],
             revision: 0,
             shadow_revision: 0,
+            source_valid: true,
+            source_epoch: 0,
+            shadow_damage_unknown: false,
             shadow_damage: ShadowDamageTracker::new(config.max_instances as usize),
             model_bounds: catalog.ranges,
             last: None,
@@ -842,6 +852,47 @@ impl BlockModelsGpu {
             self.active |= 1 << instance.kind;
         }
     }
+    /// Revoke this family's content without walking or rewriting instance rows.
+    /// Resource availability and every other caster remain unchanged.
+    pub fn revoke_source(&mut self) -> Result<(), BlockError> {
+        self.change_source_validity(false, true).map(|_| ())
+    }
+    pub fn set_source_valid(&mut self, valid: bool) -> Result<bool, BlockError> {
+        self.change_source_validity(valid, false)
+    }
+    fn change_source_validity(&mut self, valid: bool, force: bool) -> Result<bool, BlockError> {
+        if self.source_valid == valid && !force {
+            return Ok(false);
+        }
+        let epoch = self
+            .source_epoch
+            .checked_add(1)
+            .ok_or(BlockError::RevisionOverflow)?;
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(BlockError::RevisionOverflow)?;
+        let shadow = self
+            .shadow_revision
+            .checked_add(1)
+            .ok_or(BlockError::RevisionOverflow)?;
+        self.source_valid = valid;
+        self.source_epoch = epoch;
+        self.revision = revision;
+        self.shadow_revision = shadow;
+        self.shadow_damage_unknown = true;
+        self.last = None;
+        Ok(true)
+    }
+    pub fn source_valid(&self) -> bool {
+        self.source_valid
+    }
+    pub fn source_epoch(&self) -> u64 {
+        self.source_epoch
+    }
+    pub fn invalidate_prepared_frame(&mut self) {
+        self.last = None;
+    }
     pub fn prepare_frame(
         &mut self,
         queue: &wgpu::Queue,
@@ -855,6 +906,9 @@ impl BlockModelsGpu {
             .any(|v| !v.is_finite())
         {
             return Err(BlockError::InvalidCamera);
+        }
+        if !self.source_valid {
+            return Ok(BlockWork::default());
         }
         if self.last == Some((camera, self.revision)) {
             return Ok(BlockWork::default());
@@ -895,6 +949,9 @@ impl BlockModelsGpu {
         pass.dispatch_workgroups((self.previous.len() as u32).max(1).div_ceil(64), 1, 1);
     }
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> u32 {
+        if !self.source_valid {
+            return 0;
+        }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind, &[]);
         let mut draws = self.draw_buckets(pass, &self.indirect);
@@ -915,6 +972,69 @@ impl BlockModelsGpu {
     }
     pub fn indirect_buffer(&self) -> &wgpu::Buffer {
         &self.indirect
+    }
+    pub fn prepare_temporal_raster(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Result<BlockWork, BlockError> {
+        if self.temporal_raster {
+            return Ok(BlockWork::default());
+        }
+        if !self.temporal_raster_preparable() {
+            return Err(BlockError::InvalidConfig);
+        }
+        let [shadows, atmosphere, gi, ambient] = self.shader_features;
+        let source = crate::model_motion_shader::block_color(&shader_source_with_ambient(
+            shadows, atmosphere, gi, ambient,
+        )?)
+        .map_err(|_| BlockError::InvalidConfig)?;
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("optional invariant block temporal raster"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let layout = self.pipeline.get_bind_group_layout(0);
+        self.pipeline = render_pipeline(device, &layout, &shader, false, false, 1, ambient);
+        self.glass = render_pipeline(device, &layout, &shader, false, true, 1, ambient);
+        self.temporal_raster = true;
+        self.work.pipeline_compilations += 2;
+        Ok(BlockWork {
+            pipeline_compilations: 2,
+            ..Default::default()
+        })
+    }
+    pub fn temporal_raster_prepared(&self) -> bool {
+        self.temporal_raster
+    }
+    pub fn temporal_raster_preparable(&self) -> bool {
+        self.temporal_raster
+            || (self.sample_count == 1
+                && self
+                    .previous
+                    .iter()
+                    .all(|record| record.flags & HIDDEN != 0)
+                && self.last.is_none())
+    }
+    pub fn instance_records(&self) -> &[BlockInstance] {
+        &self.previous
+    }
+    pub fn instance_capacity(&self) -> u32 {
+        self.config.max_instances
+    }
+    pub fn primary_draw_mask(&self) -> u32 {
+        if self.source_valid { self.active } else { 0 }
+    }
+    pub fn colored_transporter_count(&self) -> u32 {
+        if self.source_valid {
+            self.colored_transporters
+        } else {
+            0
+        }
+    }
+    pub fn primary_render_bind(&self) -> &wgpu::BindGroup {
+        &self.bind
+    }
+    pub fn primary_render_layout(&self) -> wgpu::BindGroupLayout {
+        self.pipeline.get_bind_group_layout(0)
     }
     pub fn model_vertex_buffer(&self) -> &wgpu::Buffer {
         &self.vertices
@@ -968,7 +1088,7 @@ impl DynamicShadowCaster for BlockModelsGpu {
         self.shadow_revision
     }
     fn visit_shadow_damage(&self, previous: [u64; 4], visit: &mut dyn FnMut(WorldBounds)) -> bool {
-        if previous[1..].iter().any(|v| *v != 0) {
+        if self.shadow_damage_unknown || previous[1..].iter().any(|v| *v != 0) {
             return false;
         }
         self.shadow_damage.visit(
@@ -984,6 +1104,7 @@ impl DynamicShadowCaster for BlockModelsGpu {
     }
     fn commit_shadow_damage(&mut self) {
         self.shadow_damage.commit(self.shadow_revision);
+        self.shadow_damage_unknown = false;
     }
     fn prepare_shadow(
         &mut self,
@@ -1007,6 +1128,9 @@ impl DynamicShadowCaster for BlockModelsGpu {
         let Some(shadow) = &self.shadow else {
             return ShadowPrepareWork::default();
         };
+        if !self.source_valid {
+            return ShadowPrepareWork::default();
+        }
         if self.shadow_kind_counts.iter().all(|n| *n == 0) {
             return ShadowPrepareWork::default();
         }
@@ -1068,12 +1192,12 @@ impl DynamicShadowCaster for BlockModelsGpu {
             );
             work.upload_bytes += 16;
         }
-        work.bounds_complete = true;
+        work.bounds_complete = !self.shadow_damage_unknown;
         work
     }
     fn draw_shadow(&self, pass: &mut wgpu::RenderPass<'_>, cascade: usize) -> u32 {
         let Some(s) = &self.shadow else { return 0 };
-        if self.previous.is_empty() {
+        if !self.source_valid || self.previous.is_empty() {
             return 0;
         }
         pass.set_pipeline(&s.pipeline);
@@ -1193,6 +1317,15 @@ fn buffer_binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'
     }
 }
 /// Loading/tooling source generated by the exact constructor path.
+/// Exact constructor compute source, also used by native/Dawn source oracles.
+pub fn cull_shader_source() -> String {
+    format!(
+        "{}\n{}\n{}",
+        crate::shadows::footprint::COMMON,
+        crate::shadows::footprint::MODEL,
+        include_str!("block_models_cull.wgsl")
+    )
+}
 pub fn shader_source(shadows: bool, atmosphere: bool, gi: bool) -> Result<String, BlockError> {
     if gi && !atmosphere {
         return Err(BlockError::InvalidConfig);

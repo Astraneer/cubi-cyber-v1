@@ -898,3 +898,426 @@ mod vertical_public_fixture_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod camera_quant_public_fixture_tests {
+    use super::*;
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+    };
+
+    const PLAN: &[u8] =
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/public-plan.chj5");
+    const RESULT: &[u8] =
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/public-result.chr4");
+    const COARSE: &[u8] =
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/public-height-L3--1--3.hti2");
+    const HEIGHT_PACKETS: [&[u8]; 2] = [
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/height-0-0-3-2.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/height-0-0-3-3.cubi"),
+    ];
+    const BODY_PACKETS: [&[u8]; 16] = [
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-0-2.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-1-2.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-2-2.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-3-2.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-4-2.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-5-2.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-6-2.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-7-2.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-0-3.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-1-3.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-2-3.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-3-3.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-4-3.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-5-3.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-6-3.cubi"),
+        include_bytes!("../../tests/fixtures/horizon_camera_quant/geometry-0-3-7-3.cubi"),
+    ];
+    const NEW_KEYS: [HeightKey; 2] = [
+        HeightKey {
+            space: 0,
+            level: 0,
+            x: 3,
+            z: 2,
+        },
+        HeightKey {
+            space: 0,
+            level: 0,
+            x: 3,
+            z: 3,
+        },
+    ];
+
+    fn captured() -> Box<PlanTask> {
+        let BackgroundTask::Plan(plan) = decode_task(PLAN).unwrap() else {
+            panic!("captured public plan")
+        };
+        plan
+    }
+    fn providers() -> (Vec<net::height::HeightTile>, Vec<net::PublicGeometry>) {
+        let heights = HEIGHT_PACKETS
+            .into_iter()
+            .map(|packet| {
+                let net::ServerMessage::Height(tile) = net::decode_server(packet).unwrap() else {
+                    panic!("actual public Height packet")
+                };
+                *tile
+            })
+            .collect();
+        let bodies = BODY_PACKETS
+            .into_iter()
+            .map(|packet| {
+                let net::ServerMessage::Geometry(body) = net::decode_server(packet).unwrap() else {
+                    panic!("actual public Geometry BODY packet")
+                };
+                *body
+            })
+            .collect();
+        (heights, bodies)
+    }
+    fn certificate_snapshot(
+        plan: &PlanTask,
+    ) -> Vec<(HeightKey, net::height::HeightErrorBound, u64, bool)> {
+        plan.certificates
+            .iter()
+            .map(|c| (c.key, c.bound, c.seam_error_q1024, c.exact_replacement))
+            .collect()
+    }
+    fn runtime_plan() -> Box<PlanTask> {
+        let mut plan = captured();
+        assert_eq!(plan.certificates.len(), 337);
+        assert_eq!(
+            plan.certificates
+                .iter()
+                .filter(|c| c.exact_replacement)
+                .count(),
+            66
+        );
+        let coarse = net::height::decode(COARSE).unwrap();
+        assert_eq!(
+            coarse.key,
+            HeightKey {
+                space: 0,
+                level: 3,
+                x: -1,
+                z: -3
+            }
+        );
+        assert_eq!(coarse.source, 1);
+        assert!(matches!(coarse.replacement, Replacement::None));
+        assert!(!plan.certificates.iter().any(|c| c.key == coarse.key));
+        let seam = seam_error_q1024(&coarse.heights);
+        assert_eq!(seam, 8192, "actual production seam, not a guessed constant");
+        let bound = coarse.error.unwrap();
+        assert_eq!(
+            (bound.max_error_q1024, bound.min_height, bound.max_height),
+            (78848, 49, 126)
+        );
+        plan.certificates.push(Certificate {
+            key: coarse.key,
+            bound,
+            seam_error_q1024: seam,
+            exact_replacement: false,
+        });
+        plan.certificates.sort_unstable_by_key(|c| c.key);
+        // Actual captured physical pose, transformed by the SAME helper used by
+        // the live View. No new World, generator, Raw or client-state injection.
+        let bins = horizon_camera_bins([30.5, 81.62, -3.5], 90., -28.500003814697266).unwrap();
+        assert_eq!(bins.eye_min, [24., 80., -8.]);
+        assert_eq!(bins.eye_max, [32., 88., 0.]);
+        assert_eq!(
+            (
+                plan.config.max_tiles,
+                plan.config.max_sources,
+                plan.config.max_proxy_pages
+            ),
+            (4096, 8192, 512)
+        );
+        let p = plan.projection.as_mut().unwrap();
+        p.eye_min = bins.eye_min;
+        p.eye_max = bins.eye_max;
+        p.view_direction = bins.view_direction;
+        p.view_cosine =
+            libm::cos((libm::atan(p.diagonal_tangent) + bins.margin).min(std::f64::consts::PI));
+        p.max_abs_forward_y = bins.max_abs_forward_y;
+        p.validate().unwrap();
+        assert_eq!((p.target_pixels, p.hysteresis_pixels), (32., 8.));
+        plan
+    }
+
+    // Test-only evidence gate: even though a Column is already an exact plan
+    // hint, this INPUT proof requires ALL actual bodies and their CPU proxy jobs
+    // before promoting either certificate. It does not certify GPU residence.
+    fn ready_provider_keys(
+        plan: &PlanTask,
+        heights: &[net::height::HeightTile],
+        bodies: &[net::PublicGeometry],
+    ) -> Result<BTreeSet<HeightKey>, &'static str> {
+        if heights.len() != 2 || bodies.len() != 16 {
+            return Err("complete actual provider set required");
+        }
+        let mut by_page = BTreeMap::new();
+        for body in bodies {
+            body.validate()
+                .map_err(|_| "invalid production Geometry body")?;
+            if body.known != [255; 512]
+                || body
+                    .palette
+                    .iter()
+                    .any(|s| u32::from(s.atlas_layer) >= plan.config.atlas_layers)
+                || by_page.insert(body.page, body).is_some()
+            {
+                return Err("unknown/invalid/duplicate public provider");
+            }
+        }
+        let mut keys = BTreeSet::new();
+        let mut all_known = [255; 37];
+        all_known[36] = 1;
+        for height in heights {
+            height
+                .validate()
+                .map_err(|_| "invalid actual Height image")?;
+            if !NEW_KEYS.contains(&height.key)
+                || height.known != all_known
+                || !keys.insert(height.key)
+            {
+                return Err("unexpected/duplicate/incomplete actual Height image");
+            }
+            let old = plan
+                .certificates
+                .iter()
+                .find(|c| c.key == height.key)
+                .ok_or("missing original certificate")?;
+            if old.exact_replacement
+                || height.error != Some(old.bound)
+                || seam_error_q1024(&height.heights) != old.seam_error_q1024
+            {
+                return Err("captured certificate and actual provider bound disagree");
+            }
+            let Replacement::Column {
+                min_y,
+                max_y,
+                geometry,
+            } = &height.replacement
+            else {
+                return Err("real Column manifest required");
+            };
+            if (*min_y, *max_y, geometry.len()) != (0, 7, 8) {
+                return Err("actual full eight-page Column required");
+            }
+            for stamp in geometry {
+                let body = by_page
+                    .get(&stamp.page)
+                    .ok_or("missing actual Geometry body")?;
+                if body.source_version != stamp.source || body.view_version != stamp.view {
+                    return Err("actual body source/view disagrees with Column manifest");
+                }
+            }
+        }
+        if keys != BTreeSet::from(NEW_KEYS) {
+            return Err("two distinct actual columns required");
+        }
+        // Normal production worker performs packed public decoding/protection
+        // and builds each actual proxy. No GPU/device or synthetic voxel data.
+        for (index, body) in bodies.iter().enumerate() {
+            ProxyTask {
+                stamp: GeometryStamp {
+                    page: body.page,
+                    source: body.source_version,
+                    view: body.view_version,
+                },
+                revision: index as u64 + 1,
+                atlas_layers: plan.config.atlas_layers,
+                input: Arc::new(body.clone()),
+                separate_water: false,
+            }
+            .execute()
+            .map_err(|_| "production public proxy worker refused body")?;
+        }
+        Ok(keys)
+    }
+    fn apply_ready_providers(
+        plan: &mut PlanTask,
+        heights: &[net::height::HeightTile],
+        bodies: &[net::PublicGeometry],
+    ) -> Result<(), &'static str> {
+        // Validate every provider first, so failure never partially promotes.
+        let keys = ready_provider_keys(plan, heights, bodies)?;
+        for certificate in &mut plan.certificates {
+            if keys.contains(&certificate.key) {
+                certificate.exact_replacement = true;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn camera_quant_actual_captured_chj5_replays_native_chr4_byte_exact() {
+        assert_eq!(
+            execute_background_request(PLAN, || false)
+                .unwrap()
+                .as_slice(),
+            RESULT
+        );
+        let plan = captured();
+        let result = plan.execute().unwrap();
+        assert_eq!(result.plan.tiles.len(), 253);
+        assert_eq!(result.quality.missing_certificates, 0);
+        assert_eq!(result.quality.leaf_limited, 8);
+        assert_eq!(result.exact_leaves.len(), 8);
+        assert!(!result.quality.capacity_limited);
+        assert!((result.quality.maximum_error_pixels - 59.07427071838394).abs() < 1e-10);
+    }
+    #[test]
+    fn camera_quant_two_real_providers_do_not_hide_the_old_view_bin_failure() {
+        let mut old = captured();
+        let (heights, bodies) = providers();
+        apply_ready_providers(&mut old, &heights, &bodies).unwrap();
+        let result = old.execute().unwrap();
+        assert!(result.quality.leaf_limited > 0);
+        assert!(result.quality.maximum_error_pixels > 32.);
+    }
+    #[test]
+    fn camera_quant_actual_providers_complete_input_quality_without_demoting_old_66_flags() {
+        let unready = runtime_plan().execute().unwrap();
+        assert_eq!(unready.quality.missing_certificates, 0);
+        assert_eq!(unready.quality.leaf_limited, 2);
+        assert_eq!(unready.exact_leaves.len(), 2);
+        assert!(unready.quality.maximum_error_pixels > 32.);
+        let mut plan = runtime_plan();
+        let before = certificate_snapshot(&plan);
+        let (heights, bodies) = providers();
+        assert_eq!(bodies.len(), 16);
+        apply_ready_providers(&mut plan, &heights, &bodies).unwrap();
+        let mut changed = 0;
+        for (old, current) in before.iter().zip(&plan.certificates) {
+            assert_eq!(
+                (current.key, current.bound, current.seam_error_q1024),
+                (old.0, old.1, old.2)
+            );
+            assert!(
+                !old.3 || current.exact_replacement,
+                "never demote an existing exact certificate"
+            );
+            if old.3 != current.exact_replacement {
+                assert!(NEW_KEYS.contains(&current.key));
+                changed += 1;
+            }
+        }
+        assert_eq!(changed, 2);
+        assert_eq!(
+            plan.certificates
+                .iter()
+                .filter(|c| c.exact_replacement)
+                .count(),
+            68
+        );
+        let exact = plan
+            .certificates
+            .iter()
+            .filter(|c| c.exact_replacement)
+            .map(|c| c.key)
+            .collect::<BTreeSet<_>>();
+        let result = plan.execute().unwrap();
+        assert_eq!(result.plan.tiles.len(), 205);
+        assert_eq!(result.quality.missing_certificates, 0);
+        assert_eq!(result.quality.leaf_limited, 0);
+        assert!(!result.quality.capacity_limited);
+        assert!(
+            result.quality.maximum_error_pixels <= 32.,
+            "strict actual requested quality"
+        );
+        assert!((result.quality.maximum_error_pixels - 31.943942751554673).abs() < 1e-10);
+        assert!(result.exact_leaves.is_empty());
+        let selected_exact = result
+            .plan
+            .tiles
+            .iter()
+            .map(|t| wire_key(t.key))
+            .filter(|k| exact.contains(k))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(selected_exact.len(), 63);
+        assert!(BTreeSet::from(NEW_KEYS).is_subset(&selected_exact));
+        // This lower bound is not a manifest/GPU-slot claim for the other61.
+        assert_eq!(selected_exact.len() * 8, 504);
+    }
+    #[test]
+    fn camera_quant_missing_wrong_body_or_changed_bound_never_partially_promotes() {
+        let (heights, bodies) = providers();
+        let refused = |hs: &[net::height::HeightTile], bs: &[net::PublicGeometry]| {
+            let mut plan = runtime_plan();
+            let before = certificate_snapshot(&plan);
+            assert!(apply_ready_providers(&mut plan, hs, bs).is_err());
+            assert_eq!(certificate_snapshot(&plan), before);
+        };
+        refused(&heights, &[]); // Bare manifests do not certify this input proof.
+        refused(&heights, &bodies[..15]);
+        let mut wrong = bodies.clone();
+        wrong[15].view_version += 1;
+        refused(&heights, &wrong);
+        let mut wrong = bodies.clone();
+        wrong[15].source_version.0 += 1;
+        refused(&heights, &wrong);
+        let mut wrong = heights.clone();
+        wrong[1].error.as_mut().unwrap().max_error_q1024 += 1024;
+        refused(&wrong, &bodies);
+        let mut corrupt = BODY_PACKETS[0].to_vec();
+        corrupt[35] ^= 1;
+        assert!(
+            net::decode_server(&corrupt).is_err(),
+            "production codec checks actual public packet integrity"
+        );
+    }
+    #[test]
+    fn camera_quant_live_bins_contain_render_eye_and_orientation_at_boundary_and_world_edges() {
+        for x in [
+            -30_000_000f32,
+            -8.000001,
+            -8.,
+            -0.000001,
+            0.,
+            7.9999995,
+            8.,
+            8.000001,
+            30_000_000.,
+        ] {
+            for yaw in [
+                -180f64, -175., -0.000001, 0., 9.999999, 10., 179.999999, 180.,
+            ] {
+                for pitch in [
+                    -90f64, -89.999999, -30., -29.999999, -0.000001, 0., 9.999999, 10., 89.999999,
+                    90.,
+                ] {
+                    let eye = [x, -x, 0.];
+                    let bins = horizon_camera_bins(eye, yaw, pitch).unwrap();
+                    for (axis, actual) in eye.into_iter().enumerate() {
+                        assert!(
+                            bins.eye_min[axis] <= f64::from(actual)
+                                && f64::from(actual) <= bins.eye_max[axis]
+                        );
+                        assert_eq!(bins.eye_max[axis] - bins.eye_min[axis], 8.);
+                    }
+                    let (y, p) = (yaw.to_radians(), pitch.to_radians());
+                    let actual = [
+                        libm::sin(y) * libm::cos(p),
+                        libm::sin(p),
+                        libm::cos(y) * libm::cos(p),
+                    ];
+                    let dot = bins
+                        .view_direction
+                        .into_iter()
+                        .zip(actual)
+                        .map(|(a, b)| a * b)
+                        .sum::<f64>();
+                    assert!(
+                        dot >= libm::cos(bins.margin),
+                        "actual axis remains inside the complete immutable bin"
+                    );
+                    assert!(actual[1].abs() <= bins.max_abs_forward_y);
+                }
+            }
+        }
+    }
+}

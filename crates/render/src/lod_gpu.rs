@@ -515,6 +515,10 @@ pub struct LodProxyGpu {
     counters: Option<wgpu::Buffer>,
     render_bind: wgpu::BindGroup,
     cutout_bind: wgpu::BindGroup,
+    render_layout: wgpu::BindGroupLayout,
+    temporal_raster: bool,
+    sample_count: u32,
+    lighting_features: [bool; 2],
     cull_bind: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
     cutout_pipeline: wgpu::RenderPipeline,
@@ -884,6 +888,10 @@ impl LodProxyGpu {
             counters,
             render_bind,
             cutout_bind,
+            render_layout,
+            temporal_raster: false,
+            sample_count,
+            lighting_features: [shadows.is_some(), atmosphere.is_some()],
             cull_bind,
             pipeline,
             cutout_pipeline,
@@ -1197,6 +1205,9 @@ impl LodProxyGpu {
     }
     /// Explicit attachment width for asymmetric projections; the compatibility
     /// method above infers the aspect of standard symmetric camera matrices.
+    pub fn invalidate_prepared_frame(&mut self) {
+        self.last_frame = None;
+    }
     pub fn prepare_frame_extent(
         &mut self,
         queue: &wgpu::Queue,
@@ -1281,6 +1292,122 @@ impl LodProxyGpu {
     }
     pub fn indirect_buffer(&self) -> &wgpu::Buffer {
         &self.indirect
+    }
+    pub fn primary_render_bind(&self) -> &wgpu::BindGroup {
+        &self.render_bind
+    }
+    pub fn primary_cutout_bind(&self) -> &wgpu::BindGroup {
+        &self.cutout_bind
+    }
+    pub fn primary_render_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.render_layout
+    }
+    pub fn sample_count(&self) -> u32 {
+        self.sample_count
+    }
+    pub fn temporal_raster_prepared(&self) -> bool {
+        self.temporal_raster
+    }
+    pub fn temporal_raster_preparable(&self) -> bool {
+        self.temporal_raster
+            || (self.sample_count == 1
+                && self.last_frame.is_none()
+                && self.slots.iter().all(|slot| slot.span.is_none()))
+    }
+    pub fn temporal_slot_generations(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+        self.slots.iter().map(|slot| {
+            if slot.span.is_some() {
+                slot.generation
+            } else {
+                0
+            }
+        })
+    }
+    /// Optional single-sample temporal linkage. This does not replace either
+    /// primary visibility bucket or change ordinary MSAA/SMAA preparation.
+    pub fn prepare_temporal_raster(&mut self, device: &wgpu::Device) -> Result<u32, ProxyError> {
+        if self.temporal_raster {
+            return Ok(0);
+        }
+        if !self.temporal_raster_preparable() {
+            return Err(ProxyError::InvalidConfig);
+        }
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("optional invariant public proxy layout"),
+            bind_group_layouts: &[&self.render_layout],
+            push_constant_ranges: &[],
+        });
+        let make = |source: String, cutout: bool| -> Result<wgpu::RenderPipeline, ProxyError> {
+            let pattern = "@builtin(position)position:vec4<f32>";
+            if !source.contains(pattern) {
+                return Err(ProxyError::InvalidConfig);
+            }
+            let source = source.replacen(
+                pattern,
+                "@builtin(position)@invariant position:vec4<f32>",
+                1,
+            );
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("same public proxy geometry with invariant temporal linkage"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            Ok(
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("optional exact-depth temporal proxy color"),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vertex"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        topology: if cutout {
+                            wgpu::PrimitiveTopology::TriangleStrip
+                        } else {
+                            wgpu::PrimitiveTopology::TriangleList
+                        },
+                        cull_mode: Some(wgpu::Face::Back),
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: true,
+                        depth_compare: wgpu::CompareFunction::GreaterEqual,
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: Default::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fragment"),
+                        compilation_options: Default::default(),
+                        targets: &crate::ambient_mrt::targets(None, self.ambient_mrt),
+                    }),
+                    multiview: None,
+                    cache: None,
+                }),
+            )
+        };
+        let features = self.lighting_features;
+        let opaque = make(
+            shader_source(
+                features[0],
+                features[1],
+                self.ambient_mrt,
+                self.config.instrument,
+            ),
+            false,
+        )?;
+        let cutout = make(
+            cutout_shader_source(features[0], features[1], self.ambient_mrt),
+            true,
+        )?;
+        self.pipeline = opaque;
+        self.cutout_pipeline = cutout;
+        self.temporal_raster = true;
+        self.work.pipeline_compilations += 2;
+        Ok(2)
     }
     pub fn take_work(&mut self) -> ProxyWork {
         std::mem::take(&mut self.work)

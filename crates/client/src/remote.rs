@@ -46,6 +46,11 @@ pub struct RemoteSession {
     humans: crate::remote_humans::RemoteHumans,
     props_restore_cursor: Option<core_types::PageId>,
     water_courier: water::Courier,
+    motion_identities: Option<MotionIdentities>,
+}
+struct MotionIdentities {
+    keys: Vec<render::presented_motion::ObjectKey>,
+    humans: Box<[net::PlayerId; 64]>,
 }
 impl RemoteSession {
     pub fn new(config: NetworkConfig) -> Result<Self, String> {
@@ -73,9 +78,21 @@ impl RemoteSession {
             height_interest: BTreeSet::new(),
             props_restore_cursor: None,
             water_courier: water::Courier::new(),
+            motion_identities: None,
             humans: crate::remote_humans::RemoteHumans::new(64)
                 .map_err(|e| format!("public human capacity: {e:?}"))?,
         })
+    }
+    /// Loading/reprepare only. Ordinary profiles keep this bank absent.
+    pub fn configure_temporal_identities(&mut self, enabled: bool) {
+        if enabled && self.motion_identities.is_none() {
+            self.motion_identities = Some(MotionIdentities {
+                keys: Vec::with_capacity(self.entity_instances.len()),
+                humans: Box::new([net::PlayerId::default(); 64]),
+            });
+        } else if !enabled {
+            self.motion_identities = None;
+        }
     }
     pub fn scene_config() -> SceneConfig {
         SceneConfig {
@@ -170,9 +187,27 @@ impl RemoteSession {
                 .entity_replica()
                 .instances(space, time, [0; 3], &mut self.entity_instances)
                 .map_err(|e| format!("public entity interpolation: {e:?}"))?;
-            let humans = self
-                .humans
-                .write(
+            let keyed = view.temporal_entity_identities_prepared();
+            if keyed && self.motion_identities.is_none() {
+                return Err("temporal entity identity bank was not prepared during loading".into());
+            }
+            let humans = if keyed {
+                self.humans.write_with_identities(
+                    self.connection.remote_players_tick(),
+                    time,
+                    self.connection.remote_players(),
+                    welcome.identity,
+                    space,
+                    [0; 3],
+                    &mut self.entity_instances[count..],
+                    self.motion_identities
+                        .as_mut()
+                        .expect("prepared temporal identities")
+                        .humans
+                        .as_mut(),
+                )
+            } else {
+                self.humans.write(
                     self.connection.remote_players_tick(),
                     time,
                     self.connection.remote_players(),
@@ -181,7 +216,8 @@ impl RemoteSession {
                     [0; 3],
                     &mut self.entity_instances[count..],
                 )
-                .map_err(|e| format!("public human interpolation: {e:?}"))?;
+            }
+            .map_err(|e| format!("public human interpolation: {e:?}"))?;
             let tick = Tick(time.floor() as u64);
             let alpha = time.fract();
             let packets = self
@@ -206,11 +242,57 @@ impl RemoteSession {
                     &mut self.entity_instances[count + humans..],
                 )
                 .map_err(|e| format!("public packet interpolation: {e:?}"))?;
-            view.set_remote_entities(
-                &self.entity_instances[..count + humans + packets],
-                space,
-                [0; 3],
-            )?;
+            if keyed {
+                use crate::model_motion_identity as identities;
+                let bank = self
+                    .motion_identities
+                    .as_mut()
+                    .expect("prepared temporal identities");
+                bank.keys.clear();
+                for value in &self.entity_instances[..count] {
+                    let family = if value.kind >= 6 {
+                        identities::ITEM
+                    } else {
+                        identities::MOB
+                    };
+                    bank.keys.push(
+                        render::presented_motion::ObjectKey::native(
+                            family,
+                            space.0,
+                            u64::from(value.id_low) | (u64::from(value.id_high) << 32),
+                        )
+                        .map_err(|error| format!("actor motion identity: {error:?}"))?,
+                    );
+                }
+                for id in &bank.humans[..humans] {
+                    bank.keys.push(
+                        identities::human(space.0, *id)
+                            .map_err(|error| format!("human motion identity: {error:?}"))?,
+                    );
+                }
+                for value in &self.entity_instances[count + humans..count + humans + packets] {
+                    bank.keys.push(
+                        render::presented_motion::ObjectKey::native(
+                            identities::PACKET,
+                            space.0,
+                            u64::from(value.id_low) | (u64::from(value.id_high) << 32),
+                        )
+                        .map_err(|error| format!("packet motion identity: {error:?}"))?,
+                    );
+                }
+                view.set_remote_entities_with_identities(
+                    &self.entity_instances[..count + humans + packets],
+                    &bank.keys,
+                    space,
+                    [0; 3],
+                )?;
+            } else {
+                view.set_remote_entities(
+                    &self.entity_instances[..count + humans + packets],
+                    space,
+                    [0; 3],
+                )?;
+            }
         }
         if self.configured && self.connection.player().is_some() {
             self.pump_horizon(view, now_ms)?;

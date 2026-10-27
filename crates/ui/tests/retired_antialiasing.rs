@@ -5,7 +5,7 @@ fn retired_taa_values_survive_every_supported_storage_version_without_selecting_
     assert_eq!(COUNT, 32);
     for stored in [29, 30, COUNT] {
         for legacy in [0, 1] {
-            for canonical in [1, 4] {
+            for canonical in [1, 4, 2] {
                 let mut settings = Settings::default();
                 settings.set(Setting::Msaa, canonical).unwrap();
                 settings.set(Setting::Taa, legacy).unwrap();
@@ -30,13 +30,13 @@ fn retirement_removes_pending_work_without_claiming_any_backend_receipt() {
     assert!(!Setting::Msaa.is_retired());
     assert_eq!(SCHEMA.iter().filter(|def| def.id.is_retired()).count(), 1);
     assert_eq!(pending_graphics_mask(0) & retired, 0);
-    // No TAA receipt exists, but every active backend was acknowledged.
+    // The retired compatibility slot has no receipt; active AA uses Msaa.
     let actual_receipts = u32::MAX & !retired;
     assert_eq!(actual_receipts & retired, 0);
     assert_eq!(pending_graphics_mask(actual_receipts), 0);
     let msaa = 1u32 << Setting::Msaa as u32;
     assert_eq!(pending_graphics_mask(actual_receipts & !msaa), msaa);
-    assert!(!SCHEMA[Setting::Msaa as usize].domain.accepts(2));
+    assert!(SCHEMA[Setting::Msaa as usize].domain.accepts(2));
 }
 
 #[test]

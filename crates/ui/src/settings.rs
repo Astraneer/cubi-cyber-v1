@@ -150,7 +150,7 @@ pub const SCHEMA: [Definition; COUNT] = [
         32,
         4
     ),
-    choice!(Msaa, Graphics, "Сглаживание MSAA/SMAA", &[1, 4], 4, 4),
+    choice!(Msaa, Graphics, "Сглаживание", &[1, 4, 2], 4, 4),
     choice!(Shadows, Graphics, "Тени", &[0, 1], 1, 1),
     choice!(
         ShadowResolution,

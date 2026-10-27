@@ -69,11 +69,11 @@ pub struct Work {
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
-struct BoardGpu {
-    center: [f32; 4],
-    right_width: [f32; 4],
-    up_height: [f32; 4],
-    codes: [u32; 4],
+pub(crate) struct BoardGpu {
+    pub(crate) center: [f32; 4],
+    pub(crate) right_width: [f32; 4],
+    pub(crate) up_height: [f32; 4],
+    pub(crate) codes: [u32; 4],
 }
 const _: () = assert!(std::mem::size_of::<BoardGpu>() == INSTANCE_BYTES as usize);
 #[repr(C)]
@@ -84,6 +84,7 @@ struct CameraGpu {
 }
 pub struct RecipeBoardGpu {
     pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
     bind: wgpu::BindGroup,
     instances: wgpu::Buffer,
     camera: wgpu::Buffer,
@@ -329,6 +330,7 @@ impl RecipeBoardGpu {
         });
         Ok(Self {
             pipeline,
+            layout,
             bind,
             instances,
             camera,
@@ -501,6 +503,18 @@ impl RecipeBoardGpu {
     }
     pub fn active_boards(&self) -> u32 {
         self.active
+    }
+    pub fn capacity(&self) -> u32 {
+        self.current.len() as u32
+    }
+    pub(crate) fn primary_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.layout
+    }
+    pub(crate) fn primary_bind(&self) -> &wgpu::BindGroup {
+        &self.bind
+    }
+    pub(crate) fn uploaded_records(&self) -> &[BoardGpu] {
+        &self.current
     }
     pub fn take_work(&mut self) -> Work {
         std::mem::take(&mut self.work)

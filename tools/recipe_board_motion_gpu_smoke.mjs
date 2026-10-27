@@ -1,0 +1,40 @@
+// Actual primary invariant VS + depth-Equal namespace19 production shader.
+// Orthographic card gives an independent f64 reprojection reference at every pixel.
+import assert from 'node:assert/strict';
+import {readFile,writeFile} from 'node:fs/promises';
+import {withBrowser} from './browser.mjs';
+const root=process.argv[2]??'.local/recipe-board-motion-shaders';
+const input={color:await readFile(root+'/color.wgsl','utf8'),motion:await readFile(root+'/motion.wgsl','utf8')};
+async function run(input){
+ const adapter=await navigator.gpu.requestAdapter();if(!adapter)throw Error('WebGPU adapter missing');const device=await adapter.requestDevice(),errors=[];device.addEventListener('uncapturederror',e=>errors.push(e.error.message));device.pushErrorScope('validation');
+ const B=GPUBufferUsage,T=GPUTextureUsage,S=GPUShaderStage;
+ const buffer=(size,usage,data)=>{const b=device.createBuffer({size,usage});if(data)device.queue.writeBuffer(b,0,data);return b;};
+ const module=async code=>{const m=device.createShaderModule({code});const bad=(await m.getCompilationInfo()).messages.filter(m=>m.type==='error');if(bad.length)throw Error(JSON.stringify(bad));return m;};const colorModule=await module(input.color),motionModule=await module(input.motion);
+ const bufferEntry=(binding,visibility,type)=>({binding,visibility,buffer:{type}}),resource=(binding,buffer)=>({binding,resource:{buffer}});
+ const primaryLayout=device.createBindGroupLayout({entries:[bufferEntry(0,S.VERTEX,'uniform'),bufferEntry(1,S.VERTEX,'read-only-storage'),{binding:2,visibility:S.FRAGMENT,texture:{viewDimension:'2d-array',sampleType:'float'}},{binding:3,visibility:S.FRAGMENT,sampler:{type:'filtering'}}]});
+ const extraLayout=device.createBindGroupLayout({entries:[bufferEntry(0,S.VERTEX|S.FRAGMENT,'uniform'),bufferEntry(1,S.VERTEX,'read-only-storage'),bufferEntry(2,S.VERTEX,'read-only-storage')]});
+ const camera=buffer(80,B.UNIFORM|B.COPY_DST),current=buffer(64,B.STORAGE|B.COPY_DST),previous=buffer(64,B.STORAGE|B.COPY_DST),pairs=buffer(32,B.STORAGE|B.COPY_DST),params=buffer(96,B.UNIFORM|B.COPY_DST);
+ const atlas=device.createTexture({size:[1,1,1],format:'rgba8unorm-srgb',usage:T.TEXTURE_BINDING|T.COPY_DST});device.queue.writeTexture({texture:atlas},new Uint8Array([255,255,255,255]),{bytesPerRow:4},[1,1]);const sampler=device.createSampler();
+ const primary=device.createBindGroup({layout:primaryLayout,entries:[resource(0,camera),resource(1,current),{binding:2,resource:atlas.createView({dimension:'2d-array'})},{binding:3,resource:sampler}]}),extra=device.createBindGroup({layout:extraLayout,entries:[resource(0,params),resource(1,previous),resource(2,pairs)]});
+ const primitive={cullMode:'back'};
+ const color=await device.createRenderPipelineAsync({layout:device.createPipelineLayout({bindGroupLayouts:[primaryLayout]}),vertex:{module:colorModule,entryPoint:'vertex'},fragment:{module:colorModule,entryPoint:'fragment',targets:[{format:'rgba16float'}]},primitive,depthStencil:{format:'depth32float',depthCompare:'greater-equal',depthWriteEnabled:true}});
+ const motion=await device.createRenderPipelineAsync({layout:device.createPipelineLayout({bindGroupLayouts:[primaryLayout,extraLayout]}),vertex:{module:motionModule,entryPoint:'motion_vertex'},fragment:{module:motionModule,entryPoint:'motion_fragment',targets:[{format:'rgba16float'},{format:'rgba32uint'}]},primitive,depthStencil:{format:'depth32float',depthCompare:'equal',depthWriteEnabled:false}});
+ const texture=(format,usage)=>device.createTexture({size:[32,32],format,usage});const colorTarget=texture('rgba16float',T.RENDER_ATTACHMENT),depth=texture('depth32float',T.RENDER_ATTACHMENT),vectors=texture('rgba16float',T.RENDER_ATTACHMENT|T.COPY_SRC),identity=texture('rgba32uint',T.RENDER_ATTACHMENT|T.COPY_SRC);
+ const matrix=offset=>{const m=new Float32Array(16);for(let i=0;i<4;i++)m[i*5]=1;m[12]=offset;return m;};
+ const record=enabled=>{const a=new ArrayBuffer(64),f=new Float32Array(a),u=new Uint32Array(a);f.set([0,0,.5,0,1,0,0,1.5,0,1,0,1.5]);u.set([0,0x0f0f0f00,Number(enabled),0],12);return a;};
+ const half=h=>{const e=h>>10&31,m=h&1023,sign=h&32768?-1:1;return e===0?sign*m*2**-24:sign*(1+m/1024)*2**(e-15);};
+ async function capture({offset=0,previousOffset=0,jitter=[0,0],oldEnabled=true,enabled=true,generation=1,oldGeneration=1,uid=[0x76543210,0xfedcba98],oldUid=[0x76543210,0xfedcba98],history=true}){
+  const cm=new Float32Array(20);cm.set(matrix(offset));cm[12]+=jitter[0]/16;cm[13]-=jitter[1]/16;device.queue.writeBuffer(camera,0,cm);device.queue.writeBuffer(current,0,record(enabled));device.queue.writeBuffer(previous,0,record(oldEnabled));
+  const a=new ArrayBuffer(96),f=new Float32Array(a),u=new Uint32Array(a);f.set(matrix(previousOffset));f.set([1/32,1/32,...jitter],16);u.set([Number(history),0,0,0],20);device.queue.writeBuffer(params,0,a);device.queue.writeBuffer(pairs,0,new Uint32Array([0,...uid,generation,0,...oldUid,oldGeneration]));
+  const e=device.createCommandEncoder();let p=e.beginRenderPass({colorAttachments:[{view:colorTarget.createView(),clearValue:[0,0,0,0],loadOp:'clear',storeOp:'store'}],depthStencilAttachment:{view:depth.createView(),depthClearValue:0,depthLoadOp:'clear',depthStoreOp:'store'}});p.setPipeline(color);p.setBindGroup(0,primary);p.draw(6);p.end();
+  p=e.beginRenderPass({colorAttachments:[{view:vectors.createView(),clearValue:[0,0,0,0],loadOp:'clear',storeOp:'store'},{view:identity.createView(),clearValue:[0,0,0,0],loadOp:'clear',storeOp:'store'}],depthStencilAttachment:{view:depth.createView(),depthReadOnly:true}});p.setPipeline(motion);p.setBindGroup(0,primary);p.setBindGroup(1,extra);p.draw(6);p.end();
+  const read=buffer(24576,B.MAP_READ|B.COPY_DST);e.copyTextureToBuffer({texture:vectors},{buffer:read,bytesPerRow:256},[32,32]);e.copyTextureToBuffer({texture:identity},{buffer:read,offset:8192,bytesPerRow:512},[32,32]);device.queue.submit([e.finish()]);await read.mapAsync(GPUMapMode.READ);const memory=read.getMappedRange().slice(0),v=new Uint16Array(memory,0,4096),ids=new Uint32Array(memory,8192,4096);const out=Array.from({length:1024},(_,i)=>({v:Array.from({length:4},(_,c)=>half(v[i*4+c])),id:[...ids.slice(i*4,i*4+4)]}));read.unmap();read.destroy();return out;
+ }
+ const results=[];for(const options of[{history:false},{},{offset:-.125,jitter:[-.25,.125]},{offset:-.25,jitter:[.375,-.25]},{generation:2},{uid:[0x76543211,0xfedcba98]},{enabled:false}]){
+  const pixels=await capture(options);let known=0,valid=0,staticZero=0,maxError=0;for(const p of pixels){if(p.id[0]>>>24!==19)continue;known++;if(p.id[1]!==((options.uid??[0x76543210])[0]>>>0)||p.id[2]!==0xfedcba98||p.id[3]!== (options.generation??1))throw Error('lossy namespace/session identity');const reject=options.history===false||options.generation===2||Boolean(options.uid);if(reject){if(p.v.some(v=>v!==0))throw Error('new/lifetime/session seeded old motion');continue;}if(p.v[3]!==1)throw Error('Equal motion omitted visible known card');valid++;const want=-(options.offset??0)/2,error=Math.abs(p.v[0]-want);maxError=Math.max(maxError,error);if(error>Math.max(Math.abs(want)/2048,2**-24)||Math.abs(p.v[1])>2**-24||p.v[2]!==.5)throw Error(JSON.stringify({options,p,want,error}));if(p.v[0]===0&&p.v[1]===0)staticZero++;}
+  if(options.enabled===false){if(known)throw Error('hidden card retained ID');}else if(known<550)throw Error('primary and Equal coverage disagree');if(!Object.keys(options).length&&staticZero!==known)throw Error('static vectors not EXACT0');results.push({options,known,valid,staticZero,maxError});
+ }
+ const validation=await device.popErrorScope();if(validation||errors.length)throw Error(JSON.stringify({validation:validation?.message,errors}));device.destroy();return{ownedBytesFor9:960,extraTimingSources:0,results};
+}
+const result=await withBrowser({path:'/recipe-board-motion19',width:64,height:64},async({evaluate})=>evaluate('('+run.toString()+')('+JSON.stringify(input)+')'));
+assert.equal(result.results.length,7);await writeFile('.local/recipe-board-motion-dawn-proof.json',JSON.stringify(result,null,2)+'\n');console.log('DAWN_RECIPE_BOARD_MOTION19_OK '+JSON.stringify(result));

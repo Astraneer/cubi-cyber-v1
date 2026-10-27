@@ -119,6 +119,9 @@ struct EntityShadow {
 }
 pub struct EntityGpu {
     config: EntityConfig,
+    sample_count: u32,
+    shader_features: [bool; 4],
+    temporal_raster: bool,
     item_layers: u32,
     instances: wgpu::Buffer,
     lights: wgpu::Buffer,
@@ -622,15 +625,7 @@ impl EntityGpu {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("GPU entity frustum model buckets"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!(
-                    "{}\n{}\n{}",
-                    crate::shadows::footprint::COMMON,
-                    crate::shadows::footprint::MODEL,
-                    include_str!("entity_cull.wgsl")
-                )
-                .into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(cull_shader_source().into()),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("entity cull pipeline"),
@@ -798,6 +793,14 @@ impl EntityGpu {
         };
         Ok(Self {
             config,
+            sample_count,
+            shader_features: [
+                shadows.is_some(),
+                atmosphere.is_some(),
+                gi.is_some(),
+                geometry.ambient_mrt,
+            ],
+            temporal_raster: false,
             item_layers,
             instances,
             lights,
@@ -954,6 +957,11 @@ impl EntityGpu {
     pub fn instance_records(&self) -> &[EntityInstance] {
         &self.previous
     }
+    /// The recorded cull did not execute. Keep source records and identity,
+    /// but require the next encoder to rebuild its actual primary lists.
+    pub fn invalidate_prepared_frame(&mut self) {
+        self.last_frame = None;
+    }
     pub fn prepare_frame(
         &mut self,
         queue: &wgpu::Queue,
@@ -1010,6 +1018,94 @@ impl EntityGpu {
     }
     pub fn indirect_buffer(&self) -> &wgpu::Buffer {
         &self.indirect
+    }
+    /// Optional loading-only invariant color variant, sharing its exact pose
+    /// function with the separate depth-equal motion pass. Default is unchanged.
+    pub fn prepare_temporal_raster(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Result<EntityWork, EntityError> {
+        if self.temporal_raster {
+            return Ok(EntityWork::default());
+        }
+        if !self.temporal_raster_preparable() {
+            return Err(EntityError::InvalidConfig);
+        }
+        let [shadows, atmosphere, gi, ambient] = self.shader_features;
+        let source = crate::model_motion_shader::entity_color(&shader_source_with_ambient(
+            shadows, atmosphere, gi, ambient,
+        )?)
+        .map_err(|_| EntityError::InvalidConfig)?;
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("optional invariant entity temporal raster"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let bind_layout = self.pipeline.get_bind_group_layout(0);
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("entity temporal color uses the existing bind"),
+            bind_group_layouts: &[&bind_layout],
+            push_constant_ranges: &[],
+        });
+        let attributes = crate::model_motion_shader::entity_vertex_attributes();
+        let targets = crate::ambient_mrt::targets(None, ambient);
+        self.pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("optional invariant single-sample entity color"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vertex"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &attributes,
+                }],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fragment"),
+                compilation_options: Default::default(),
+                targets: &targets,
+            }),
+            multiview: None,
+            cache: None,
+        });
+        self.temporal_raster = true;
+        self.work.pipeline_compilations += 1;
+        Ok(EntityWork {
+            pipeline_compilations: 1,
+            ..Default::default()
+        })
+    }
+    pub fn temporal_raster_prepared(&self) -> bool {
+        self.temporal_raster
+    }
+    pub fn temporal_raster_preparable(&self) -> bool {
+        self.temporal_raster
+            || (self.sample_count == 1 && self.previous.is_empty() && self.last_frame.is_none())
+    }
+    pub fn instance_capacity(&self) -> u32 {
+        self.config.max_entities
+    }
+    pub fn primary_render_bind(&self) -> &wgpu::BindGroup {
+        &self.render_bind
+    }
+    /// Loading only; the motion owner retains this layout rather than querying
+    /// it while encoding frames.
+    pub fn primary_render_layout(&self) -> wgpu::BindGroupLayout {
+        self.pipeline.get_bind_group_layout(0)
     }
     pub fn model_vertex_buffer(&self) -> &wgpu::Buffer {
         &self.vertices
@@ -1232,6 +1328,15 @@ fn buffer_binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'
 }
 
 /// Loading/tooling source generated by the exact constructor path.
+/// Exact constructor compute source, also used by native/Dawn source oracles.
+pub fn cull_shader_source() -> String {
+    format!(
+        "{}\n{}\n{}",
+        crate::shadows::footprint::COMMON,
+        crate::shadows::footprint::MODEL,
+        include_str!("entity_cull.wgsl")
+    )
+}
 pub fn shader_source(shadows: bool, atmosphere: bool, gi: bool) -> Result<String, EntityError> {
     if gi && !atmosphere {
         return Err(EntityError::InvalidConfig);

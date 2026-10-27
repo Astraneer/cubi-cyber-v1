@@ -104,6 +104,195 @@ fn contents_events_and_unknown_pages_never_invent_models() {
     source.detach(&mut world);
 }
 #[test]
+fn temporal_publication_tracks_only_successful_gpu_slots_and_never_reuses_a_lifetime() {
+    use render::{
+        block_models::{BlockConfig, BlockModelsGpu},
+        terrain_gpu::{AtlasImage, GpuConfig, TerrainGpu, UploadBudget},
+    };
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    let terrain = TerrainGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        64,
+        64,
+        render::OutputTransfer::Attachment,
+        GpuConfig {
+            max_pages: 8,
+            max_quads: 8192,
+            occlusion: false,
+        },
+        &AtlasImage::donor().unwrap(),
+    )
+    .unwrap();
+    let mut models = BlockModelsGpu::new(
+        &gpu.device,
+        &gpu.queue,
+        terrain.geometry(),
+        BlockConfig {
+            max_instances: 16,
+            atlas_layers: 186,
+        },
+        None,
+    )
+    .unwrap();
+    models
+        .reserve_slots(&gpu.queue, 16, &mut UploadBudget::new(1024))
+        .unwrap();
+    let mut world = fixture();
+    let mut source = PropsSource::attach(&mut world, limits()).unwrap();
+    assert_eq!(source.temporal_registration_bytes(), 0);
+    assert!(source.prepare_temporal_publications().unwrap());
+    assert_eq!(
+        source.temporal_registration_bytes(),
+        limits().max_instances * 8
+    );
+    finish(&mut source, &world);
+    let mut events = Vec::with_capacity(16);
+    assert_eq!(
+        source
+            .flush_sampled_with_publications(
+                &gpu.queue,
+                &mut models,
+                [0; 3],
+                &mut UploadBudget::new(0),
+                16,
+                |_| None,
+                |event| events.push(event)
+            )
+            .unwrap(),
+        0
+    );
+    assert!(events.is_empty());
+    assert_eq!(
+        source
+            .flush_sampled_with_publications(
+                &gpu.queue,
+                &mut models,
+                [0; 3],
+                &mut UploadBudget::new(192),
+                16,
+                |_| None,
+                |event| events.push(event)
+            )
+            .unwrap(),
+        3
+    );
+    assert_eq!(events.len(), 3);
+    let original = *events
+        .iter()
+        .find(|event| event.position == Some(p(2)))
+        .unwrap();
+    assert_ne!(original.registration, 0);
+    let original_gpu = models.instance_records()[original.slot as usize];
+    events.clear();
+    let mut tx = Transaction::new(Tick(2), SpaceId(0));
+    tx.set_cell(p(2), Cell::AIR);
+    world.commit(tx).unwrap();
+    source.ingest(&mut world, 64, |_| u32::MAX).unwrap();
+    source
+        .flush_sampled_with_publications(
+            &gpu.queue,
+            &mut models,
+            [0; 3],
+            &mut UploadBudget::new(0),
+            16,
+            |_| None,
+            |event| events.push(event),
+        )
+        .unwrap();
+    assert!(events.is_empty());
+    assert_eq!(
+        models.instance_records()[original.slot as usize],
+        original_gpu
+    );
+    source
+        .flush_sampled_with_publications(
+            &gpu.queue,
+            &mut models,
+            [0; 3],
+            &mut UploadBudget::new(64),
+            16,
+            |_| None,
+            |event| events.push(event),
+        )
+        .unwrap();
+    assert_eq!(
+        events,
+        &[PropsPublication {
+            slot: original.slot,
+            position: None,
+            registration: original.registration
+        }]
+    );
+    events.clear();
+    let mut tx = Transaction::new(Tick(3), SpaceId(0));
+    tx.set_cell(p(2), Cell::from_parts(rules::ids::CHEST, 3));
+    world.commit(tx).unwrap();
+    source.ingest(&mut world, 64, |_| u32::MAX).unwrap();
+    source
+        .flush_sampled_with_publications(
+            &gpu.queue,
+            &mut models,
+            [0; 3],
+            &mut UploadBudget::new(64),
+            16,
+            |_| None,
+            |event| events.push(event),
+        )
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].slot, original.slot);
+    assert_eq!(events[0].position, original.position);
+    assert_ne!(events[0].registration, original.registration);
+    let second = events[0];
+    // A complete CPU remove/recreate may occur while the GPU still shows the
+    // previous chest. Its next publication must change lifetime even when the
+    // eventual64B pose happens to be exactly equal to the old visible record.
+    for (tick, cell) in [(4, Cell::AIR), (5, Cell::from_parts(rules::ids::CHEST, 3))] {
+        let mut tx = Transaction::new(Tick(tick), SpaceId(0));
+        tx.set_cell(p(2), cell);
+        world.commit(tx).unwrap();
+        source.ingest(&mut world, 64, |_| u32::MAX).unwrap();
+    }
+    events.clear();
+    source
+        .flush_sampled_with_publications(
+            &gpu.queue,
+            &mut models,
+            [0; 3],
+            &mut UploadBudget::new(64),
+            16,
+            |_| None,
+            |event| events.push(event),
+        )
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].position, original.position);
+    assert_ne!(events[0].registration, second.registration);
+    let scope = telemetry::AllocationScope::begin().unwrap();
+    for _ in 0..1000 {
+        assert_eq!(
+            source
+                .flush_sampled_with_publications(
+                    &gpu.queue,
+                    &mut models,
+                    [0; 3],
+                    &mut UploadBudget::new(0),
+                    16,
+                    |_| None,
+                    |_| panic!("idle publication")
+                )
+                .unwrap(),
+            0
+        );
+    }
+    let allocations = scope.finish();
+    assert_eq!(allocations.allocating_calls(), 0);
+    assert_eq!(allocations.dealloc_calls, 0);
+    source.detach(&mut world);
+}
+#[test]
 fn actual_world_models_publish_stable_gpu_records_light_and_public_animation() {
     pollster::block_on(async {
         use render::{

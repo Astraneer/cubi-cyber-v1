@@ -59,6 +59,7 @@ struct BrowserState {
     product: Option<product_ui::ProductUi>,
     socket: Option<browser_network::BrowserSocket>,
     resetting: bool,
+    rejected_resize: Option<([u32; 2], u32, u64)>,
     recorder: Option<telemetry::flight::FlightRecorder>,
     gpu_capture: Option<client::capture::FrameGpuCapture>,
     last_present_ms: f64,
@@ -265,6 +266,69 @@ impl BrowserState {
         let width = (f64::from(self.canvas.client_width().max(1)) * ratio).round() as u32;
         let height = (f64::from(self.canvas.client_height().max(1)) * ratio).round() as u32;
         if width != self.config.width || height != self.config.height {
+            // A pending candidate still owns these targets. Recheck the DOM
+            // extent on the next callback after its completion is committed.
+            if self.view.pending_presentation_frame().is_some() {
+                return Ok(());
+            }
+            let scale = self
+                .product
+                .as_ref()
+                .map_or(self.view.render_scale(), |product| {
+                    product.settings_target().get(ui::settings::Setting::Scale) as u32
+                });
+            let resize_key = (
+                [width, height],
+                scale,
+                self.view.temporal_allocation_bytes(),
+            );
+            let temporal = self.view.temporal_prepared();
+            let loading_temporal = self.resetting
+                && self.product.as_ref().is_some_and(|product| {
+                    product.settings_target().get(ui::settings::Setting::Msaa) == 2
+                });
+            if (temporal || loading_temporal) && self.rejected_resize == Some(resize_key) {
+                return Ok(());
+            }
+            let rejection = if temporal {
+                self.view
+                    .validate_resize(&self.gpu.device, width, height)
+                    .err()
+            } else if loading_temporal {
+                product_antialiasing_plan(
+                    &self.gpu.device,
+                    [width, height],
+                    self.product
+                        .as_ref()
+                        .expect("product loading")
+                        .settings_target(),
+                )
+                .err()
+            } else {
+                None
+            };
+            if let Some(error) = rejection {
+                self.rejected_resize = Some(resize_key);
+                // Keep the old intrinsic canvas, Surface and View. CSS may scale
+                // that retained image; no unsupported GPU targets are created.
+                if let Some(product) = &mut self.product {
+                    product.layer.app.set_status(&error);
+                    if matches!(
+                        product.layer.app.screen,
+                        ui::app::Screen::Game
+                            | ui::app::Screen::Pause
+                            | ui::app::Screen::Settings(_)
+                    ) {
+                        product
+                            .layer
+                            .app
+                            .open(ui::app::Screen::Settings(ui::settings::Section::Graphics));
+                    }
+                }
+                web_sys::console::warn_1(&js_error(&error));
+                return Ok(());
+            }
+            self.rejected_resize = None;
             self.canvas.set_width(width);
             self.canvas.set_height(height);
             self.config.width = width;
@@ -276,6 +340,8 @@ impl BrowserState {
                     .resize(&self.gpu.device, width, height)
                     .map_err(js_error)?;
             }
+        } else {
+            self.rejected_resize = None;
         }
         Ok(())
     }
@@ -363,25 +429,23 @@ impl BrowserState {
         }
         Ok(())
     }
+    /// GPU callbacks only signal completion; the window thread commits the
+    /// matching presented transaction before admitting another encode.
+    fn complete_temporal_presentations(&mut self) -> Result<(), JsValue> {
+        let completed = u64::from(self.completed_submission.load(Ordering::Acquire));
+        if let Some(frame) = self.view.pending_presentation_frame()
+            && frame <= completed
+        {
+            self.view.commit_presentation(frame).map_err(js_error)?;
+        }
+        Ok(())
+    }
     /// Bounded CPU/network/worker progress, with no GPU queue or surface access.
     fn advance_cpu(&mut self, now: f64) -> Result<(), JsValue> {
         let started = clock_ms();
-        if let Some(product) = &mut self.product {
-            product.observe_completed(u64::from(self.completed_submission.load(Ordering::Acquire)));
-        }
+        self.complete_temporal_presentations()?;
         let elapsed = (now - self.last_ms).max(0.0) / 1000.0;
         self.last_ms = now;
-        if self.product.is_none()
-            || self
-                .socket
-                .as_ref()
-                .is_some_and(|socket| socket.session().connection().welcome().is_some())
-        {
-            self.view
-                .set_movement_replay_time((now.max(0.0) * 1_000_000.0).min(u64::MAX as f64) as u64)
-                .map_err(js_error)?;
-            self.view.advance_input(elapsed).map_err(js_error)?;
-        }
         if !self.resetting
             && let Some(socket) = &mut self.socket
         {
@@ -396,6 +460,20 @@ impl BrowserState {
                 product.sync_quality(&mut self.view, now as u64, false);
             }
         }
+        // Import current Raw/LIGHT/public-model sources before their bounded
+        // CPU phase, matching Native. A new public-model frame must not sit
+        // behind this frame's already-consumed public queue at upload time.
+        if self.product.is_none()
+            || self
+                .socket
+                .as_ref()
+                .is_some_and(|socket| socket.session().connection().welcome().is_some())
+        {
+            self.view
+                .set_movement_replay_time((now.max(0.0) * 1_000_000.0).min(u64::MAX as f64) as u64)
+                .map_err(js_error)?;
+            self.view.advance_input(elapsed).map_err(js_error)?;
+        }
         let simulation_end = clock_ms();
         self.presentation_probe.arm(
             self.view.edit_revision(),
@@ -403,6 +481,14 @@ impl BrowserState {
         );
         if !self.resetting {
             self.pump()?;
+        }
+        // Network/derived progress above discovers revocations before an old
+        // initial World/HUD completion can admit input in this CPU turn.
+        if let Some(product) = &mut self.product {
+            product.observe_completed(
+                u64::from(self.completed_submission.load(Ordering::Acquire)),
+                self.view.props_source_epoch(),
+            );
         }
         let jobs_end = clock_ms();
         let ns = |ms: f64| (ms.max(0.) * 1_000_000.) as u64;
@@ -421,6 +507,7 @@ impl BrowserState {
                 }
             });
         }
+        self.complete_temporal_presentations()?;
         self.observe_presentations();
         self.resize()?;
         let now = web_sys::window()
@@ -529,6 +616,13 @@ impl BrowserState {
             Err(error) => return Err(js_error(format!("WebGPU frame failed:{error}"))),
         };
         let output = frame.texture.create_view(&Default::default());
+        let submitted = self
+            .submitted
+            .checked_add(1)
+            .ok_or("frame sequence exhausted")?;
+        self.view
+            .set_presentation_frame_id(u64::from(submitted))
+            .map_err(js_error)?;
         let mut world_ready = false;
         let mut used_cached = false;
         let mut encoder = self
@@ -540,52 +634,56 @@ impl BrowserState {
         if let Some(capture) = &mut self.gpu_capture {
             capture.begin_frame(&mut encoder, self.gpu.queue.get_timestamp_period());
         }
-        if initial_loading {
-            self.view.encode_loading_clear(&mut encoder, &output);
-        } else if draw_world {
-            if cached_background
-                && self
-                    .view
-                    .encode_cached_present(&mut encoder, &output)
-                    .map_err(js_error)?
-            {
-                used_cached = true;
-            } else {
-                let hdr_before = self.view.renderer_mut().hdr_revision();
-                self.view
-                    .encode(
+        let encoded = (|| -> Result<(), String> {
+            if initial_loading {
+                self.view.encode_loading_clear(&mut encoder, &output);
+            } else if draw_world {
+                if cached_background && self.view.encode_cached_present(&mut encoder, &output)? {
+                    used_cached = true;
+                } else {
+                    let hdr_before = self.view.renderer_mut().hdr_revision();
+                    self.view.encode(
                         &self.gpu.queue,
                         &mut encoder,
                         &output,
                         self.config.width,
                         self.config.height,
-                    )
-                    .map_err(js_error)?;
-                world_ready = self.view.renderer_mut().hdr_revision() != hdr_before
-                    && self.view.is_ready()
-                    && self.view.has_cached_present();
+                    )?;
+                    world_ready = self.view.renderer_mut().hdr_revision() != hdr_before
+                        && self.view.is_ready()
+                        && self.view.has_cached_present();
+                }
+            } else {
+                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("product menu background"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &output,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.02,
+                                g: 0.03,
+                                b: 0.04,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
             }
-        } else {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("product menu background"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &output,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.02,
-                            g: 0.03,
-                            b: 0.04,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+            Ok(())
+        })();
+        if let Err(error) = encoded {
+            self.view
+                .discard_presentation(u64::from(submitted))
+                .map_err(|rollback| {
+                    js_error(format!("{error}; presentation rollback failed: {rollback}"))
+                })?;
+            return Err(js_error(error));
         }
         if let Some(product) = &mut self.product {
             product.layer.encode(&mut encoder, &output);
@@ -593,27 +691,22 @@ impl BrowserState {
         let ticket = self.gpu_capture.as_mut().and_then(|capture| {
             if draw_world && !initial_loading {
                 self.view
-                    .encode_gpu_capture(capture, &mut encoder, u64::from(self.submitted) + 1)
+                    .encode_gpu_capture(capture, &mut encoder, u64::from(submitted))
             } else {
-                capture.encode_sources(
-                    std::iter::empty(),
-                    &mut encoder,
-                    u64::from(self.submitted) + 1,
-                )
+                capture.encode_sources(std::iter::empty(), &mut encoder, u64::from(submitted))
             }
         });
         let encode_end = clock_ms();
         self.gpu.queue.submit([encoder.finish()]);
+        self.view
+            .mark_presentation_submitted(u64::from(submitted))
+            .map_err(js_error)?;
         self.ui_pending = false;
         if let (Some(capture), Some(ticket)) = (&mut self.gpu_capture, ticket) {
             capture.submitted(ticket);
         }
         frame.present();
-        self.submitted = self
-            .submitted
-            .checked_add(1)
-            .ok_or("frame sequence exhausted")?;
-        let submitted = self.submitted;
+        self.submitted = submitted;
         self.ui_submission.submitted(
             u64::from(submitted),
             self.product.as_ref().and_then(|product| {
@@ -634,7 +727,12 @@ impl BrowserState {
                     product.layer.app.screen,
                     ui::app::Screen::Game | ui::app::Screen::Death
                 );
-            product.submitted(u64::from(submitted), world_ready, game_ui);
+            product.submitted(
+                u64::from(submitted),
+                world_ready,
+                game_ui,
+                self.view.props_source_epoch(),
+            );
         }
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         let pending_cpu_ns = std::mem::take(&mut self.pending_cpu_ns);
@@ -677,7 +775,7 @@ impl BrowserState {
         let in_flight = self.in_flight.clone();
         let completed = self.completed_submission.clone();
         let presentation = self.presentation_completion.clone();
-        let revision = self.view.rendered_edit_revision();
+        let revision = self.view.presentation_edit_revision();
         self.gpu.queue.on_submitted_work_done(move || {
             let mut progress = presentation
                 .lock()
@@ -775,30 +873,51 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
     };
     match command {
         product_ui::Command::Connect { address, name } => {
-            let near = {
-                let mut borrowed = state.borrow_mut();
-                let settings = borrowed
-                    .product
-                    .as_ref()
-                    .map(|product| product.settings_target().clone())
-                    .unwrap_or_default();
-                match client::near_profile::NearProfile::plan(
-                    settings.get(ui::settings::Setting::Near) as u16,
-                    Default::default(),
-                ) {
-                    Ok(near) => near,
-                    Err(error) => {
-                        if let Some(product) = &mut borrowed.product {
-                            product.layer.app.set_status(error.message());
-                            product
-                                .layer
-                                .app
-                                .open(ui::app::Screen::Settings(ui::settings::Section::Graphics));
+            let (near, antialiasing) =
+                {
+                    let mut borrowed = state.borrow_mut();
+                    let settings = borrowed
+                        .product
+                        .as_ref()
+                        .map(|product| product.settings_target().clone())
+                        .unwrap_or_default();
+                    let antialiasing = match product_antialiasing_plan(
+                        &borrowed.gpu.device,
+                        [borrowed.config.width, borrowed.config.height],
+                        &settings,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            if let Some(product) = &mut borrowed.product {
+                                product.layer.app.set_status(&error);
+                                product.layer.app.open(ui::app::Screen::Settings(
+                                    ui::settings::Section::Graphics,
+                                ));
+                            }
+                            return;
                         }
-                        return;
+                    };
+                    match client::near_profile::NearProfile::plan(
+                        settings.get(ui::settings::Setting::Near) as u16,
+                        Default::default(),
+                    ) {
+                        Ok(near) => (near, antialiasing),
+                        Err(error) => {
+                            if let Some(product) = &mut borrowed.product {
+                                product.layer.app.set_status(error.message());
+                                product.layer.app.open(ui::app::Screen::Settings(
+                                    ui::settings::Section::Graphics,
+                                ));
+                            }
+                            return;
+                        }
                     }
-                }
-            };
+                };
+            if antialiasing.mode == client::antialiasing::Mode::Temporal
+                && let Some(product) = &mut state.borrow_mut().product
+            {
+                product.connecting();
+            }
             let (fresh, epoch) = {
                 let mut state = state.borrow_mut();
                 state.connection_epoch = state.connection_epoch.wrapping_add(1);
@@ -917,7 +1036,7 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                         render::OutputTransfer::ShaderSrgb,
                         client::view::terrain_gpu_config(),
                         &atlas,
-                        settings.get(ui::settings::Setting::Msaa) as u32,
+                        antialiasing.samples,
                     )
                     .map_err(js_error)?;
                     let mut scene = client::remote::RemoteSession::scene_config();
@@ -960,6 +1079,9 @@ fn process_product_commands(state: &Rc<RefCell<BrowserState>>) {
                     }
                     view.resize(&device, borrowed.config.width, borrowed.config.height)
                         .map_err(js_error)?;
+                    if antialiasing.mode == client::antialiasing::Mode::Temporal {
+                        view.prepare_temporal(&device, &queue).map_err(js_error)?;
+                    }
                     borrowed.view = view;
                     borrowed.ui_submission.invalidate();
                     if let Some(recorder) = &mut borrowed.recorder {
@@ -1145,6 +1267,20 @@ fn apply_local_materials(
     state.view.invalidate();
     Ok(())
 }
+fn product_antialiasing_plan(
+    device: &wgpu::Device,
+    surface: [u32; 2],
+    settings: &ui::settings::Settings,
+) -> Result<client::antialiasing::Plan, String> {
+    client::antialiasing::preflight_graph(
+        settings.get(ui::settings::Setting::Msaa),
+        surface,
+        settings.get(ui::settings::Setting::Scale) as u32,
+        device.limits().max_texture_dimension_2d,
+        device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
+        client::antialiasing::product_capacities(),
+    )
+}
 fn prepare_product_world(
     view: &mut ClientView,
     device: &wgpu::Device,
@@ -1255,6 +1391,9 @@ fn connect_socket(state: &Rc<RefCell<BrowserState>>, address: String, name: Stri
     };
     match browser_network::BrowserSocket::connect(&address, &name, clock_ms() as u64) {
         Ok(mut socket) => {
+            socket
+                .session_mut()
+                .configure_temporal_identities(state.view.temporal_prepared());
             if let Err(error) = socket.session_mut().connection_mut().set_near_profile(near) {
                 if let Some(product) = &mut state.product {
                     product.layer.app.set_status(&format!("{error:?}"));
@@ -2016,17 +2155,6 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
     // uses a real loading thread; the browser limitation remains explicit.
     animation_frame().await?;
     let atlas = AtlasImage::donor().map_err(js_error)?;
-    let terrain = TerrainGpu::new(
-        &gpu.device,
-        &gpu.queue,
-        config.format,
-        width,
-        height,
-        render::OutputTransfer::ShaderSrgb,
-        client::view::terrain_gpu_config(),
-        &atlas,
-    )
-    .map_err(|error| js_error(error.to_string()))?;
     let params = web_sys::UrlSearchParams::new_with_str(&window.location().search()?)?;
     let mut product = if diagnostic {
         None
@@ -2037,6 +2165,30 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
             config.format,
         )?)
     };
+    let mut antialiasing_error = None;
+    let samples = if let Some(product) = &product {
+        match product_antialiasing_plan(&gpu.device, [width, height], product.settings_target()) {
+            Ok(plan) => plan.samples,
+            Err(error) => {
+                antialiasing_error = Some(error);
+                4
+            }
+        }
+    } else {
+        4
+    };
+    let terrain = TerrainGpu::new_with_samples(
+        &gpu.device,
+        &gpu.queue,
+        config.format,
+        width,
+        height,
+        render::OutputTransfer::ShaderSrgb,
+        client::view::terrain_gpu_config(),
+        &atlas,
+        samples,
+    )
+    .map_err(|error| js_error(error.to_string()))?;
     let mut scene_config = if diagnostic {
         client::SceneConfig::forest()
     } else {
@@ -2065,7 +2217,9 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
     .map_err(js_error)?;
     if let Some(product) = &mut product {
         animation_frame().await?;
-        if let Err(error) = client::near_profile::NearProfile::plan(
+        if let Some(error) = antialiasing_error {
+            product.layer.app.set_status(&error);
+        } else if let Err(error) = client::near_profile::NearProfile::plan(
             product.settings_target().get(ui::settings::Setting::Near) as u16,
             Default::default(),
         ) {
@@ -2081,6 +2235,11 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
                 product.settings_target(),
             )?;
             prepare_material_variant(&mut view, &gpu.device, &gpu.queue, &atlas)?;
+            view.resize(&gpu.device, width, height).map_err(js_error)?;
+            if product.settings_target().get(ui::settings::Setting::Msaa) == 2 {
+                view.prepare_temporal(&gpu.device, &gpu.queue)
+                    .map_err(js_error)?;
+            }
         }
         let applied = view.apply_settings(product.settings_target());
         product
@@ -2190,6 +2349,7 @@ async fn start_forest(diagnostic: bool) -> Result<JsValue, JsValue> {
         product,
         socket: None,
         resetting: false,
+        rejected_resize: None,
         recorder,
         gpu_capture,
         last_present_ms: clock_ms(),

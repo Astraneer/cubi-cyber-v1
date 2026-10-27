@@ -32,6 +32,90 @@ fn player(id: u8) -> PlayerState {
     }
 }
 #[test]
+fn temporal_uuid_suffix_preserves_full_ids_order_and_atomic_capacity_without_allocations() {
+    let mut keyed = RemoteHumans::new(4).unwrap();
+    let mut legacy = RemoteHumans::new(4).unwrap();
+    let mut a = player(1);
+    let mut b = player(1);
+    b.identity.0[15] = 2; // All low64 identity bits are identical.
+    a.position[0] = -2.;
+    b.position[0] = 3.;
+    let own = player(3);
+    let mut hidden = player(4);
+    hidden.mode = 3;
+    let mut out = [empty(); 4];
+    let mut reference = [empty(); 4];
+    let mut ids = [PlayerId::default(); 4];
+    let source = [&own, &a, &hidden, &b];
+    assert_eq!(
+        keyed.write_with_identities(
+            Tick(1),
+            1.,
+            source.into_iter(),
+            own.identity,
+            SpaceId(0),
+            [0; 3],
+            &mut out,
+            &mut ids
+        ),
+        Ok(2)
+    );
+    assert_eq!(
+        legacy.write(
+            Tick(1),
+            1.,
+            source.into_iter(),
+            own.identity,
+            SpaceId(0),
+            [0; 3],
+            &mut reference
+        ),
+        Ok(2)
+    );
+    assert_eq!(out, reference);
+    assert_eq!(&ids[..2], &[a.identity, b.identity]);
+    let prior_out = out;
+    let prior_ids = ids;
+    assert_eq!(
+        keyed.write_with_identities(
+            Tick(2),
+            2.,
+            [&b, &a].into_iter(),
+            own.identity,
+            SpaceId(0),
+            [0; 3],
+            &mut out,
+            &mut ids[..1]
+        ),
+        Err(Error::Capacity)
+    );
+    assert_eq!(out, prior_out);
+    assert_eq!(ids, prior_ids);
+    assert_eq!(keyed.len(), 2);
+    let scope = telemetry::AllocationScope::begin().unwrap();
+    for _ in 0..10_000 {
+        assert_eq!(
+            keyed.write_with_identities(
+                Tick(1),
+                1.,
+                [&b, &a].into_iter(),
+                own.identity,
+                SpaceId(0),
+                [0; 3],
+                &mut out,
+                &mut ids
+            ),
+            Ok(2)
+        );
+        assert_eq!(&ids[..2], &[b.identity, a.identity]);
+        assert_eq!(out[0].position[0], 3.);
+        assert_eq!(out[1].position[0], -2.);
+    }
+    let counts = scope.finish();
+    assert_eq!(counts.allocating_calls(), 0);
+    assert_eq!(counts.dealloc_calls, 0);
+}
+#[test]
 fn confirmed_human_uses_shared_motion_animation_and_interpolates_wrapped_head_yaw() {
     let mut humans = RemoteHumans::new(64).unwrap();
     let mut output = [empty(); 64];

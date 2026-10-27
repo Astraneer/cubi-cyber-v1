@@ -20,8 +20,10 @@ mod entities;
 pub mod environment;
 pub mod horizon;
 mod horizon_runtime;
+pub mod model_motion;
 pub mod recipe_boards;
 mod settings;
+pub mod temporal;
 pub use horizon_runtime::HorizonJobStats;
 mod lighting;
 pub mod props;
@@ -184,6 +186,7 @@ pub struct ClientView {
     horizon: Option<Box<horizon_runtime::PreparedHorizon>>,
     distant_shadows: Option<Box<distant_shadows::ViewDistantShadows>>,
     recipe_boards: Option<Box<recipe_boards::ViewRecipeBoards>>,
+    temporal: Option<Box<temporal::ViewTemporal>>,
     frame_upload_remaining: u64,
     frame_delta_seconds: f32,
     clock: clock::ClockState,
@@ -249,6 +252,7 @@ pub struct ClientView {
     cached_world_version: Version,
     cached_upload_bytes: u64,
     cached_visual_revision: u64,
+    cached_props_epoch: u64,
     observed_world_version: Version,
     observed_upload_bytes: u64,
     encoded_shadows: bool,
@@ -289,6 +293,7 @@ impl ClientView {
             props: None,
             water: None,
             environment: None,
+            temporal: None,
             horizon: None,
             distant_shadows: None,
             recipe_boards: None,
@@ -366,6 +371,7 @@ impl ClientView {
             cached_world_version: Version(0),
             cached_upload_bytes: 0,
             cached_visual_revision: 0,
+            cached_props_epoch: 0,
             observed_world_version: Version(0),
             observed_upload_bytes: 0,
             encoded_shadows: false,
@@ -574,6 +580,21 @@ impl ClientView {
         self.props = Some(Box::new(props));
         self.invalidate();
         Ok(())
+    }
+    /// Persistent equality token for the actually drawable block-model family.
+    /// A late completion cannot qualify HDR captured under an older token.
+    pub fn props_source_epoch(&self) -> u64 {
+        self.props.as_ref().map_or(0, |p| p.gpu.source_epoch())
+    }
+    pub fn props_sources_valid(&self) -> bool {
+        self.props.as_ref().is_none_or(|p| p.gpu.source_valid())
+    }
+    fn observe_props_source_epoch(&mut self, previous: u64) {
+        if previous != self.props_source_epoch() {
+            self.cached_presentation_available = false;
+            self.renderer.invalidate();
+            self.force_redraw = true;
+        }
     }
     pub fn props_source(&self) -> Option<&crate::props_source::PropsSource> {
         self.props.as_ref().map(|props| &props.source)
@@ -880,7 +901,15 @@ impl ClientView {
                     .timing_sources(&self.renderer)
                     .into_iter()
                     .flatten()
-                    .chain(shadows),
+                    .chain(shadows)
+                    .chain(
+                        self.temporal
+                            .as_ref()
+                            .map(|t| t.timing_sources())
+                            .into_iter()
+                            .flatten()
+                            .flatten(),
+                    ),
                 encoder,
                 frame,
             )
@@ -922,6 +951,30 @@ impl ClientView {
         let work = entities
             .set_remote_frame(source, &self.scene, space, origin)
             .map_err(|error| format!("public entity frame: {error:?}"))?;
+        self.retained_foreground_work.record(telemetry::WorkCounts {
+            cells_scanned: work.light_reads,
+            ..telemetry::WorkCounts::ZERO
+        });
+        Ok(true)
+    }
+    pub fn temporal_entity_identities_prepared(&self) -> bool {
+        self.entities
+            .as_ref()
+            .is_some_and(|entities| entities.published_temporal_identities().is_some())
+    }
+    pub fn set_remote_entities_with_identities(
+        &mut self,
+        source: &[rules::entities::mob::Instance],
+        identities: &[render::presented_motion::ObjectKey],
+        space: SpaceId,
+        origin: [i64; 3],
+    ) -> Result<bool, String> {
+        let Some(entities) = &mut self.entities else {
+            return Ok(false);
+        };
+        let work = entities
+            .set_remote_frame_with_identities(source, identities, &self.scene, space, origin)
+            .map_err(|error| format!("public temporal entity frame: {error:?}"))?;
         self.retained_foreground_work.record(telemetry::WorkCounts {
             cells_scanned: work.light_reads,
             ..telemetry::WorkCounts::ZERO
@@ -1185,19 +1238,23 @@ impl ClientView {
         if let Some(lighting) = &mut self.lighting {
             lighting
                 .advance_cpu(&mut self.scene)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| format!("client lighting CPU: {error}"))?;
         }
+        let props_epoch = self.props_source_epoch();
         if let Some(props) = &mut self.props {
             props.set_visual_alpha(self.accumulator / sim::TICK_SECONDS);
-            let work = props.advance_cpu(&mut self.scene, self.tick)?;
+            let work = props
+                .advance_cpu(&mut self.scene, self.tick)
+                .map_err(|error| format!("block models CPU: {error}"))?;
             self.record_props_work(work);
         }
+        self.observe_props_source_epoch(props_epoch);
         if let Some(water) = &mut self.water {
             #[cfg(not(target_arch = "wasm32"))]
             let stats = water.pump_native(&mut self.scene, self.tick);
             #[cfg(target_arch = "wasm32")]
             let stats = water.phase(&mut self.scene, self.tick);
-            let stats = stats.map_err(|error| error.to_string())?;
+            let stats = stats.map_err(|error| format!("physical water CPU: {error}"))?;
             self.retained_worker_work.record(telemetry::WorkCounts {
                 cells_scanned: stats.work.worker_cells + stats.work.worker_halo_samples,
                 quads_emitted: stats.work.worker_quads,
@@ -1402,12 +1459,7 @@ impl ClientView {
     pub fn render_extent(&self) -> [u32; 2] {
         self.renderer.extent()
     }
-    /// Surface/UI dimensions stay native. Prepared HDR/depth/environment targets
-    /// use the selected scale; existing final Post expands them to the surface.
-    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) -> Result<(), String> {
-        if width == 0 || height == 0 {
-            return Ok(());
-        }
+    fn desired_render_extent(&self, width: u32, height: u32) -> Result<(u32, [u32; 2]), String> {
         let scale = if self.environment.is_some() {
             self.requested_settings.as_ref().map_or(100, |settings| {
                 settings.get(ui::settings::Setting::Scale) as u32
@@ -1419,7 +1471,31 @@ impl ClientView {
             return Err("render scale must be85..100 percent".into());
         }
         let scaled = |axis: u32| (u64::from(axis) * u64::from(scale)).div_ceil(100) as u32;
-        let [render_width, render_height] = [scaled(width), scaled(height)];
+        Ok((scale, [scaled(width), scaled(height)]))
+    }
+    /// Read-only resource preflight for the requested physical extent. The
+    /// window shells call this before changing their surface/canvas, so a
+    /// temporal allocation rejection retains the current View and session.
+    pub fn validate_resize(
+        &self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        let (_, extent) = self.desired_render_extent(width, height)?;
+        self.preflight_temporal_resize(device, extent)
+    }
+    /// Surface/UI dimensions stay native. Prepared HDR/depth/environment targets
+    /// use the selected scale; existing final Post expands them to the surface.
+    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) -> Result<(), String> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        let (scale, [render_width, render_height]) = self.desired_render_extent(width, height)?;
+        self.preflight_temporal_resize(device, [render_width, render_height])?;
         self.invalidate();
         if let Some(environment) = &mut self.environment {
             if environment.width != render_width || environment.height != render_height {
@@ -1451,6 +1527,7 @@ impl ClientView {
                 ..telemetry::WorkCounts::ZERO
             });
             self.render_scale = scale;
+            self.resize_temporal(device)?;
             Ok(())
         } else {
             self.renderer
@@ -1952,6 +2029,7 @@ impl ClientView {
                     parameters.projection(environment.width, environment.height),
                 )
             });
+        let props_epoch = self.props_source_epoch();
         if let Some(props) = &mut self.props {
             let work = props.upload_ready(&self.scene, queue, budget, self.tick)?;
             if work.changed {
@@ -1959,6 +2037,7 @@ impl ClientView {
             }
             self.record_props_work(work);
         }
+        self.observe_props_source_epoch(props_epoch);
         let near_ready = self.near_meshes_ready();
         let far_water_ready = self.far_water_guard_ready();
         if let (Some(water), Some(environment)) = (&mut self.water, &mut self.environment) {
@@ -2165,7 +2244,11 @@ impl ClientView {
     pub fn needs_redraw(&self, width: u32, height: u32) -> bool {
         let parameters = self.camera_parameters();
         let camera = parameters.projection(width, height);
+        if self.temporal.is_some() {
+            return self.temporal_needs_redraw(camera, self.environment_state(parameters.eye));
+        }
         self.force_redraw
+            || self.cached_props_epoch != self.props_source_epoch()
             || self.page_links_dirty
             || self.cached_camera != Some(camera)
             || self
@@ -2199,6 +2282,12 @@ impl ClientView {
     ) -> Result<bool, String> {
         self.encoded_shadows = false;
         self.encoded_terrain = false;
+        if !self.cached_presentation_available
+            || self.cached_props_epoch != self.props_source_epoch()
+        {
+            self.cached_presentation_available = false;
+            return Ok(false);
+        }
         let Some(environment) = &mut self.environment else {
             return Ok(false);
         };
@@ -2214,7 +2303,9 @@ impl ClientView {
         Ok(encoded)
     }
     pub fn has_cached_present(&self) -> bool {
-        self.cached_presentation_available && self.environment.is_some()
+        self.cached_presentation_available
+            && self.cached_props_epoch == self.props_source_epoch()
+            && self.environment.is_some()
     }
     /// Menu-only changes use the same upload allowance and existing Post
     /// resources; world/source queues remain retained for the next scene frame.
@@ -2242,10 +2333,17 @@ impl ClientView {
         }
         self.encoded_shadows = false;
         self.encoded_terrain = false;
-        if !self.near_far_join_ready() {
+        if self.cached_props_epoch != self.props_source_epoch() {
+            // The environment also owns scene caches. Force an actual current
+            // HDR graph instead of letting its Post reuse an older family.
+            self.renderer.invalidate();
+            self.force_redraw = true;
+        }
+        if !self.near_far_join_ready() || self.temporal_restore_needed() {
             if self.encode_cached_present(encoder, output)? {
                 return Ok(TerrainFrameWork::default());
             }
+            self.encode_unpresented_temporal_restore(encoder)?;
             // A resized/initial target has no prior HDR. A real clear keeps
             // Loading/UI valid without exposing a partially joined scene.
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2380,14 +2478,19 @@ impl ClientView {
             });
             self.upload_bytes_total = self.upload_bytes_total.saturating_add(bytes);
         }
-        let scene_needed = self.environment.as_ref().is_none_or(|environment| {
-            environment.owner.scene_needed(
-                &self.renderer,
-                &camera,
-                CullingMode::FrustumAndHiZ,
-                state,
-            )
-        });
+        if self.temporal.is_some() {
+            return self.encode_temporal_scene(queue, encoder, output, camera, state);
+        }
+        let props_epoch = self.props_source_epoch();
+        let scene_needed = self.cached_props_epoch != props_epoch
+            || self.environment.as_ref().is_none_or(|environment| {
+                environment.owner.scene_needed(
+                    &self.renderer,
+                    &camera,
+                    CullingMode::FrustumAndHiZ,
+                    state,
+                )
+            });
         if scene_needed && let Some(entities) = &mut self.entities {
             let work = entities
                 .prepare_camera(queue, encoder, camera)
@@ -2525,6 +2628,9 @@ impl ClientView {
         if scene_needed {
             self.encoded_terrain = work.passes != 0;
             self.cached_presentation_available = self.environment.is_some();
+            if work.passes != 0 {
+                self.cached_props_epoch = props_epoch;
+            }
             self.cached_camera = Some(camera);
             self.cached_visual_revision = self.renderer.visual_revision();
             self.cached_world_version = self.scene.world().version();

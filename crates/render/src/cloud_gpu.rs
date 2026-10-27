@@ -106,6 +106,14 @@ struct Params {
     quality: [u32; 4],
     optics: [f32; 4],
 }
+/// Actual current low-resolution transport/depth composite bindings for the
+/// optional temporal mask; retains the same depth-aware upsampling weights.
+pub struct CloudTemporalSource<'a> {
+    pub bind: &'a wgpu::BindGroup,
+    pub extent: [u32; 2],
+    pub samples: u32,
+    pub prepared: bool,
+}
 pub struct CloudGpu {
     sample_count: u32,
     config: CloudConfig,
@@ -822,4 +830,20 @@ impl CloudGpu {
     pub fn statistics_buffer(&self) -> &wgpu::Buffer {
         &self.statistics
     }
+    pub fn temporal_source(&self) -> CloudTemporalSource<'_> {
+        CloudTemporalSource {
+            bind: &self.composite_bind,
+            extent: [self.width, self.height],
+            samples: self.sample_count,
+            prepared: self.last.is_some(),
+        }
+    }
+    /// Loading only; no bind/layout work is performed by temporal_source.
+    pub fn temporal_layout(&self) -> wgpu::BindGroupLayout {
+        self.composite.get_bind_group_layout(0)
+    }
+}
+/// Loading-only source for an optional consumer of the exact color composite.
+pub fn temporal_composite_source(samples: u32) -> String {
+    crate::sampling::shader(include_str!("cloud_composite.wgsl"), samples).into_owned()
 }

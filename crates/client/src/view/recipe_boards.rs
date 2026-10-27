@@ -34,6 +34,12 @@ pub(super) struct ViewRecipeBoards {
     pending_time: Option<i32>,
 }
 impl ViewRecipeBoards {
+    pub(super) fn gpu(&self) -> &RecipeBoardGpu {
+        &self.gpu
+    }
+    pub(super) fn session(&self) -> Option<u64> {
+        self.landmark.map(|l| l.session)
+    }
     fn set_landmark(&mut self, landmark: Option<net::spawn::Landmark>) -> Result<bool, String> {
         if self.landmark == landmark {
             return Ok(false);
@@ -173,7 +179,11 @@ impl ClientView {
         queue: &wgpu::Queue,
         images: &recipe_board_images::BoardImages,
     ) -> Result<(), String> {
-        if self.recipe_boards.is_some() || self.terrain_frames != 0 || !self.resident.is_empty() {
+        if self.recipe_boards.is_some()
+            || self.temporal.is_some()
+            || self.terrain_frames != 0
+            || !self.resident.is_empty()
+        {
             return Err("recipe boards must be prepared once before scene uploads".into());
         }
         let gpu = RecipeBoardGpu::new(

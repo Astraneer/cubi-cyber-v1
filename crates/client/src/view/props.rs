@@ -4,7 +4,8 @@ use super::{ViewEnvironment, ViewLighting};
 use crate::{
     ClientScene,
     props_source::{
-        PropsBuilt, PropsContext, PropsLimits, PropsSource, PropsTask, PropsWork, VisibleRegion,
+        PropsBuilt, PropsContext, PropsLimits, PropsPublication, PropsSource, PropsTask, PropsWork,
+        VisibleRegion,
     },
 };
 use core_types::{PageId, Tick};
@@ -51,6 +52,8 @@ pub struct ViewProps {
     pending: VecDeque<Box<PropsBuilt>>,
     retry: Option<Dispatch<PropsTask>>,
     alpha: f64,
+    temporal_identities: Option<Vec<Option<PropsPublication>>>,
+    quarantined: bool,
     #[cfg(not(target_arch = "wasm32"))]
     native: jobs::NativePool<PropsTask, Box<PropsBuilt>>,
 }
@@ -106,6 +109,8 @@ impl ViewProps {
             pending: VecDeque::with_capacity(limits.max_running),
             retry: None,
             alpha: 0.,
+            temporal_identities: None,
+            quarantined: false,
             #[cfg(not(target_arch = "wasm32"))]
             native: jobs::NativePool::new(
                 1,
@@ -117,6 +122,28 @@ impl ViewProps {
             )
             .map_err(|error| format!("model worker: {error:?}"))?,
         })
+    }
+    /// Loading only. Default profiles allocate no temporal identity bank.
+    pub fn prepare_temporal_raster(&mut self, device: &wgpu::Device) -> Result<u32, String> {
+        if !self.gpu.temporal_raster_preparable() {
+            return Err("prop temporal preparation requires loading resources".into());
+        }
+        self.source
+            .prepare_temporal_publications()
+            .map_err(|error| error.to_string())?;
+        let work = self
+            .gpu
+            .prepare_temporal_raster(device)
+            .map_err(|error| error.to_string())?;
+        if self.temporal_identities.is_none() {
+            self.temporal_identities = Some(vec![None; self.gpu.instance_capacity() as usize]);
+        }
+        self.stats.pipeline_compilations += work.pipeline_compilations;
+        Ok(work.pipeline_compilations)
+    }
+    /// Paired with gpu.instance_records(): CPU-only changes cannot advance it.
+    pub fn published_temporal_identities(&self) -> Option<&[Option<PropsPublication>]> {
+        self.temporal_identities.as_deref()
     }
     fn configure_interest(&mut self, scene: &ClientScene, tick: Tick) -> Result<(), String> {
         let config = scene.config();
@@ -159,6 +186,20 @@ impl ViewProps {
     /// Journal traversal, certificate revocation, public animation and result
     /// installation continue while the GPU submission slot is occupied.
     pub fn advance_cpu(
+        &mut self,
+        scene: &mut ClientScene,
+        tick: Tick,
+    ) -> Result<PropsWork, String> {
+        match self.advance_cpu_inner(scene, tick) {
+            Ok(work) => Ok(work),
+            Err(error) => {
+                self.quarantine_source()
+                    .map_err(|gate| format!("{error}; model quarantine: {gate}"))?;
+                Err(error)
+            }
+        }
+    }
+    fn advance_cpu_inner(
         &mut self,
         scene: &mut ClientScene,
         tick: Tick,
@@ -219,7 +260,7 @@ impl ViewProps {
         #[cfg(not(target_arch = "wasm32"))]
         self.pump_native(scene, tick)?;
         let work = self.source.take_work();
-        self.record(scene, tick, work);
+        self.record(scene, tick, work)?;
         Ok(work)
     }
     pub fn set_visual_alpha(&mut self, alpha: f64) {
@@ -356,21 +397,53 @@ impl ViewProps {
         budget: &mut UploadBudget,
         tick: Tick,
     ) -> Result<PropsWork, String> {
-        self.source
-            .flush_sampled(queue, &mut self.gpu, [0; 3], budget, 256, |position| {
-                if scene.config().authoritative_remote {
-                    scene.read_authoritative_light(position)
-                } else {
-                    scene
-                        .world()
-                        .page(position.page())
-                        .map(|page| page.light(position.local_index()))
-                }
-            })
-            .map_err(|error| error.to_string())?;
+        match self.upload_ready_inner(scene, queue, budget, tick) {
+            Ok(work) => Ok(work),
+            Err(error) => {
+                self.quarantine_source()
+                    .map_err(|gate| format!("{error}; model quarantine: {gate}"))?;
+                Err(error)
+            }
+        }
+    }
+    fn upload_ready_inner(
+        &mut self,
+        scene: &ClientScene,
+        queue: &wgpu::Queue,
+        budget: &mut UploadBudget,
+        tick: Tick,
+    ) -> Result<PropsWork, String> {
+        let light_at = |position: core_types::BlockPos| {
+            if scene.config().authoritative_remote {
+                scene.read_authoritative_light(position)
+            } else {
+                scene
+                    .world()
+                    .page(position.page())
+                    .map(|page| page.light(position.local_index()))
+            }
+        };
+        match self.temporal_identities.as_mut() {
+            Some(identities) => self.source.flush_sampled_with_publications(
+                queue,
+                &mut self.gpu,
+                [0; 3],
+                budget,
+                256,
+                light_at,
+                |publication| {
+                    identities[publication.slot as usize] =
+                        publication.position.map(|_| publication);
+                },
+            ),
+            None => self
+                .source
+                .flush_sampled(queue, &mut self.gpu, [0; 3], budget, 256, light_at),
+        }
+        .map_err(|error| error.to_string())?;
         self.gpu.take_work();
         let work = self.source.take_work();
-        self.record(scene, tick, work);
+        self.record(scene, tick, work)?;
         Ok(work)
     }
     pub fn publish_public_frame(
@@ -398,7 +471,18 @@ impl ViewProps {
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> u32 {
         self.gpu.draw(pass)
     }
-    fn record(&mut self, scene: &ClientScene, tick: Tick, work: PropsWork) {
+    fn quarantine_source(&mut self) -> Result<(), String> {
+        self.gpu
+            .revoke_source()
+            .map_err(|error| error.to_string())?;
+        self.quarantined = true;
+        self.stats.ready = false;
+        Ok(())
+    }
+    fn record(&mut self, scene: &ClientScene, tick: Tick, work: PropsWork) -> Result<(), String> {
+        if work.cursor_recoveries > 0 {
+            self.quarantine_source()?;
+        }
         self.stats.worker_cells += work.worker_cells;
         self.stats.worker_mask_words += work.worker_mask_words;
         self.stats.owner_light_reads += work.owner_light_reads;
@@ -420,6 +504,13 @@ impl ViewProps {
             && self.pending.is_empty()
             && self.contexts.is_empty()
             && self.retry.is_none();
+        if self.quarantined && self.stats.ready {
+            self.gpu
+                .set_source_valid(true)
+                .map_err(|error| error.to_string())?;
+            self.quarantined = false;
+        }
+        Ok(())
     }
 }
 fn tint(value: Option<u16>) -> u32 {
@@ -430,3 +521,7 @@ fn tint(value: Option<u16>) -> u32 {
         r | (g << 8) | (b << 16) | 0xff000000
     })
 }
+
+#[cfg(test)]
+#[path = "props_recovery_gpu_tests.rs"]
+mod recovery_gpu_tests;

@@ -583,11 +583,9 @@ impl ClientView {
         let parameters = self.camera_parameters();
         let eye = parameters.eye;
         let [width, height] = self.renderer.extent();
-        // A whole camera cell and a ten-degree FOV interval certify every
+        // A whole eight-block camera cell and a ten-degree FOV interval certify every
         // interpolated/bobbed pose until a bin changes, instead of replanning
         // continuously during a sprint's FOV interpolation.
-        let eye_min = eye.map(|v| (f64::from(v) / 16.).floor() * 16.);
-        let eye_max = eye_min.map(|v| v + 16.);
         let lower_fov = (f64::from(parameters.fov) / 10.).floor().max(0.1) * 10.;
         let upper_fov = (lower_fov + 10.).min(179.);
         let focal_pixels =
@@ -604,9 +602,14 @@ impl ClientView {
         let actual_yaw = libm::atan2(look[0], look[2]).to_degrees();
         let actual_pitch =
             libm::atan2(look[1], libm::sqrt(look[0] * look[0] + look[2] * look[2])).to_degrees();
-        let (view_direction, margin, max_abs_forward_y) =
-            horizon::orientation_certificate(actual_yaw, actual_pitch, 45., 10.)
-                .map_err(|e| e.to_string())?;
+        let horizon::HorizonCameraBins {
+            eye_min,
+            eye_max,
+            view_direction,
+            margin,
+            max_abs_forward_y,
+        } = horizon::horizon_camera_bins(eye, actual_yaw, actual_pitch)
+            .map_err(|e| e.to_string())?;
         let view_cosine =
             libm::cos((libm::atan(diagonal_tangent) + margin).min(std::f64::consts::PI));
         let Some(horizon) = &mut self.horizon else {

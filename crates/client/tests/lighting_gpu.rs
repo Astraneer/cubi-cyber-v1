@@ -112,6 +112,423 @@ fn read_word(gpu: &render::Gpu, lighting: &ClientLighting, index: usize) -> u32 
     buffer.unmap();
     result
 }
+fn source_proof_raw(page: PageId, view: u64, state: u16) -> net::PageUpdate {
+    let mut cells = Box::new([Cell::AIR; 4096]);
+    cells[8 + 16 * (8 + 16 * 8)] = Cell::from_parts(rules::ids::AIR, state);
+    net::PageUpdate::Snapshot(net::PageSnapshot {
+        page,
+        version: view,
+        source_version: core_types::Version(500 + view),
+        applied_action: net::ActionId(view),
+        cells,
+    })
+}
+fn source_proof_light(page: PageId, cells: u64, version: u64, value: u32) -> net::light::Update {
+    net::light::Update::Snapshot(net::light::Snapshot {
+        header: net::light::Header {
+            page,
+            cell_view: cells,
+            version,
+            source: core_types::Version(1),
+        },
+        values: Box::new([value; 4096]),
+    })
+}
+fn source_proof_settle(
+    gpu: &render::Gpu,
+    lighting: &mut ClientLighting,
+    scene: &mut client::ClientScene,
+) {
+    for _ in 0..512 {
+        let work = lighting
+            .pump_scene(
+                &gpu.queue,
+                scene,
+                Tick(100),
+                &mut UploadBudget::new(1000000),
+            )
+            .unwrap();
+        if work.ready {
+            return;
+        }
+    }
+    panic!("source proof fixture did not settle");
+}
+fn source_proof_volume(
+    gpu: &render::Gpu,
+    lighting: &ClientLighting,
+    handle: render::terrain_gpu::PageHandle,
+) -> Vec<u32> {
+    let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("complete real GPU light image equality oracle"),
+        size: LIGHT_PAGE_BYTES,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    encoder.copy_buffer_to_buffer(
+        lighting.light_volumes().buffer(),
+        u64::from(handle.slot) * LIGHT_PAGE_BYTES,
+        &buffer,
+        0,
+        LIGHT_PAGE_BYTES,
+    );
+    gpu.queue.submit([encoder.finish()]);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+    gpu.device.poll(wgpu::PollType::Wait).unwrap();
+    receiver.recv().unwrap().unwrap();
+    let bytes = buffer.slice(..).get_mapped_range();
+    let words = bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect();
+    drop(bytes);
+    buffer.unmap();
+    words
+}
+#[test]
+fn actual_full_volume_retags_only_after_current_certificates_and_exact_support_proof() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut terrain = setup(&gpu);
+        let mut scene = client::ClientScene::new(client::SceneConfig {
+            center: BlockPos {
+                space: SpaceId(0),
+                x: 8,
+                y: 8,
+                z: 8,
+            },
+            horizontal_radius: 0,
+            vertical_radius: 0,
+            max_loaded_pages: 27,
+            authoritative_remote: true,
+            ..client::SceneConfig::forest()
+        })
+        .unwrap();
+        let hdr = net::light::pack(15, 7, [231, 17, 255]).unwrap();
+        let supports: Vec<_> = scene.requested_pages().collect();
+        assert_eq!(supports.len(), 27);
+        for source in &supports {
+            scene
+                .import_authoritative_page(&source_proof_raw(*source, 10, 0), Tick(1))
+                .unwrap();
+            scene
+                .import_authoritative_light(&source_proof_light(*source, 10, 1, hdr), Tick(1))
+                .unwrap();
+        }
+        let mut settings = config().with_authoritative_source();
+        // Exercise partial journal ownership rather than relying on one large drain.
+        settings.max_journal_entries = 1;
+        let mut lighting = ClientLighting::prepare_scene(
+            &gpu.device,
+            &gpu.queue,
+            &mut terrain,
+            &mut scene,
+            settings,
+            [8.; 3],
+            [0.3, 0.8, 0.2],
+        )
+        .unwrap();
+        let mut handle = terrain
+            .upload_page(
+                &gpu.queue,
+                None,
+                1,
+                translation([0.; 3]),
+                &PageMesh::default(),
+                &mut UploadBudget::new(1000000),
+            )
+            .unwrap();
+        let bounds = WorldBounds::new([0.; 3], [16.; 3]).unwrap();
+        lighting.register_page(page(), handle, bounds).unwrap();
+        source_proof_settle(&gpu, &mut lighting, &mut scene);
+        let initial = source_proof_volume(&gpu, &lighting, handle);
+        assert_eq!(initial[0], 0);
+        assert!(initial[1..].iter().all(|value| *value == hdr));
+
+        // Positive: two actual new certificates precede the next GPU pump. No
+        // old Scene certificate is synthesized, and all5832 GPU words stay equal.
+        let changed = [PageId { z: -1, ..page() }, PageId { y: -1, ..page() }];
+        let versions: Vec<_> = supports
+            .iter()
+            .map(|p| scene.world().page_version(*p))
+            .collect();
+        for source in changed {
+            let raw = scene
+                .import_authoritative_page(&source_proof_raw(source, 11, 0), Tick(2))
+                .unwrap();
+            assert!(raw.change.is_none());
+            assert!(scene.authoritative_light_version(source).is_none());
+            let light = scene
+                .import_authoritative_light(&source_proof_light(source, 11, 2, hdr), Tick(2))
+                .unwrap();
+            assert!(light.change.is_none());
+        }
+        assert_eq!(
+            versions,
+            supports
+                .iter()
+                .map(|p| scene.world().page_version(*p))
+                .collect::<Vec<_>>()
+        );
+        let retag = lighting
+            .pump_scene(&gpu.queue, &mut scene, Tick(2), &mut UploadBudget::new(0))
+            .unwrap();
+        assert_eq!(
+            (retag.source_retags, retag.upload_bytes, retag.gpu_pages),
+            (1, 0, 0)
+        );
+        assert!(retag.ready);
+        assert_eq!(source_proof_volume(&gpu, &lighting, handle), initial);
+
+        // Negative1: identical Raw alone still revokes. Eight bytes suffice for
+        // the real uniform-zero shader header; no full upload can hide the test.
+        scene
+            .import_authoritative_page(&source_proof_raw(page(), 12, 0), Tick(3))
+            .unwrap();
+        assert!(scene.authoritative_light_version(page()).is_none());
+        let revoked = lighting
+            .pump_scene(&gpu.queue, &mut scene, Tick(3), &mut UploadBudget::new(8))
+            .unwrap();
+        assert_eq!(revoked.source_retags, 0);
+        assert_eq!(revoked.unknown_source_pages, 1);
+        let dark = source_proof_volume(&gpu, &lighting, handle);
+        assert_ne!(dark[0] & 0x40000000, 0);
+        assert_eq!(dark[1], 0);
+
+        // Negative2: an already-cleared slot cannot be recovered by retagging,
+        // even when a real same-valued certificate now makes all sources current.
+        scene
+            .import_authoritative_light(&source_proof_light(page(), 12, 3, hdr), Tick(4))
+            .unwrap();
+        let waiting = lighting
+            .pump_scene(&gpu.queue, &mut scene, Tick(4), &mut UploadBudget::new(0))
+            .unwrap();
+        assert_eq!(waiting.source_retags, 0);
+        assert!(!waiting.ready);
+        assert_eq!(source_proof_volume(&gpu, &lighting, handle)[1], 0);
+        source_proof_settle(&gpu, &mut lighting, &mut scene);
+        assert_eq!(source_proof_volume(&gpu, &lighting, handle), initial);
+
+        // Negative3a: a full image can contain current World samples while an
+        // older journal record is partial. A later wire-only change must still
+        // refuse retention until that cursor is caught up.
+        let corner = PageId {
+            x: -1,
+            y: -1,
+            z: -1,
+            ..page()
+        };
+        let intermediate = net::light::pack(12, 2, [5, 77, 199]).unwrap();
+        scene
+            .import_authoritative_light(
+                &net::light::Update::Delta(net::light::Delta {
+                    header: net::light::Header {
+                        page: corner,
+                        cell_view: 10,
+                        version: 2,
+                        source: core_types::Version(2),
+                    },
+                    base: 1,
+                    //4094 lies beyond the primary halo;4095 is its corner.
+                    changes: vec![(4094, intermediate), (4095, intermediate)],
+                }),
+                Tick(5),
+            )
+            .unwrap();
+        scene
+            .import_authoritative_page(&source_proof_raw(changed[0], 13, 0), Tick(5))
+            .unwrap();
+        scene
+            .import_authoritative_light(&source_proof_light(changed[0], 13, 3, hdr), Tick(5))
+            .unwrap();
+        let full_with_partial = lighting
+            .pump_scene(
+                &gpu.queue,
+                &mut scene,
+                Tick(5),
+                &mut UploadBudget::new(LIGHT_PAGE_BYTES + 8),
+            )
+            .unwrap();
+        assert_eq!(full_with_partial.source_retags, 0);
+        assert_eq!(full_with_partial.upload_bytes, LIGHT_PAGE_BYTES + 8);
+        assert!(lighting.ready_diagnostics(&scene).partial_record);
+        assert_eq!(
+            source_proof_volume(&gpu, &lighting, handle)[1],
+            intermediate
+        );
+        scene
+            .import_authoritative_page(&source_proof_raw(changed[1], 14, 0), Tick(5))
+            .unwrap();
+        scene
+            .import_authoritative_light(&source_proof_light(changed[1], 14, 3, hdr), Tick(5))
+            .unwrap();
+        let partial = lighting
+            .pump_scene(&gpu.queue, &mut scene, Tick(5), &mut UploadBudget::new(8))
+            .unwrap();
+        assert!(lighting.ready_diagnostics(&scene).partial_record);
+        assert_eq!((partial.source_retags, partial.upload_bytes), (0, 8));
+        assert_ne!(
+            source_proof_volume(&gpu, &lighting, handle)[0] & 0x40000000,
+            0
+        );
+        source_proof_settle(&gpu, &mut lighting, &mut scene);
+
+        // Negative3b: a successful one-corner patch invalidates the full witness.
+        let next = net::light::pack(14, 3, [17, 231, 255]).unwrap();
+        scene
+            .import_authoritative_light(
+                &net::light::Update::Delta(net::light::Delta {
+                    header: net::light::Header {
+                        page: corner,
+                        cell_view: 10,
+                        version: 3,
+                        source: core_types::Version(3),
+                    },
+                    base: 2,
+                    changes: vec![(4095, next)],
+                }),
+                Tick(5),
+            )
+            .unwrap();
+        lighting.ingest_scene_cpu(&mut scene).unwrap();
+        assert!(lighting.ready_diagnostics(&scene).partial_record);
+        for _ in 0..32 {
+            let state = lighting.ready_diagnostics(&scene);
+            if !state.partial_record && state.journal_lag_records == 0 {
+                break;
+            }
+            lighting.ingest_scene_cpu(&mut scene).unwrap();
+        }
+        let patch = lighting
+            .pump_scene(&gpu.queue, &mut scene, Tick(5), &mut UploadBudget::new(4))
+            .unwrap();
+        assert_eq!((patch.source_retags, patch.upload_bytes), (0, 4));
+        assert_eq!(source_proof_volume(&gpu, &lighting, handle)[1], next);
+        let source = changed[0];
+        scene
+            .import_authoritative_page(&source_proof_raw(source, 15, 0), Tick(6))
+            .unwrap();
+        scene
+            .import_authoritative_light(&source_proof_light(source, 15, 4, hdr), Tick(6))
+            .unwrap();
+        let after_patch = lighting
+            .pump_scene(&gpu.queue, &mut scene, Tick(6), &mut UploadBudget::new(8))
+            .unwrap();
+        assert_eq!(after_patch.source_retags, 0);
+        assert_ne!(
+            source_proof_volume(&gpu, &lighting, handle)[0] & 0x40000000,
+            0
+        );
+        source_proof_settle(&gpu, &mut lighting, &mut scene);
+
+        // Negative4: a raw mutation with no derived channel still changes the
+        // actual whole-page support and cannot reuse the old image proof.
+        let mesh = scene.world().input_version(page(), client::MESH_CHANNELS);
+        let light = scene
+            .world()
+            .input_version(page(), core_types::ChannelMask::LIGHTING);
+        let before = scene.world().page_version(page());
+        let raw = scene
+            .import_authoritative_page(&source_proof_raw(page(), 14, 9), Tick(7))
+            .unwrap();
+        assert!(raw.change.unwrap().channels.is_empty());
+        assert_ne!(scene.world().page_version(page()), before);
+        assert_eq!(
+            scene.world().input_version(page(), client::MESH_CHANNELS),
+            mesh
+        );
+        assert_eq!(
+            scene
+                .world()
+                .input_version(page(), core_types::ChannelMask::LIGHTING),
+            light
+        );
+        scene
+            .import_authoritative_light(&source_proof_light(page(), 14, 4, hdr), Tick(7))
+            .unwrap();
+        let raw_changed = lighting
+            .pump_scene(&gpu.queue, &mut scene, Tick(7), &mut UploadBudget::new(8))
+            .unwrap();
+        assert_eq!(raw_changed.source_retags, 0);
+        source_proof_settle(&gpu, &mut lighting, &mut scene);
+
+        // Negative5: removal/recreation cannot ABA back to a stored support.
+        scene.remove_authoritative_page(corner, Tick(8)).unwrap();
+        scene
+            .import_authoritative_page(&source_proof_raw(corner, 20, 0), Tick(9))
+            .unwrap();
+        scene
+            .import_authoritative_light(&source_proof_light(corner, 20, 1, hdr), Tick(9))
+            .unwrap();
+        let recreated = lighting
+            .pump_scene(&gpu.queue, &mut scene, Tick(9), &mut UploadBudget::new(8))
+            .unwrap();
+        assert_eq!(recreated.source_retags, 0);
+        source_proof_settle(&gpu, &mut lighting, &mut scene);
+
+        // Negative6: terrain slot reuse creates a new generation. Registration
+        // has no inherited proof even when every source certificate is current.
+        lighting.unregister_handle(handle);
+        terrain
+            .release_page(&gpu.queue, handle, &mut UploadBudget::new(1000000))
+            .unwrap();
+        let old_handle = handle;
+        handle = terrain
+            .upload_page(
+                &gpu.queue,
+                None,
+                1,
+                translation([0.; 3]),
+                &PageMesh::default(),
+                &mut UploadBudget::new(1000000),
+            )
+            .unwrap();
+        assert_eq!(handle.slot, old_handle.slot);
+        assert_ne!(handle.generation, old_handle.generation);
+        assert!(!lighting.light_volumes().retains_full_image(handle, 1));
+        lighting.register_page(page(), handle, bounds).unwrap();
+        let new_generation = lighting
+            .pump_scene(&gpu.queue, &mut scene, Tick(10), &mut UploadBudget::new(0))
+            .unwrap();
+        assert_eq!(new_generation.source_retags, 0);
+        assert!(!new_generation.ready);
+        source_proof_settle(&gpu, &mut lighting, &mut scene);
+
+        // Negative7: reconnect prepares a new lighting owner; no successful GPU
+        // image/proof can be inherited from another owner or its local clocks.
+        drop(lighting);
+        let mut fresh = ClientLighting::prepare_scene(
+            &gpu.device,
+            &gpu.queue,
+            &mut terrain,
+            &mut scene,
+            settings,
+            [8.; 3],
+            [0.3, 0.8, 0.2],
+        )
+        .unwrap();
+        fresh.register_page(page(), handle, bounds).unwrap();
+        let new_owner = fresh
+            .pump_scene(&gpu.queue, &mut scene, Tick(11), &mut UploadBudget::new(0))
+            .unwrap();
+        assert_eq!(new_owner.source_retags, 0);
+        assert!(!new_owner.ready);
+        source_proof_settle(&gpu, &mut fresh, &mut scene);
+        assert!(
+            source_proof_volume(&gpu, &fresh, handle)[1..]
+                .iter()
+                .all(|value| *value == hdr)
+        );
+    });
+}
 #[test]
 fn owner_runs_cpu_solver_dirty_uploads_and_shadow_cache_without_geometry_rebuild() {
     pollster::block_on(async {

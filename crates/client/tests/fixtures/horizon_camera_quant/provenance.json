@@ -1,0 +1,177 @@
+{
+  "схема": 1,
+  "описание": "Публичные входы настоящего worker и две полные Column для регрессии корзин камеры; без Raw/учётных данных/identity/приватного seed.",
+  "исходный_коммит": "2421b5bbc0cc8fb322a75b75087a94ec3bcf9208",
+  "протоколы": [
+    "CHJ5",
+    "CHR4",
+    "HTI2",
+    "CUBI1 Height/Geometry"
+  ],
+  "публичная_конфигурация": {
+    "seedDefault": 1,
+    "spawnOverride": false,
+    "noGeneration": false,
+    "freshCanonicalStores": true
+  },
+  "проба_камеры": {
+    "viewport": [
+      960,
+      540
+    ],
+    "near": 32,
+    "horizon": 16,
+    "msaa": 4,
+    "lodError": 32,
+    "publicActorPosition": [
+      30.5,
+      80,
+      -3.5
+    ],
+    "physicalYaw": 270,
+    "physicalPitch": 28.500003814697266,
+    "renderYaw": 90,
+    "renderPitch": -28.500003814697266,
+    "firstGameCompleted": true
+  },
+  "провайдеры": {
+    "columns": [
+      [
+        0,
+        0,
+        3,
+        2
+      ],
+      [
+        0,
+        0,
+        3,
+        3
+      ]
+    ],
+    "normalAnonymousRequest": "RequestExactHeight",
+    "credentialSupplied": false,
+    "OwnerActions": false,
+    "pagesPerColumn": 8,
+    "actualGeometryBodies": 16,
+    "allManifestBodySourceViewHeadersMatched": true,
+    "separateFreshStoreFromCapturedClient": true,
+    "samePrivateStoreClaim": false
+  },
+  "проверки_входов": {
+    "baselinePairedWasmByteExact": true,
+    "originalExactFlags": 66,
+    "authorizedFlagPromotions": 2,
+    "oldFlagsDemoted": 0,
+    "selectedExactColumns": 63,
+    "strictPixels": 32,
+    "measuredMaximumPixels": 31.943942751554673,
+    "missingCertificates": 0,
+    "leafLimited": 0,
+    "capacityLimited": false,
+    "pairedWasmSha256": "70e76b0eee2e42bd5e04704550023b75dbc8730faebf1e1ecaf1746f804eff1a",
+    "sourceFilesUnchanged": 1745,
+    "compilerControlInputsUnchanged": 802
+  },
+  "ограничения": [
+    "Это подтверждённые публичные входы и CPU-качество выбора; GPU front/lease swap здесь не проверяются.",
+    "Source Height и source/view Geometry — разные публичные домены версий; сравниваются соответствующие manifest/body stamps.",
+    "504 страницы — нижняя граница63 полных колонок; manifests прежних61 не входят в эту пробу.",
+    "Нативный Rust replay обязателен перед продвижением; здесь зафиксирован отдельный подтверждённый WASM-прогон. Статус подготовки Rust-тестов: authored_only."
+  ],
+  "стоимость": "Eye cell16→8: до2× больше пересечений на ось; yaw45→10: до4,5× больше корзин при вращении. Квоты контекстов, памяти,512 страниц,32px и дедлайны не меняются; фактическую работу и публикацию проверяет отдельный продуктовый прогон.",
+  "binaryFiles": {
+    "geometry-0-3-0-2.cubi": {
+      "sha256": "1fdfb8ed8e7273e1f5dbd4929b834bb7a2b9da9e75b60f9436fcefae78cfcafb",
+      "bytes": 1606
+    },
+    "geometry-0-3-0-3.cubi": {
+      "sha256": "cf73128bdfac1d5e1daa291af19ac7ee8087203f47ac0836b9eafab8d5012729",
+      "bytes": 1606
+    },
+    "geometry-0-3-1-2.cubi": {
+      "sha256": "342e7607994939dfb767a2debe0165588c7dfcfaca6dd18249020c8f0b88c6ae",
+      "bytes": 1087
+    },
+    "geometry-0-3-1-3.cubi": {
+      "sha256": "5d11e0fd8c42988e32ed8f80c68a27606a0c0596be75ba38b21b5a8bdb44bcf7",
+      "bytes": 1087
+    },
+    "geometry-0-3-2-2.cubi": {
+      "sha256": "953deb3818b2ede92c1f97a8f20b1dd002f2cc755f128e36f0cd0ec9ee8cf5ba",
+      "bytes": 1087
+    },
+    "geometry-0-3-2-3.cubi": {
+      "sha256": "112f715c0fd8741129a49be732b91115da0b23ac88ad8d2465d04e22d6fcf478",
+      "bytes": 1087
+    },
+    "geometry-0-3-3-2.cubi": {
+      "sha256": "331313e35b8f7d416fc72c36ab8929148a50fe53afe12dc13885d8059950d3b4",
+      "bytes": 1087
+    },
+    "geometry-0-3-3-3.cubi": {
+      "sha256": "7e320a7a89f17020e67b9c3e447ff6ceb0ae26b28b203337c40b19e9681047ed",
+      "bytes": 1087
+    },
+    "geometry-0-3-4-2.cubi": {
+      "sha256": "23a772d3a076c5214e71670ab9881d78e433b562507e9adfc29dd562292b4169",
+      "bytes": 3191
+    },
+    "geometry-0-3-4-3.cubi": {
+      "sha256": "1c6d5b70361fe6904433a80b373040162e63004d807dd4f3a20f496f3cbb2e77",
+      "bytes": 3219
+    },
+    "geometry-0-3-5-2.cubi": {
+      "sha256": "a67555ab78f72ffce171577b1efbd6caab25eeabf254689bf5f6bb380120855e",
+      "bytes": 2125
+    },
+    "geometry-0-3-5-3.cubi": {
+      "sha256": "1dc3f4da035e8969cd60430797990c619dff720de297dc3fc9db2a47824971ae",
+      "bytes": 2658
+    },
+    "geometry-0-3-6-2.cubi": {
+      "sha256": "79125fd0d63969300d672b907c22312771707905efc8d4b0f547bbd8799f7e78",
+      "bytes": 1080
+    },
+    "geometry-0-3-6-3.cubi": {
+      "sha256": "8c0c7324da01e7c47b1c27d5cc6008278a63fa43270accca06033242e3734a33",
+      "bytes": 1080
+    },
+    "geometry-0-3-7-2.cubi": {
+      "sha256": "a94227522296dd920c689473778055364a5a585c231290005ee85a8ee4e4b2df",
+      "bytes": 1080
+    },
+    "geometry-0-3-7-3.cubi": {
+      "sha256": "bd3979140ff95608e7efe8ee576b500ce3cfe99679a3c6617c5f27b1ef4623c0",
+      "bytes": 1080
+    },
+    "height-0-0-3-2.cubi": {
+      "sha256": "ea056fe082e0609ce365bad77d4b5d9548173a393863ae1678d8193da494b8d9",
+      "bytes": 3092
+    },
+    "height-0-0-3-3.cubi": {
+      "sha256": "04d89d52bcb003ef403768ec9bb1e49750ce44acce3f03e8d6453432741fc3c0",
+      "bytes": 3092
+    },
+    "public-height-L3--1--3.hti2": {
+      "sha256": "6de347e62f8220bcfce0c30983102c8cd96b226f691d0081f195639dd905b9be",
+      "bytes": 2804
+    },
+    "public-plan.chj5": {
+      "sha256": "7b458f1069c6d27bc123baa76c4290c045346e33b71bc906b2b441a7cb63a1f5",
+      "bytes": 16416
+    },
+    "public-result.chr4": {
+      "sha256": "7bcaf7f09c54ceafb31c119c2525b2328560e21639856dfe7d6531ccda6ba974",
+      "bytes": 4540
+    }
+  },
+  "binaryFileCount": 21,
+  "binaryBytes": 55191,
+  "снимок_сборки": {
+    "baselineCommit": "2421b5bbc0cc8fb322a75b75087a94ec3bcf9208",
+    "isolatedCandidate": true,
+    "pairManifestSha256": "0cdfd03e352af9d53d9187b4d2ad0fddaf3ea1b599e8a4781b9fea0861dc6700",
+    "sourceReceiptSha256": "62baa983630352c9dfcc7245d2d8d621f85656a24b78d20a421b89921d498132"
+  }
+}

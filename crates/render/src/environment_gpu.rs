@@ -3,6 +3,7 @@
 use crate::contact_ao::{
     ContactAoConfig, ContactAoError, ContactAoGpu, ContactAoInputs, ContactAoWork,
 };
+mod temporal;
 use crate::{
     OutputTransfer,
     aerial_gpu::{
@@ -24,6 +25,8 @@ use crate::{
     },
     water_gpu::{WaterConfig, WaterError, WaterGpu, WaterInputs, WaterState, WaterWork},
 };
+use temporal::TemporalAttachment;
+pub use temporal::TemporalInputs;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EnvironmentConfig {
     pub atmosphere: AtmosphereConfig,
@@ -86,6 +89,9 @@ pub struct EnvironmentBudget {
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EnvironmentWork {
+    pub temporal: crate::taa::TaaWork,
+    pub temporal_optics: crate::temporal_optics_mask::Work,
+    pub motion_draws: u32,
     pub contact_ao: ContactAoWork,
     pub aerial: AerialWork,
     pub celestial: CelestialWork,
@@ -114,6 +120,9 @@ pub enum EnvironmentError {
     Celestial(CelestialError),
     Aerial(AerialError),
     ContactAo(ContactAoError),
+    Temporal(crate::taa::Error),
+    TemporalOptics(crate::temporal_optics_mask::Error),
+    Motion(crate::model_motion::Error),
 }
 impl std::fmt::Display for EnvironmentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -139,6 +148,9 @@ error_from!(PostError, Post);
 error_from!(CelestialError, Celestial);
 error_from!(AerialError, Aerial);
 error_from!(ContactAoError, ContactAo);
+error_from!(crate::taa::Error, Temporal);
+error_from!(crate::model_motion::Error, Motion);
+error_from!(crate::temporal_optics_mask::Error, TemporalOptics);
 
 struct AerialShadowOwner {
     parameters: wgpu::Buffer,
@@ -165,6 +177,7 @@ pub struct EnvironmentGpu {
     clouds: Option<CloudGpu>,
     gi: Option<GiGpu>,
     post: PostGpu,
+    temporal: Option<Box<TemporalAttachment>>,
     aerial: Option<AerialGpu>,
     celestial: Option<CelestialGpu>,
     moon_phase: u8,
@@ -338,6 +351,7 @@ impl EnvironmentGpu {
             clouds,
             gi,
             post,
+            temporal: None,
             aerial: None,
             celestial: None,
             moon_phase: 0,
@@ -391,6 +405,9 @@ impl EnvironmentGpu {
             return Err(EnvironmentError::UploadBudget);
         }
         terrain.resize(device, width, height)?;
+        if let Some(temporal) = &mut self.temporal {
+            temporal.inputs_dirty = true;
+        }
         if let Some(ao) = &mut self.contact_ao {
             ao.resize_inputs(
                 device,
@@ -821,6 +838,13 @@ impl EnvironmentGpu {
         state: EnvironmentState,
         gi_rays: u32,
     ) -> bool {
+        if self
+            .temporal
+            .as_ref()
+            .is_some_and(|owner| owner.gpu.pending().is_some())
+        {
+            return true;
+        }
         let gi_planned = self.gi_pending(state)
             && self
                 .gi
@@ -862,6 +886,20 @@ impl EnvironmentGpu {
         state: EnvironmentState,
         gi_rays: u32,
     ) -> bool {
+        self.temporal_source_needed_with_rays(terrain, camera, mode, state, gi_rays)
+            || self.post.needs_redraw(self.output_revision)
+    }
+    /// HDR inputs only, excluding Post adaptation/presentation. Query before
+    /// beginning a temporal candidate, using its last presented raster camera
+    /// when the unjittered source camera has not changed.
+    pub fn temporal_source_needed_with_rays(
+        &self,
+        terrain: &TerrainGpu,
+        camera: &Camera,
+        mode: CullingMode,
+        state: EnvironmentState,
+        gi_rays: u32,
+    ) -> bool {
         self.scene_needed_with_rays(terrain, camera, mode, state, gi_rays)
             || self.water.as_ref().is_some_and(|water| {
                 water.needs_redraw(self.water_state(*camera, state, terrain.hdr_revision()))
@@ -877,7 +915,6 @@ impl EnvironmentGpu {
                     self.atmosphere_revision,
                 ))
             })
-            || self.post.needs_redraw(self.output_revision)
     }
     /// Present a previously completed HDR while atomic near/far admission is
     /// pending. No camera, atmosphere, GI, water or scene commands are encoded.
@@ -892,10 +929,26 @@ impl EnvironmentGpu {
         if !self.encoded || !self.post.has_cached_source() {
             return Ok(None);
         }
+        let mut temporal_work = crate::taa::TaaWork::default();
+        if let Some(temporal) = &mut self.temporal {
+            if temporal.inputs_dirty
+                || temporal.gpu.pending().is_some()
+                || temporal.gpu.presented().is_none()
+            {
+                return Ok(None);
+            }
+            // Do not issue the restore copy if the complete cached Post plan
+            // cannot run. History remains the last actually presented frame.
+            if self.post.pending_cached_work().pixels() > *remaining_pixels {
+                return Err(EnvironmentError::WorkBudget);
+            }
+            temporal_work.history_copy_bytes = temporal.gpu.restore_presented_output(encoder)?;
+        }
         let post = self
             .post
             .present_cached(encoder, output, remaining_pixels)?;
         let work = EnvironmentWork {
+            temporal: temporal_work,
             passes: post.passes,
             draws: post.draws,
             post,
@@ -919,12 +972,83 @@ impl EnvironmentGpu {
         budget: &mut EnvironmentBudget,
         extra: impl FnOnce(&mut wgpu::RenderPass<'_>) -> u32,
     ) -> Result<EnvironmentWork, EnvironmentError> {
+        self.encode_with_temporal(
+            queue,
+            encoder,
+            terrain,
+            output,
+            camera,
+            mode,
+            state,
+            budget,
+            extra,
+            0,
+            |_, _, _| Err(EnvironmentError::Temporal(crate::taa::Error::InvalidFrame)),
+        )
+    }
+    /// The callback clears/rasterizes actual object motion into the prepared
+    /// inputs. Its exact upload credit participates in the same global preflight.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_with_temporal(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        terrain: &mut TerrainGpu,
+        output: &wgpu::TextureView,
+        camera: &Camera,
+        mode: CullingMode,
+        state: EnvironmentState,
+        budget: &mut EnvironmentBudget,
+        extra: impl FnOnce(&mut wgpu::RenderPass<'_>) -> u32,
+        motion_upload_bytes: u64,
+        motion: impl FnOnce(
+            &wgpu::Queue,
+            &mut wgpu::CommandEncoder,
+            &mut UploadBudget,
+        ) -> Result<u32, EnvironmentError>,
+    ) -> Result<EnvironmentWork, EnvironmentError> {
         self.last_work = EnvironmentWork::default();
         if !state.valid() || camera.inverse_view_projection().is_none() {
             return Err(EnvironmentError::InvalidState);
         }
-        if !self.needs_redraw_with_rays(terrain, camera, mode, state, budget.gi_rays) {
+        let token = self.temporal.as_ref().and_then(|owner| owner.gpu.pending());
+        let temporal_plan = self
+            .temporal
+            .as_ref()
+            .map(|owner| {
+                if owner.inputs_dirty {
+                    return Err(crate::taa::Error::InvalidFrame);
+                }
+                token.map(|token| owner.gpu.pending_work(token)).transpose()
+            })
+            .transpose()?
+            .flatten();
+        let optics_plan = self
+            .temporal
+            .as_ref()
+            .filter(|_| temporal_plan.is_some())
+            .and_then(|owner| owner.optics.as_ref())
+            .map(|optics| optics.pending_work(self.water.as_ref(), self.clouds.as_ref()))
+            .transpose()?
+            .unwrap_or_default();
+        if temporal_plan.is_none()
+            && !self.needs_redraw_with_rays(terrain, camera, mode, state, budget.gi_rays)
+        {
             return Ok(self.last_work);
+        }
+        let post_token = self
+            .temporal
+            .as_ref()
+            .and_then(|owner| owner.post_frame)
+            .or_else(|| token.map(crate::post::PostFrameToken::from));
+        if let Some(token) = token
+            && post_token != Some(token.into())
+        {
+            return Err(EnvironmentError::InvalidState);
+        }
+        if self.temporal.is_some() {
+            self.post
+                .validate_temporal_begin(post_token.ok_or(EnvironmentError::InvalidState)?)?;
         }
         let atmosphere_work = self
             .atmosphere
@@ -958,7 +1082,11 @@ impl EnvironmentGpu {
                 .min(config.max_jobs)
                 .min(budget.gi_rays / (config.rays_per_probe + 6))
             });
-        let scene_needed = self.scene_needed_with_gi(terrain, camera, mode, state, gi_plan > 0);
+        let scene_needed = temporal_plan.is_some()
+            || self.scene_needed_with_gi(terrain, camera, mode, state, gi_plan > 0);
+        if scene_needed && self.temporal.is_some() && token.is_none() {
+            return Err(EnvironmentError::Temporal(crate::taa::Error::InvalidFrame));
+        }
         let ao_plan = self
             .contact_ao
             .as_ref()
@@ -1006,9 +1134,9 @@ impl EnvironmentGpu {
         } else {
             CloudWork::default()
         };
-        let next_output = self
-            .output_revision
-            .wrapping_add(u64::from(precloud_changed || cloud_plan.passes > 0));
+        let next_output = self.output_revision.wrapping_add(u64::from(
+            precloud_changed || cloud_plan.passes > 0 || temporal_plan.is_some(),
+        ));
         let post_plan = self.post.pending_work(next_output);
         if ao_plan.max_depth_reads > budget.contact_depth_reads
             || atmosphere_work.integration_steps > budget.atmosphere_steps
@@ -1016,7 +1144,11 @@ impl EnvironmentGpu {
             || cloud_plan.max_density_samples > budget.cloud_density_samples
             || aerial_plan.integration_steps > budget.aerial_steps
             || aerial_plan.composition_samples > budget.aerial_samples
-            || post_plan.pixels() > budget.post_pixels
+            || post_plan
+                .pixels()
+                .saturating_add(temporal_plan.map_or(0, |work| work.pixels))
+                .saturating_add(optics_plan.pixels)
+                > budget.post_pixels
         {
             return Err(EnvironmentError::WorkBudget);
         }
@@ -1038,6 +1170,9 @@ impl EnvironmentGpu {
             + celestial_upload
             + aerial_plan.upload_bytes
             + ao_plan.upload_bytes;
+        let parameter_bytes = parameter_bytes.saturating_add(temporal_plan.map_or(0, |work| {
+            work.upload_bytes.saturating_add(motion_upload_bytes)
+        }));
         if parameter_bytes > budget.upload_bytes {
             return Err(EnvironmentError::UploadBudget);
         }
@@ -1153,11 +1288,39 @@ impl EnvironmentGpu {
             )?;
             budget.cloud_density_samples -= work.clouds.max_density_samples;
         }
+        if let (Some(owner), Some(token)) = (&mut self.temporal, token) {
+            work.motion_draws = motion(queue, encoder, &mut upload)?;
+            if let Some(optics) = &owner.optics {
+                work.temporal_optics = optics.encode(
+                    encoder,
+                    self.water.as_ref(),
+                    self.clouds.as_ref(),
+                    budget.post_pixels,
+                )?;
+                budget.post_pixels -= work.temporal_optics.pixels;
+            }
+            work.temporal = owner.gpu.encode(queue, encoder, token, &mut upload)?;
+            budget.post_pixels -= work.temporal.pixels;
+        }
         self.post
             .set_delta(queue, state.delta_seconds, &mut upload)?;
-        work.post = self
-            .post
-            .encode(encoder, output, next_output, &mut budget.post_pixels)?;
+        work.post = if let Some(token) = post_token {
+            let work = self.post.encode_temporal(
+                encoder,
+                output,
+                next_output,
+                &mut budget.post_pixels,
+                token,
+            )?;
+            self.temporal
+                .as_mut()
+                .expect("temporal post token")
+                .post_frame = None;
+            work
+        } else {
+            self.post
+                .encode(encoder, output, next_output, &mut budget.post_pixels)?
+        };
         self.last_delta = state.delta_seconds;
         self.precloud_revision = next_precloud;
         self.preaerial_revision = next_preaerial;
@@ -1172,19 +1335,33 @@ impl EnvironmentGpu {
             + work.gi.passes
             + work.post.passes
             + work.aerial.passes
-            + work.contact_ao.passes;
+            + work.contact_ao.passes
+            + work.temporal_optics.passes
+            + work.temporal.passes
+            + u32::from(temporal_plan.is_some());
         work.draws = work.terrain.draw_calls
             + work.water.draws
             + work.clouds.draws
             + work.post.draws
             + work.aerial.draws
-            + work.contact_ao.draws;
+            + work.contact_ao.draws
+            + work.temporal_optics.draws
+            + work.temporal.passes
+            + work.motion_draws;
         self.last_work = work;
         self.encoded = true;
         Ok(work)
     }
     /// Call if an encoded graph was abandoned, rather than submitted/presented.
     pub fn invalidate(&mut self, terrain: &mut TerrainGpu, tick: u64) {
+        self.invalidate_scene_sources(terrain, tick);
+        self.post.invalidate();
+    }
+    /// An abandoned, unsubmitted scene did not execute the GPU work which its
+    /// CPU node caches recorded. Rebuild those sources while preserving the
+    /// independently restored Post/exposure cache for UI-only presentation.
+    pub fn invalidate_scene_sources(&mut self, terrain: &mut TerrainGpu, tick: u64) {
+        self.last_work = EnvironmentWork::default();
         terrain.invalidate();
         self.atmosphere.invalidate();
         if let Some(ao) = &mut self.contact_ao {
@@ -1203,9 +1380,8 @@ impl EnvironmentGpu {
             gi.invalidate(tick);
         }
         self.last_gi_attempt = None;
-        self.post.invalidate();
     }
-    pub fn extra_timing_sources(&self) -> [Option<TimingSource<'_>>; 8] {
+    pub fn extra_timing_sources(&self) -> [Option<TimingSource<'_>>; 10] {
         [
             self.contact_ao
                 .as_ref()
@@ -1257,9 +1433,29 @@ impl EnvironmentGpu {
                     )
                 })
                 .flatten(),
+            self.temporal
+                .as_ref()
+                .filter(|_| {
+                    self.last_work.temporal.passes > 0
+                        || self.last_work.temporal.history_copy_bytes > 0
+                })
+                .and_then(|owner| owner.gpu.timing_source())
+                .map(|mut source| {
+                    source.kinds = [13; 32];
+                    source
+                }),
+            self.temporal
+                .as_ref()
+                .filter(|_| self.last_work.temporal_optics.passes > 0)
+                .and_then(|owner| owner.optics.as_ref())
+                .and_then(crate::temporal_optics_mask::TemporalOpticsMask::timing_source)
+                .map(|mut source| {
+                    source.kinds = [13; 32];
+                    source
+                }),
         ]
     }
-    pub fn timing_sources<'a>(&'a self, terrain: &'a TerrainGpu) -> [Option<TimingSource<'a>>; 9] {
+    pub fn timing_sources<'a>(&'a self, terrain: &'a TerrainGpu) -> [Option<TimingSource<'a>>; 11] {
         let scene = if self.last_work.terrain.passes > 0 {
             terrain.timestamp_buffer().map(|(buffer, period)| {
                 let graph = terrain.frame_graph();
@@ -1285,10 +1481,20 @@ impl EnvironmentGpu {
         } else {
             None
         };
-        let [ao, multiple, aerial, water, clouds, post, gi, atmosphere] =
-            self.extra_timing_sources();
+        let [
+            ao,
+            multiple,
+            aerial,
+            water,
+            clouds,
+            post,
+            gi,
+            atmosphere,
+            temporal,
+            optics,
+        ] = self.extra_timing_sources();
         [
-            scene, ao, water, aerial, multiple, clouds, post, gi, atmosphere,
+            scene, ao, water, aerial, multiple, clouds, post, gi, atmosphere, temporal, optics,
         ]
     }
 }

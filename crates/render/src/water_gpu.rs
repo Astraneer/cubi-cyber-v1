@@ -191,6 +191,18 @@ struct Slot {
     references: u32,
     model: [[f32; 4]; 4],
 }
+/// Borrowed current geometry for optional temporal invalidation. No shading or
+/// refraction is repeated; the bind/indirect list is the actual color list.
+pub struct WaterTemporalSource<'a> {
+    pub bind: &'a wgpu::BindGroup,
+    pub indirect: &'a wgpu::Buffer,
+    pub depth: &'a wgpu::TextureView,
+    pub extent: [u32; 2],
+    pub samples: u32,
+    pub quads: u32,
+    pub enabled: bool,
+    pub prepared: bool,
+}
 pub struct WaterGpu {
     sample_count: u32,
     config: WaterConfig,
@@ -1575,6 +1587,22 @@ impl WaterGpu {
     pub fn depth_msaa(&self) -> &wgpu::TextureView {
         &self.depth
     }
+    pub fn temporal_source(&self) -> WaterTemporalSource<'_> {
+        WaterTemporalSource {
+            bind: &self.bind,
+            indirect: &self.indirect,
+            depth: &self.depth,
+            extent: [self.width, self.height],
+            samples: self.sample_count,
+            quads: self.active_quad_count(),
+            enabled: self.surface_enabled,
+            prepared: self.last.is_some(),
+        }
+    }
+    /// Loading only; frame planning/encoding needs no layout handle allocation.
+    pub fn temporal_layout(&self) -> wgpu::BindGroupLayout {
+        self.pipeline.get_bind_group_layout(0)
+    }
     pub fn resolved_view(&self) -> &wgpu::TextureView {
         self.reflection
             .as_ref()
@@ -1602,6 +1630,15 @@ impl WaterGpu {
         self.last_cull = None;
         self.last_snapshot = None
     }
+}
+/// The identical vertex declaration/body used by the physical surface. Global
+/// optical declarations are retained, but this entry reaches bindings0..3 only.
+pub fn temporal_vertex_source(samples: u32) -> String {
+    let source = include_str!("water.wgsl");
+    let (vertex, _) = source
+        .split_once("@vertex fn background_vertex")
+        .expect("water vertex source contract");
+    crate::sampling::shader(vertex, samples).into_owned()
 }
 fn buffer_layout(
     binding: u32,

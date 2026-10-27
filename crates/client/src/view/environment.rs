@@ -26,6 +26,9 @@ pub use source_jobs::SourceJobStats;
 #[derive(Clone, Copy, Debug)]
 pub struct EnvironmentProfile {
     pub graphics: EnvironmentConfig,
+    /// Requested loading attachment. Receipt requires the View's actual motion
+    /// owners and the attached resolver; this flag alone does not apply TAA.
+    pub temporal: Option<render::taa::TaaConfig>,
     pub celestials: Option<CelestialConfig>,
     pub aerial: Option<AerialConfig>,
     pub multiple_scattering: Option<MultipleScatteringConfig>,
@@ -47,6 +50,7 @@ impl Default for EnvironmentProfile {
     fn default() -> Self {
         Self {
             graphics: EnvironmentConfig::default(),
+            temporal: None,
             celestials: Some(CelestialConfig::default()),
             aerial: Some(AerialConfig::default()),
             multiple_scattering: Some(MultipleScatteringConfig::default()),
@@ -67,12 +71,18 @@ impl Default for EnvironmentProfile {
     }
 }
 impl EnvironmentProfile {
-    /// Product AA choice. MSAA4 retains the original resources; single-sample
-    /// presentation prepares a physical-resolution morphological AA graph.
-    pub fn with_antialiasing(mut self, samples: u32) -> Result<Self, ViewEnvironmentError> {
-        self.graphics.post.smaa = match samples {
+    /// Product AA choice:1=SMAA1,2=TAA1,4=MSAA4. The temporal choice is a
+    /// loading request until actual geometry motion attaches its inputs.
+    pub fn with_antialiasing(mut self, mode: u32) -> Result<Self, ViewEnvironmentError> {
+        self.temporal = match mode {
+            1 | 4 => None,
+            2 => Some(render::taa::TaaConfig::default()),
+            _ => return Err(ViewEnvironmentError::InvalidConfig),
+        };
+        self.graphics.post.smaa = match mode {
             4 => None,
             1 => Some(render::smaa::SmaaConfig::default()),
+            2 => None,
             _ => return Err(ViewEnvironmentError::InvalidConfig),
         };
         Ok(self)
@@ -278,6 +288,11 @@ impl ViewEnvironment {
         eye: [f32; 3],
         sun: [f32; 3],
     ) -> Result<Self, ViewEnvironmentError> {
+        if profile.temporal.is_some()
+            && (terrain.sample_count() != 1 || profile.graphics.post.smaa.is_some())
+        {
+            return Err(ViewEnvironmentError::InvalidConfig);
+        }
         if profile.graphics.gi.is_some()
             && (profile.journal_rows_per_pump == 0
                 || profile.source_pages_per_pump == 0
@@ -348,6 +363,13 @@ impl ViewEnvironment {
             gi_rays_left: profile.gi_rays_per_tick,
             gi_started: false,
         })
+    }
+    /// A loading request, separate from the actual prepared-backend receipt.
+    pub fn requested_temporal_config(&self) -> Option<render::taa::TaaConfig> {
+        self.profile.temporal
+    }
+    pub(super) fn temporal_optical_mask_needed(&self) -> bool {
+        self.profile.graphics.water.is_some() || self.profile.graphics.clouds.is_some()
     }
     pub fn state(
         eye: [f32; 3],
@@ -526,6 +548,34 @@ impl ViewEnvironment {
             self.available_gi_rays(state.tick),
         )
     }
+    pub fn temporal_source_needed(
+        &self,
+        terrain: &TerrainGpu,
+        camera: &Camera,
+        mode: CullingMode,
+        state: EnvironmentState,
+    ) -> bool {
+        self.gpu.temporal_source_needed_with_rays(
+            terrain,
+            camera,
+            mode,
+            state,
+            self.available_gi_rays(state.tick),
+        )
+    }
+    /// No encoded GPU work ran. Retain the already spent per-tick GI credit,
+    /// but do not advertise an abandoned first trace as a submitted result.
+    pub(super) fn discard_unsubmitted_scene(
+        &mut self,
+        terrain: &mut TerrainGpu,
+        tick: u64,
+        gi_started: bool,
+    ) {
+        self.gpu.invalidate_scene_sources(terrain, tick);
+        self.gi_started = gi_started;
+        self.stats.gi_started = gi_started;
+        self.stats.gpu = EnvironmentWork::default();
+    }
     /// Preserve the last complete scene during a pending atomic coverage join.
     pub fn encode_cached_present(
         &mut self,
@@ -555,6 +605,41 @@ impl ViewEnvironment {
         upload: &mut UploadBudget,
         extra: impl FnOnce(&mut wgpu::RenderPass<'_>) -> u32,
     ) -> Result<EnvironmentWork, ViewEnvironmentError> {
+        self.encode_with_temporal(
+            queue,
+            encoder,
+            terrain,
+            output,
+            camera,
+            mode,
+            state,
+            upload,
+            extra,
+            0,
+            |_, _, _| Err(EnvironmentError::Temporal(render::taa::Error::InvalidFrame)),
+        )
+    }
+    /// The exact motion credit is preflighted with every other graph node.
+    /// A pending candidate uses the same token as the presented-pose cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_with_temporal(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        terrain: &mut TerrainGpu,
+        output: &wgpu::TextureView,
+        camera: &Camera,
+        mode: CullingMode,
+        state: EnvironmentState,
+        upload: &mut UploadBudget,
+        extra: impl FnOnce(&mut wgpu::RenderPass<'_>) -> u32,
+        motion_upload_bytes: u64,
+        motion: impl FnOnce(
+            &wgpu::Queue,
+            &mut wgpu::CommandEncoder,
+            &mut UploadBudget,
+        ) -> Result<u32, EnvironmentError>,
+    ) -> Result<EnvironmentWork, ViewEnvironmentError> {
         let mut budget = EnvironmentBudget {
             contact_depth_reads: self.profile.contact_depth_reads,
             aerial_steps: self.profile.aerial_steps,
@@ -566,7 +651,7 @@ impl ViewEnvironment {
             gi_rays: self.available_gi_rays(state.tick),
             post_pixels: self.profile.post_pixels,
         };
-        let work = self.gpu.encode(
+        let work = self.gpu.encode_with_temporal(
             queue,
             encoder,
             terrain,
@@ -576,6 +661,8 @@ impl ViewEnvironment {
             state,
             &mut budget,
             extra,
+            motion_upload_bytes,
+            motion,
         )?;
         self.gi_tick = Some(state.tick);
         self.gi_rays_left = budget.gi_rays;

@@ -994,6 +994,15 @@ impl TerrainGpu {
         &self.indirect
     }
 
+    /// Optional temporal raster reuses the exact prepared primary bindings and
+    /// visibility lists. These accessors do not allocate or change that state.
+    pub fn primary_render_bind(&self) -> &wgpu::BindGroup {
+        &self.render_bind
+    }
+    pub fn primary_render_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.render_layout
+    }
+
     /// Loading-screen configuration only: prepare lit variants and bind separate
     /// light/shadow resources before the first frame. No runtime shader compilation.
     pub fn attach_lighting(

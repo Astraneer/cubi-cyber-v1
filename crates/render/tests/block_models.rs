@@ -715,3 +715,194 @@ mod ports_markers;
 
 #[path = "common/connector_color.rs"]
 mod connector_color;
+
+#[test]
+fn source_gate_retires_actual_old_shadow_depth_without_upload_and_preserves_other_family() {
+    use render::{
+        entity_gpu::{EntityConfig, EntityGpu, EntityInstance},
+        shadows::{DynamicShadowCaster, ShadowCasterPair, ShadowConfig, ShadowGpu},
+    };
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let terrain = terrain(&gpu);
+    for projected_bounds in [false, true] {
+        let config = ShadowConfig {
+            resolution: 128,
+            half_widths: [8., 16., 32.],
+            depth_half_extent: 32.,
+            max_updates_per_frame: 3,
+            dynamic_casters: true,
+            projected_bounds,
+            ..ShadowConfig::default()
+        };
+        let mut shadows = ShadowGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            terrain.geometry(),
+            config,
+            [0.; 3],
+            [0., 1., 0.],
+        )
+        .unwrap();
+        let mut oracle = ShadowGpu::new(
+            &gpu.device,
+            &gpu.queue,
+            terrain.geometry(),
+            config,
+            [0.; 3],
+            [0., 1., 0.],
+        )
+        .unwrap();
+        let make_props = |s: &ShadowGpu| {
+            BlockModelsGpu::new(
+                &gpu.device,
+                &gpu.queue,
+                terrain.geometry(),
+                BlockConfig {
+                    max_instances: 1,
+                    atlas_layers: 186,
+                },
+                Some(s),
+            )
+            .unwrap()
+        };
+        let make_mobs = |s: &ShadowGpu| {
+            EntityGpu::new(
+                &gpu.device,
+                &gpu.queue,
+                terrain.geometry(),
+                EntityConfig {
+                    max_entities: 1,
+                    atlas_layers: 186,
+                },
+                Some(s),
+            )
+            .unwrap()
+        };
+        let mut props = make_props(&shadows);
+        let mut empty_props = make_props(&oracle);
+        let mut mobs = make_mobs(&shadows);
+        let mut oracle_mobs = make_mobs(&oracle);
+        let mut chest = prop(kind::CHEST);
+        chest.position = [-2., 0., 0.];
+        props
+            .upload(&gpu.queue, &[chest], &mut UploadBudget::new(64))
+            .unwrap();
+        let mob = EntityInstance {
+            position: [2., 0., 0.],
+            body_yaw: 0.,
+            head_yaw: 0.,
+            pitch: 0.,
+            limb_phase: 0.,
+            limb_amount: 0.,
+            kind: 0,
+            flags: 0,
+            color: 0,
+            id_low: 1,
+            id_high: 0,
+            death_roll: 0.,
+            scale: 1.,
+            reserved: 0.,
+        };
+        mobs.upload(&gpu.queue, &[mob], &[], &mut UploadBudget::new(68))
+            .unwrap();
+        oracle_mobs
+            .upload(&gpu.queue, &[mob], &[], &mut UploadBudget::new(68))
+            .unwrap();
+        let encode = |s: &mut ShadowGpu, p: &mut BlockModelsGpu, m: &mut EntityGpu| {
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            let work = s
+                .encode_dynamic(
+                    &gpu.queue,
+                    &mut encoder,
+                    &mut ShadowCasterPair {
+                        first: m,
+                        second: p,
+                    },
+                )
+                .unwrap();
+            gpu.queue.submit([encoder.finish()]);
+            gpu.device.poll(wgpu::PollType::Wait).unwrap();
+            work
+        };
+        let bytes = |p: &BlockModelsGpu| {
+            let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("source gate actual unchanged instance bytes"),
+                size: 64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            encoder.copy_buffer_to_buffer(p.instance_buffer(), 0, &buffer, 0, 64);
+            gpu.queue.submit([encoder.finish()]);
+            read(&gpu, &buffer)
+        };
+        encode(&mut oracle, &mut empty_props, &mut oracle_mobs);
+        let mob_only = shadow_depths(&gpu, oracle.sampled_texture(), 128);
+        assert!(
+            mob_only.iter().any(|v| *v > 0.),
+            "independent mob-only oracle must contain real depth"
+        );
+        encode(&mut shadows, &mut props, &mut mobs);
+        let with_chest = shadow_depths(&gpu, shadows.sampled_texture(), 128);
+        assert_ne!(
+            with_chest, mob_only,
+            "positive Chest shadow oracle is missing"
+        );
+        let old_bytes = bytes(&props);
+        assert_eq!(
+            u32::from_le_bytes(old_bytes[20..24].try_into().unwrap())
+                & render::block_models::HIDDEN,
+            0
+        );
+        let epoch = props.source_epoch();
+        props.take_work();
+        props.revoke_source().unwrap();
+        assert!(!props.source_valid());
+        assert_ne!(props.source_epoch(), epoch);
+        assert!(
+            props.available(),
+            "resource availability must survive content revocation"
+        );
+        assert_eq!(props.primary_draw_mask(), 0);
+        assert_eq!(props.colored_transporter_count(), 0);
+        assert_eq!(
+            props.take_work().upload_bytes,
+            0,
+            "O(1) gate must not hide N instance rows"
+        );
+        assert_eq!(bytes(&props), old_bytes);
+        let retired = encode(&mut shadows, &mut props, &mut mobs);
+        assert!(retired.dynamic_restore_draws > 0);
+        assert_eq!(
+            shadow_depths(&gpu, shadows.sampled_texture(), 128),
+            mob_only,
+            "retired Chest shadow leaked or valid mob shadow was cleared (projected={projected_bounds})"
+        );
+        let revoked = props.source_epoch();
+        props.revoke_source().unwrap();
+        assert_ne!(
+            props.source_epoch(),
+            revoked,
+            "repeated loss must retire late snapshots too"
+        );
+        encode(&mut shadows, &mut props, &mut mobs);
+        assert_eq!(
+            shadow_depths(&gpu, shadows.sampled_texture(), 128),
+            mob_only
+        );
+        assert!(props.set_source_valid(true).unwrap());
+        assert_eq!(
+            bytes(&props),
+            old_bytes,
+            "reopening must not publish fake hidden rows"
+        );
+        encode(&mut shadows, &mut props, &mut mobs);
+        assert_eq!(
+            shadow_depths(&gpu, shadows.sampled_texture(), 128),
+            with_chest,
+            "valid family did not restore independently of its unchanged GPU records"
+        );
+    }
+    assert!(pollster::block_on(gpu.device.pop_error_scope()).is_none());
+}

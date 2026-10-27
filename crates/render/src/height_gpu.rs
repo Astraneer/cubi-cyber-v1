@@ -108,6 +108,9 @@ pub struct HeightGpu {
     camera: wgpu::Buffer,
     indirect: wgpu::Buffer,
     bind: wgpu::BindGroup,
+    render_layout: wgpu::BindGroupLayout,
+    temporal_raster: bool,
+    lighting_features: [bool; 2],
     cull_bind: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
     near_pipeline: Option<wgpu::RenderPipeline>,
@@ -229,6 +232,7 @@ impl HeightGpu {
             label: Some("public height grid draw layout"),
             entries: &entries,
         });
+        let render_layout = layout.clone();
         let cull_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("height tile GPU visibility"),
             entries: &[
@@ -385,6 +389,9 @@ impl HeightGpu {
             camera,
             indirect,
             bind,
+            render_layout,
+            temporal_raster: false,
+            lighting_features: [shadows.is_some(), atmosphere.is_some()],
             cull_bind,
             pipeline,
             near_pipeline,
@@ -710,6 +717,9 @@ impl HeightGpu {
         }
         Ok(bytes)
     }
+    pub fn invalidate_prepared_frame(&mut self) {
+        self.last = None;
+    }
     pub fn prepare_frame(
         &mut self,
         queue: &wgpu::Queue,
@@ -771,6 +781,111 @@ impl HeightGpu {
     }
     pub fn indirect_buffer(&self) -> &wgpu::Buffer {
         &self.indirect
+    }
+    pub fn primary_render_bind(&self) -> &wgpu::BindGroup {
+        &self.bind
+    }
+    pub fn primary_render_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.render_layout
+    }
+    pub fn sample_count(&self) -> u32 {
+        self.sample_count
+    }
+    pub fn temporal_raster_prepared(&self) -> bool {
+        self.temporal_raster
+    }
+    pub fn temporal_raster_preparable(&self) -> bool {
+        self.temporal_raster
+            || (self.sample_count == 1
+                && self.last.is_none()
+                && self.slots.iter().all(|slot| slot.key.is_none()))
+    }
+    pub fn temporal_slot_generations(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+        self.slots.iter().map(|slot| {
+            if slot.key.is_some() {
+                slot.generation
+            } else {
+                0
+            }
+        })
+    }
+    /// Loading-only exact raster linkage for the optional depth-equal motion
+    /// pass. Ordinary constructors retain their original source and resources.
+    pub fn prepare_temporal_raster(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Result<u32, HeightGpuError> {
+        if self.temporal_raster {
+            return Ok(0);
+        }
+        if !self.temporal_raster_preparable() {
+            return Err(HeightGpuError::InvalidConfig);
+        }
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("optional invariant height layout"),
+            bind_group_layouts: &[&self.render_layout],
+            push_constant_ranges: &[],
+        });
+        let make = |source: String| -> Result<wgpu::RenderPipeline, HeightGpuError> {
+            let pattern = "@builtin(position)position:vec4<f32>";
+            if !source.contains(pattern) {
+                return Err(HeightGpuError::InvalidConfig);
+            }
+            let source = source.replacen(
+                pattern,
+                "@builtin(position)@invariant position:vec4<f32>",
+                1,
+            );
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("same height geometry with invariant temporal linkage"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            Ok(
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("optional exact-depth temporal height color"),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vertex"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        cull_mode: Some(wgpu::Face::Back),
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: true,
+                        depth_compare: wgpu::CompareFunction::GreaterEqual,
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: Default::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fragment"),
+                        compilation_options: Default::default(),
+                        targets: &crate::ambient_mrt::targets(None, self.ambient_mrt),
+                    }),
+                    multiview: None,
+                    cache: None,
+                }),
+            )
+        };
+        let features = self.lighting_features;
+        let ordinary = make(shader_source(features[0], features[1], self.ambient_mrt))?;
+        let near = make(near_shader_source(
+            features[0],
+            features[1],
+            self.ambient_mrt,
+            false,
+        ))?;
+        self.pipeline = ordinary;
+        self.near_pipeline = Some(near);
+        self.temporal_raster = true;
+        self.work.pipeline_compilations += 2;
+        Ok(2)
     }
     pub fn payload_buffer(&self) -> &wgpu::Buffer {
         &self.payload

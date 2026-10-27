@@ -10,6 +10,7 @@ use render::{
         EntityConfig, EntityError, EntityGpu, EntityInstance, EntityWork, PRIMARY_HIDDEN,
     },
     light_volume::PackedLight,
+    presented_motion::ObjectKey,
     shadows::ShadowGpu,
     terrain_gpu::{Camera, TerrainGpu, UploadBudget},
 };
@@ -48,6 +49,12 @@ pub struct ViewEntities {
     last_count: usize,
     casts_shadows: bool,
     authoritative_light: bool,
+    temporal_identities: Option<TemporalIdentities>,
+}
+struct TemporalIdentities {
+    remote: Vec<Option<ObjectKey>>,
+    staging: Vec<Option<ObjectKey>>,
+    published: Vec<Option<ObjectKey>>,
 }
 impl ViewEntities {
     pub fn prepare(
@@ -138,13 +145,60 @@ impl ViewEntities {
             last_count: 0,
             casts_shadows: shadows.is_some(),
             authoritative_light,
+            temporal_identities: None,
         })
+    }
+    pub fn prepare_temporal_raster(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Result<EntityWork, EntityError> {
+        let work = self.gpu.prepare_temporal_raster(device)?;
+        if self.temporal_identities.is_none() {
+            let capacity = self.gpu.instance_capacity() as usize;
+            self.temporal_identities = Some(TemporalIdentities {
+                remote: Vec::with_capacity(capacity),
+                staging: Vec::with_capacity(capacity),
+                published: Vec::with_capacity(capacity),
+            });
+        }
+        self.stats.pipeline_compilations += work.pipeline_compilations;
+        Ok(work)
+    }
+    pub fn published_temporal_identities(&self) -> Option<&[Option<ObjectKey>]> {
+        self.temporal_identities
+            .as_ref()
+            .map(|bank| bank.published.as_slice())
     }
     /// CPU frame conversion is bounded and atomic; original item sprites use
     /// the same stable layers as the UI, with their own GPU texture array.
     pub fn set_remote_frame(
         &mut self,
         source: &[rules::entities::mob::Instance],
+        scene: &crate::ClientScene,
+        space: SpaceId,
+        origin: [i64; 3],
+    ) -> Result<EntityCopyWork, EntityFrameError> {
+        self.set_remote_frame_inner(source, None, scene, space, origin)
+    }
+    /// Every key is exact actor/packet64bit or a full-UUID allocated key. Legacy
+    /// unkeyed input remains explicitly unsupported by the temporal pass.
+    pub fn set_remote_frame_with_identities(
+        &mut self,
+        source: &[rules::entities::mob::Instance],
+        identities: &[ObjectKey],
+        scene: &crate::ClientScene,
+        space: SpaceId,
+        origin: [i64; 3],
+    ) -> Result<EntityCopyWork, EntityFrameError> {
+        if identities.len() != source.len() || identities.iter().any(|key| key.space() != space.0) {
+            return Err(EntityFrameError::InvalidIdentity);
+        }
+        self.set_remote_frame_inner(source, Some(identities), scene, space, origin)
+    }
+    fn set_remote_frame_inner(
+        &mut self,
+        source: &[rules::entities::mob::Instance],
+        identities: Option<&[ObjectKey]>,
         scene: &crate::ClientScene,
         space: SpaceId,
         origin: [i64; 3],
@@ -167,6 +221,11 @@ impl ViewEntities {
                 }
             })?;
         self.remote_space = space;
+        if let Some(bank) = &mut self.temporal_identities {
+            bank.remote.clear();
+            bank.remote
+                .extend((0..source.len()).map(|i| identities.map(|keys| keys[i])));
+        }
         self.remote_origin = origin;
         self.stats.remote_records = source.len();
         self.stats.light_reads += work.light_reads;
@@ -216,9 +275,28 @@ impl ViewEntities {
             self.instances.push(instance);
             self.lights.push(packed);
         }
+        if let Some(bank) = &mut self.temporal_identities {
+            bank.staging.clear();
+            bank.staging.extend_from_slice(&bank.remote);
+            // The local body is a separately typed owner within this View's
+            // source epoch. It cannot collide with a remote Human UUID token.
+            if instance.is_some() {
+                bank.staging.push(Some(
+                    ObjectKey::native(crate::model_motion_identity::LOCAL, space.0, 0)
+                        .expect("fixed local family"),
+                ));
+            }
+            if bank.staging.len() != self.instances.len() {
+                return Err(EntityError::InvalidInstance);
+            }
+        }
         let work = self
             .gpu
             .upload(queue, &self.instances, &self.lights, budget)?;
+        if let Some(bank) = &mut self.temporal_identities {
+            bank.published.clear();
+            bank.published.extend_from_slice(&bank.staging);
+        }
         let changed = self.last != instance
             || self.last_light != packed
             || self.last_count != self.instances.len()

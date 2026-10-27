@@ -29,6 +29,7 @@ pub struct PresentationGate {
     phase: Phase,
     last_submitted: u64,
     floor: u64,
+    source_epoch: Option<u64>,
 }
 impl Default for PresentationGate {
     fn default() -> Self {
@@ -36,6 +37,7 @@ impl Default for PresentationGate {
             phase: Phase::World,
             last_submitted: 0,
             floor: 0,
+            source_epoch: None,
         }
     }
 }
@@ -45,17 +47,32 @@ impl PresentationGate {
     pub fn reset(&mut self) {
         self.floor = self.last_submitted;
         self.phase = Phase::World;
+        self.source_epoch = None;
+    }
+    /// Recovery revokes pending initial World/HUD work. An already admitted
+    /// Game remains admitted; its scene owner separately quarantines the data.
+    fn observe_source(&mut self, epoch: u64) {
+        if self.phase != Phase::Ready && self.source_epoch.is_some_and(|old| old != epoch) {
+            self.reset();
+        }
     }
     /// Called only after actual queue submission AND surface presentation.
     /// `world` requires an encoded HDR scene with the normal source/content
     /// readiness; `game_ui` requires cached HDR plus the prepared Game HUD.
     pub fn submitted(&mut self, id: u64, world: bool, game_ui: bool) {
+        self.submitted_with_source(id, world, game_ui, 0);
+    }
+    pub fn submitted_with_source(&mut self, id: u64, world: bool, game_ui: bool, epoch: u64) {
+        self.observe_source(epoch);
         if id <= self.last_submitted {
             return;
         }
         self.last_submitted = id;
         match self.phase {
-            Phase::World if world && id > self.floor => self.phase = Phase::WorldPending(id),
+            Phase::World if world && id > self.floor => {
+                self.source_epoch = Some(epoch);
+                self.phase = Phase::WorldPending(id);
+            }
             Phase::GameUi(first) if game_ui && id > first => {
                 self.phase = Phase::GameUiPending {
                     world: first,
@@ -66,6 +83,12 @@ impl PresentationGate {
         }
     }
     pub fn completed(&mut self, id: u64) -> Option<Event> {
+        self.completed_with_source(id, 0)
+    }
+    /// Hosts observe this only after network/derived CPU progress has discovered
+    /// current revocations. Completion of a retired epoch cannot reopen input.
+    pub fn completed_with_source(&mut self, id: u64, epoch: u64) -> Option<Event> {
+        self.observe_source(epoch);
         match self.phase {
             Phase::WorldPending(first) if id >= first => {
                 self.phase = Phase::GameUi(first);
@@ -148,5 +171,50 @@ mod tests {
             Some(ui::app::Intent::PointerCapture(false))
         );
         assert!(app.take_intent().is_none());
+    }
+    #[test]
+    fn recovery_rejects_late_world_and_cannot_admit_a_no_models_unready_scene() {
+        let mut gate = PresentationGate::default();
+        gate.submitted_with_source(100, true, false, 7);
+        assert_eq!(gate.completed_with_source(100, 8), None);
+        assert!(!gate.needs_game_ui());
+        assert!(!gate.input_admitted());
+        gate.submitted_with_source(101, false, true, 8);
+        assert_eq!(gate.completed_with_source(101, 8), None);
+        // A real but unready/quarantined scene cannot become the new World proof.
+        gate.submitted_with_source(102, false, false, 8);
+        assert_eq!(gate.completed_with_source(102, 8), None);
+        gate.submitted_with_source(103, true, false, 9);
+        assert_eq!(gate.completed_with_source(102, 9), None);
+        assert_eq!(
+            gate.completed_with_source(103, 9),
+            Some(Event::PrepareGameUi)
+        );
+        gate.submitted_with_source(104, false, true, 9);
+        assert_eq!(gate.completed_with_source(104, 9), Some(Event::AdmitInput));
+    }
+    #[test]
+    fn recovery_rejects_late_cached_hud_and_does_not_reset_an_already_admitted_game() {
+        let mut gate = PresentationGate::default();
+        gate.submitted_with_source(200, true, false, 2);
+        assert_eq!(
+            gate.completed_with_source(200, 2),
+            Some(Event::PrepareGameUi)
+        );
+        gate.submitted_with_source(201, false, true, 2);
+        assert_eq!(gate.completed_with_source(201, 3), None);
+        assert!(!gate.input_admitted());
+        gate.submitted_with_source(202, true, false, 4);
+        assert_eq!(
+            gate.completed_with_source(202, 4),
+            Some(Event::PrepareGameUi)
+        );
+        gate.submitted_with_source(203, false, true, 4);
+        assert_eq!(gate.completed_with_source(203, 4), Some(Event::AdmitInput));
+        assert_eq!(gate.completed_with_source(203, 5), None);
+        assert!(gate.input_admitted());
+        gate.reset();
+        assert_eq!(gate.completed_with_source(203, 5), None);
+        assert!(!gate.input_admitted());
     }
 }

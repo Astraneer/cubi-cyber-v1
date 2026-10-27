@@ -41,7 +41,7 @@ export async function componentProfile({call,evaluate,painted,click,ui}) {
   if(process.env.CUBI_UI_COMPONENT_SMAA==='1') {
     await click(130,78);await painted();
     const msaa=await evaluate("window.__CUBI.product_ui_widget('Setting(Msaa)')");assert(msaa);
-    await click(msaa[0]+msaa[2]/2,msaa[1]+msaa[3]/2);
+    await click(msaa[0]+msaa[2]/2,msaa[1]+msaa[3]/2,'right');
     assert.equal((await ui()).requestedSamples,1);choices.requestedSamples=1;
   }
   await painted();
@@ -101,7 +101,7 @@ export async function graphicsControls({call,evaluate,waitFor,waitUi,painted,key
   await widget('Back');await key('Escape','Escape');const exposed=await world('exposure-after');
   const exposurePixels=compare(baseExposure,exposed);assert(exposurePixels.changed>500,'actual tone compensation did not change pixels');
   assert.equal(exposure.framePipelineCompilations,0);
-  await menu('Settings');await widget('Setting(Msaa)',true);
+  await menu('Settings');await widget('Setting(Msaa)',true,'right');
   await waitUi(s=>s.screen==='Game'&&s.requestedSamples===1&&s.smaaPrepared===1&&s.smaaReservedBytes>0,120000);
   const selected=await waitFor('window.__M2Stats()',s=>s.sampleCount===1&&s.connected&&s.lightReady&&(!requireFar||s.horizonHeightFront>0),120000);
   await world('msaa-one');

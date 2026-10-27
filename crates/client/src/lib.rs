@@ -1,6 +1,7 @@
 //! Shared client-side world/cache owner and bounded background generation/meshing.
 //! Platform shells only transport immutable tasks, upload finished meshes, and present.
 #![forbid(unsafe_code)]
+pub mod antialiasing;
 pub mod audio_bridge;
 pub mod benchmark;
 pub mod block_models;
@@ -17,6 +18,7 @@ pub mod height_neighbors;
 pub mod lighting;
 pub mod local_materials;
 pub mod lodcache;
+pub mod model_motion_identity;
 pub mod near_profile;
 pub mod network;
 mod overrides;

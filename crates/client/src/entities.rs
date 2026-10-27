@@ -20,6 +20,7 @@ pub enum EntityFrameError {
     Capacity,
     InvalidKind,
     InvalidPosition,
+    InvalidIdentity,
     MissingItemIcon(u16),
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

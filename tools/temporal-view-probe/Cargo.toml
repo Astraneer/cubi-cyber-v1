@@ -1,0 +1,39 @@
+[package]
+name = "temporal-view-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+client = { path = "../../crates/client" }
+render = { path = "../../crates/render" }
+core-types = { path = "../../crates/core-types" }
+net = { path = "../../crates/net" }
+rules = { path = "../../crates/rules" }
+sim = { path = "../../crates/sim" }
+jobs = { path = "../../crates/jobs" }
+telemetry = { path = "../../crates/telemetry" }
+wgpu = { version = "=26.0.1", default-features = false, features = ["std", "wgsl", "dx12", "vulkan", "webgpu"] }
+futures-channel = "=0.3.31"
+serde_json = "=1.0.145"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.104"
+wasm-bindgen-futures = "=0.4.54"
+web-sys = { version = "=0.3.81", features = ["HtmlCanvasElement", "Window", "console"] }
+console_error_panic_hook = "=0.1.7"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+pollster = "=0.4.0"
+
+[patch.crates-io]
+libloading = { path = "../../crates/compat-libloading" }
+unicode-ident = { path = "../../crates/compat-unicode-ident" }
+
+[profile.dev]
+debug = 1
