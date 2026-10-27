@@ -163,7 +163,9 @@ impl RemoteSession {
             }
         }
         let input = view.take_remote_input();
-        let changes = self.pump_scene(&mut view.scene, input, now_ms)?;
+        let changes = self
+            .pump_scene(&mut view.scene, input, now_ms)
+            .map_err(|error| format!("public scene import: {error}"))?;
         view.set_recipe_board_landmark(self.connection.spawn_landmark())?;
         if self.connection.welcome().is_some() {
             let (tick, sub_tick) = self.connection.visual_clock_sample(now_ms);
@@ -175,7 +177,8 @@ impl RemoteSession {
             }
             view.note_remote_change(&change)?;
         }
-        self.pump_props(view)?;
+        self.pump_props(view)
+            .map_err(|error| format!("public model import: {error}"))?;
         if let Some(player) = self.connection.player() {
             view.install_remote_player(player, self.connection.predicted_tick())?;
         }
@@ -295,7 +298,8 @@ impl RemoteSession {
             }
         }
         if self.configured && self.connection.player().is_some() {
-            self.pump_horizon(view, now_ms)?;
+            self.pump_horizon(view, now_ms)
+                .map_err(|error| format!("public horizon import: {error}"))?;
             self.water_courier.wanted(view.horizon_wanted_water())?;
             self.counters.imported_water_images +=
                 self.water_courier
@@ -318,7 +322,10 @@ impl RemoteSession {
                 .authoritative_version(frame.page)
                 .is_some_and(|raw| raw.view == frame.cell_view)
             {
-                self.counters.imported_props_frames += u64::from(view.publish_remote_props(frame)?);
+                self.counters.imported_props_frames += u64::from(
+                    view.publish_remote_props(frame)
+                        .map_err(|error| format!("new public model: {error}"))?,
+                );
             }
         }
         let start = self.props_restore_cursor;
@@ -340,8 +347,10 @@ impl RemoteSession {
                 .and_then(|source| source.public_binding(frame.page))
                 == Some((frame.cell_view, frame.view));
             if matched && !installed {
-                self.counters.imported_props_frames +=
-                    u64::from(view.publish_remote_props(frame.clone())?);
+                self.counters.imported_props_frames += u64::from(
+                    view.publish_remote_props(frame.clone())
+                        .map_err(|error| format!("retained public model: {error}"))?,
+                );
             }
         }
         if visited == 0 {
@@ -363,16 +372,19 @@ impl RemoteSession {
                 let Some(page) = self.connection.take_geometry_removal() else {
                     break;
                 };
-                view.remove_remote_geometry(page)?;
+                view.remove_remote_geometry(page)
+                    .map_err(|error| format!("public geometry withdrawal: {error}"))?;
             }
             for geometry in self.connection.take_geometry_updates(4) {
-                view.ingest_remote_geometry(&geometry)?;
+                view.ingest_remote_geometry(&geometry)
+                    .map_err(|error| format!("public geometry ingest: {error}"))?;
             }
             for _ in 0..4 {
                 let Some(tile) = self.connection.take_height_update() else {
                     break;
                 };
-                view.ingest_remote_height(tile)?;
+                view.ingest_remote_height(tile)
+                    .map_err(|error| format!("public height ingest: {error}"))?;
             }
         }
         let mut retired = [None; 4];

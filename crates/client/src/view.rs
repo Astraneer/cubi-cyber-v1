@@ -1271,7 +1271,8 @@ impl ClientView {
                 ..telemetry::WorkCounts::ZERO
             });
         }
-        self.advance_horizon_cpu()?;
+        self.advance_horizon_cpu()
+            .map_err(|error| format!("horizon planner CPU: {error}"))?;
         let source_camera = self
             .environment
             .as_ref()

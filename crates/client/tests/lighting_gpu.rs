@@ -159,6 +159,13 @@ fn source_proof_volume(
     lighting: &ClientLighting,
     handle: render::terrain_gpu::PageHandle,
 ) -> Vec<u32> {
+    source_buffer_words(gpu, lighting.light_volumes().buffer(), handle)
+}
+fn source_buffer_words(
+    gpu: &render::Gpu,
+    source: &wgpu::Buffer,
+    handle: render::terrain_gpu::PageHandle,
+) -> Vec<u32> {
     let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("complete real GPU light image equality oracle"),
         size: LIGHT_PAGE_BYTES,
@@ -167,7 +174,7 @@ fn source_proof_volume(
     });
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     encoder.copy_buffer_to_buffer(
-        lighting.light_volumes().buffer(),
+        source,
         u64::from(handle.slot) * LIGHT_PAGE_BYTES,
         &buffer,
         0,
@@ -300,8 +307,9 @@ fn actual_full_volume_retags_only_after_current_certificates_and_exact_support_p
         assert_eq!(revoked.source_retags, 0);
         assert_eq!(revoked.unknown_source_pages, 1);
         let dark = source_proof_volume(&gpu, &lighting, handle);
-        assert_ne!(dark[0] & 0x40000000, 0);
-        assert_eq!(dark[1], 0);
+        assert_ne!(dark[0] & (1 << 13), 0);
+        assert_eq!(source_region_raster(&gpu, &lighting, handle), [0.; 4]);
+        assert!(source_region_raster_at(&gpu, &lighting, handle, [-1.; 3])[0] > 15.);
 
         // Negative2: an already-cleared slot cannot be recovered by retagging,
         // even when a real same-valued certificate now makes all sources current.
@@ -313,7 +321,7 @@ fn actual_full_volume_retags_only_after_current_certificates_and_exact_support_p
             .unwrap();
         assert_eq!(waiting.source_retags, 0);
         assert!(!waiting.ready);
-        assert_eq!(source_proof_volume(&gpu, &lighting, handle)[1], 0);
+        assert_eq!(source_region_raster(&gpu, &lighting, handle), [0.; 4]);
         source_proof_settle(&gpu, &mut lighting, &mut scene);
         assert_eq!(source_proof_volume(&gpu, &lighting, handle), initial);
 
@@ -377,11 +385,12 @@ fn actual_full_volume_retags_only_after_current_certificates_and_exact_support_p
             .pump_scene(&gpu.queue, &mut scene, Tick(5), &mut UploadBudget::new(8))
             .unwrap();
         assert!(lighting.ready_diagnostics(&scene).partial_record);
-        assert_eq!((partial.source_retags, partial.upload_bytes), (0, 8));
-        assert_ne!(
-            source_proof_volume(&gpu, &lighting, handle)[0] & 0x40000000,
-            0
+        assert_eq!((partial.source_retags, partial.upload_bytes), (0, 4));
+        assert_eq!(
+            source_region_raster_at(&gpu, &lighting, handle, [8., -1., 8.]),
+            [0.; 4]
         );
+        assert!(source_region_raster(&gpu, &lighting, handle)[0] > 15.);
         source_proof_settle(&gpu, &mut lighting, &mut scene);
 
         // Negative3b: a successful one-corner patch invalidates the full witness.
@@ -426,10 +435,11 @@ fn actual_full_volume_retags_only_after_current_certificates_and_exact_support_p
             .pump_scene(&gpu.queue, &mut scene, Tick(6), &mut UploadBudget::new(8))
             .unwrap();
         assert_eq!(after_patch.source_retags, 0);
-        assert_ne!(
-            source_proof_volume(&gpu, &lighting, handle)[0] & 0x40000000,
-            0
+        assert_eq!(
+            source_region_raster_at(&gpu, &lighting, handle, [8., 8., -1.]),
+            [0.; 4]
         );
+        assert!(source_region_raster(&gpu, &lighting, handle)[0] > 15.);
         source_proof_settle(&gpu, &mut lighting, &mut scene);
 
         // Negative4: a raw mutation with no derived channel still changes the
@@ -607,6 +617,23 @@ fn source_region_raster(
     lighting: &ClientLighting,
     handle: render::terrain_gpu::PageHandle,
 ) -> [f32; 4] {
+    source_region_raster_at(gpu, lighting, handle, [8.; 3])
+}
+fn source_region_raster_at(
+    gpu: &render::Gpu,
+    lighting: &ClientLighting,
+    handle: render::terrain_gpu::PageHandle,
+    position: [f32; 3],
+) -> [f32; 4] {
+    source_buffer_raster(gpu, lighting.light_volumes().buffer(), handle, position, 1)
+}
+fn source_buffer_raster(
+    gpu: &render::Gpu,
+    buffer: &wgpu::Buffer,
+    handle: render::terrain_gpu::PageHandle,
+    position: [f32; 3],
+    samples: u32,
+) -> [f32; 4] {
     let shader = gpu
         .device
         .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -617,14 +644,23 @@ fn source_region_raster(
 @vertex fn vertex(@builtin(vertex_index)i:u32)->@builtin(position)vec4<f32>{{
  let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));return vec4(p[i],0.,1.);}}
 @fragment fn fragment()->@location(0)vec4<f32>{{
- return sample_page_light({}u,vec3(8.,8.,8.),vec3(0.,1.,0.));}}
+ return sample_page_light({}u,vec3({:?},{:?},{:?}),vec3(0.,1.,0.));}}
 "#,
                     include_str!("../../render/src/light_volume.wgsl"),
-                    handle.slot
+                    handle.slot,
+                    position[0],
+                    position[1],
+                    position[2]
                 )
                 .into(),
             ),
         });
+    let format = if samples == 1 {
+        wgpu::TextureFormat::Rgba32Float
+    } else {
+        wgpu::TextureFormat::Rgba16Float
+    };
+    let row_bytes = if samples == 1 { 512 } else { 256 };
     let pipeline = gpu
         .device
         .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -638,13 +674,16 @@ fn source_region_raster(
             },
             primitive: Default::default(),
             depth_stencil: None,
-            multisample: Default::default(),
+            multisample: wgpu::MultisampleState {
+                count: samples,
+                ..Default::default()
+            },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fragment"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba32Float,
+                    format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -657,30 +696,50 @@ fn source_region_raster(
         layout: &pipeline.get_bind_group_layout(0),
         entries: &[wgpu::BindGroupEntry {
             binding: 12,
-            resource: lighting.light_volumes().buffer().as_entire_binding(),
+            resource: buffer.as_entire_binding(),
         }],
     });
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("16 actual HDR fragments"),
         size: wgpu::Extent3d {
-            width: 16,
+            width: 32,
             height: 1,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba32Float,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let read = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("completed HDR fragment readback"),
-        size: 256,
+        size: row_bytes as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let view = texture.create_view(&Default::default());
+    let msaa = (samples > 1).then(|| {
+        gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("actual four-sample LIGHT mask raster"),
+            size: wgpu::Extent3d {
+                width: 32,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: samples,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+    });
+    let view = msaa
+        .as_ref()
+        .unwrap_or(&texture)
+        .create_view(&Default::default());
+    let resolved = texture.create_view(&Default::default());
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -688,7 +747,7 @@ fn source_region_raster(
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &view,
                 depth_slice: None,
-                resolve_target: None,
+                resolve_target: (samples > 1).then_some(&resolved),
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                     store: wgpu::StoreOp::Store,
@@ -713,12 +772,12 @@ fn source_region_raster(
             buffer: &read,
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(256),
+                bytes_per_row: Some(row_bytes),
                 rows_per_image: Some(1),
             },
         },
         wgpu::Extent3d {
-            width: 16,
+            width: 32,
             height: 1,
             depth_or_array_layers: 1,
         },
@@ -732,8 +791,23 @@ fn source_region_raster(
     gpu.device.poll(wgpu::PollType::Wait).unwrap();
     receiver.recv().unwrap().unwrap();
     let bytes = read.slice(..).get_mapped_range();
-    let result =
-        std::array::from_fn(|i| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()));
+    let result = std::array::from_fn(|i| {
+        if samples == 1 {
+            f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+        } else {
+            let h = u16::from_le_bytes(bytes[i * 2..i * 2 + 2].try_into().unwrap());
+            let sign = if h & 0x8000 == 0 { 1.0 } else { -1.0 };
+            let e = (h >> 10) & 31;
+            let m = h & 1023;
+            sign * if e == 0 {
+                f32::from(m) * 2f32.powi(-24)
+            } else if e == 31 {
+                if m == 0 { f32::INFINITY } else { f32::NAN }
+            } else {
+                (1.0 + f32::from(m) / 1024.0) * 2f32.powi(i32::from(e) - 15)
+            }
+        }
+    });
     drop(bytes);
     read.unmap();
     result
@@ -897,13 +971,17 @@ fn changed_source_regions_repair_real_patched_gpu_image_without_blacking_untouch
             )
             .unwrap();
         assert_ne!(
-            source_proof_volume(&gpu, &f.lighting, f.handle)[0] & 0x40000000,
+            source_proof_volume(&gpu, &f.lighting, f.handle)[0] & (1 << 4),
             0
         );
-        assert_eq!(source_region_raster(&gpu, &f.lighting, f.handle), [0.; 4]);
-        assert_eq!(work.upload_bytes, 8);
+        assert_eq!(
+            source_region_raster_at(&gpu, &f.lighting, f.handle, [8., -1., 8.]),
+            [0.; 4]
+        );
+        assert!(source_region_raster(&gpu, &f.lighting, f.handle)[0] > 15.);
+        assert_eq!(work.upload_bytes, 4);
         assert_eq!(work.sample_reads, 0);
-        // An already uniform slot cannot be promoted by a subsequent small fill.
+        // Repairing another source cannot clear the still-revoked bottom box.
         f.scene
             .import_authoritative_light(&source_proof_light(edge, 12, 3, f.hdr), Tick(7))
             .unwrap();
@@ -916,9 +994,13 @@ fn changed_source_regions_repair_real_patched_gpu_image_without_blacking_untouch
                 &mut UploadBudget::new(64),
             )
             .unwrap();
-        assert_eq!(work.upload_bytes, 0);
-        assert_eq!(work.sample_reads, 0);
-        assert_eq!(source_region_raster(&gpu, &f.lighting, f.handle), [0.; 4]);
+        assert_eq!(work.upload_bytes, 64);
+        assert_eq!(work.sample_reads, 16);
+        assert_eq!(
+            source_region_raster_at(&gpu, &f.lighting, f.handle, [8., -1., 8.]),
+            [0.; 4]
+        );
+        assert!(source_region_raster(&gpu, &f.lighting, f.handle)[0] > 15.);
         source_proof_settle(&gpu, &mut f.lighting, &mut f.scene);
         assert!(source_region_raster(&gpu, &f.lighting, f.handle)[0] > 15.);
     });
@@ -974,9 +1056,10 @@ fn source_region_repair_reserves_later_residents_mandatory_revoke_bytes() {
             )
             .unwrap();
         let image = source_proof_volume(&gpu, &f.lighting, handle);
-        assert_ne!(image[0] & 0x40000000, 0);
-        assert_eq!(image[1], 0);
-        assert_eq!(work.upload_bytes, 16);
+        assert_ne!(image[0] & (1 << 13), 0);
+        assert_eq!(source_region_raster(&gpu, &f.lighting, handle), [0.; 4]);
+        assert!(source_region_raster(&gpu, &f.lighting, f.handle)[0] > 15.);
+        assert_eq!(work.upload_bytes, 8);
         assert_eq!(work.sample_reads, 0);
     });
 }
@@ -1256,6 +1339,307 @@ fn owner_runs_cpu_solver_dirty_uploads_and_shadow_cache_without_geometry_rebuild
         println!(
             "M4 CPU→GPUowner initialCells={cells},uploadedBytes={uploads},removalCells={removal_cells},idleCells=0,idleUploads=0"
         );
+    });
+}
+
+#[test]
+fn static_world_metadata_batch_exhausts_sample_credit_without_blacking_unchanged_source_box() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut f = source_region_fixture(&gpu);
+        let right = PageId { x: 1, ..page() };
+        let handle = f
+            .terrain
+            .upload_page(
+                &gpu.queue,
+                None,
+                1,
+                translation([16., 0., 0.]),
+                &PageMesh::default(),
+                &mut UploadBudget::new(1000000),
+            )
+            .unwrap();
+        f.lighting
+            .register_page(
+                right,
+                handle,
+                WorldBounds::new([16., 0., 0.], [32., 16., 16.]).unwrap(),
+            )
+            .unwrap();
+        source_proof_settle(&gpu, &mut f.lighting, &mut f.scene);
+        // One boundary light changes both real volumes by successful sparse
+        // PATCHes, invalidating their conservative FULL witnesses.
+        let value = net::light::pack(14, 3, [17, 231, 255]).unwrap();
+        f.scene
+            .import_authoritative_light(
+                &net::light::Update::Delta(net::light::Delta {
+                    header: net::light::Header {
+                        page: page(),
+                        cell_view: 10,
+                        version: 2,
+                        source: core_types::Version(2),
+                    },
+                    base: 1,
+                    changes: vec![(15 + 16 * 8 + 256 * 8, value)],
+                }),
+                Tick(2),
+            )
+            .unwrap();
+        assert_eq!(
+            f.lighting
+                .pump_scene(&gpu.queue, &mut f.scene, Tick(2), &mut UploadBudget::new(4))
+                .unwrap()
+                .upload_bytes,
+            4
+        );
+        assert_eq!(
+            f.lighting
+                .pump_scene(&gpu.queue, &mut f.scene, Tick(2), &mut UploadBudget::new(4))
+                .unwrap()
+                .upload_bytes,
+            4
+        );
+        let before = source_proof_volume(&gpu, &f.lighting, handle);
+        let world = f.scene.world().version();
+        for source in [page(), right] {
+            let values = Box::new(std::array::from_fn(|i| {
+                let light = f
+                    .scene
+                    .world()
+                    .page(source)
+                    .unwrap()
+                    .light(core_types::LocalIdx::new(i as u16).unwrap());
+                net::light::pack(light.sky, light.block, light.rgb).unwrap()
+            }));
+            assert!(
+                f.scene
+                    .import_authoritative_page(&source_proof_raw(source, 11, 0), Tick(3))
+                    .unwrap()
+                    .change
+                    .is_none()
+            );
+            assert!(
+                f.scene
+                    .import_authoritative_light(
+                        &net::light::Update::Snapshot(net::light::Snapshot {
+                            header: net::light::Header {
+                                page: source,
+                                cell_view: 11,
+                                version: 3,
+                                source: core_types::Version(3)
+                            },
+                            values,
+                        }),
+                        Tick(3)
+                    )
+                    .unwrap()
+                    .change
+                    .is_none()
+            );
+        }
+        assert_eq!(f.scene.world().version(), world);
+        let work = f
+            .lighting
+            .pump_scene(
+                &gpu.queue,
+                &mut f.scene,
+                Tick(3),
+                &mut UploadBudget::new(1000000),
+            )
+            .unwrap();
+        // First4352-sample repair leaves only1480 of the5832 shared credit.
+        // Second4352-sample repair must refuse; its two changed source boxes
+        // become masked with4B. The independent north source must stay HDR.
+        let after = source_proof_volume(&gpu, &f.lighting, handle);
+        assert_eq!(&after[1..], &before[1..]);
+        assert_eq!(after[0], (1 << 12) | (1 << 13));
+        assert_eq!(source_region_raster(&gpu, &f.lighting, handle), [0.; 4]);
+        assert!(source_region_raster_at(&gpu, &f.lighting, handle, [8., 8., -1.])[0] > 15.);
+        assert_eq!((work.sample_reads, work.upload_bytes), (4352, 4352 * 4 + 4));
+        assert!(!work.ready && work.pending_gpu_pages > 0);
+        source_proof_settle(&gpu, &mut f.lighting, &mut f.scene);
+        assert_eq!(source_proof_volume(&gpu, &f.lighting, handle)[0], 0);
+        assert!(source_region_raster(&gpu, &f.lighting, handle)[0] > 15.);
+    });
+}
+
+#[test]
+fn source_mask_and_complete_repair_are_atomic_and_generic_patch_cannot_clear_revocation() {
+    pollster::block_on(async {
+        use render::{
+            light_volume::{LightUpdate, LightUploadError, LightVolumeGpu, PackedLight},
+            terrain_gpu::PageHandle,
+        };
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut light = LightVolumeGpu::new(&gpu.device, 2).unwrap();
+        let handle = PageHandle {
+            slot: 0,
+            generation: 1,
+        };
+        let hdr = PackedLight::new(15, 7, [240, 0, 240]).unwrap();
+        light
+            .upload_page(
+                &gpu.queue,
+                handle,
+                1,
+                &[hdr; render::light_volume::LIGHT_SAMPLES],
+                &mut UploadBudget::new(LIGHT_PAGE_BYTES),
+            )
+            .unwrap();
+        let before = source_buffer_words(&gpu, light.buffer(), handle);
+        assert_eq!(
+            light.revoke_sources(&gpu.queue, handle, 2, 1, &mut UploadBudget::new(3)),
+            Err(LightUploadError::UploadBudget)
+        );
+        assert_eq!(source_buffer_words(&gpu, light.buffer(), handle), before);
+        light
+            .revoke_sources(&gpu.queue, handle, 2, 1, &mut UploadBudget::new(4))
+            .unwrap();
+        assert!(!light.retains_full_image(handle, 2));
+        assert!(light.retains_sample_image(handle, 2));
+        assert_eq!(
+            source_buffer_raster(&gpu, light.buffer(), handle, [-1.; 3], 1),
+            [0.; 4]
+        );
+        assert_eq!(
+            source_buffer_raster(&gpu, light.buffer(), handle, [8.; 3], 1),
+            [16., 0., 16., 1.]
+        );
+        let changed = PackedLight::new(12, 5, [120, 0, 120]).unwrap();
+        let update = [LightUpdate {
+            index: 0,
+            value: changed,
+        }];
+        light
+            .upload_patch(&gpu.queue, handle, 3, &update, &mut UploadBudget::new(4))
+            .unwrap();
+        assert_eq!(
+            source_buffer_raster(&gpu, light.buffer(), handle, [-1.; 3], 1),
+            [0.; 4]
+        );
+        let before = source_buffer_words(&gpu, light.buffer(), handle);
+        assert_eq!(
+            light.upload_sources(&gpu.queue, handle, 4, 1, &update, &mut UploadBudget::new(4)),
+            Err(LightUploadError::UploadBudget)
+        );
+        assert_eq!(source_buffer_words(&gpu, light.buffer(), handle), before);
+        assert_eq!(
+            light.upload_sources(
+                &gpu.queue,
+                handle,
+                4,
+                1 << 13,
+                &update,
+                &mut UploadBudget::new(1000000)
+            ),
+            Err(LightUploadError::InvalidIndex)
+        );
+        assert_eq!(source_buffer_words(&gpu, light.buffer(), handle), before);
+        light
+            .upload_sources(&gpu.queue, handle, 4, 1, &update, &mut UploadBudget::new(8))
+            .unwrap();
+        assert_eq!(source_buffer_words(&gpu, light.buffer(), handle)[0], 0);
+        assert_eq!(
+            source_buffer_raster(&gpu, light.buffer(), handle, [-1.; 3], 1)[0],
+            8.
+        );
+        let before = source_buffer_words(&gpu, light.buffer(), handle);
+        assert_eq!(
+            light.revoke_sources(&gpu.queue, handle, 5, 1 << 13, &mut UploadBudget::new(0)),
+            Err(LightUploadError::UploadBudget)
+        );
+        assert_eq!(source_buffer_words(&gpu, light.buffer(), handle), before);
+    });
+}
+
+#[test]
+fn alias_and_uniform_region_masks_are_visible_in_aa1_aa4_and_full_upload_resets_them() {
+    pollster::block_on(async {
+        use render::{
+            light_volume::{LightUpdate, LightUploadError, LightVolumeGpu, PackedLight},
+            terrain_gpu::PageHandle,
+        };
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut light = LightVolumeGpu::new(&gpu.device, 2).unwrap();
+        let base = PageHandle {
+            slot: 0,
+            generation: 1,
+        };
+        let alias = PageHandle {
+            slot: 1,
+            generation: 1,
+        };
+        let hdr = PackedLight::new(15, 7, [240, 0, 240]).unwrap();
+        light
+            .upload_uniform(&gpu.queue, base, 1, hdr, &mut UploadBudget::new(8))
+            .unwrap();
+        light
+            .alias_page(&gpu.queue, alias, base, &mut UploadBudget::new(4))
+            .unwrap();
+        assert!(light.retains_region_image(base, 1));
+        assert!(!light.retains_sample_image(base, 1));
+        assert!(!light.retains_region_image(alias, 1));
+        assert!(!light.retains_region_image(
+            PageHandle {
+                generation: 2,
+                ..base
+            },
+            1
+        ));
+        light
+            .revoke_sources(&gpu.queue, base, 2, 1, &mut UploadBudget::new(4))
+            .unwrap();
+        for aa in [1, 4] {
+            assert_eq!(
+                source_buffer_raster(&gpu, light.buffer(), alias, [-1.; 3], aa),
+                [0.; 4]
+            );
+            assert_eq!(
+                source_buffer_raster(&gpu, light.buffer(), alias, [8.; 3], aa),
+                [16., 0., 16., 1.]
+            );
+        }
+        assert_eq!(
+            light.upload_sources(
+                &gpu.queue,
+                base,
+                3,
+                1,
+                &[LightUpdate {
+                    index: 0,
+                    value: hdr
+                }],
+                &mut UploadBudget::new(8)
+            ),
+            Err(LightUploadError::StaleHandle)
+        );
+        assert_eq!(
+            light.revoke_sources(&gpu.queue, alias, 3, 1, &mut UploadBudget::new(4)),
+            Err(LightUploadError::StaleHandle)
+        );
+        light
+            .upload_page(
+                &gpu.queue,
+                base,
+                3,
+                &[hdr; render::light_volume::LIGHT_SAMPLES],
+                &mut UploadBudget::new(LIGHT_PAGE_BYTES),
+            )
+            .unwrap();
+        assert_eq!(source_buffer_words(&gpu, light.buffer(), base)[0], 0);
+        assert!(light.retains_full_image(base, 3));
+        for aa in [1, 4] {
+            assert_eq!(
+                source_buffer_raster(&gpu, light.buffer(), alias, [-1.; 3], aa),
+                [16., 0., 16., 1.]
+            );
+        }
     });
 }
 #[test]

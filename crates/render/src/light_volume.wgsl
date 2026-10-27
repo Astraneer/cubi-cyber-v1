@@ -8,7 +8,11 @@ fn sample_page_light(slot:u32,local_position:vec3<f32>,local_normal:vec3<f32>)->
     let light_slot=select(slot,header&0x7fffffffu,(header&0x80000000u)!=0u);
     let resolved_header=page_lights[light_slot*5833u];
     let sampled=page_lights[light_slot*5833u+1u+p.x+18u*(p.z+18u*p.y)];
-    let packed=select(sampled,page_lights[light_slot*5833u+1u],(resolved_header&0x40000000u)!=0u);
+    let source_class=select(select(vec3(1u),vec3(2u),p==vec3(17u)),vec3(0u),p==vec3(0u));
+    let source=source_class.x+3u*source_class.z+9u*source_class.y;
+    let uniform=(resolved_header&0x40000000u)!=0u;
+    let revoked=(resolved_header&(1u<<source))!=0u;
+    let packed=select(select(sampled,page_lights[light_slot*5833u+1u],uniform),0u,revoked);
     // Minecraft level attenuation. Block is gameplay luminance; RGB already
     // contains visible emission, so block is deliberately not added a second time.
     let rgb=vec3<f32>(f32((packed>>8u)&255u),f32((packed>>16u)&255u),f32(packed>>24u));

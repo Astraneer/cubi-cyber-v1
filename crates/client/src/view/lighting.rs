@@ -15,6 +15,7 @@ use world::lighting::LightBudget;
 pub const SUN: [f32; 3] = [0.35, 0.8, 0.2];
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LightingStats {
+    pub mask: crate::lighting::LightMaskDiagnostics,
     pub journal_entries: u64,
     pub coalesced_light_changes: u64,
     pub cpu_cells: u64,
@@ -154,6 +155,7 @@ impl ViewLighting {
     }
     pub fn snapshot(&self, scene: &ClientScene) -> LightingStats {
         let mut stats = self.stats;
+        stats.mask = self.owner.mask_diagnostics();
         stats.pending_source_pages = self.source_pending_pages(scene);
         stats.pending_shadow_cascades = self.owner.shadows().cache().pending();
         stats.ready = self.is_ready(scene);

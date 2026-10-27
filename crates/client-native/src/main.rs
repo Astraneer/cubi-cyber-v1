@@ -175,6 +175,7 @@ struct NativeState {
     recorder: Box<telemetry::FrameRecorder<600>>,
     frames: u64,
     scene_receipts: Option<scene_receipts::Tracker>,
+    light_mask_diagnostics: bool,
     last_frame: Instant,
     cpu_continuations: u64,
     captured: bool,
@@ -553,6 +554,7 @@ impl NativeState {
             recorder: Box::new(telemetry::FrameRecorder::new()),
             frames: 0,
             scene_receipts: scene_receipts::Tracker::from_env(),
+            light_mask_diagnostics: std::env::var_os("CUBI_LIGHT_MASK_DIAGNOSTICS").is_some(),
             last_frame: Instant::now(),
             cpu_continuations: 0,
             captured: false,
@@ -790,9 +792,13 @@ impl NativeState {
             if let Some(remote) = &mut self.remote {
                 {
                     let mut session = remote.session()?;
-                    session.pump(view, now)?;
+                    session
+                        .pump(view, now)
+                        .map_err(|error| format!("remote session CPU: {error}"))?;
                     if let Some(product) = &mut self.product {
-                        product.sync(session.connection(), view)?;
+                        product
+                            .sync(session.connection(), view)
+                            .map_err(|error| format!("product synchronization CPU: {error}"))?;
                         product.sync_quality(view, now, self.flight.benchmark_configured());
                     }
                 }
@@ -805,7 +811,8 @@ impl NativeState {
                     .as_nanos()
                     .min(u128::from(u64::MAX)) as u64,
             )?;
-            view.advance_input(elapsed)?;
+            view.advance_input(elapsed)
+                .map_err(|error| format!("view input CPU: {error}"))?;
             stages[1] = Some(flight::nanos(started.elapsed()));
             let jobs = Instant::now();
             let mut budget = client::ClientScene::default_budget();
@@ -816,7 +823,7 @@ impl NativeState {
                     &mut budget,
                     8,
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| format!("native scene jobs: {error}"))?;
             stages[2] = Some(flight::nanos(jobs.elapsed()));
             if let Some(error) = view.scene.error() {
                 return Err(error.to_string());
@@ -1177,6 +1184,44 @@ impl NativeState {
         }
         stages[6] = Some(flight::nanos(present_started.elapsed()));
         self.frames = submission;
+        if self.light_mask_diagnostics
+            && let Some(mask) = self
+                .view
+                .as_deref()
+                .and_then(ClientView::lighting_stats)
+                .map(|s| s.mask)
+                .filter(|m| m.enabled && m.serial != 0)
+        {
+            println!(
+                "NATIVE_UI_LIGHT_MASK frame={} phase=after_submit pump={} tick={} last={:?} total={:?} samples={} masked_slots={} masked_regions={}",
+                submission,
+                mask.serial,
+                mask.tick,
+                mask.last,
+                mask.total,
+                mask.sample_reads,
+                mask.masked_slots,
+                mask.masked_regions
+            );
+            for f in mask.focus {
+                println!(
+                    "NATIVE_UI_LIGHT_MASK_FOCUS frame={} pump={} page={:?} handle={:?} image={:?} changed={:07x} known={:07x} reason={:x} samples={} credit={} bytes={} reserve={}",
+                    submission,
+                    mask.serial,
+                    f.page,
+                    f.handle,
+                    f.image,
+                    f.changed,
+                    f.known,
+                    f.reason,
+                    f.samples,
+                    f.credit,
+                    f.bytes,
+                    f.reserve
+                );
+            }
+        }
+
         if let Some((stamp, passes)) = scene_receipt
             && let Some(trace) = &mut self.scene_receipts
             && let Some(record) = trace.submitted(submission, stamp, passes)

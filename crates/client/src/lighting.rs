@@ -731,8 +731,48 @@ pub struct LightingReadyDiagnostics {
     pub sky_columns: usize,
     pub pending_shadow_cascades: u32,
 }
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LightMaskFocus {
+    pub page: PageId,
+    pub handle: [u32; 2],
+    pub image: [u64; 4],
+    pub changed: u32,
+    pub known: u32,
+    pub reason: u16,
+    pub samples: u64,
+    pub credit: u64,
+    pub bytes: u64,
+    pub reserve: u64,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LightMaskDiagnostics {
+    pub enabled: bool,
+    pub serial: u64,
+    pub tick: u64,
+    // retag,repair,regionMask,wholeUniform,cpu,bytes,reserve,slot,noRevokeBudget,NoneRegions
+    pub last: [u64; 10],
+    pub total: [u64; 10],
+    pub sample_reads: u64,
+    pub masked_slots: u64,
+    pub masked_regions: u64,
+    pub focus: [LightMaskFocus; 6],
+}
+const _: () = assert!(std::mem::size_of::<LightMaskDiagnostics>() <= 1024);
+impl LightMaskDiagnostics {
+    fn prepared() -> Self {
+        #[cfg(target_arch = "wasm32")]
+        let enabled = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        let enabled = std::env::var_os("CUBI_LIGHT_MASK_DIAGNOSTICS").is_some();
+        Self {
+            enabled,
+            ..Self::default()
+        }
+    }
+}
 pub struct ClientLighting {
     config: ClientLightingConfig,
+    mask_diagnostics: LightMaskDiagnostics,
     engine: Option<LightingEngine>,
     sky: SkyProof,
     lights: LightVolumeGpu,
@@ -801,6 +841,7 @@ impl ClientLighting {
             }
         }
         Ok(Self {
+            mask_diagnostics: LightMaskDiagnostics::prepared(),
             config,
             engine,
             sky: SkyProof {
@@ -1135,6 +1176,9 @@ impl ClientLighting {
     pub fn take_upload_bytes(&mut self) -> u64 {
         self.lights.take_upload_bytes()
     }
+    pub fn mask_diagnostics(&self) -> LightMaskDiagnostics {
+        self.mask_diagnostics
+    }
     pub fn light_volumes(&self) -> &LightVolumeGpu {
         &self.lights
     }
@@ -1162,6 +1206,17 @@ impl ClientLighting {
         }
         let mut work = ClientLightingWork::default();
         self.ingest(scene.derived_world_mut(), &mut work)?;
+        let mut counts = [0u64; 10];
+        let trace = self.mask_diagnostics.enabled;
+        let mut focus = [LightMaskFocus::default(); 6];
+        let center = scene.config().center.page();
+        for (i, f) in focus.iter_mut().enumerate() {
+            f.page = PageId {
+                x: center.x.checked_add((i % 3) as i32 - 1).unwrap_or(center.x),
+                y: center.y.checked_add((i / 3) as i32).unwrap_or(center.y),
+                ..center
+            };
+        }
         let mut remaining_residents = self.residents.len();
         for (&page, resident) in &mut self.residents {
             remaining_residents -= 1;
@@ -1211,6 +1266,9 @@ impl ClientLighting {
                 {
                     resident.bindings = bindings;
                     work.source_retags += 1;
+                    if trace {
+                        counts[0] += 1;
+                    }
                     continue;
                 }
                 // An observed unknown/revocation, dirty image or unproved patch
@@ -1239,7 +1297,9 @@ impl ClientLighting {
                     .saturating_mul(LIGHT_SAMPLES);
                 let remaining_samples = sample_limit
                     .saturating_sub(usize::try_from(work.sample_reads).unwrap_or(usize::MAX));
-                let patch_bytes = samples as u64 * 4;
+                let patch_bytes = self
+                    .lights
+                    .source_patch_bytes(resident.handle, changed, samples);
                 // No early repair may spend later residents' eight-byte revoke
                 // credit, including a new None→Some region whose old path did
                 // not clear anything. This is conservative even when all later
@@ -1247,6 +1307,29 @@ impl ClientLighting {
                 let later_revoke_bytes = u64::try_from(remaining_residents)
                     .unwrap_or(u64::MAX)
                     .saturating_mul(8);
+                let patch_slot = self
+                    .lights
+                    .retains_sample_image(resident.handle, resident.upload_revision);
+                let reason = u16::from(samples > remaining_samples)
+                    | u16::from(patch_bytes > budget.remaining_bytes) << 1
+                    | u16::from(
+                        patch_bytes.saturating_add(later_revoke_bytes) > budget.remaining_bytes,
+                    ) << 2
+                    | u16::from(!patch_slot) << 3;
+                if trace {
+                    for bit in 0..4 {
+                        counts[4 + bit] += u64::from(reason & (1 << bit) != 0);
+                    }
+                    counts[9] += bindings.iter().filter(|s| s.is_none()).count() as u64;
+                    if let Some(f) = focus.iter_mut().find(|f| f.page == page) {
+                        f.changed = changed;
+                        f.reason = reason;
+                        f.samples = samples as u64;
+                        f.credit = remaining_samples as u64;
+                        f.bytes = budget.remaining_bytes;
+                        f.reserve = later_revoke_bytes;
+                    }
+                }
                 // A successful patch need not have a full-proof witness. Its
                 // untouched source regions still carry their own admitted
                 // bindings. Replace every changed region atomically, using only
@@ -1270,16 +1353,20 @@ impl ClientLighting {
                         |source| scene.authoritative_light_version(source).is_some(),
                     );
                     work.sample_reads += sampled.samples;
-                    work.upload_bytes += self.lights.upload_patch(
+                    work.upload_bytes += self.lights.upload_sources(
                         queue,
                         resident.handle,
                         version,
+                        changed,
                         &self.scratch.updates,
                         budget,
                     )?;
                     resident.upload_revision = version;
                     resident.bindings = bindings;
                     work.source_repairs += 1;
+                    if trace {
+                        counts[1] += 1;
+                    }
                     work.gpu_pages += 1;
                     continue;
                 }
@@ -1288,7 +1375,40 @@ impl ClientLighting {
                     .iter()
                     .zip(bindings)
                     .any(|(old, new)| old.is_some() && old != &new);
+                if revoked
+                    && self
+                        .lights
+                        .retains_region_image(resident.handle, resident.upload_revision)
+                {
+                    if budget.remaining_bytes < 4 {
+                        work.backpressure = true;
+                        if trace {
+                            counts[8] += 1;
+                        }
+                        continue;
+                    }
+                    let version = resident
+                        .upload_revision
+                        .checked_add(1)
+                        .ok_or(ClientLightingError::CoordinateOverflow)?;
+                    work.upload_bytes += self.lights.revoke_sources(
+                        queue,
+                        resident.handle,
+                        version,
+                        changed,
+                        budget,
+                    )?;
+                    resident.upload_revision = version;
+                    resident.bindings = bindings;
+                    if trace {
+                        counts[2] += 1;
+                    }
+                    continue;
+                }
                 if revoked {
+                    if trace {
+                        counts[3] += 1;
+                    }
                     if budget.remaining_bytes < 8 {
                         work.backpressure = true;
                         continue;
@@ -1320,6 +1440,35 @@ impl ClientLighting {
                 work.confirmed_source_pages += 1;
             } else {
                 work.unknown_source_pages += 1;
+            }
+        }
+        if trace {
+            for f in &mut focus {
+                if let Some(resident) = self.residents.get(&f.page) {
+                    f.handle = [resident.handle.slot, resident.handle.generation];
+                    f.image = self.lights.source_image_state(resident.handle);
+                    f.known = resident
+                        .bindings
+                        .iter()
+                        .enumerate()
+                        .fold(0, |m, (i, b)| m | (u32::from(b.is_some()) << i));
+                }
+            }
+            let diag = &mut self.mask_diagnostics;
+            diag.serial = diag.serial.saturating_add(1);
+            diag.tick = tick.0;
+            diag.last = counts;
+            diag.focus = focus;
+            for (i, count) in counts.into_iter().enumerate() {
+                diag.total[i] = diag.total[i].saturating_add(count);
+            }
+            diag.sample_reads = work.sample_reads;
+            diag.masked_slots = 0;
+            diag.masked_regions = 0;
+            for resident in self.residents.values() {
+                let mask = self.lights.source_image_state(resident.handle)[3] as u32;
+                diag.masked_slots += u64::from(mask != 0);
+                diag.masked_regions += u64::from(mask.count_ones());
             }
         }
         work.pending_gpu_pages = self.dirty.pending_pages();

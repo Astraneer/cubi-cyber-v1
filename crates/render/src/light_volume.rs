@@ -10,6 +10,7 @@ pub const LIGHT_EDGE: usize = 18;
 pub const LIGHT_SAMPLES: usize = LIGHT_EDGE * LIGHT_EDGE * LIGHT_EDGE;
 pub const LIGHT_PAGE_WORDS: usize = LIGHT_SAMPLES + 1;
 pub const LIGHT_PAGE_BYTES: u64 = LIGHT_PAGE_WORDS as u64 * 4;
+pub const LIGHT_SOURCE_MASK: u32 = (1 << 27) - 1;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
@@ -77,7 +78,9 @@ struct Slot {
     initialized: bool,
     alias: Option<PageHandle>,
     uniform: bool,
+    revoked: u32,
 }
+const _: () = assert!(std::mem::size_of::<Slot>() <= 48);
 
 pub struct LightVolumeGpu {
     buffer: wgpu::Buffer,
@@ -90,18 +93,142 @@ impl LightVolumeGpu {
     /// A uniform revocation, alias, reused generation or later patch cannot
     /// match the owner's stored full-upload revision.
     pub fn retains_full_image(&self, handle: PageHandle, version: u64) -> bool {
-        self.retains_sample_image(handle, version)
+        self.retains_sample_image(handle, version) && self.slots[handle.slot as usize].revoked == 0
     }
     /// Exact initialized nonuniform image, including a successful partial patch.
     /// The owner must separately prove which source regions remain authorized.
     pub fn retains_sample_image(&self, handle: PageHandle, version: u64) -> bool {
+        self.retains_region_image(handle, version) && !self.slots[handle.slot as usize].uniform
+    }
+    /// Exact region image permits an initialized uniform scalar too. Sparse
+    /// sample patching still requires retains_sample_image/nonuniform storage.
+    pub fn retains_region_image(&self, handle: PageHandle, version: u64) -> bool {
         self.slots.get(handle.slot as usize).is_some_and(|slot| {
             slot.initialized
                 && slot.generation == handle.generation
                 && slot.version == version
                 && slot.alias.is_none()
-                && !slot.uniform
         })
+    }
+    /// Queued PUBLIC sample-image metadata, not a GPU readback/completion proof.
+    pub fn source_image_state(&self, handle: PageHandle) -> [u64; 4] {
+        self.slots.get(handle.slot as usize).map_or([0; 4], |s| {
+            [
+                u64::from(s.generation),
+                s.version,
+                u64::from(s.initialized)
+                    | u64::from(s.uniform) << 1
+                    | u64::from(s.alias.is_some()) << 2
+                    | u64::from(s.generation == handle.generation) << 3,
+                u64::from(s.revoked),
+            ]
+        })
+    }
+    /// Four-byte fail-closed revocation of complete source boxes. Unaffected
+    /// regions keep their admitted image; aliases read this same base header.
+    pub fn revoke_sources(
+        &mut self,
+        queue: &wgpu::Queue,
+        handle: PageHandle,
+        version: u64,
+        changed: u32,
+        budget: &mut UploadBudget,
+    ) -> Result<u64, LightUploadError> {
+        if changed == 0 || changed & !LIGHT_SOURCE_MASK != 0 {
+            return Err(LightUploadError::InvalidIndex);
+        }
+        let slot = self
+            .slots
+            .get_mut(handle.slot as usize)
+            .ok_or(LightUploadError::InvalidSlot)?;
+        if !slot.initialized || slot.generation != handle.generation || slot.alias.is_some() {
+            return Err(LightUploadError::StaleHandle);
+        }
+        if version <= slot.version {
+            return Err(LightUploadError::StaleVersion);
+        }
+        if budget.remaining_bytes < 4 {
+            return Err(LightUploadError::UploadBudget);
+        }
+        let mask = slot.revoked | changed;
+        let header = mask | if slot.uniform { 0x40000000 } else { 0 };
+        queue.write_buffer(
+            &self.buffer,
+            u64::from(handle.slot) * LIGHT_PAGE_BYTES,
+            bytemuck::bytes_of(&header),
+        );
+        slot.revoked = mask;
+        slot.version = version;
+        budget.remaining_bytes -= 4;
+        self.upload_bytes += 4;
+        Ok(4)
+    }
+    pub fn source_patch_bytes(&self, handle: PageHandle, changed: u32, samples: usize) -> u64 {
+        samples as u64 * 4
+            + u64::from(
+                self.slots
+                    .get(handle.slot as usize)
+                    .is_some_and(|s| s.revoked & changed != 0),
+            ) * 4
+    }
+    /// Only this complete-region route may clear source revoke bits. Length,
+    /// uniqueness and membership prove every index of each selected box is
+    /// rewritten. All samples AND the optional header-clear preflight together.
+    pub fn upload_sources(
+        &mut self,
+        queue: &wgpu::Queue,
+        handle: PageHandle,
+        version: u64,
+        changed: u32,
+        updates: &[LightUpdate],
+        budget: &mut UploadBudget,
+    ) -> Result<u64, LightUploadError> {
+        if changed == 0 || changed & !LIGHT_SOURCE_MASK != 0 {
+            return Err(LightUploadError::InvalidIndex);
+        }
+        let expected = (0..27)
+            .filter(|i| changed & (1 << i) != 0)
+            .map(|i| {
+                [i % 3, i / 9, (i / 3) % 3]
+                    .map(|a| if a == 1 { 16usize } else { 1 })
+                    .into_iter()
+                    .product::<usize>()
+            })
+            .sum::<usize>();
+        if updates.len() != expected
+            || updates.iter().any(|u| {
+                usize::from(u.index) >= LIGHT_SAMPLES
+                    || changed & (1 << source_index(usize::from(u.index))) == 0
+            })
+            || updates.windows(2).any(|p| p[0].index >= p[1].index)
+        {
+            return Err(LightUploadError::InvalidIndex);
+        }
+        let slot = *self
+            .slots
+            .get(handle.slot as usize)
+            .ok_or(LightUploadError::InvalidSlot)?;
+        if !self.retains_sample_image(handle, slot.version) {
+            return Err(LightUploadError::StaleHandle);
+        }
+        let mask = slot.revoked & !changed;
+        let header = u64::from(mask != slot.revoked) * 4;
+        if updates.len() as u64 * 4 + header > budget.remaining_bytes {
+            return Err(LightUploadError::UploadBudget);
+        }
+        let mut bytes = self.upload_patch(queue, handle, version, updates, budget)?;
+        if header != 0 {
+            queue.write_buffer(
+                &self.buffer,
+                u64::from(handle.slot) * LIGHT_PAGE_BYTES,
+                bytemuck::bytes_of(&mask),
+            );
+            self.slots[handle.slot as usize].revoked = mask;
+            budget.remaining_bytes -= 4;
+            self.upload_bytes += 4;
+            bytes += 4;
+        }
+        Ok(bytes)
     }
     pub fn new(device: &wgpu::Device, max_pages: u32) -> Result<Self, LightUploadError> {
         let size = u64::from(max_pages) * LIGHT_PAGE_BYTES;
@@ -179,6 +306,7 @@ impl LightVolumeGpu {
             initialized: true,
             alias: Some(source),
             uniform: false,
+            revoked: 0,
         };
         budget.remaining_bytes -= 4;
         self.upload_bytes += 4;
@@ -211,12 +339,15 @@ impl LightVolumeGpu {
         {
             return Ok(0);
         }
-        let header_bytes =
-            if slot.initialized && slot.generation == handle.generation && slot.uniform {
-                0
-            } else {
-                4
-            };
+        let header_bytes = if slot.initialized
+            && slot.generation == handle.generation
+            && slot.uniform
+            && slot.revoked == 0
+        {
+            0
+        } else {
+            4
+        };
         let bytes = 4 + header_bytes;
         if budget.remaining_bytes < bytes {
             return Err(LightUploadError::UploadBudget);
@@ -239,6 +370,7 @@ impl LightVolumeGpu {
             initialized: true,
             alias: None,
             uniform: true,
+            revoked: 0,
         };
         budget.remaining_bytes -= bytes;
         self.upload_bytes += bytes;
@@ -285,6 +417,7 @@ impl LightVolumeGpu {
             initialized: true,
             alias: None,
             uniform: false,
+            revoked: 0,
         };
         budget.remaining_bytes -= LIGHT_PAGE_BYTES;
         self.upload_bytes += LIGHT_PAGE_BYTES;
@@ -350,6 +483,18 @@ impl LightVolumeGpu {
         self.upload_bytes += bytes;
         Ok(bytes)
     }
+}
+fn source_index(index: usize) -> usize {
+    let class = |v| {
+        if v == 0 {
+            0
+        } else if v == 17 {
+            2
+        } else {
+            1
+        }
+    };
+    class(index % 18) + 3 * class(index / 18 % 18) + 9 * class(index / (18 * 18))
 }
 
 #[cfg(test)]
