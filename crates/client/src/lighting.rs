@@ -4,7 +4,9 @@
 //! backpressure. A color change touches at most eight page/halo volumes. GPU
 //! publication is acknowledged only after its upload succeeds.
 use core_types::{BlockPos, LocalIdx, PageId, Version};
-use render::light_volume::{LIGHT_SAMPLES, LightUpdate, PackedLight, light_index};
+use render::light_volume::{
+    LIGHT_PAGE_BYTES, LIGHT_SAMPLES, LightUpdate, PackedLight, light_index,
+};
 use std::collections::BTreeMap;
 use world::{LightChange, World};
 const WORDS: usize = LIGHT_SAMPLES.div_ceil(64);
@@ -78,6 +80,20 @@ impl LightDirtyTracker {
     }
     pub fn pending_version(&self, page: PageId) -> Option<Version> {
         self.pages.get(&page).map(|dirty| dirty.version)
+    }
+    fn pending_upload(&self, page: PageId) -> Option<(usize, u64)> {
+        self.pages.get(&page).map(|dirty| {
+            if dirty.full {
+                (LIGHT_SAMPLES, LIGHT_PAGE_BYTES)
+            } else {
+                let samples = dirty
+                    .cells
+                    .iter()
+                    .map(|word| word.count_ones() as usize)
+                    .sum::<usize>();
+                (samples, samples as u64 * 4)
+            }
+        })
     }
     pub fn first_page(&self) -> Option<PageId> {
         self.ordered.first().map(|(_, page)| *page)
@@ -349,6 +365,60 @@ fn sample(
         work.unknown_reads += 1;
         PackedLight::default()
     }
+}
+
+// The27 source pages partition the18³ volume into disjoint1/16/1 boxes.
+// Counting first permits a complete CPU/byte preflight before sampling anything.
+fn source_region_samples(changed: u32) -> usize {
+    (0..27)
+        .filter(|index| changed & (1 << index) != 0)
+        .map(|index| {
+            [index % 3, index / 9, (index / 3) % 3]
+                .map(|axis| if axis == 1 { 16 } else { 1 })
+                .into_iter()
+                .product::<usize>()
+        })
+        .sum()
+}
+fn source_region_patch(
+    world: &World,
+    page: PageId,
+    changed: u32,
+    scratch: &mut LightUploadScratch,
+    known: impl Fn(PageId) -> bool,
+) -> LightSampleWork {
+    let mut cells = [0u64; WORDS];
+    let mut sources = changed;
+    while sources != 0 {
+        let source = sources.trailing_zeros() as usize;
+        sources &= sources - 1;
+        let ranges = [source % 3, source / 9, (source / 3) % 3].map(|axis| match axis {
+            0 => 0..1,
+            1 => 1..17,
+            _ => 17..18,
+        });
+        for y in ranges[1].clone() {
+            for z in ranges[2].clone() {
+                for x in ranges[0].clone() {
+                    let index = x + 18 * (z + 18 * y);
+                    cells[index / 64] |= 1 << (index % 64);
+                }
+            }
+        }
+    }
+    scratch.updates.clear();
+    let mut work = LightSampleWork::default();
+    for (word_index, mut bits) in cells.into_iter().enumerate() {
+        while bits != 0 {
+            let index = word_index * 64 + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            scratch.updates.push(LightUpdate {
+                index: index as u16,
+                value: sample(world, page, index, &mut work, &known),
+            });
+        }
+    }
+    work
 }
 
 use core_types::{ChannelMask, SpaceId, Tick};
@@ -639,6 +709,8 @@ pub struct ClientLightingWork {
     pub retired_dirty_pages: usize,
     /// Actual new certificates retagged an unchanged successful full GPU image.
     pub source_retags: usize,
+    /// Current source-region samples repaired without revoking unrelated ones.
+    pub source_repairs: usize,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LightingReadyDiagnostics {
@@ -1090,7 +1162,9 @@ impl ClientLighting {
         }
         let mut work = ClientLightingWork::default();
         self.ingest(scene.derived_world_mut(), &mut work)?;
+        let mut remaining_residents = self.residents.len();
         for (&page, resident) in &mut self.residents {
+            remaining_residents -= 1;
             let mut bindings = [None; 27];
             let mut i = 0;
             for dy in -1..=1 {
@@ -1148,6 +1222,65 @@ impl ClientLighting {
                     .is_err()
                 {
                     work.backpressure = true;
+                    continue;
+                }
+                let changed = resident
+                    .bindings
+                    .iter()
+                    .zip(bindings)
+                    .enumerate()
+                    .fold(0u32, |mask, (index, (old, new))| {
+                        mask | (u32::from(old != &new) << index)
+                    });
+                let samples = source_region_samples(changed);
+                let sample_limit = self
+                    .config
+                    .max_gpu_pages_per_pump
+                    .saturating_mul(LIGHT_SAMPLES);
+                let remaining_samples = sample_limit
+                    .saturating_sub(usize::try_from(work.sample_reads).unwrap_or(usize::MAX));
+                let patch_bytes = samples as u64 * 4;
+                // No early repair may spend later residents' eight-byte revoke
+                // credit, including a new None→Some region whose old path did
+                // not clear anything. This is conservative even when all later
+                // bindings happen to remain unchanged.
+                let later_revoke_bytes = u64::try_from(remaining_residents)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(8);
+                // A successful patch need not have a full-proof witness. Its
+                // untouched source regions still carry their own admitted
+                // bindings. Replace every changed region atomically, using only
+                // current certificates (unknown samples become zero).
+                if samples <= remaining_samples
+                    && patch_bytes <= budget.remaining_bytes
+                    && patch_bytes.saturating_add(later_revoke_bytes) <= budget.remaining_bytes
+                    && self
+                        .lights
+                        .retains_sample_image(resident.handle, resident.upload_revision)
+                {
+                    let version = resident
+                        .upload_revision
+                        .checked_add(1)
+                        .ok_or(ClientLightingError::CoordinateOverflow)?;
+                    let sampled = source_region_patch(
+                        scene.world(),
+                        page,
+                        changed,
+                        &mut self.scratch,
+                        |source| scene.authoritative_light_version(source).is_some(),
+                    );
+                    work.sample_reads += sampled.samples;
+                    work.upload_bytes += self.lights.upload_patch(
+                        queue,
+                        resident.handle,
+                        version,
+                        &self.scratch.updates,
+                        budget,
+                    )?;
+                    resident.upload_revision = version;
+                    resident.bindings = bindings;
+                    work.source_repairs += 1;
+                    work.gpu_pages += 1;
                     continue;
                 }
                 let revoked = resident
@@ -1691,6 +1824,17 @@ impl ClientLighting {
                 continue;
             }
             considered += 1;
+            let sample_limit = self
+                .config
+                .max_gpu_pages_per_pump
+                .saturating_mul(LIGHT_SAMPLES);
+            let remaining_samples = sample_limit
+                .saturating_sub(usize::try_from(work.sample_reads).unwrap_or(usize::MAX));
+            let (samples, bytes) = self.dirty.pending_upload(page).expect("dirty page");
+            if samples > remaining_samples || bytes > budget.remaining_bytes {
+                work.backpressure = true;
+                break;
+            }
             let prepared = self
                 .dirty
                 .prepare_filtered(world, page, &mut self.scratch, &known)

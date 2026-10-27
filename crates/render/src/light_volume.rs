@@ -90,6 +90,11 @@ impl LightVolumeGpu {
     /// A uniform revocation, alias, reused generation or later patch cannot
     /// match the owner's stored full-upload revision.
     pub fn retains_full_image(&self, handle: PageHandle, version: u64) -> bool {
+        self.retains_sample_image(handle, version)
+    }
+    /// Exact initialized nonuniform image, including a successful partial patch.
+    /// The owner must separately prove which source regions remain authorized.
+    pub fn retains_sample_image(&self, handle: PageHandle, version: u64) -> bool {
         self.slots.get(handle.slot as usize).is_some_and(|slot| {
             slot.initialized
                 && slot.generation == handle.generation

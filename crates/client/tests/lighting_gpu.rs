@@ -319,7 +319,7 @@ fn actual_full_volume_retags_only_after_current_certificates_and_exact_support_p
 
         // Negative3a: a full image can contain current World samples while an
         // older journal record is partial. A later wire-only change must still
-        // refuse retention until that cursor is caught up.
+        // refuse a zero-copy retag. Its face repair cannot fit the8B budget.
         let corner = PageId {
             x: -1,
             y: -1,
@@ -354,11 +354,14 @@ fn actual_full_volume_retags_only_after_current_certificates_and_exact_support_p
                 &gpu.queue,
                 &mut scene,
                 Tick(5),
-                &mut UploadBudget::new(LIGHT_PAGE_BYTES + 8),
+                &mut UploadBudget::new(LIGHT_PAGE_BYTES + 16 * 16 * 4),
             )
             .unwrap();
         assert_eq!(full_with_partial.source_retags, 0);
-        assert_eq!(full_with_partial.upload_bytes, LIGHT_PAGE_BYTES + 8);
+        assert_eq!(
+            full_with_partial.upload_bytes,
+            LIGHT_PAGE_BYTES + 16 * 16 * 4
+        );
         assert!(lighting.ready_diagnostics(&scene).partial_record);
         assert_eq!(
             source_proof_volume(&gpu, &lighting, handle)[1],
@@ -527,6 +530,519 @@ fn actual_full_volume_retags_only_after_current_certificates_and_exact_support_p
                 .iter()
                 .all(|value| *value == hdr)
         );
+    });
+}
+
+struct SourceRegionFixture {
+    terrain: TerrainGpu,
+    scene: client::ClientScene,
+    lighting: ClientLighting,
+    handle: render::terrain_gpu::PageHandle,
+    hdr: u32,
+}
+fn source_region_fixture(gpu: &render::Gpu) -> SourceRegionFixture {
+    let mut terrain = setup(gpu);
+    let mut scene = client::ClientScene::new(client::SceneConfig {
+        center: BlockPos {
+            space: SpaceId(0),
+            x: 8,
+            y: 8,
+            z: 8,
+        },
+        horizontal_radius: 0,
+        vertical_radius: 0,
+        max_loaded_pages: 27,
+        authoritative_remote: true,
+        ..client::SceneConfig::forest()
+    })
+    .unwrap();
+    let hdr = net::light::pack(15, 7, [231, 17, 255]).unwrap();
+    for source in scene.requested_pages().collect::<Vec<_>>() {
+        scene
+            .import_authoritative_page(&source_proof_raw(source, 10, 0), Tick(1))
+            .unwrap();
+        scene
+            .import_authoritative_light(&source_proof_light(source, 10, 1, hdr), Tick(1))
+            .unwrap();
+    }
+    let mut settings = config().with_authoritative_source();
+    settings.max_gpu_pages_per_pump = 1;
+    let mut lighting = ClientLighting::prepare_scene(
+        &gpu.device,
+        &gpu.queue,
+        &mut terrain,
+        &mut scene,
+        settings,
+        [8.; 3],
+        [0.3, 0.8, 0.2],
+    )
+    .unwrap();
+    let handle = terrain
+        .upload_page(
+            &gpu.queue,
+            None,
+            1,
+            translation([0.; 3]),
+            &PageMesh::default(),
+            &mut UploadBudget::new(1000000),
+        )
+        .unwrap();
+    lighting
+        .register_page(page(), handle, WorldBounds::new([0.; 3], [16.; 3]).unwrap())
+        .unwrap();
+    source_proof_settle(gpu, &mut lighting, &mut scene);
+    SourceRegionFixture {
+        terrain,
+        scene,
+        lighting,
+        handle,
+        hdr,
+    }
+}
+// Real float raster using the unchanged product's header/alias/sample shader.
+// This proves that a preserved unrelated sample is physically visible and HDR,
+// rather than merely leaving stale words behind a uniform-black header.
+fn source_region_raster(
+    gpu: &render::Gpu,
+    lighting: &ClientLighting,
+    handle: render::terrain_gpu::PageHandle,
+) -> [f32; 4] {
+    let shader = gpu
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("source repair actual product LIGHT sampling raster"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    r#"{}
+@vertex fn vertex(@builtin(vertex_index)i:u32)->@builtin(position)vec4<f32>{{
+ let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));return vec4(p[i],0.,1.);}}
+@fragment fn fragment()->@location(0)vec4<f32>{{
+ return sample_page_light({}u,vec3(8.,8.,8.),vec3(0.,1.,0.));}}
+"#,
+                    include_str!("../../render/src/light_volume.wgsl"),
+                    handle.slot
+                )
+                .into(),
+            ),
+        });
+    let pipeline = gpu
+        .device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("actual HDR source-region repair oracle"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vertex"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fragment"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba32Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+            cache: None,
+        });
+    let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("actual LIGHT volume"),
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[wgpu::BindGroupEntry {
+            binding: 12,
+            resource: lighting.light_volumes().buffer().as_entire_binding(),
+        }],
+    });
+    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("16 actual HDR fragments"),
+        size: wgpu::Extent3d {
+            width: 16,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let read = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("completed HDR fragment readback"),
+        size: 256,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let view = texture.create_view(&Default::default());
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("source repair retained sample actual raster"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &read,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: Some(1),
+            },
+        },
+        wgpu::Extent3d {
+            width: 16,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    gpu.queue.submit([encoder.finish()]);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    read.slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap()
+        });
+    gpu.device.poll(wgpu::PollType::Wait).unwrap();
+    receiver.recv().unwrap().unwrap();
+    let bytes = read.slice(..).get_mapped_range();
+    let result =
+        std::array::from_fn(|i| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()));
+    drop(bytes);
+    read.unmap();
+    result
+}
+
+#[test]
+fn changed_source_regions_repair_real_patched_gpu_image_without_blacking_untouched_hdr() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut f = source_region_fixture(&gpu);
+        let corner = PageId {
+            x: -1,
+            y: -1,
+            z: -1,
+            ..page()
+        };
+        let patched = net::light::pack(12, 3, [5, 77, 199]).unwrap();
+        f.scene
+            .import_authoritative_light(
+                &net::light::Update::Delta(net::light::Delta {
+                    header: net::light::Header {
+                        page: corner,
+                        cell_view: 10,
+                        version: 2,
+                        source: core_types::Version(2),
+                    },
+                    base: 1,
+                    changes: vec![(4095, patched)],
+                }),
+                Tick(2),
+            )
+            .unwrap();
+        let work = f
+            .lighting
+            .pump_scene(&gpu.queue, &mut f.scene, Tick(2), &mut UploadBudget::new(4))
+            .unwrap();
+        assert_eq!((work.upload_bytes, work.sample_reads), (4, 1));
+        let before = source_proof_volume(&gpu, &f.lighting, f.handle);
+        assert_eq!(before[0], 0);
+        assert_eq!(before[1], patched);
+
+        // A real prior PATCH erased the successful-FULL witness. Two new
+        // current sources cover a256-word bottom face and16-word bottom edge.
+        let bottom = PageId { y: -1, ..page() };
+        let edge = PageId {
+            y: -1,
+            z: -1,
+            ..page()
+        };
+        for source in [bottom, edge] {
+            assert!(
+                f.scene
+                    .import_authoritative_page(&source_proof_raw(source, 11, 0), Tick(3))
+                    .unwrap()
+                    .change
+                    .is_none()
+            );
+            assert!(f.scene.authoritative_light_version(source).is_none());
+            assert!(
+                f.scene
+                    .import_authoritative_light(&source_proof_light(source, 11, 2, f.hdr), Tick(3))
+                    .unwrap()
+                    .change
+                    .is_none()
+            );
+        }
+        let work = f
+            .lighting
+            .pump_scene(
+                &gpu.queue,
+                &mut f.scene,
+                Tick(3),
+                &mut UploadBudget::new(272 * 4),
+            )
+            .unwrap();
+        // Old code with the same fixture queues the8B uniform-black header;
+        // comparing every real GPU word here fails before telemetry assertions.
+        assert_eq!(source_proof_volume(&gpu, &f.lighting, f.handle), before);
+        let hdr = source_region_raster(&gpu, &f.lighting, f.handle);
+        assert!((hdr[0] - 231. / 15.).abs() < 0.0001 && hdr[2] > 16.);
+        assert_eq!(
+            (work.source_retags, work.upload_bytes, work.sample_reads),
+            (0, 1088, 272)
+        );
+        assert!(!work.ready && work.pending_gpu_pages > 0);
+
+        // A current changed corner repairs exactly one actual sample, even
+        // with ample byte credit: repair+normal uploads share5832 sample credit.
+        let value = net::light::pack(14, 2, [19, 221, 255]).unwrap();
+        f.scene
+            .import_authoritative_page(&source_proof_raw(corner, 12, 0), Tick(4))
+            .unwrap();
+        // The previous corner Delta carried source2; the replacement snapshot
+        // must preserve monotonic source causality, independently of cell_view.
+        let corner_light = net::light::Update::Snapshot(net::light::Snapshot {
+            header: net::light::Header {
+                page: corner,
+                cell_view: 12,
+                version: 3,
+                source: core_types::Version(3),
+            },
+            values: Box::new([value; 4096]),
+        });
+        f.scene
+            .import_authoritative_light(&corner_light, Tick(4))
+            .unwrap();
+        let work = f
+            .lighting
+            .pump_scene(
+                &gpu.queue,
+                &mut f.scene,
+                Tick(4),
+                &mut UploadBudget::new(2 * LIGHT_PAGE_BYTES),
+            )
+            .unwrap();
+        let mut expected = before.clone();
+        expected[1] = value;
+        assert_eq!(source_proof_volume(&gpu, &f.lighting, f.handle), expected);
+        assert_eq!((work.upload_bytes, work.sample_reads), (4, 1));
+        assert!(work.backpressure && !work.ready);
+
+        // Actual observed None zeros its entire16-word source edge; unrelated
+        // corner/center/HDR words stay exactly equal, without any fabricated cert.
+        f.scene
+            .import_authoritative_page(&source_proof_raw(edge, 12, 0), Tick(5))
+            .unwrap();
+        assert!(f.scene.authoritative_light_version(edge).is_none());
+        let work = f
+            .lighting
+            .pump_scene(
+                &gpu.queue,
+                &mut f.scene,
+                Tick(5),
+                &mut UploadBudget::new(64),
+            )
+            .unwrap();
+        for x in 0..16 {
+            expected[1 + light_index([x, -1, -1]).unwrap()] = 0;
+        }
+        assert_eq!(source_proof_volume(&gpu, &f.lighting, f.handle), expected);
+        assert_eq!((work.upload_bytes, work.sample_reads), (64, 16));
+        assert!(source_region_raster(&gpu, &f.lighting, f.handle)[0] > 15.);
+
+        // One byte short cannot partially repair a face. The original full
+        // revoke remains the fallback, physically black in the product shader.
+        f.scene
+            .import_authoritative_page(&source_proof_raw(bottom, 12, 0), Tick(6))
+            .unwrap();
+        f.scene
+            .import_authoritative_light(&source_proof_light(bottom, 12, 3, f.hdr), Tick(6))
+            .unwrap();
+        let work = f
+            .lighting
+            .pump_scene(
+                &gpu.queue,
+                &mut f.scene,
+                Tick(6),
+                &mut UploadBudget::new(1023),
+            )
+            .unwrap();
+        assert_ne!(
+            source_proof_volume(&gpu, &f.lighting, f.handle)[0] & 0x40000000,
+            0
+        );
+        assert_eq!(source_region_raster(&gpu, &f.lighting, f.handle), [0.; 4]);
+        assert_eq!(work.upload_bytes, 8);
+        assert_eq!(work.sample_reads, 0);
+        // An already uniform slot cannot be promoted by a subsequent small fill.
+        f.scene
+            .import_authoritative_light(&source_proof_light(edge, 12, 3, f.hdr), Tick(7))
+            .unwrap();
+        let work = f
+            .lighting
+            .pump_scene(
+                &gpu.queue,
+                &mut f.scene,
+                Tick(7),
+                &mut UploadBudget::new(64),
+            )
+            .unwrap();
+        assert_eq!(work.upload_bytes, 0);
+        assert_eq!(work.sample_reads, 0);
+        assert_eq!(source_region_raster(&gpu, &f.lighting, f.handle), [0.; 4]);
+        source_proof_settle(&gpu, &mut f.lighting, &mut f.scene);
+        assert!(source_region_raster(&gpu, &f.lighting, f.handle)[0] > 15.);
+    });
+}
+
+#[test]
+fn source_region_repair_reserves_later_residents_mandatory_revoke_bytes() {
+    pollster::block_on(async {
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut f = source_region_fixture(&gpu);
+        let right = PageId { x: 1, ..page() };
+        let handle = f
+            .terrain
+            .upload_page(
+                &gpu.queue,
+                None,
+                1,
+                translation([16., 0., 0.]),
+                &PageMesh::default(),
+                &mut UploadBudget::new(1000000),
+            )
+            .unwrap();
+        f.lighting
+            .register_page(
+                right,
+                handle,
+                WorldBounds::new([16., 0., 0.], [32., 16., 16.]).unwrap(),
+            )
+            .unwrap();
+        source_proof_settle(&gpu, &mut f.lighting, &mut f.scene);
+        let left = PageId { x: -1, ..page() };
+        f.scene
+            .import_authoritative_page(&source_proof_raw(left, 11, 0), Tick(2))
+            .unwrap();
+        f.scene
+            .import_authoritative_light(&source_proof_light(left, 11, 2, f.hdr), Tick(2))
+            .unwrap();
+        f.scene
+            .import_authoritative_page(&source_proof_raw(right, 11, 0), Tick(2))
+            .unwrap();
+        assert!(f.scene.authoritative_light_version(right).is_none());
+        // First resident's two256-word faces individually fit2048B, but
+        // spending them would starve the later resident's mandatory8B revoke.
+        let work = f
+            .lighting
+            .pump_scene(
+                &gpu.queue,
+                &mut f.scene,
+                Tick(2),
+                &mut UploadBudget::new(2048),
+            )
+            .unwrap();
+        let image = source_proof_volume(&gpu, &f.lighting, handle);
+        assert_ne!(image[0] & 0x40000000, 0);
+        assert_eq!(image[1], 0);
+        assert_eq!(work.upload_bytes, 16);
+        assert_eq!(work.sample_reads, 0);
+    });
+}
+
+#[test]
+fn source_region_slot_guard_rejects_uniform_alias_stale_generation_and_revision() {
+    pollster::block_on(async {
+        use render::{
+            light_volume::{LightUpdate, LightVolumeGpu, PackedLight},
+            terrain_gpu::PageHandle,
+        };
+        let gpu = render::Gpu::request(&render::instance(), None, true)
+            .await
+            .unwrap();
+        let mut volumes = LightVolumeGpu::new(&gpu.device, 3).unwrap();
+        let base = PageHandle {
+            slot: 0,
+            generation: 1,
+        };
+        let alias = PageHandle {
+            slot: 1,
+            generation: 1,
+        };
+        let value = PackedLight::new(15, 7, [231, 17, 255]).unwrap();
+        assert!(!volumes.retains_full_image(base, 0));
+        volumes
+            .upload_page(
+                &gpu.queue,
+                base,
+                1,
+                &[value; render::light_volume::LIGHT_SAMPLES],
+                &mut UploadBudget::new(LIGHT_PAGE_BYTES),
+            )
+            .unwrap();
+        volumes
+            .upload_patch(
+                &gpu.queue,
+                base,
+                2,
+                &[LightUpdate { index: 0, value }],
+                &mut UploadBudget::new(4),
+            )
+            .unwrap();
+        assert!(volumes.retains_full_image(base, 2));
+        assert!(!volumes.retains_full_image(base, 1));
+        assert!(!volumes.retains_full_image(
+            PageHandle {
+                generation: 2,
+                ..base
+            },
+            2
+        ));
+        volumes
+            .alias_page(&gpu.queue, alias, base, &mut UploadBudget::new(4))
+            .unwrap();
+        assert!(!volumes.retains_full_image(alias, 2));
+        volumes
+            .upload_uniform(
+                &gpu.queue,
+                base,
+                3,
+                PackedLight::default(),
+                &mut UploadBudget::new(8),
+            )
+            .unwrap();
+        assert!(!volumes.retains_full_image(base, 3));
     });
 }
 #[test]
@@ -1024,7 +1540,10 @@ fn scene_source_certificate_gates_zero_snapshot_and_revokes_high_rgb_on_cell_vie
             .unwrap();
         assert!(known.ready);
         assert_eq!(known.confirmed_source_pages, 1);
-        assert_eq!(known.upload_bytes, LIGHT_PAGE_BYTES);
+        // Filling a previously unknown source may first repair its4096-word
+        // region, then finish the unchanged full-publication queue in this pump.
+        assert!((LIGHT_PAGE_BYTES..=LIGHT_PAGE_BYTES + 4096 * 4).contains(&known.upload_bytes));
+        assert!(known.sample_reads <= 4 * render::light_volume::LIGHT_SAMPLES as u64);
         let hdr = net::light::pack(15, 7, [231, 17, 255]).unwrap();
         scene
             .import_authoritative_light(&packet(2, hdr), Tick(4))

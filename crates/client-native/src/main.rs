@@ -3,6 +3,7 @@ mod flight;
 mod loading;
 mod product_ui;
 mod remote_transport;
+mod scene_receipts;
 use client::view::{ClientView, InputKey};
 use render::terrain_gpu::UploadBudget;
 use std::{
@@ -173,6 +174,7 @@ struct NativeState {
     // async return slots and window-event state moves on the 1 MiB Windows stack.
     recorder: Box<telemetry::FrameRecorder<600>>,
     frames: u64,
+    scene_receipts: Option<scene_receipts::Tracker>,
     last_frame: Instant,
     cpu_continuations: u64,
     captured: bool,
@@ -253,6 +255,7 @@ impl NativeState {
                     }
                     self.remote = None;
                     self.capture(false);
+                    self.retire_scene_receipts();
                     self.view = None;
                     self.workers = None;
                     if let Some(product) = &mut self.product {
@@ -340,6 +343,7 @@ impl NativeState {
         }
         self.capture(false);
         self.remote = None;
+        self.retire_scene_receipts();
         self.view = None;
         self.workers = None;
         let mut hash = 0xcbf29ce484222325_u64;
@@ -548,6 +552,7 @@ impl NativeState {
             workers,
             recorder: Box::new(telemetry::FrameRecorder::new()),
             frames: 0,
+            scene_receipts: scene_receipts::Tracker::from_env(),
             last_frame: Instant::now(),
             cpu_continuations: 0,
             captured: false,
@@ -731,6 +736,7 @@ impl NativeState {
                 if self.mode == SceneMode::Product {
                     self.flight.begin_scene()?;
                 }
+                self.retire_scene_receipts();
                 self.view = Some(view);
                 self.loading = None;
                 self.loading_cancel = None;
@@ -1045,6 +1051,7 @@ impl NativeState {
             .ok_or("frame sequence exhausted")?;
         let mut world_ready = false;
         let mut used_cached = false;
+        let mut scene_receipt = None;
         let encode_started = Instant::now();
         let mut work = if let Some(view) = self.view.as_deref_mut() {
             view.set_presentation_frame_id(submission)?;
@@ -1069,13 +1076,26 @@ impl NativeState {
                     used_cached = true;
                 } else {
                     let hdr_before = view.renderer_mut().hdr_revision();
-                    view.encode(
+                    let terrain_work = view.encode(
                         &self.gpu.queue,
                         &mut encoder,
                         &output,
                         self.config.width,
                         self.config.height,
                     )?;
+                    if terrain_work.passes > 0 && self.scene_receipts.is_some() {
+                        let stamp = scene_receipts::Stamp {
+                            camera: view
+                                .current_camera_signature(self.config.width, self.config.height),
+                            world: view.scene.world().version().0,
+                            visual: view.renderer_mut().visual_revision(),
+                            uploads: view.stats().upload_bytes_total,
+                            extent: view.render_extent(),
+                            samples: view.render_sample_count(),
+                            temporal: view.temporal_prepared(),
+                        };
+                        scene_receipt = Some((stamp, terrain_work.passes));
+                    }
                     world_ready = view.renderer_mut().hdr_revision() != hdr_before
                         && view.is_ready()
                         && view.has_cached_present();
@@ -1086,6 +1106,11 @@ impl NativeState {
                 view.discard_presentation(submission).map_err(|rollback| {
                     format!("{error}; presentation rollback failed: {rollback}")
                 })?;
+                if let Some(trace) = &mut self.scene_receipts
+                    && let Some(record) = trace.discard(submission)
+                {
+                    record.print(None);
+                }
                 return Err(error);
             }
             if let Some(product) = &mut self.product {
@@ -1150,6 +1175,12 @@ impl NativeState {
         }
         stages[6] = Some(flight::nanos(present_started.elapsed()));
         self.frames = submission;
+        if let Some((stamp, passes)) = scene_receipt
+            && let Some(trace) = &mut self.scene_receipts
+            && let Some(record) = trace.submitted(submission, stamp, passes)
+        {
+            record.print(None);
+        }
         self.recorder.push(telemetry::FrameRecord {
             frame: self.frames,
             cpu_ns: flight::nanos(started.elapsed()),
@@ -1192,13 +1223,46 @@ impl NativeState {
             );
         }
     }
+    fn retire_scene_receipts(&mut self) {
+        if let Some(trace) = &mut self.scene_receipts
+            && let Some(record) = trace.replace_owner()
+        {
+            record.print(None);
+        }
+    }
     fn complete_temporal_presentations(&mut self) -> Result<(), String> {
         let completed = self.completed_submission.load(Ordering::Acquire);
-        if let Some(view) = self.view.as_deref_mut()
-            && let Some(frame) = view.pending_presentation_frame()
-            && frame <= completed
-        {
-            view.commit_presentation(frame)?;
+        let mut validated_commit = None;
+        if let Some(view) = self.view.as_deref_mut() {
+            if let Some(frame) = view.pending_presentation_frame()
+                && frame <= completed
+            {
+                view.commit_presentation(frame)?;
+                validated_commit = Some(frame);
+            }
+            if let Some(trace) = &mut self.scene_receipts
+                && trace
+                    .pending_frame()
+                    .is_some_and(|frame| frame <= completed)
+            {
+                // CPU authority may already be newer. These are the actual
+                // committed renderer cache stamps, never live Scene readiness.
+                let rendered = scene_receipts::Stamp {
+                    camera: view.rendered_camera_signature(),
+                    world: view.rendered_world_version().0,
+                    visual: view.rendered_visual_revision(),
+                    uploads: view.rendered_upload_bytes(),
+                    extent: view.render_extent(),
+                    samples: view.render_sample_count(),
+                    temporal: view.temporal_prepared(),
+                };
+                let camera = view
+                    .factory_encoded_camera()
+                    .map(|(camera, origin)| (camera.view_projection, origin));
+                if let Some(record) = trace.completed(completed, rendered, validated_commit) {
+                    record.print(camera);
+                }
+            }
         }
         Ok(())
     }
