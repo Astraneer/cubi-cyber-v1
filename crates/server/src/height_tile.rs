@@ -1,7 +1,7 @@
 //! Pure worker builder for authoritative public terrain-baseline height tiles.
 //! All committed edits are protected geometry; AIR removals cannot vanish after
 //! page eviction or be filled by a coarse baseline. No raw Cell enters the DTO.
-use crate::height_index::{TileEdits, TileKey};
+use crate::height_index::{EditedColumn, TileEdits, TileKey};
 pub const PUBLIC_SURFACE_SCHEMA: u16 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PublicTerrainSurface {
@@ -116,8 +116,17 @@ pub fn build_tile(
 pub fn build_tile_with_regions(
     edits: &TileEdits,
     regions: &[[i32; 4]],
+    baseline: impl FnMut(i32, i32) -> Option<PublicTerrainSurface>,
+    limits: HeightBuildLimits,
+) -> Result<(PublicHeightTile, HeightBuildWork), HeightBuildError> {
+    build_tile_with_boundary_policy(edits, regions, baseline, limits, false)
+}
+fn build_tile_with_boundary_policy(
+    edits: &TileEdits,
+    regions: &[[i32; 4]],
     mut baseline: impl FnMut(i32, i32) -> Option<PublicTerrainSurface>,
     limits: HeightBuildLimits,
+    canonical_public_boundary: bool,
 ) -> Result<(PublicHeightTile, HeightBuildWork), HeightBuildError> {
     if limits.max_columns == 0
         || limits.max_cells == 0
@@ -148,9 +157,9 @@ pub fn build_tile_with_regions(
     }
     if edits.columns.iter().any(|c| {
         c.space != edits.key.space
-            || i64::from(c.x) < bounds[0]
+            || i64::from(c.x) < bounds[0] - 1
             || i64::from(c.x) > bounds[2]
-            || i64::from(c.z) < bounds[1]
+            || i64::from(c.z) < bounds[1] - 1
             || i64::from(c.z) > bounds[3]
             || c.cells.is_empty()
     }) {
@@ -217,7 +226,11 @@ pub fn build_tile_with_regions(
         }
         let x = (i64::from(column.x) - bounds[0]).div_euclid(step) as i32;
         let z = (i64::from(column.z) - bounds[1]).div_euclid(step) as i32;
-        if (0..16).contains(&x) && (0..16).contains(&z) {
+        let own_body = (0..16).contains(&x) && (0..16).contains(&z);
+        if !own_body && canonical_public_boundary && !public_boundary_changed(column, surface) {
+            continue;
+        }
+        if own_body {
             highest_replacement_y = highest_replacement_y.max(
                 column
                     .cells
@@ -227,7 +240,10 @@ pub fn build_tile_with_regions(
                     .expect("validated nonempty column"),
             );
         }
-        protect(&mut tile, x, z);
+        // A foreign rim cell can expose a face OWNED by the nearest in-tile
+        // voxel. The authority requests that owner's actual public geometry;
+        // it never invents a wall/skirt. Foreign Y cannot extend this column.
+        protect(&mut tile, x.clamp(0, 15), z.clamp(0, 15));
     }
     // Region metadata catches structures lying BETWEEN sparse samples.
     for region in regions {
@@ -298,7 +314,7 @@ pub fn build_canonical_tile(
     }
     let bounds = generator.public_structure_bounds();
     let regions = bounds.as_slice();
-    let (mut tile, mut work) = build_tile_with_regions(
+    let (mut tile, mut work) = build_tile_with_boundary_policy(
         edits,
         regions,
         |x, z| {
@@ -321,6 +337,7 @@ pub fn build_canonical_tile(
             })
         },
         limits,
+        true,
     )?;
     let tile_bounds = edits.key.bounds().ok_or(HeightBuildError::InvalidInput)?;
     let Ok(bound) = generator.public_height_error(
@@ -350,6 +367,82 @@ pub fn build_canonical_tile(
     Ok((tile, work))
 }
 
+// Public render/occlusion/fluid geometry, deliberately excluding material IDs,
+// texture/tint, private ores, and emission-only state. properties.shape includes
+// raw IDs and therefore MUST NOT identify this dependency. The canonical
+// undecorated terrain envelope contains only full opaque ground, source water,
+// and AIR; a cube-to-cube material replacement cannot expose a neighbour face.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PublicBoundaryShape {
+    render: u8,
+    opaque: bool,
+    fluid: u8,
+    level: u16,
+}
+impl PublicBoundaryShape {
+    const AIR: Self = Self {
+        render: 0,
+        opaque: false,
+        fluid: 0,
+        level: 0,
+    };
+    const GROUND: Self = Self {
+        render: 1,
+        opaque: true,
+        fluid: 0,
+        level: 0,
+    };
+    const WATER: Self = Self {
+        render: 3,
+        opaque: false,
+        fluid: rules::blocks::FLUID_WATER,
+        level: 0,
+    };
+    fn actual(cell: core_types::Cell) -> Option<Self> {
+        let definition = rules::block(cell.id())?;
+        let properties = rules::properties(cell);
+        let render = match definition.render {
+            rules::blocks::Render::None
+            | rules::blocks::Render::Cross
+            | rules::blocks::Render::Model(_) => 0,
+            rules::blocks::Render::Cube => 1,
+            rules::blocks::Render::Leaves | rules::blocks::Render::Glass => 2,
+            rules::blocks::Render::Water => 3,
+        };
+        Some(Self {
+            render,
+            opaque: properties.opaque,
+            fluid: definition.fluid,
+            level: if definition.fluid == 0 {
+                0
+            } else {
+                cell.state() & 15
+            },
+        })
+    }
+}
+fn public_boundary_changed(column: &EditedColumn, surface: Option<PublicTerrainSurface>) -> bool {
+    let Some(surface) = surface else {
+        return true;
+    };
+    column.cells.iter().any(|edit| {
+        // Keep the existing top/exposure domain: a raw buried AIR row can be a
+        // closed component sealed by PublicProjection, so it is not an exterior
+        // proof. Below-ground tunnel closure requires a separate public witness.
+        if edit.y < surface.ground_y {
+            return false;
+        }
+        let baseline = if edit.y <= surface.ground_y {
+            PublicBoundaryShape::GROUND
+        } else if edit.y < surface.height {
+            PublicBoundaryShape::WATER
+        } else {
+            PublicBoundaryShape::AIR
+        };
+        PublicBoundaryShape::actual(edit.cell).is_none_or(|actual| actual != baseline)
+    })
+}
+
 /// A camera may request the exact public representation of a non-flat leaf.
 /// This only promotes representation metadata; the existing stream must still
 /// obtain all canonical pages and source/view manifests before publication.
@@ -377,5 +470,44 @@ fn protect(tile: &mut PublicHeightTile, x: i32, z: i32) {
     if (0..16).contains(&x) && (0..16).contains(&z) {
         let index = (x + z * 16) as usize;
         tile.protected[index / 8] |= 1 << (index % 8);
+    }
+}
+
+#[cfg(test)]
+mod boundary_shape_tests {
+    use super::*;
+    fn changed(y: i32, id: u16, state: u16) -> bool {
+        public_boundary_changed(
+            &EditedColumn {
+                space: core_types::SpaceId(0),
+                x: 0,
+                z: 0,
+                cells: vec![crate::height_index::IndexedCell {
+                    y,
+                    cell: core_types::Cell::from_parts(id, state),
+                    source_tx: core_types::TxId(1),
+                }],
+            },
+            Some(PublicTerrainSurface {
+                height: 49,
+                ground_y: 40,
+                atlas_layer: 3,
+                tint: u32::MAX,
+                protected: false,
+            }),
+        )
+    }
+    #[test]
+    fn water_kind_level_and_occlusion_are_meaningful_but_opaque_ids_are_not() {
+        assert!(!changed(48, rules::ids::WATER, 0));
+        assert!(changed(48, rules::ids::WATER, 1));
+        assert!(changed(48, rules::ids::AIR, 0));
+        assert!(changed(48, rules::ids::LAVA, 0));
+        assert!(changed(48, rules::ids::STONE, 0));
+        assert!(!changed(49, rules::ids::AIR, 0));
+        assert!(!changed(40, rules::ids::STONE, 0));
+        assert!(!changed(40, rules::ids::IRON_ORE, 0));
+        assert!(changed(40, rules::ids::GLASS, 0));
+        assert!(changed(49, 65535, 0));
     }
 }

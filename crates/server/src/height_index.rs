@@ -1,6 +1,7 @@
 //! Private persisted overrides for public height-tile authority. Every committed
 //! cell edit, including AIR, survives page eviction. No raw cell crosses to wire.
-//! Morton-ordered columns make a dyadic tile capture a bounded contiguous range.
+//! Morton-ordered bodies and two derived ordered column indices capture sparse
+//! one-cell halos without probing every coordinate along a coarse perimeter.
 use core_types::{BlockPos, Cell, PageId, SpaceId, TxId};
 use std::collections::{BTreeMap, BTreeSet};
 pub const SCHEMA: u16 = 2;
@@ -110,6 +111,10 @@ struct Column {
 pub struct HeightEditIndex {
     limits: IndexLimits,
     columns: BTreeMap<(SpaceId, u64), Column>,
+    // Derived keys only, rebuilt by insert_cell for live writes and both codecs.
+    // AIR/reverts retain their columns; each retained column owns exactly two keys.
+    columns_xz: BTreeSet<(SpaceId, i32, i32)>,
+    columns_zx: BTreeSet<(SpaceId, i32, i32)>,
     stamps: BTreeMap<TileKey, u64>,
     // Derived exact canonical body stamps, never serialized. Every row remains
     // retained (including AIR/reverts), so entries are bounded by max_cells.
@@ -141,6 +146,8 @@ impl HeightEditIndex {
         Ok(Self {
             limits,
             columns: BTreeMap::new(),
+            columns_xz: BTreeSet::new(),
+            columns_zx: BTreeSet::new(),
             stamps: BTreeMap::new(),
             body_page_stamps: BTreeMap::new(),
             cells: 0,
@@ -181,6 +188,14 @@ impl HeightEditIndex {
     }
     pub fn column_count(&self) -> usize {
         self.columns.len()
+    }
+    pub fn column_index_entries(&self) -> usize {
+        self.columns_xz.len() + self.columns_zx.len()
+    }
+    /// Logical derived key bytes only; BTreeSet allocator/node overhead is excluded.
+    /// No persisted records or quota are added: two entries per retained column.
+    pub fn column_index_bytes(&self) -> usize {
+        self.column_index_entries() * std::mem::size_of::<(SpaceId, i32, i32)>()
     }
     pub fn stamp_count(&self) -> usize {
         self.stamps.len()
@@ -339,6 +354,10 @@ impl HeightEditIndex {
     }
     fn insert_cell(&mut self, edit: CellEdit, tx: TxId) {
         let p = edit.position;
+        if !self.columns.contains_key(&(p.space, morton(p.x, p.z))) {
+            self.columns_xz.insert((p.space, p.x, p.z));
+            self.columns_zx.insert((p.space, p.z, p.x));
+        }
         let column = self
             .columns
             .entry((p.space, morton(p.x, p.z)))
@@ -439,18 +458,39 @@ impl HeightEditIndex {
             }
             selected.insert(*id);
         }
-        // 17+16 shared boundary sample columns are outside the half-open tile body.
-        let step = 1_i64 << key.level;
-        for i in 0..=16 {
-            for (x, z) in [(b[2], b[1] + i * step), (b[0] + i * step, b[3])] {
-                if let (Ok(x), Ok(z)) = (i32::try_from(x), i32::try_from(z)) {
-                    let id = (key.space, morton(x, z));
-                    if self.columns.contains_key(&id) {
-                        selected.insert(id);
-                        if selected.len() > max_columns {
-                            return Err(IndexError::Capacity);
-                        }
-                    }
+        // Complete one-cell halo of the half-open body: [min-1,max] inclusive.
+        // Four range traversals visit only retained halo columns. X strips own
+        // all four corners; Z strips cover only the body-width interior.
+        // Keep bounds in i64: legal tiles may end at i32::MAX+1.
+        let zmin = (b[1] - 1).max(i64::from(i32::MIN)) as i32;
+        let zmax = b[3].min(i64::from(i32::MAX)) as i32;
+        for x in [b[0] - 1, b[2]] {
+            let Ok(x) = i32::try_from(x) else {
+                continue;
+            };
+            for &(space, _, z) in self
+                .columns_xz
+                .range((key.space, x, zmin)..=(key.space, x, zmax))
+            {
+                selected.insert((space, morton(x, z)));
+                if selected.len() > max_columns {
+                    return Err(IndexError::Capacity);
+                }
+            }
+        }
+        let xmin = b[0] as i32;
+        let xmax = (b[2] - 1) as i32;
+        for z in [b[1] - 1, b[3]] {
+            let Ok(z) = i32::try_from(z) else {
+                continue;
+            };
+            for &(space, _, x) in self
+                .columns_zx
+                .range((key.space, z, xmin)..=(key.space, z, xmax))
+            {
+                selected.insert((space, morton(x, z)));
+                if selected.len() > max_columns {
+                    return Err(IndexError::Capacity);
                 }
             }
         }
@@ -650,6 +690,13 @@ impl HeightEditIndex {
                 if tx > last_tx || index.get(e.position).is_some() {
                     return Err(IndexError::Malformed);
                 }
+                if !index
+                    .columns
+                    .contains_key(&(e.position.space, morton(e.position.x, e.position.z)))
+                    && index.columns.len() >= limits.max_columns
+                {
+                    return Err(IndexError::Capacity);
+                }
                 index.insert_cell(e, tx);
             }
         } else {
@@ -736,6 +783,13 @@ impl HeightEditIndex {
         if (ready && !index.pending.is_empty()) || r.at != bytes.len() {
             return Err(IndexError::Malformed);
         }
+        // Preserve saved private stamps verbatim. HeightAuthority::restore is a
+        // loading operation; Server::new creates fresh HeightWorker/HeightHeads,
+        // peers and projection owners, so no old tile or in-flight capture is
+        // reused across restart. Sources are opaque equality tokens, not numeric
+        // lower bounds on retained row TxIds. Expanded affected() invalidates
+        // every later boundary mutation within the new owner lifetime. A future
+        // hot index replacement must first retire those derived owners/captures.
         let encoded_size = 36u128
             + index.columns.len() as u128 * 16
             + index.runs as u128 * 20
@@ -792,25 +846,17 @@ fn affected(p: BlockPos) -> Vec<TileKey> {
     let mut out = Vec::with_capacity(44);
     for level in 0..=MAX_LEVEL {
         let span = 16_i64 << level;
-        let x = i64::from(p.x).div_euclid(span);
-        let z = i64::from(p.z).div_euclid(span);
-        let xs = if i64::from(p.x).rem_euclid(span) == 0 {
-            2
-        } else {
-            1
-        };
-        let zs = if i64::from(p.z).rem_euclid(span) == 0 {
-            2
-        } else {
-            1
-        };
-        for dx in 0..xs {
-            for dz in 0..zs {
+        // Exactly the tiles whose [min-1,max] halo contains this coordinate.
+        // span >=16 gives at most two keys per axis, four per level,44 total.
+        let xs = (i64::from(p.x) - 1).div_euclid(span)..=(i64::from(p.x) + 1).div_euclid(span);
+        let zs = (i64::from(p.z) - 1).div_euclid(span)..=(i64::from(p.z) + 1).div_euclid(span);
+        for x in xs {
+            for z in zs.clone() {
                 let key = TileKey {
                     space: p.space,
                     level,
-                    x: (x - dx) as i32,
-                    z: (z - dz) as i32,
+                    x: x as i32,
+                    z: z as i32,
                 };
                 if key.bounds().is_some() {
                     out.push(key)
