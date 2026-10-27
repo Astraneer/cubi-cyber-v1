@@ -1,6 +1,6 @@
 //! Optional whole-scene presentation transaction. A submitted encoder is not a
 //! presented frame; every history and pose bank commits behind the same fence.
-use super::{ClientView, model_motion::ViewModelMotion};
+use super::{ClientView, EncodedSceneStamp, camera_signature, model_motion::ViewModelMotion};
 use core_types::Version;
 use render::{
     environment_gpu::{EnvironmentError, EnvironmentState, TemporalInputs},
@@ -446,6 +446,33 @@ impl ClientView {
     pub fn pending_presentation_frame(&self) -> Option<u64> {
         self.temporal.as_ref().and_then(|t| t.pending_frame())
     }
+    pub fn presented_presentation_frame(&self) -> Option<u64> {
+        self.temporal
+            .as_ref()
+            .map(|t| t.presented_frame())
+            .filter(|frame| *frame != 0)
+    }
+    /// Read immediately after encode, before another View operation. Temporal
+    /// encode may advance live renderer revisions after reserving its Scene;
+    /// the candidate is the identity that commit_presentation will publish.
+    /// Cached presents, Post-only work and unfinished candidates have no stamp.
+    pub fn encoded_scene_stamp(&self) -> Option<EncodedSceneStamp> {
+        if let Some(temporal) = &self.temporal {
+            let candidate = temporal.candidate?;
+            return (candidate.encoded && candidate.work.passes > 0).then(|| EncodedSceneStamp {
+                camera: camera_signature(candidate.base),
+                world: candidate.world,
+                visual: candidate.visual,
+                uploads: candidate.uploads,
+            });
+        }
+        self.encoded_terrain.then(|| EncodedSceneStamp {
+            camera: self.rendered_camera_signature(),
+            world: self.cached_world_version,
+            visual: self.cached_visual_revision,
+            uploads: self.cached_upload_bytes,
+        })
+    }
 }
 
 impl ClientView {
@@ -816,6 +843,9 @@ impl ClientView {
         if let Some(candidate) = &mut temporal.candidate {
             candidate.draw = camera;
             candidate.uploads = self.upload_bytes_total;
+            // Atmosphere/GI updates invalidate the renderer before the color
+            // pass. Retain the revision actually used by this encoded Scene.
+            candidate.visual = self.renderer.visual_revision();
             candidate.props = props_encoded.get();
             candidate.work = work.terrain;
             candidate.encoded = true;

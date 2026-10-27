@@ -169,6 +169,54 @@ fn setup_with_exposure(gpu: &render::Gpu, exposure: f32) -> ClientView {
     }
     view
 }
+
+#[test]
+fn encoded_scene_identity_survives_live_renderer_revision_changes_until_commit() {
+    let gpu = pollster::block_on(render::Gpu::request(&render::instance(), None, true)).unwrap();
+    gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let mut view = setup(&gpu);
+    assert!(view.encoded_scene_stamp().is_none());
+    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("encoded Scene identity regression"),
+        size: wgpu::Extent3d {
+            width: EXTENT[0],
+            height: EXTENT[1],
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let output = texture.create_view(&Default::default());
+    view.set_presentation_frame_id(1).unwrap();
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    let work = view
+        .encode(&gpu.queue, &mut encoder, &output, EXTENT[0], EXTENT[1])
+        .unwrap();
+    assert!(work.passes > 0);
+    let encoded = view.encoded_scene_stamp().unwrap();
+    assert_eq!(encoded.visual, view.renderer_mut().visual_revision());
+    // A later redraw request cannot relabel the already encoded transaction.
+    view.renderer_mut().invalidate();
+    assert_ne!(encoded.visual, view.renderer_mut().visual_revision());
+    assert_eq!(view.encoded_scene_stamp(), Some(encoded));
+    gpu.queue.submit([encoder.finish()]);
+    view.mark_presentation_submitted(1).unwrap();
+    gpu.device.poll(wgpu::PollType::Wait).unwrap();
+    view.commit_presentation(1).unwrap();
+    assert_eq!(view.presented_presentation_frame(), Some(1));
+    assert_eq!(encoded.camera, view.rendered_camera_signature());
+    assert_eq!(encoded.world, view.rendered_world_version());
+    assert_eq!(encoded.visual, view.rendered_visual_revision());
+    assert_eq!(encoded.uploads, view.rendered_upload_bytes());
+    assert!(view.encoded_scene_stamp().is_none());
+    assert!(view.needs_redraw(EXTENT[0], EXTENT[1]));
+    assert!(pollster::block_on(gpu.device.pop_error_scope()).is_none());
+}
+
 fn publish(gpu: &render::Gpu, view: &mut ClientView, prepared: &PreparedMaterials) -> u64 {
     let pack = MaterialPackGpu::upload(&gpu.device, &gpu.queue, prepared).unwrap();
     apply_albedo_in_place(&gpu.queue, view.renderer_mut().geometry(), prepared).unwrap();

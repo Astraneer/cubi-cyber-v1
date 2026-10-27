@@ -36,6 +36,16 @@ pub use lighting::{LightingStats, ViewLighting};
 pub use props::{PropsStats, ViewProps};
 pub use remote::RemoteInput;
 
+/// Source identity retained by an encoded terrain Scene. GPU completion and
+/// presentation validation are separate from this read-only encoding receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodedSceneStamp {
+    pub camera: u64,
+    pub world: Version,
+    pub visual: u64,
+    pub uploads: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum InputKey {

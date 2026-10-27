@@ -1084,12 +1084,14 @@ impl NativeState {
                         self.config.height,
                     )?;
                     if terrain_work.passes > 0 && self.scene_receipts.is_some() {
+                        let encoded = view
+                            .encoded_scene_stamp()
+                            .ok_or("terrain encode has no Scene identity")?;
                         let stamp = scene_receipts::Stamp {
-                            camera: view
-                                .current_camera_signature(self.config.width, self.config.height),
-                            world: view.scene.world().version().0,
-                            visual: view.renderer_mut().visual_revision(),
-                            uploads: view.stats().upload_bytes_total,
+                            camera: encoded.camera,
+                            world: encoded.world.0,
+                            visual: encoded.visual,
+                            uploads: encoded.uploads,
                             extent: view.render_extent(),
                             samples: view.render_sample_count(),
                             temporal: view.temporal_prepared(),
@@ -1238,7 +1240,11 @@ impl NativeState {
                 && frame <= completed
             {
                 view.commit_presentation(frame)?;
-                validated_commit = Some(frame);
+                // Source revocation discards a completed candidate successfully;
+                // only an actual publication can certify its Scene receipt.
+                validated_commit = view
+                    .presented_presentation_frame()
+                    .filter(|presented| *presented == frame);
             }
             if let Some(trace) = &mut self.scene_receipts
                 && trace
