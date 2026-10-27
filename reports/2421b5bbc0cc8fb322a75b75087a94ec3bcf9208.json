@@ -1,0 +1,25 @@
+{
+  "checks": {
+    "linux": "failure",
+    "server_scale": "success",
+    "windows": "success"
+  },
+  "conclusion": "failure",
+  "delivery": {
+    "status": "blocked_checks"
+  },
+  "reported_at": "2026-10-27T01:39:44.624796+00:00",
+  "repository": "Astraneer/cubi-cyber-v1",
+  "schema_version": 2,
+  "source": {
+    "branch": "m4-lighting",
+    "sha": "2421b5bbc0cc8fb322a75b75087a94ec3bcf9208",
+    "stage": "M4"
+  },
+  "workflow": {
+    "name": "Acceptance",
+    "run_attempt": "1",
+    "run_id": "40430877560",
+    "url": "https://github.com/Astraneer/cubi-cyber-v1/actions/runs/40430877560"
+  }
+}
