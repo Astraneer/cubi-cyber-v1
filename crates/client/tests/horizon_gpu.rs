@@ -462,6 +462,7 @@ fn reselected_cached_parent_waits_for_fresh_identical_source_before_gpu_publicat
             target_pixels: 32.,
             hysteresis_pixels: 8.,
             view_direction: [0., -1., 0.],
+            max_abs_forward_y: 1.,
             view_cosine: 0.,
         };
         horizon.set_projection(low).unwrap();

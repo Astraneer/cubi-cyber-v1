@@ -19,6 +19,7 @@ run_check 'Rust Clippy' cargo clippy --locked --workspace --all-targets -- -D wa
 run_check 'Workspace tests' cargo test --locked --workspace
 run_check 'Benchmark route and HTML' bash tools/check_bench.sh
 run_check 'Python helpers' python3 -m unittest discover -s tools -p 'test_*.py'
+run_check 'UI presentation and public timeout diagnostics' node --test tools/ui_presentation_barrier.test.mjs tools/product_ui_diagnostics.test.mjs
 run_check 'Native window' bash tools/native_smoke.sh
 run_check 'Web build' bash tools/build_web.sh
 run_check 'Native/WASM determinism' bash tools/check_determinism.sh

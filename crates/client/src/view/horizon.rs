@@ -27,6 +27,15 @@ pub const MAX_PROXY_WORK_CELLS: u64 = 524_288;
 #[path = "horizon_selection.rs"]
 mod selection;
 pub use selection::{Certificate, Projection, SelectionQuality, seam_error_q1024};
+pub fn orientation_certificate(
+    yaw: f64,
+    pitch: f64,
+    yaw_step: f64,
+    pitch_step: f64,
+) -> Result<([f64; 3], f64, f64), Error> {
+    selection::orientation_certificate(yaw, pitch, yaw_step, pitch_step)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub max_tiles: usize,

@@ -16,6 +16,79 @@ pub struct Projection {
     /// angular quantization margin, so a current visible tile cannot be culled.
     pub view_direction: [f64; 3],
     pub view_cosine: f64,
+    /// Vertical upper-envelope displacement only; this does not certify arbitrary
+    /// voxel walls, underwater surfaces or horizontal correspondence.
+    /// Supremum of |actual camera forward dot world Y| for this snapshot.
+    /// Generic/legacy projections must use1; only a certified pitch bin tightens it.
+    pub max_abs_forward_y: f64,
+}
+impl Default for Projection {
+    fn default() -> Self {
+        Self {
+            eye_min: [0.; 3],
+            eye_max: [0.; 3],
+            focal_pixels: 1.,
+            diagonal_tangent: 1.,
+            target_pixels: 32.,
+            hysteresis_pixels: 8.,
+            view_direction: [0., 0., 1.],
+            view_cosine: -1.,
+            max_abs_forward_y: 1.,
+        }
+    }
+}
+/// The whole floor-aligned pitch bin bounds vertical displacement, including
+/// clipped polar bins. Input is the actual camera axis after bob/third-person.
+pub fn orientation_certificate(
+    yaw: f64,
+    pitch: f64,
+    yaw_step: f64,
+    pitch_step: f64,
+) -> Result<([f64; 3], f64, f64), Error> {
+    if !yaw.is_finite()
+        || !pitch.is_finite()
+        || !(-90. ..=90.).contains(&pitch)
+        || ![yaw_step, pitch_step]
+            .into_iter()
+            .all(|v| v.is_finite() && v > 0. && v <= 90.)
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let yaw_bucket = (yaw / yaw_step).floor();
+    let pitch_bucket = (pitch / pitch_step).floor();
+    if !yaw_bucket.is_finite() || !pitch_bucket.is_finite() {
+        return Err(Error::InvalidConfig);
+    }
+    let centre_yaw = yaw_bucket * yaw_step + yaw_step * 0.5;
+    let centre_pitch = pitch_bucket * pitch_step + pitch_step * 0.5;
+    let y = centre_yaw.to_radians();
+    let p = centre_pitch.to_radians();
+    if ![centre_yaw, centre_pitch, y, p]
+        .into_iter()
+        .all(f64::is_finite)
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let axis = [
+        libm::sin(y) * libm::cos(p),
+        libm::sin(p),
+        libm::cos(y) * libm::cos(p),
+    ];
+    let cosine =
+        libm::cos((yaw_step * 0.5).to_radians()) * libm::cos((pitch_step * 0.5).to_radians());
+    let margin = libm::acos(cosine.clamp(-1., 1.)) + 1e-10;
+    let limit = (centre_pitch.abs() + pitch_step * 0.5)
+        .min(90.)
+        .to_radians();
+    let s = (libm::sin(limit) + 1e-10).min(1.);
+    if axis.iter().any(|v| !v.is_finite())
+        || !margin.is_finite()
+        || !s.is_finite()
+        || !(0. ..=1.).contains(&s)
+    {
+        return Err(Error::InvalidConfig);
+    }
+    Ok((axis, margin, s))
 }
 impl Projection {
     pub fn validate(self) -> Result<(), Error> {
@@ -36,6 +109,8 @@ impl Projection {
             || self.hysteresis_pixels >= self.target_pixels
             || self.view_direction.iter().any(|v| !v.is_finite())
             || (self.view_direction.iter().map(|v| v * v).sum::<f64>() - 1.).abs() > 1e-6
+            || !self.max_abs_forward_y.is_finite()
+            || !(0. ..=1.).contains(&self.max_abs_forward_y)
             || !self.view_cosine.is_finite()
             || !(-1.0..=1.0).contains(&self.view_cosine)
         {
@@ -65,8 +140,14 @@ impl Projection {
             let half = (hi[axis] - lo[axis] + self.eye_max[axis] - self.eye_min[axis]) * 0.5;
             radius_squared += half * half;
         }
+        if !radius_squared.is_finite() || delta.iter().any(|v| !v.is_finite()) {
+            return true;
+        }
         radius += libm::sqrt(radius_squared);
         let distance = libm::sqrt(delta.iter().map(|v| v * v).sum::<f64>());
+        if !radius.is_finite() || !distance.is_finite() {
+            return true;
+        }
         if distance <= radius {
             return true;
         }
@@ -83,7 +164,7 @@ impl Projection {
             .map(|(a, b)| a * b)
             .sum::<f64>()
             / distance;
-        actual + 1e-12 >= allowed
+        !actual.is_finite() || !allowed.is_finite() || actual + 1e-12 >= allowed
     }
     /// Conservative displacement within the viewport cone. A visible endpoint
     /// has z>=distance/sqrt(1+tan(diagonal)^2). Bounding the perspective quotient
@@ -116,12 +197,50 @@ impl Projection {
         if error == 0. {
             return 0.;
         }
+        self.displacement_error_pixels(libm::sqrt(distance_squared), error)
+    }
+    fn displacement_error_pixels(self, distance: f64, error: f64) -> f64 {
+        if !distance.is_finite()
+            || !error.is_finite()
+            || !self.focal_pixels.is_finite()
+            || !self.diagonal_tangent.is_finite()
+            || !self.max_abs_forward_y.is_finite()
+            || distance < 0.
+            || error < 0.
+        {
+            return f64::INFINITY;
+        }
         let k = libm::sqrt(1. + self.diagonal_tangent * self.diagonal_tangent);
-        let denominator = libm::sqrt(distance_squared) / k - error;
-        if denominator <= 0. {
-            f64::INFINITY
+        if !k.is_finite() || k <= 0. {
+            return f64::INFINITY;
+        }
+        // Preserve exact legacy/general arithmetic, not only algebraic equality.
+        if self.max_abs_forward_y == 1. {
+            let denominator = distance / k - error;
+            if !denominator.is_finite() || denominator <= 0. {
+                return f64::INFINITY;
+            }
+            let result = self.focal_pixels * error * k / denominator;
+            return if result.is_finite() && result >= 0. {
+                result
+            } else {
+                f64::INFINITY
+            };
+        }
+        let s = self.max_abs_forward_y.min(self.diagonal_tangent / k);
+        let numerator = libm::sqrt((1. - s * s).max(0.)) + self.diagonal_tangent * s;
+        // Only the proxy/LOD endpoint needs to be inside the certified AABB.
+        // For a visible true endpoint q=(z*t,z), p=q+e*n satisfies
+        // ||p|| <= k*p_z + E*N. A positive denominator also proves p_z>0.
+        let denominator = distance / k - error * numerator / k;
+        if !numerator.is_finite() || !denominator.is_finite() || denominator <= 0. {
+            return f64::INFINITY;
+        }
+        let result = self.focal_pixels * error * numerator / denominator;
+        if result.is_finite() && result >= 0. {
+            result.next_up()
         } else {
-            self.focal_pixels * error * k / denominator
+            f64::INFINITY
         }
     }
 }
@@ -576,6 +695,7 @@ mod tests {
             target_pixels: 10.,
             hysteresis_pixels: 2.,
             view_direction: [0., -1., 0.],
+            max_abs_forward_y: 1.,
             view_cosine: 0.,
         }
     }
@@ -710,6 +830,7 @@ mod tests {
             target_pixels: 10.,
             hysteresis_pixels: 2.,
             view_direction: [0., -1., 0.],
+            max_abs_forward_y: 1.,
             view_cosine: 0.,
         };
         let c = Certificate {
@@ -827,6 +948,7 @@ mod tests {
             target_pixels: 10.,
             hysteresis_pixels: 2.,
             view_direction: [0., 0., 1.],
+            max_abs_forward_y: 1.,
             view_cosine: 0.9,
         };
         let c = Certificate {
@@ -917,6 +1039,7 @@ mod tests {
                 target_pixels: 32.,
                 hysteresis_pixels: 8.,
                 view_direction: [0., 0., 1.],
+                max_abs_forward_y: 1.,
                 view_cosine: libm::cos(
                     libm::atan(
                         libm::tan(80f64.to_radians() * 0.5)
@@ -984,6 +1107,7 @@ mod tests {
                 }
                 if added == 0 {
                     let strict = Projection {
+                        max_abs_forward_y: 1.,
                         view_cosine: libm::cos(libm::atan(projection.diagonal_tangent)),
                         ..projection
                     };
@@ -1110,5 +1234,244 @@ mod tests {
             ),
             "top at lower boundary belongs to the page below"
         );
+    }
+}
+
+#[cfg(test)]
+mod vertical_bound_tests {
+    use super::*;
+    #[test]
+    fn general_s1_is_exact_legacy_and_invalid_inputs_fail_closed() {
+        let p = Projection::default();
+        assert_eq!(p.max_abs_forward_y, 1.);
+        for invalid in [-0.001, 1.001, f64::NAN, f64::INFINITY] {
+            assert!(
+                Projection {
+                    max_abs_forward_y: invalid,
+                    ..p
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for d in [0., 1., 4., 10., 64., 10000.] {
+            for e in [0.001, 0.5, 1., 10.] {
+                let k = libm::sqrt(1. + p.diagonal_tangent * p.diagonal_tangent);
+                let old = if d / k - e <= 0. {
+                    f64::INFINITY
+                } else {
+                    p.focal_pixels * e * k / (d / k - e)
+                };
+                assert_eq!(p.displacement_error_pixels(d, e).to_bits(), old.to_bits());
+            }
+        }
+    }
+    #[test]
+    fn finite_extremes_cannot_be_culled_or_hide_nan_as_zero_quality() {
+        let ordinary = Projection {
+            max_abs_forward_y: 0.174,
+            focal_pixels: 385.,
+            diagonal_tangent: 1.7115357351239278,
+            ..Projection::default()
+        };
+        let huge_diagonal = Projection {
+            diagonal_tangent: f64::MAX,
+            ..ordinary
+        };
+        let huge_focal = Projection {
+            focal_pixels: f64::MAX,
+            ..ordinary
+        };
+        let huge_eye = Projection {
+            eye_min: [f64::MAX; 3],
+            eye_max: [f64::MAX; 3],
+            ..ordinary
+        };
+        for projection in [huge_diagonal, huge_focal, huge_eye] {
+            projection.validate().unwrap();
+            let certificates = (-2..=2)
+                .flat_map(|z| {
+                    (-2..=2).map(move |x| Certificate {
+                        key: HeightKey {
+                            space: 0,
+                            level: 0,
+                            x,
+                            z,
+                        },
+                        bound: net::height::HeightErrorBound {
+                            max_error_q1024: 1024,
+                            min_height: 70,
+                            max_height: 80,
+                        },
+                        seam_error_q1024: 512,
+                        exact_replacement: false,
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert!(projection.could_be_visible(certificates[0]));
+            assert_eq!(projection.error_pixels(certificates[0]), f64::INFINITY);
+            let result = PublicSelection {
+                config: Config {
+                    horizon_level: 0,
+                    near_volume: None,
+                    ..Config::default()
+                },
+                space: 0,
+                camera: [0, 0],
+                near_radius: 0,
+                projection,
+                certificates,
+                previous: vec![],
+                refine: vec![],
+            }
+            .execute()
+            .unwrap();
+            assert_eq!(
+                result.quality.maximum_error_pixels,
+                f64::INFINITY,
+                "quality must hold, never hide NaN with f64::max"
+            );
+            assert!(result.quality.leaf_limited > 0);
+        }
+    }
+    #[test]
+    fn finite_inputs_cannot_escape_as_nonfinite_orientation_certificates() {
+        for (yaw, pitch, yaw_step, pitch_step) in [
+            (f64::MAX, 0., f64::MIN_POSITIVE, 10.),
+            (0., 90., 45., f64::from_bits(1)),
+            (f64::MAX, 0., 45., 10.),
+        ] {
+            match orientation_certificate(yaw, pitch, yaw_step, pitch_step) {
+                Ok((axis, margin, s)) => assert!(
+                    axis.into_iter().all(f64::is_finite)
+                        && margin.is_finite()
+                        && s.is_finite()
+                        && (0. ..=1.).contains(&s)
+                ),
+                Err(Error::InvalidConfig) => (),
+                Err(other) => panic!("unexpected error: {other}"),
+            }
+        }
+        assert!(orientation_certificate(f64::MAX, 0., f64::MIN_POSITIVE, 10.).is_err());
+        assert!(orientation_certificate(0., 90., 45., f64::from_bits(1)).is_err());
+    }
+    #[test]
+    fn certified_pitch_bin_includes_bob_axis_and_both_poles() {
+        for p in [-90., -89., -10., -0.00001, 0., 5., 9.99999, 10., 89., 90.] {
+            let (axis, margin, s) = orientation_certificate(0., p, 45., 10.).unwrap();
+            assert!(s <= 1. && s + 1e-15 >= libm::sin(p.to_radians()).abs());
+            let actual = [0., libm::sin(p.to_radians()), libm::cos(p.to_radians())];
+            let dot = axis
+                .into_iter()
+                .zip(actual)
+                .map(|(a, b)| a * b)
+                .sum::<f64>();
+            assert!(dot + 1e-14 >= libm::cos(margin));
+            if p.abs() == 90. {
+                assert_eq!(s, 1.);
+            }
+        }
+        let (_, _, s) = orientation_certificate(0., 0., 45., 10.).unwrap();
+        assert!(s >= libm::sin(10f64.to_radians()) && s < 0.174);
+    }
+    #[test]
+    fn arbitrary_roll_pinhole_displacements_are_bounded_and_false_horizontal_certificate_fails() {
+        let mut state = 3056019349u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut cases = 0;
+        for limit in [0f64, 5., 10., 20., 30., 60., 90.] {
+            let smax = libm::sin(limit.to_radians());
+            let p = Projection {
+                focal_pixels: 385.59996182037094,
+                diagonal_tangent: 1.7115357351239278,
+                max_abs_forward_y: smax,
+                ..Projection::default()
+            };
+            let general = Projection {
+                max_abs_forward_y: 1.,
+                ..p
+            };
+            for _ in 0..5000 {
+                let s = libm::sin(((next() * 2. - 1.) * limit).to_radians());
+                let rotation = (next() * 2. - 1.) * std::f64::consts::PI;
+                let n = [
+                    libm::cos(rotation) * libm::sqrt(1. - s * s),
+                    libm::sin(rotation) * libm::sqrt(1. - s * s),
+                    s,
+                ];
+                let theta = (next() * 2. - 1.) * std::f64::consts::PI;
+                let r = p.diagonal_tangent * libm::sqrt(next());
+                let radius = 10. + 1990. * next();
+                let distance_fraction = 0.2 + 0.8 * next();
+                let z = radius / libm::sqrt(1. + r * r);
+                let point = [r * libm::cos(theta) * z, r * libm::sin(theta) * z, z];
+                let error = radius * (0.0001 + 1.9999 * next());
+                let e = (2. * next() - 1.) * error;
+                let displaced: [f64; 3] = std::array::from_fn(|i| point[i] + e * n[i]);
+                let proxy_norm = libm::sqrt(displaced.into_iter().map(|v| v * v).sum::<f64>());
+                let d = proxy_norm * distance_fraction;
+                let bound = p.displacement_error_pixels(d, error);
+                if !bound.is_finite() {
+                    cases += 1;
+                    continue;
+                }
+                assert!(
+                    displaced[2] > 0.,
+                    "positive bound proves proxy positive depth"
+                );
+                let du = displaced[0] / displaced[2] - point[0] / point[2];
+                let dv = displaced[1] / displaced[2] - point[1] / point[2];
+                let actual = p.focal_pixels * libm::sqrt(du * du + dv * dv);
+                assert!(
+                    actual <= bound + bound.max(1.) * 2e-13,
+                    "{limit}/{actual}/{bound}"
+                );
+                assert!(
+                    bound <= general.displacement_error_pixels(d, error) + bound.max(1.) * 2e-13
+                );
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 35000);
+        let d_tangent = 1.7115357351239278f64;
+        let s = libm::sin(10f64.to_radians());
+        let e = 0.1;
+        let q = [-d_tangent, 0., 1.];
+        let proxy = [q[0] - e * libm::sqrt(1. - s * s), 0., 1. - e * s];
+        let proxy_distance = libm::sqrt(proxy.into_iter().map(|v| v * v).sum::<f64>());
+        let k = libm::sqrt(1. + d_tangent * d_tangent);
+        let numerator = libm::sqrt(1. - s * s) + d_tangent * s;
+        let actual = 385.59996182037094 * (proxy[0] / proxy[2] - q[0]).abs();
+        let stronger = 385.59996182037094 * e * numerator / (proxy_distance / k - e * s);
+        assert!(
+            actual > stronger,
+            "the -ES bound is unsafe with only a proxy endpoint AABB"
+        );
+        let robust = Projection {
+            focal_pixels: 385.59996182037094,
+            diagonal_tangent: d_tangent,
+            max_abs_forward_y: s,
+            ..Projection::default()
+        }
+        .displacement_error_pixels(proxy_distance, e);
+        assert!(actual <= robust);
+
+        let p = Projection {
+            focal_pixels: 385.59996182037094,
+            diagonal_tangent: 1.7115357351239278,
+            max_abs_forward_y: 0.,
+            ..Projection::default()
+        };
+        let k = libm::sqrt(1. + p.diagonal_tangent * p.diagonal_tangent);
+        let e = 0.1;
+        let s = 0.5;
+        let x = -p.diagonal_tangent;
+        let moved_x = x - e * libm::sqrt(1. - s * s);
+        let moved_z = 1. - e * s;
+        let actual = p.focal_pixels * (moved_x / moved_z - x).abs();
+        assert!(actual > p.displacement_error_pixels(k, e));
     }
 }

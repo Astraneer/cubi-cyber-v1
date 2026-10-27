@@ -31,6 +31,7 @@ fn main() -> Result<(), String> {
         target_pixels: 32.,
         hysteresis_pixels: 8.,
         view_direction: [0., 0., 1.],
+        max_abs_forward_y: 1.,
         view_cosine: libm::cos(libm::atan(diagonal) + 37.5f64.to_radians()),
     };
     for seed in [1, 1337] {

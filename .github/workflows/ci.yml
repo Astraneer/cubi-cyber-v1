@@ -69,6 +69,7 @@ jobs:
           path: |
             .local/artifacts/**/*.png
             .local/artifacts/*smoke.json
+            .local/artifacts/jobs-*.json
             .local/artifacts/bench/*.json
             .local/artifacts/bench/*.html
             .local/artifacts/product-flight-recorder.json

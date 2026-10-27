@@ -601,22 +601,14 @@ impl ClientView {
         ];
         let look: [f64; 3] =
             std::array::from_fn(|i| f64::from(parameters.target[i]) - f64::from(eye[i]));
-        let yaw = (libm::atan2(look[0], look[2]).to_degrees() / 45.).floor() * 45. + 22.5;
-        let pitch = (libm::atan2(look[1], libm::sqrt(look[0] * look[0] + look[2] * look[2]))
-            .to_degrees()
-            / 30.)
-            .floor()
-            * 30.
-            + 15.;
-        let (yaw, pitch) = (yaw.to_radians(), pitch.to_radians());
-        let view_direction = [
-            libm::sin(yaw) * libm::cos(pitch),
-            libm::sin(pitch),
-            libm::cos(yaw) * libm::cos(pitch),
-        ];
-        let view_cosine = libm::cos(
-            (libm::atan(diagonal_tangent) + 37.5f64.to_radians()).min(std::f64::consts::PI),
-        );
+        let actual_yaw = libm::atan2(look[0], look[2]).to_degrees();
+        let actual_pitch =
+            libm::atan2(look[1], libm::sqrt(look[0] * look[0] + look[2] * look[2])).to_degrees();
+        let (view_direction, margin, max_abs_forward_y) =
+            horizon::orientation_certificate(actual_yaw, actual_pitch, 45., 10.)
+                .map_err(|e| e.to_string())?;
+        let view_cosine =
+            libm::cos((libm::atan(diagonal_tangent) + margin).min(std::f64::consts::PI));
         let Some(horizon) = &mut self.horizon else {
             return Ok(());
         };
@@ -638,6 +630,7 @@ impl ClientView {
                 hysteresis_pixels: 8.,
                 view_direction,
                 view_cosine,
+                max_abs_forward_y,
             })
             .map_err(|error| error.to_string())?;
         horizon.phase(self.tick, self.scene.config().center.space.0, camera_page)?;

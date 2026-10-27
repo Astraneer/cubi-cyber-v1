@@ -21,7 +21,7 @@ impl std::fmt::Display for WireError {
 impl std::error::Error for WireError {}
 pub fn encode_background_task(task: &BackgroundTask) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::with_capacity(30_000);
-    out.extend_from_slice(b"CHJ4");
+    out.extend_from_slice(b"CHJ5");
     match task {
         BackgroundTask::Plan(task) => {
             if task.refine.len() > net::height::MAX_TILES
@@ -74,7 +74,7 @@ pub fn encode_background_task(task: &BackgroundTask) -> Result<Vec<u8>, WireErro
                         p.hysteresis_pixels,
                     ])
                     .chain(p.view_direction)
-                    .chain([p.view_cosine])
+                    .chain([p.view_cosine, p.max_abs_forward_y])
                 {
                     w64(&mut out, n.to_bits());
                 }
@@ -134,9 +134,11 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
         return Err(WireError::Length);
     }
     let mut r = Reader { bytes, at: 0 };
-    if r.take::<4>()? != *b"CHJ4" {
-        return Err(WireError::Magic);
-    }
+    let version = match r.take::<4>()? {
+        magic if magic == *b"CHJ4" => 4,
+        magic if magic == *b"CHJ5" => 5,
+        _ => return Err(WireError::Magic),
+    };
     let task = match r.u8()? {
         1 => {
             let id = r.u64()?;
@@ -213,6 +215,11 @@ fn decode_task(bytes: &[u8]) -> Result<BackgroundTask, WireError> {
                         hysteresis_pixels: values[9],
                         view_direction: values[10..13].try_into().unwrap(),
                         view_cosine: values[13],
+                        max_abs_forward_y: if version == 4 {
+                            1.
+                        } else {
+                            f64::from_bits(r.u64()?)
+                        },
                     };
                     p.validate().map_err(|_| WireError::Invalid)?;
                     Some(p)
@@ -715,5 +722,179 @@ impl Reader<'_> {
     }
     fn u64(&mut self) -> Result<u64, WireError> {
         Ok(u64::from_le_bytes(self.take()?))
+    }
+}
+
+#[cfg(test)]
+mod vertical_wire_tests {
+    use super::*;
+    #[test]
+    fn old_projection_defaults_s1_new_wire_roundtrips_and_invalid_s_rejects() {
+        let fixture = BackgroundTask::Plan(Box::new(PlanTask {
+            id: 1,
+            generation: 1,
+            config: Config::default(),
+            space: 0,
+            camera: [0, 0],
+            refine: vec![],
+            near_radius: 2,
+            projection: Some(Projection::default()),
+            certificates: vec![],
+            previous: vec![],
+        }));
+        let mut bytes = encode_background_task(&fixture).unwrap();
+        let offset = bytes.len() - 12; // final S then two empty counts
+        bytes.drain(offset..offset + 8);
+        bytes[3] = b'4';
+        assert_eq!(&bytes[..4], b"CHJ4");
+        let mut task = decode_task(&bytes).unwrap();
+        let BackgroundTask::Plan(p) = &mut task else {
+            panic!("plan")
+        };
+        assert_eq!(p.projection.unwrap().max_abs_forward_y, 1.);
+        p.projection.as_mut().unwrap().max_abs_forward_y = libm::sin(10f64.to_radians());
+        let encoded = encode_background_task(&task).unwrap();
+        assert_eq!(&encoded[..4], b"CHJ5");
+        assert_eq!(encoded.len(), bytes.len() + 8);
+        let BackgroundTask::Plan(decoded) = decode_task(&encoded).unwrap() else {
+            panic!("plan")
+        };
+        assert_eq!(
+            decoded.projection.unwrap().max_abs_forward_y,
+            libm::sin(10f64.to_radians())
+        );
+        let mut bad = encoded.clone();
+        bad[offset..offset + 8].copy_from_slice(&1.0001f64.to_bits().to_le_bytes());
+        assert!(decode_task(&bad).is_err());
+        let mut bad = encoded;
+        bad[offset..offset + 8].copy_from_slice(&f64::NAN.to_bits().to_le_bytes());
+        assert!(decode_task(&bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod vertical_public_fixture_tests {
+    use super::*;
+    #[test]
+    fn actual_public_plan_and_height_converge_without_new_exact_columns() {
+        let bytes = include_bytes!("../../tests/fixtures/horizon_vertical/public-plan.chj4");
+        let height_bytes =
+            include_bytes!("../../tests/fixtures/horizon_vertical/public-height-L2-1--2.hti2");
+        assert_eq!(bytes.len(), 15347);
+        assert_eq!(height_bytes.len(), 2804);
+        let BackgroundTask::Plan(old) = decode_task(bytes).unwrap() else {
+            panic!("plan")
+        };
+        assert_eq!(old.projection.unwrap().max_abs_forward_y, 1.);
+        assert_eq!((old.id, old.generation), (313, 348));
+        assert_eq!(
+            (
+                old.config.max_tiles,
+                old.config.max_sources,
+                old.config.max_proxy_pages
+            ),
+            (4096, 8192, 512)
+        );
+        assert_eq!(
+            (old.config.screen_error_pixels, old.config.hysteresis_pixels),
+            (32., 8.)
+        );
+        let original_exact = old
+            .certificates
+            .iter()
+            .filter(|c| c.exact_replacement)
+            .map(|c| c.key)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(original_exact.len(), 64);
+        let legacy = old.execute().unwrap();
+        assert_eq!(legacy.quality.leaf_limited, 22);
+        assert_eq!(legacy.quality.missing_certificates, 0);
+        assert!((legacy.quality.maximum_error_pixels - 50.28962549113061).abs() < 1e-10);
+        assert_eq!(legacy.exact_leaves.len(), 22);
+        assert_eq!(legacy.plan.tiles.len(), 265);
+        let original_selected = legacy
+            .plan
+            .tiles
+            .iter()
+            .map(|t| wire_key(t.key))
+            .filter(|key| original_exact.contains(key))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            original_selected, original_exact,
+            "all64 original exact manifests belonged to the observed512-page interest"
+        );
+        let tile = net::height::decode(height_bytes).unwrap();
+        assert_eq!(
+            tile.key,
+            net::height::HeightKey {
+                space: 0,
+                level: 2,
+                x: 1,
+                z: -2
+            }
+        );
+        assert_eq!(tile.source, 1);
+        assert!(matches!(tile.replacement, net::height::Replacement::None));
+        assert_eq!(tile.protected, [0; 32]);
+        let added = Certificate {
+            key: tile.key,
+            bound: tile.error.unwrap(),
+            seam_error_q1024: seam_error_q1024(&tile.heights),
+            exact_replacement: false,
+        };
+        assert_eq!(added.seam_error_q1024, 512);
+        assert_eq!(
+            (
+                added.bound.max_error_q1024,
+                added.bound.min_height,
+                added.bound.max_height
+            ),
+            (1024, 70, 80)
+        );
+        for yaw_step in [45., 15.] {
+            let BackgroundTask::Plan(mut plan) = decode_task(bytes).unwrap() else {
+                panic!("plan")
+            };
+            let prior = plan.certificates.clone();
+            assert!(!prior.iter().any(|c| c.key == added.key));
+            plan.certificates.push(added);
+            plan.certificates.sort_unstable_by_key(|c| c.key);
+            for old in &prior {
+                let current = plan.certificates.iter().find(|c| c.key == old.key).unwrap();
+                assert_eq!(current.bound, old.bound);
+                assert_eq!(current.seam_error_q1024, old.seam_error_q1024);
+                assert_eq!(current.exact_replacement, old.exact_replacement);
+            }
+            let (axis, margin, s) = orientation_certificate(0., 0., yaw_step, 10.).unwrap();
+            let p = plan.projection.as_mut().unwrap();
+            assert_eq!(p.eye_min, [0., 80., 0.]);
+            assert_eq!(p.eye_max, [16., 96., 16.]);
+            p.view_direction = axis;
+            p.view_cosine =
+                libm::cos((libm::atan(p.diagonal_tangent) + margin).min(std::f64::consts::PI));
+            p.max_abs_forward_y = s;
+            let result = plan.execute().unwrap();
+            assert_eq!((result.id, result.generation), (313, 348));
+            assert_eq!(result.quality.missing_certificates, 0);
+            assert_eq!(result.quality.leaf_limited, 0);
+            assert!(!result.quality.capacity_limited);
+            assert!(result.quality.maximum_error_pixels <= 32.);
+            assert!((result.quality.maximum_error_pixels - 31.78570467936542).abs() < 1e-8);
+            assert!(result.exact_leaves.is_empty());
+            let selected = result
+                .plan
+                .tiles
+                .iter()
+                .map(|t| wire_key(t.key))
+                .filter(|k| original_exact.contains(k))
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(selected.len(), 62);
+            assert!(selected.is_subset(&original_exact));
+            // These unchanged manifests are a subset of the original64 whose
+            // observed public interest was already512 pages (provenance.json).
+            // No new exact keys/Geometry pages are requested. This does not
+            // synthesize manifests or certify physical GPU publication.
+            assert!(selected.len() <= 64);
+        }
     }
 }

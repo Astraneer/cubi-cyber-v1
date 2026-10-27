@@ -299,6 +299,7 @@ fn initial_far_quality_commits_during_loading_before_any_hdr_and_handles_explici
             target_pixels: 32.,
             hysteresis_pixels: 8.,
             view_direction: [0., 0., -1.],
+            max_abs_forward_y: 1.,
             view_cosine: -1.,
         })
         .unwrap();

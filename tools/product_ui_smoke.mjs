@@ -7,6 +7,7 @@ import {join} from 'node:path';
 import {withBrowser,pngPixels,pause,root} from './browser.mjs';
 import {UI_PRESENTATION_SNAPSHOT,waitForUiPresentation} from './ui_presentation_barrier.mjs';
 import {componentProfile,graphicsControls,horizonProfile} from './ui_graphics_controls.mjs';
+import {productTimeoutSnapshot} from './product_ui_diagnostics.mjs';
 await mkdir(join(root,'.local/tmp'),{recursive:true});
 const folder=await mkdtemp(join(root,'.local/tmp/product-authority-'));
 const ready=join(folder,'ready'),pack=join(folder,'private.zip'),minecraft=join(folder,'minecraft/.minecraft'),downloads=join(folder,'downloads');
@@ -32,7 +33,18 @@ try{
   await withBrowser({width:780,height:437,path:'/'},async({call,evaluate,waitFor,onEvent})=>{
     await waitFor('document.documentElement?.dataset.app',s=>s==='ready');
     const componentOnly=process.env.CUBI_UI_COMPONENT_ONLY==='1';
-    const status=()=>evaluate('window.__M2Stats()');const ui=()=>evaluate('window.__CUBI.product_ui_stats()');const waitUi=async(predicate,timeout=120000)=>{try{return await waitFor('window.__CUBI.product_ui_stats()',predicate,timeout);}catch(error){console.error('PRODUCT_TIMEOUT_STATE '+JSON.stringify(await status()));throw error;}};const painted=()=>waitForUiPresentation({read:()=>evaluate(UI_PRESENTATION_SNAPSHOT),pause});
+    const status=()=>evaluate('window.__M2Stats()');const ui=()=>evaluate('window.__CUBI.product_ui_stats()');const waitUi=async(predicate,timeout=120000)=>{try{return await waitFor('window.__CUBI.product_ui_stats()',predicate,timeout);}catch(error){
+      // Save only fixed public counters, before browser/server cleanup. Never
+      // include status text, chat, identity, URLs, local imports or error stacks.
+      try {
+        const sample=await evaluate('({browser:window.__M2Stats(),ui:window.__CUBI.product_ui_stats()})');
+        const snapshot=productTimeoutSnapshot(sample,timeout);
+        await mkdir(join(root,'.local/artifacts'),{recursive:true});
+        await writeFile(join(root,'.local/artifacts/product-ui-timeout-smoke.json'),JSON.stringify(snapshot,null,2)+'\n');
+        console.error('PRODUCT_TIMEOUT_STATE '+JSON.stringify(snapshot));
+      } catch { console.error('PRODUCT_TIMEOUT_DIAGNOSTICS_UNAVAILABLE'); }
+      throw error;
+    }};const painted=()=>waitForUiPresentation({read:()=>evaluate(UI_PRESENTATION_SNAPSHOT),pause});
     const key=async(code,key=code)=>{await call('Input.dispatchKeyEvent',{type:'keyDown',code,key});await call('Input.dispatchKeyEvent',{type:'keyUp',code,key});};
     const type=async text=>{for(const char of text)await key(char>='0'&&char<='9'?`Digit${char}`:char==='.'?'Period':char===':'?'Semicolon':'KeyX',char);};
     const click=async(x,y,button='left')=>{await painted();await call('Input.dispatchMouseEvent',{type:'mouseMoved',x,y});await call('Input.dispatchMouseEvent',{type:'mousePressed',x,y,button,clickCount:1});await call('Input.dispatchMouseEvent',{type:'mouseReleased',x,y,button,clickCount:1});await pause(150);};

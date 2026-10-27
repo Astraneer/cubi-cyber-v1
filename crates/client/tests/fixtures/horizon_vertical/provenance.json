@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "scope": "Public derived terrain DTOs only. No Raw pages, identity, credential, Owner action or private Store data.",
+  "capturedSourceCommit": "5f82c274d000e831af1c7d5610e268a74d94bf77",
+  "publicSeed": 1,
+  "plan": {
+    "file": "public-plan.chj4",
+    "bytes": 15347,
+    "sha256": "5c9da747d00b5b712b1881ce57e70401b0875a0866513036959a27499fb50460",
+    "kind": "CHJ4 public PlanTask",
+    "id": 313,
+    "generation": 348,
+    "renderExtent": [
+      960,
+      540
+    ],
+    "eyeBox": [
+      [
+        0,
+        80,
+        0
+      ],
+      [
+        16,
+        96,
+        16
+      ]
+    ],
+    "actualLook": [
+      0,
+      0,
+      1
+    ],
+    "originalExactColumns": 64,
+    "originalWantedGeometryPages": 512,
+    "originalKnownGeometryPages": 512
+  },
+  "height": {
+    "file": "public-height-L2-1--2.hti2",
+    "bytes": 2804,
+    "sha256": "d99ad7fe8b78da2bc9f6fc7e492b53f6b46c7d427e1362c8bab7f655ede1b5b9",
+    "kind": "HTI2 public HeightTile",
+    "key": [
+      0,
+      2,
+      1,
+      -2
+    ],
+    "source": 1,
+    "errorQ1024": 1024,
+    "minHeight": 70,
+    "maxHeight": 80,
+    "replacement": "None",
+    "query": "Normal RequestHeight in a new anonymous session to the same frozen default-seed authority, outside protected spawn; not a reuse of the prior private Store."
+  },
+  "limitations": [
+    "Headless selector regression, no GPU front or general-mesh acceptance.",
+    "Existing exact certificate flags stay exact. No new Geometry/Water/body flags are fabricated.",
+    "Full arbitrary cliff/riser/underwater representation remains a separate pre-existing issue."
+  ]
+}
