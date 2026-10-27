@@ -89,7 +89,15 @@ impl Server {
                     && peer.height_requests.len() < MAX_TILES
                     && !peer.height_requests.contains_key(key)
                 {
-                    peer.height_requests.push_back((*key, None));
+                    // Internal private-HID recertification is conditional on
+                    // the last PUBLIC image. An explicit client full request
+                    // already queued for this key remains authoritative.
+                    let known = peer
+                        .height_subscriptions
+                        .get(key)
+                        .copied()
+                        .filter(|s| *s != 0);
+                    peer.height_requests.push_back((*key, known));
                 }
             }
         }
@@ -157,7 +165,9 @@ impl Server {
             if self.runtimes.height.index().source(tile.key) != Ok(tile.source) {
                 let peer = self.peers.get_mut(&connection).expect("present peer");
                 if !peer.height_requests.contains_key(&key) {
-                    peer.height_requests.push_back((key, None));
+                    // Preserve request intent across a stale private job:
+                    // internal Some stays conditional; explicit None stays full.
+                    peer.height_requests.push_back((key, known));
                 }
                 self.counters.height_discarded += 1;
                 continue;
@@ -259,7 +269,12 @@ impl Server {
                                 if peer.geometry_requests.len() < MAX_GEOMETRY
                                     && !peer.geometry_requests.iter().any(|(p, _)| p == page)
                                 {
-                                    peer.geometry_requests.push_back((*page, None));
+                                    let known = peer
+                                        .geometry_subscriptions
+                                        .get(page)
+                                        .copied()
+                                        .filter(|s| s.0 != 0);
+                                    peer.geometry_requests.push_back((*page, known));
                                 }
                             }
                         }
@@ -370,17 +385,27 @@ impl Server {
             let Ok(source) = self.runtimes.height.index().source(akey) else {
                 continue;
             };
-            if self
-                .height_worker
-                .inflight
-                .values()
-                .any(|(c, k, s, _)| *c == connection && *k == key && *s == source)
-                || self
-                    .height_worker
-                    .ready
-                    .iter()
-                    .any(|(c, t, _)| *c == connection && t.key == akey && t.source == source)
-            {
+            // A duplicate is still a request: explicit full intent must reach
+            // the already-owned completion rather than vanish with the queue
+            // entry. Conflicting acknowledgements require a full response too.
+            let mut merged = false;
+            for (c, k, s, pending_known) in self.height_worker.inflight.values_mut() {
+                if *c == connection && *k == key && *s == source {
+                    if *pending_known != known {
+                        *pending_known = None;
+                    }
+                    merged = true;
+                }
+            }
+            for (c, tile, pending_known) in &mut self.height_worker.ready {
+                if *c == connection && tile.key == akey && tile.source == source {
+                    if *pending_known != known {
+                        *pending_known = None;
+                    }
+                    merged = true;
+                }
+            }
+            if merged {
                 continue;
             }
             let Ok(edits) = self.runtimes.height.index().capture(akey, 4096, 65536) else {
@@ -476,3 +501,7 @@ fn height_wire_failure(wire: &HeightTile) -> &'static str {
     }
     "height_wire_replacement"
 }
+
+#[cfg(test)]
+#[path = "height_request_overlap_tests.rs"]
+mod request_overlap_tests;

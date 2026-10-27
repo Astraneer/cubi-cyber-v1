@@ -357,3 +357,137 @@ fn neighbouring_portal_automatically_republishes_centre_geometry_and_public_heig
     assert!(changed.water_view > water.water_view);
     assert_eq!(changed.cells[halo_index(pos(31, 40, 8), page(2))], 1);
 }
+
+fn recert_projection_trace(messages: &[ServerMessage]) -> Vec<Vec<u8>> {
+    messages
+        .iter()
+        .filter(|m| {
+            matches!(
+                m,
+                ServerMessage::Geometry(_)
+                    | ServerMessage::GeometryUnavailable(_)
+                    | ServerMessage::Height(_)
+                    | ServerMessage::HeightUnavailable(_)
+                    | ServerMessage::WaterHalo(_)
+                    | ServerMessage::WaterUnavailable(_)
+            )
+        })
+        .map(|m| net::encode_server(m).unwrap())
+        .collect()
+}
+#[test]
+fn private_recertification_is_wire_silent_explicit_full_survives_and_public_withdrawal_is_immediate()
+ {
+    let (world, _, _) = worlds();
+    let directory = Directory::new();
+    let mut h = H::open(&directory, world);
+    let height = h.exact();
+    let water = h.water(&height, 2);
+    h.send(ClientMessage::RequestWater(Request {
+        page: page(2),
+        geometry_source: water.geometry_source,
+        geometry_view: water.geometry_view,
+        column_source: water.column_source,
+        acknowledged: Some(water.water_view),
+    }));
+    let first_geometry = net::encode_server(&ServerMessage::Geometry(Box::new(
+        h.geometry[&page(2)].clone(),
+    )))
+    .unwrap();
+    let first_height = net::encode_server(&ServerMessage::Height(height.clone())).unwrap();
+    for _ in 0..50 {
+        h.step()
+    }
+    h.out.clear();
+    let hidden = pos(21, 35, 3);
+    assert_eq!(h.server.world().read(hidden), CellRead::Known(Cell::AIR));
+    let old_page = h.server.world().page_version(hidden.page());
+    let submitted = h.server.counters().geometry_submitted;
+    let mut tx = Transaction::new(Tick(h.server.current_tick().0 + 1), SpaceId(0));
+    tx.set_cell(hidden, Cell::from_parts(rules::ids::LAVA, 0));
+    assert!(h.server.queue_transaction(tx).is_ok());
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        h.step();
+        let stats = h.server.cold_projection_stats().unwrap();
+        if h.server.world().page_version(hidden.page()) > old_page
+            && !h.server.awaiting_durability()
+            && h.server.counters().geometry_submitted > submitted
+            && stats.queued == 0
+            && stats.running == 0
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "real private durable edit must recertify"
+        );
+    }
+    for _ in 0..50 {
+        h.step()
+    }
+    assert!(
+        recert_projection_trace(&h.out).is_empty(),
+        "private-only recertification emitted public Geometry/Height/Water headers/bodies/Unavailable"
+    );
+    assert_eq!(
+        h.server.world().read(hidden),
+        CellRead::Known(Cell::from_parts(rules::ids::LAVA, 0))
+    );
+    // Explicit callers can still demand the same complete public image.
+    h.send(ClientMessage::RequestGeometry {
+        page: page(2),
+        known: None,
+    });
+    let full = h.until(|m| matches!(m,ServerMessage::Geometry(g)if g.page==page(2)));
+    assert_eq!(net::encode_server(&full).unwrap(), first_geometry);
+    h.send(ClientMessage::RequestExactHeight {
+        key: key(),
+        known: None,
+    });
+    let full = h.until(|m| matches!(m,ServerMessage::Height(t)if t.key==key()));
+    assert_eq!(net::encode_server(&full).unwrap(), first_height);
+    // A visible sky voxel is a positive public-source control. Its previous
+    // water binding is denied synchronously, rather than treated as private WAIT.
+    let sky = pos(31, 127, 8);
+    assert_eq!(h.server.world().read(sky), CellRead::Known(Cell::AIR));
+    let mut tx = Transaction::new(Tick(h.server.current_tick().0 + 1), SpaceId(0));
+    tx.set_cell(sky, Cell::from_parts(rules::ids::STONE, 0));
+    assert!(h.server.queue_transaction(tx).is_ok());
+    h.until(|m| matches!(m,ServerMessage::Height(t)if t.key==key()&&t.source!=height.source));
+    h.out.clear();
+    let inbox_free = h.server.inbox_capacity();
+    h.send(ClientMessage::RequestWater(Request {
+        page: page(2),
+        geometry_source: water.geometry_source,
+        geometry_view: water.geometry_view,
+        column_source: water.column_source,
+        acknowledged: Some(water.water_view),
+    }));
+    // handle() admits to the bounded inbox. A response belongs to the next
+    // actual domain tick and its durable outbox, not to transport enqueue.
+    let admission_deadline = Instant::now() + Duration::from_secs(40);
+    while h.server.inbox_capacity() != inbox_free {
+        assert!(
+            Instant::now() < admission_deadline,
+            "water request was not processed"
+        );
+        h.step();
+    }
+    if h.server.awaiting_durability() {
+        let batches = h.server.counters().durable_batches;
+        while h.server.counters().durable_batches == batches {
+            assert!(
+                Instant::now() < admission_deadline,
+                "water response batch was not durable"
+            );
+            h.step();
+        }
+    }
+    assert!(
+        h.out
+            .iter()
+            .any(|m| matches!(m,ServerMessage::WaterUnavailable(p)if *p==page(2))),
+        "a genuinely replaced public binding is withdrawn in the request response"
+    );
+}

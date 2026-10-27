@@ -7,12 +7,19 @@ use core_types::{PageId, SpaceId};
 use net::{ServerMessage, height::HeightKey, water::Request};
 pub(super) use owner::Owner;
 pub use owner::Stats;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Admission {
+    Denied,
+    RecertWait,
+    Ready,
+}
+
 impl Server {
     pub fn far_water_stats(&self) -> Stats {
         self.far_water.stats(self.tick)
     }
-    pub(super) fn water_allowed(&self, connection: u64, peer: &Peer, request: Request) -> bool {
-        allowed(
+    fn water_admission(&self, connection: u64, peer: &Peer, request: Request) -> Admission {
+        admission(
             &self.world,
             self.runtimes.height.index(),
             self.geometry.projection.as_ref(),
@@ -34,14 +41,15 @@ impl Server {
             let Some(ready) = self.far_water.poll(&self.world) else {
                 continue;
             };
-            if !self
-                .peers
-                .get(&ready.key.0)
-                .is_some_and(|p| self.water_allowed(ready.key.0, p, ready.request))
-            {
-                // A replacement source must request a fresh binding. Its old
-                // public front remains on the client until the pair is ready.
-                continue;
+            match self.peers.get(&ready.key.0).map_or(Admission::Denied, |p| {
+                self.water_admission(ready.key.0, p, ready.request)
+            }) {
+                Admission::Ready => {}
+                Admission::RecertWait => {
+                    self.far_water.defer(ready.key);
+                    continue;
+                }
+                Admission::Denied => continue,
             }
             let connection = ready.key.0;
             if let Ok(halo) = self.far_water.publish(ready, self.tick) {
@@ -56,16 +64,21 @@ impl Server {
             let Some((key, request)) = self.far_water.next_request() else {
                 break;
             };
-            if !self
-                .peers
-                .get(&key.0)
-                .is_some_and(|p| self.water_allowed(key.0, p, request))
-            {
-                output.push(Outgoing::reliable(
-                    key.0,
-                    ServerMessage::WaterUnavailable(key.1),
-                ));
-                continue;
+            match self.peers.get(&key.0).map_or(Admission::Denied, |p| {
+                self.water_admission(key.0, p, request)
+            }) {
+                Admission::Ready => {}
+                Admission::RecertWait => {
+                    self.far_water.defer(key);
+                    continue;
+                }
+                Admission::Denied => {
+                    output.push(Outgoing::reliable(
+                        key.0,
+                        ServerMessage::WaterUnavailable(key.1),
+                    ));
+                    continue;
+                }
             }
             if self.geometry.uses_cold(key.1) {
                 let owner = self.geometry.projection.as_mut().expect("cold owner");
@@ -140,7 +153,9 @@ fn column_key(page: PageId) -> HeightKey {
         z: page.z,
     }
 }
-pub(super) fn allowed(
+/// Public binding authorization and private worker readiness are distinct.
+/// A recertifying private input cannot manufacture a public Unavailable event.
+pub(super) fn admission(
     world: &world::World,
     index: &crate::height_index::HeightEditIndex,
     projection: Option<&crate::cold_projection_owner::Owner>,
@@ -148,13 +163,13 @@ pub(super) fn allowed(
     connection: u64,
     peer: &Peer,
     request: Request,
-) -> bool {
+) -> Admission {
     if !peer.ready
         || request.validate().is_err()
         || request.page.space != SpaceId(0)
         || peer.space != SpaceId(0)
     {
-        return false;
+        return Admission::Denied;
     }
     let key = HeightKey {
         space: 0,
@@ -162,33 +177,46 @@ pub(super) fn allowed(
         x: request.page.x,
         z: request.page.z,
     };
-    let authority = crate::height_index::TileKey {
-        space: SpaceId(0),
-        level: 0,
-        x: request.page.x,
-        z: request.page.z,
-    };
-    peer.height_subscriptions.get(&key) == Some(&request.column_source)
-        && height_heads.public_source(connection, key) == Some(request.column_source)
-        && height_heads.private_source(connection, key) == index.source(authority).ok()
-        && peer.geometry_subscriptions.get(&request.page) == Some(&request.geometry_source)
-        && peer.geometry_views.get(&request.page) == Some(&request.geometry_view)
-        && (if let Some(owner) = projection {
-            owner.head(request.page, world, index).is_some_and(|head| {
-                head.source == request.geometry_source && head.view == request.geometry_view
-            })
-        } else {
-            world
-                .page(request.page)
-                .is_some_and(|p| crate::geometry::source_version(p) == request.geometry_source)
-        })
-        && net::aoi_contains(
+    if peer.height_subscriptions.get(&key) != Some(&request.column_source)
+        || height_heads.public_source(connection, key) != Some(request.column_source)
+        || peer.geometry_subscriptions.get(&request.page) != Some(&request.geometry_source)
+        || peer.geometry_views.get(&request.page) != Some(&request.geometry_view)
+        || !net::aoi_contains(
             crate::position_page(peer.space, peer.player.pos),
             request.page,
             1024,
             1024,
             false,
         )
+    {
+        return Admission::Denied;
+    }
+    if let Some(owner) = projection {
+        let Some(published) = owner.published_head(request.page) else {
+            return Admission::Denied;
+        };
+        if published.source != request.geometry_source || published.view != request.geometry_view {
+            return Admission::Denied;
+        }
+        if owner.head(request.page, world, index).is_none() {
+            return Admission::RecertWait;
+        }
+    } else if world
+        .page(request.page)
+        .is_none_or(|p| crate::geometry::source_version(p) != request.geometry_source)
+    {
+        return Admission::Denied;
+    }
+    let authority = crate::height_index::TileKey {
+        space: SpaceId(0),
+        level: 0,
+        x: request.page.x,
+        z: request.page.z,
+    };
+    if height_heads.private_source(connection, key) != index.source(authority).ok() {
+        return Admission::RecertWait;
+    }
+    Admission::Ready
 }
 
 #[cfg(test)]

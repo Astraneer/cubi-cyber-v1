@@ -1207,7 +1207,14 @@ impl Server {
                         if peer.geometry_subscriptions.contains_key(&page)
                             && !peer.geometry_requests.iter().any(|(p, _)| *p == page)
                         {
-                            peer.geometry_requests.push_back((page, None));
+                            // A durable PRIVATE input invalidates worker certificates,
+                            // not an unchanged published public image.
+                            let known = peer
+                                .geometry_subscriptions
+                                .get(&page)
+                                .copied()
+                                .filter(|v| v.0 != 0);
+                            peer.geometry_requests.push_back((page, known));
                         }
                     }
                 }
@@ -1577,15 +1584,21 @@ impl Server {
                     peer.geometry_subscriptions
                         .entry(page)
                         .or_insert(Version(0));
-                    if peer.geometry_requests.len() < height_stream::MAX_GEOMETRY
-                        && !peer.geometry_requests.iter().any(|(p, _)| *p == page)
+                    if let Some((_, queued_known)) =
+                        peer.geometry_requests.iter_mut().find(|(p, _)| *p == page)
                     {
+                        // An explicit client full request dominates an internal
+                        // conditional recertification already in this queue.
+                        if known.is_none() {
+                            *queued_known = None;
+                        }
+                    } else if peer.geometry_requests.len() < height_stream::MAX_GEOMETRY {
                         peer.geometry_requests.push_back((page, known));
                     }
                 }
             }
             ClientMessage::RequestWater(request) => {
-                if !far_water::allowed(
+                if far_water::admission(
                     &self.world,
                     self.runtimes.height.index(),
                     self.geometry.projection.as_ref(),
@@ -1593,10 +1606,11 @@ impl Server {
                     connection,
                     peer,
                     request,
-                ) || self
-                    .far_water
-                    .request(connection, request, self.tick)
-                    .is_err()
+                ) == far_water::Admission::Denied
+                    || self
+                        .far_water
+                        .request(connection, request, self.tick)
+                        .is_err()
                 {
                     out.push(Outgoing::reliable(
                         connection,
@@ -1621,6 +1635,10 @@ impl Server {
                     }
                     if peer.height_exact.contains(&key) {
                         known = None;
+                    }
+                    // Both ordinary and exact explicit full requests dominate
+                    // an internal conditional recertification already queued.
+                    if known.is_none() {
                         peer.height_requests.force_full(&key);
                     }
                     if peer.height_requests.len() < height_stream::MAX_TILES

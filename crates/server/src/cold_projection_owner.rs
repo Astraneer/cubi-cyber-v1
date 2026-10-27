@@ -806,6 +806,16 @@ impl Owner {
         column.certificate = Some(Arc::clone(&body.certificate));
         Ok(())
     }
+    /// Last published public identity while this page is still owned. This is
+    /// NOT a current private certificate and cannot authorize a new body. It
+    /// distinguishes recertification WAIT from an actual public withdrawal.
+    pub fn published_head(&self, page: PageId) -> Option<Head> {
+        let key = canonical(page)?;
+        if !self.leases.contains_key(&page) {
+            return None;
+        }
+        Some(self.columns.get(&key)?.heads[page.y as usize]?.head)
+    }
     pub fn head(&self, page: PageId, world: &World, index: &HeightEditIndex) -> Option<Head> {
         let key = canonical(page)?;
         if !self.leases.contains_key(&page) {
