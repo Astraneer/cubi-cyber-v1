@@ -58,7 +58,9 @@ impl Harness {
         }
     }
     fn settle(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        self.settle_until(Instant::now() + Duration::from_secs(10));
+    }
+    fn settle_until(&mut self, deadline: Instant) {
         while self.server.awaiting_durability() {
             self.server.tick(self.now);
             assert!(!self.server.is_failed());
@@ -67,6 +69,42 @@ impl Harness {
         }
     }
 }
+/// `Server::tick` may finish a durable batch and admit the next logical tick
+/// in the same call when this harness's retained wall clock is already due.
+/// Settle both branches at a common logical boundary, not independently.
+fn settle_pair(left: &mut Harness, right: &mut Harness) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "paired fsync deadline");
+        let left_tick = left.server.current_tick().0;
+        let right_tick = right.server.current_tick().0;
+        assert!(
+            left_tick.abs_diff(right_tick) <= 1,
+            "paired durability may only cross the next retained tick"
+        );
+        let target = left_tick.max(right_tick);
+        while left.server.current_tick().0 < target {
+            assert!(Instant::now() < deadline, "paired live catch-up deadline");
+            left.step();
+        }
+        while right.server.current_tick().0 < target {
+            assert!(
+                Instant::now() < deadline,
+                "paired recovered catch-up deadline"
+            );
+            right.step();
+        }
+        left.settle_until(deadline);
+        right.settle_until(deadline);
+        if left.server.current_tick() == right.server.current_tick()
+            && !left.server.awaiting_durability()
+            && !right.server.awaiting_durability()
+        {
+            return;
+        }
+    }
+}
+
 fn sky(server: &Server, p: BlockPos) -> u8 {
     server
         .world()
@@ -377,8 +415,16 @@ fn active_surface_gets_real_profile_daylight_and_unloaded_high_roof_stays_dark_a
             h.step();
         }
     }
-    recovered.settle();
-    h.settle();
+    eprintln!(
+        "before paired durability liveTick{:?} recoveredTick{:?} livePending={} recoveredPending={} liveNow={} recoveredNow={}",
+        h.server.current_tick(),
+        recovered.server.current_tick(),
+        h.server.awaiting_durability(),
+        recovered.server.awaiting_durability(),
+        h.now,
+        recovered.now
+    );
+    settle_pair(&mut h, &mut recovered);
     eprintln!(
         "paired roof continuation liveSky={} recoveredSky={} liveTick{:?} recoveredTick{:?} livePending{:?} recoveredPending{:?}",
         sky(&h.server, feet),
@@ -414,8 +460,7 @@ fn active_surface_gets_real_profile_daylight_and_unloaded_high_roof_stays_dark_a
         while h.server.current_tick() < recovered.server.current_tick() {
             h.step();
         }
-        h.settle();
-        recovered.settle();
+        settle_pair(&mut h, &mut recovered);
         assert_eq!(h.server.current_tick(), recovered.server.current_tick());
     }
     assert_eq!(
@@ -432,4 +477,105 @@ fn active_surface_gets_real_profile_daylight_and_unloaded_high_roof_stays_dark_a
         0,
         "recovered sparse blockers still deny unknown sky"
     );
+}
+
+/// A real pending WAL completion is retained inside `Server` even if the writer
+/// thread has already fsynced it. This fixture never waits for a lucky race.
+fn pending_page_birth(label: &str) -> (Directory, Harness) {
+    let directory = Directory(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/tmp")
+            .join(format!(
+                "daylight-paired-settle-{}-{label}",
+                std::process::id()
+            )),
+    );
+    std::fs::create_dir_all(&directory.0).unwrap();
+    let (store, _) = save::Store::open(&directory.0).unwrap();
+    store
+        .load_or_create_private_entropy(|| Ok(ENTROPY))
+        .unwrap();
+    drop(store);
+    let feet = BlockPos {
+        space: SpaceId(0),
+        x: 0,
+        y: 80,
+        z: 0,
+    };
+    let mut config = directory.config(feet);
+    config.generation_enabled = false;
+    let mut h = Harness {
+        server: Server::open_with_world(config, World::new(rules::properties, 4096)).unwrap(),
+        now: 0,
+    };
+    let mut tx = Transaction::new(Tick(1), SpaceId(0));
+    tx.create_page(
+        PageId {
+            space: SpaceId(0),
+            x: 0,
+            y: 0,
+            z: 0,
+        },
+        vec![Cell::AIR; 4096],
+    );
+    h.server
+        .queue_transaction(tx)
+        .unwrap_or_else(|_| panic!("queue controlled page birth"));
+    h.until("pending page birth", |server| {
+        server.current_tick() == Tick(1) && server.awaiting_durability()
+    });
+    assert_eq!(h.server.current_tick(), Tick(1));
+    assert!(h.server.awaiting_durability());
+    (directory, h)
+}
+
+#[test]
+fn paired_durability_settling_matches_ticks_with_asymmetric_completed_wal() {
+    // Negative causal control: one Server has already applied its first WAL
+    // completion at a not-yet-due timestamp, while the other retains it. Move
+    // only the fixture clocks past the next due time, not any Server state.
+    let (_old_left_directory, mut old_left) = pending_page_birth("old-left");
+    let (_old_right_directory, mut old_right) = pending_page_birth("old-right");
+    old_left.settle();
+    assert_eq!(old_left.server.current_tick(), Tick(1));
+    assert!(!old_left.server.awaiting_durability());
+    assert!(old_right.server.awaiting_durability());
+    let due_now = old_left.now.max(old_right.now) + 50;
+    old_left.now = due_now;
+    old_right.now = due_now;
+    old_left.settle();
+    old_right.settle();
+    assert_eq!(old_left.server.current_tick(), Tick(1));
+    assert_eq!(
+        old_right.server.current_tick(),
+        Tick(2),
+        "finishing the retained WAL also admits exactly the next due tick"
+    );
+
+    let (_left_directory, mut left) = pending_page_birth("paired-left");
+    let (_right_directory, mut right) = pending_page_birth("paired-right");
+    left.settle();
+    assert_eq!(left.server.current_tick(), right.server.current_tick());
+    assert!(!left.server.awaiting_durability());
+    assert!(right.server.awaiting_durability());
+    let due_now = left.now.max(right.now) + 50;
+    left.now = due_now;
+    right.now = due_now;
+    settle_pair(&mut left, &mut right);
+    assert_eq!(left.server.current_tick(), Tick(2));
+    assert_eq!(left.server.current_tick(), right.server.current_tick());
+    assert!(!left.server.awaiting_durability());
+    assert!(!right.server.awaiting_durability());
+    assert_eq!(
+        left.server.world().canonical_hash(),
+        right.server.world().canonical_hash(),
+        "the same logical continuation has the same persisted world and light"
+    );
+    let p = BlockPos {
+        space: SpaceId(0),
+        x: 0,
+        y: 0,
+        z: 0,
+    };
+    assert_eq!(sky(&left.server, p), sky(&right.server, p));
 }
